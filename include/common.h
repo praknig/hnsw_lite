@@ -1,3 +1,13 @@
+/**
+* @file common.h
+ * @brief Shared types and constants used by every Layer 1 file.
+ *
+ * Contains no classes. Defines:
+ *  - NodeId: the internal number of a vector (0, 1, 2, ...).
+ *  - kEmpty: the value that marks an unused neighbor slot.
+ *  - kAlign / kFloatsPerLine: the 64-byte cache line and how many floats fit in it.
+ *  - round_up(): rounds a size up to a multiple (used for padding).
+ */
 #pragma once
 #include <cstddef>
 #include <cstdint>

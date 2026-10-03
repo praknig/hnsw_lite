@@ -5,8 +5,21 @@
 
 namespace vecdb {
 
-    // The doorway to Layer 1. Keeps the three parts in sync so that a vector's
-    // number is the same in IdMap, VectorStore and GraphStorage.
+    /**
+     * @brief Single entry point to Layer 1; keeps IdMap, VectorStore and GraphStorage in sync.
+     *
+     * insert() does, in order:
+     *  1. Checks the vector size.
+     *  2. Gets a new NodeId from IdMap (fails on a duplicate user ID).
+     *  3. Stores the vector in VectorStore.
+     *  4. Creates the node's neighbor slots in GraphStorage.
+     *
+     * Rules:
+     *  - All input checks happen before any change, so invalid input changes nothing.
+     *  - The same vector always has the same NodeId in all three parts.
+     *  - The level is passed in for now; the HNSW layer will choose it later.
+     *  - Not thread-safe.
+     */
     class Storage {
     public:
         explicit Storage(std::size_t dim, std::size_t M = 16) : vectors_(dim), graph_(M) {}

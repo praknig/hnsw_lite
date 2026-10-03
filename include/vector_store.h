@@ -8,11 +8,26 @@
 
 namespace vecdb {
 
-// Stores vectors back to back on "shelves" (fixed-size blocks).
-// - Each row is padded to a multiple of 16 floats, so every row starts
-//   on a 64-byte boundary. Padding is always zero.
-// - Shelves are never moved or resized, so addresses stay valid forever.
-// - Vector N lives on shelf N >> shelf_bits, at row N & mask.
+/**
+ * @brief Stores all vectors in 64-byte-aligned, zero-padded rows.
+ *
+ * Layout:
+ *  - Each vector gets the next number (0, 1, 2, ...).
+ *  - Each row holds `dim` values followed by zeros, up to `stride` values,
+ *    where stride = dim rounded up to a multiple of 16. Every row therefore
+ *    starts on a 64-byte boundary. The padding is always zero.
+ *  - Rows live in fixed-size blocks of 2^shelf_bits rows. Blocks are added
+ *    when needed and never moved, so returned spans stay valid.
+ *
+ * Finding vector N (arithmetic only):
+ *  - block = N >> shelf_bits, row = N & mask
+ *  - address = block start + row * stride
+ *
+ * Rules:
+ *  - add() only accepts vectors of exactly `dim` values.
+ *  - get() returns a read-only std::span of `dim` values; get_padded() includes the padding.
+ *  - Not thread-safe.
+ */
 class VectorStore {
 public:
     explicit VectorStore(std::size_t dim, unsigned shelf_bits = 16)

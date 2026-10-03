@@ -7,8 +7,21 @@
 
 namespace vecdb {
 
-    // Owns one block of memory that starts on a 64-byte boundary and is filled
-    // with a byte value (zero by default). Frees itself automatically (RAII).
+    /**
+     * @brief Owns one block of memory that starts on a 64-byte boundary.
+     *
+     * Responsibilities:
+     *  - Requests `bytes` of memory (rounded up to a multiple of 64) from the system.
+     *  - Fills every byte with `fill` (0 by default).
+     *  - Frees the memory automatically in the destructor (RAII).
+     *
+     * Rules:
+     *  - Not copyable: two copies would free the same memory twice.
+     *  - Movable: ownership passes to the new object; the old one becomes empty.
+     *  - The memory address never changes while the block is alive.
+     *
+     * Used by: VectorStore, GraphStorage and Arena. No other file calls new/delete.
+     */
     class AlignedBlock {
     public:
         explicit AlignedBlock(std::size_t bytes, unsigned char fill = 0)

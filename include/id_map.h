@@ -8,9 +8,20 @@
 
 namespace vecdb {
 
-    // Translates between the user's ids (any 64-bit number) and our dense
-    // internal numbers (0, 1, 2, ...). Also remembers which vectors are deleted.
-    // Used on insert/delete/lookup only, never inside the search loop.
+    /**
+     * @brief Translates between user IDs and internal NodeIds, and tracks deletions.
+     *
+     * Data:
+     *  - to_external_: position N holds the user ID of vector N.
+     *  - to_internal_: hash map from user ID to N.
+     *  - deleted_: one byte per vector, 1 if the vector is deleted.
+     *
+     * Rules:
+     *  - Internal numbers are given out in order: 0, 1, 2, ...
+     *  - A user ID can be added only once.
+     *  - Deleting only sets a flag ("tombstone"); nothing is freed or renumbered.
+     *  - Used on insert, delete and lookup only, never inside the search loop.
+     */
     class IdMap {
     public:
         NodeId add(std::uint64_t external) {

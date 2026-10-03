@@ -1,5 +1,16 @@
-// Tests for Layer 1. Build and run:
-//   g++ -std=c++20 -O1 -Wall -Wextra -fsanitize=address,undefined -Iinclude tests/test_layer1.cpp -o test && ./test
+/**
+ * @file test_layer1.cpp
+ * @brief Tests for every Layer 1 class. Prints "All Layer 1 tests passed." on success.
+ *
+ * Checks that:
+ *  - Memory starts on 64-byte boundaries and starts as zero.
+ *  - Padding stays zero and vector addresses never change after new blocks are added.
+ *  - New neighbor lists are empty and levels are enforced.
+ *  - Invalid input (wrong size, unknown id, duplicate user id) is rejected.
+ *
+ * Build and run without CMake:
+ *   g++ -std=c++20 -Wall -Wextra -Iinclude tests/test_layer1.cpp -o test && ./test
+ */
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>

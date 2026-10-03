@@ -8,13 +8,29 @@
 
 namespace vecdb {
 
-// Neighbor lists for the HNSW graph.
-// - Level 0: every node gets a fixed page of M0 = 2*M slots, stored on
-//   shelves exactly like VectorStore (page N found by arithmetic).
-//   With M = 16 a page is 32 * 4 = 128 bytes = two cache lines.
-// - Levels 1+: only the few nodes that reach them get pages, taken from
-//   the Arena. Each such node gets one block of `level * M` slots.
-// Unused slots hold kEmpty, which marks the end of a list.
+/**
+ * @brief Stores the HNSW neighbor lists of every node on every level.
+ *
+ * Level 0 (every node):
+ *  - A fixed list of M0 = 2*M slots per node, stored in blocks of
+ *    2^shelf_bits nodes and found by arithmetic, like VectorStore.
+ *  - With M = 16 a list is 32 * 4 = 128 bytes, exactly two cache lines.
+ *
+ * Levels 1 and above (only some nodes):
+ *  - A node at level L gets one Arena allocation of L * M slots:
+ *    one list of M slots for each level from 1 to L.
+ *  - upper_[N] points to that allocation, or is nullptr for level-0 nodes.
+ *
+ * Empty slots:
+ *  - Unused slots hold kEmpty; count() returns the slots before the first kEmpty.
+ *  - Level-0 blocks are filled with byte 0xFF, which makes every slot kEmpty.
+ *
+ * Rules:
+ *  - Nodes are added in order; node N here matches vector N in VectorStore.
+ *  - links() throws if the node does not reach the requested level.
+ *  - Levels are limited to 0..255.
+ *  - Not thread-safe.
+ */
 class GraphStorage {
 public:
     explicit GraphStorage(std::size_t M = 16, unsigned shelf_bits = 16)
