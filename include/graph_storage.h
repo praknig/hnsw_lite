@@ -1,0 +1,77 @@
+#pragma once
+#include <algorithm>
+#include <span>
+#include <stdexcept>
+#include <vector>
+
+#include "arena.h"
+
+namespace vecdb {
+
+// Neighbor lists for the HNSW graph.
+// - Level 0: every node gets a fixed page of M0 = 2*M slots, stored on
+//   shelves exactly like VectorStore (page N found by arithmetic).
+//   With M = 16 a page is 32 * 4 = 128 bytes = two cache lines.
+// - Levels 1+: only the few nodes that reach them get pages, taken from
+//   the Arena. Each such node gets one block of `level * M` slots.
+// Unused slots hold kEmpty, which marks the end of a list.
+class GraphStorage {
+public:
+    explicit GraphStorage(std::size_t M = 16, unsigned shelf_bits = 16)
+        : M_(M), M0_(2 * M), shelf_bits_(shelf_bits),
+          mask_((std::size_t{1} << shelf_bits) - 1) {
+        if (M == 0) throw std::invalid_argument("M must be > 0");
+    }
+
+    // Registers the next node (its id is size()) with the given top level.
+    NodeId add_node(int level) {
+        if (level < 0 || level > 255) throw std::invalid_argument("bad level");
+        auto id = static_cast<NodeId>(levels_.size());
+        if ((id & mask_) == 0)  // new shelf, every byte 0xFF == every slot kEmpty
+            layer0_.emplace_back((mask_ + 1) * M0_ * sizeof(NodeId), 0xFF);
+
+        NodeId* upper = nullptr;
+        if (level > 0) {
+            upper = arena_.allocate_array<NodeId>(std::size_t(level) * M_);
+            std::fill_n(upper, std::size_t(level) * M_, kEmpty);
+        }
+        levels_.push_back(static_cast<std::uint8_t>(level));
+        upper_.push_back(upper);
+        return id;
+    }
+
+    // Writable window onto node `id`'s slots at `level` (M0 or M slots).
+    std::span<NodeId> links(NodeId id, int level) {
+        if (id >= levels_.size() || level < 0 || level > levels_[id])
+            throw std::out_of_range("node does not exist on this level");
+        if (level == 0) {
+            auto* base = reinterpret_cast<NodeId*>(layer0_[id >> shelf_bits_].data());
+            return {base + (id & mask_) * M0_, M0_};
+        }
+        return {upper_[id] + std::size_t(level - 1) * M_, M_};
+    }
+    std::span<const NodeId> links(NodeId id, int level) const {
+        return const_cast<GraphStorage*>(this)->links(id, level);
+    }
+
+    // Number of used slots = position of the first kEmpty.
+    static std::size_t count(std::span<const NodeId> slots) {
+        return std::size_t(std::find(slots.begin(), slots.end(), kEmpty) - slots.begin());
+    }
+
+    int level(NodeId id) const { return levels_.at(id); }
+    std::size_t size() const { return levels_.size(); }
+    std::size_t M() const { return M_; }
+    std::size_t M0() const { return M0_; }
+
+private:
+    std::size_t M_, M0_;
+    unsigned shelf_bits_;
+    std::size_t mask_;
+    std::vector<AlignedBlock> layer0_;  // shelves of level-0 pages
+    std::vector<std::uint8_t> levels_;  // top level of each node
+    std::vector<NodeId*> upper_;        // upper-level block, or nullptr
+    Arena arena_;                       // memory for upper-level blocks
+};
+
+}  // namespace vecdb
