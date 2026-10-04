@@ -66,7 +66,8 @@ private:
  *  - acquire() takes an idle list (or creates one if none is idle), resets it,
  *    and returns it inside a Handle.
  *  - The Handle gives the list back automatically when it goes out of scope,
- *    even if the search throws an exception.
+ *    even if the search throws an exception. Giving it back never allocates
+ *    (room is reserved when a list is created), so it can never fail.
  *  - A mutex protects the idle stack, so several searches can run at once.
  */
 class VisitedListPool {
@@ -103,7 +104,14 @@ public:
                 idle_.pop_back();
             }
         }
-        if (!list) list = std::make_unique<VisitedList>();
+        if (!list) {
+            list = std::make_unique<VisitedList>();
+            // Make room in the stock for every list ever created, so returning a
+            // list (in the Handle's destructor) never needs to allocate.
+            std::lock_guard<std::mutex> lock(mutex_);
+            idle_.reserve(created_ + 1);
+            ++created_;
+        }
         list->reset(node_count);
         return Handle(*this, std::move(list));
     }
@@ -115,7 +123,8 @@ public:
     }
 
 private:
-    /// Puts a list back. Never throws: if storing it fails, the list is just freed.
+    /// Puts a list back. Never allocates, because acquire() reserved room for
+    /// every list it created. The try/catch is only a safety net.
     void release(std::unique_ptr<VisitedList> list) noexcept {
         try {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -126,6 +135,7 @@ private:
 
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<VisitedList>> idle_;
+    std::size_t created_ = 0;  // lists ever created; idle_ has room for all of them
 };
 
 }  // namespace vecdb

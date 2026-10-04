@@ -47,6 +47,23 @@ public:
         return id;
     }
 
+    /// Puts a new vector into a free (released) slot instead of appending.
+    /// Same checks as insert(); also throws std::logic_error if `slot` is not free.
+    /// All-or-nothing: if anything fails, the slot is still free and nothing changed.
+    NodeId insert_into(NodeId slot, std::uint64_t external, std::span<const float> v, int level) {
+        if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
+        if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");
+        ids_.bind(slot, external);  // all-or-nothing (slot not free, duplicate, out of memory)
+        try {
+            graph_.reset_node(slot, level);  // all-or-nothing
+        } catch (...) {
+            ids_.release(external);  // the slot is free again
+            throw;
+        }
+        vectors_.overwrite(slot, v);  // cannot fail: dimension and slot already checked
+        return slot;
+    }
+
     const VectorStore& vectors() const { return vectors_; }
     GraphStorage& graph() { return graph_; }
     const GraphStorage& graph() const { return graph_; }

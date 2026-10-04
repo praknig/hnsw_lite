@@ -118,7 +118,7 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
-  # Data races in the groups that use several threads.
+  # Data races in the threaded groups, plus deletion (which future concurrent writes will share).
   thread-sanitizer:
     name: Linux / ThreadSanitizer
     runs-on: ubuntu-24.04
@@ -142,4 +142,4 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive
 
       - name: Test threaded groups
-        run: ./build/test_comprehensive --group concurrency --group helpers
+        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion

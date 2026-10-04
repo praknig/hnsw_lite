@@ -56,6 +56,52 @@ public:
     void mark_deleted(NodeId id) { deleted_.at(id) = 1; }
     bool is_deleted(NodeId id) const { return deleted_.at(id) != 0; }
 
+    /// Real deletion: frees the user ID so it can be added again, and marks its
+    /// slot as free (deleted) so the slot can be reused. Returns the freed slot,
+    /// or nothing if the ID is unknown or already released. Never throws.
+    std::optional<NodeId> release(std::uint64_t external) noexcept {
+        auto it = to_internal_.find(external);
+        if (it == to_internal_.end()) return std::nullopt;
+        const NodeId slot = it->second;
+        to_internal_.erase(it);
+        deleted_[slot] = 1;
+        return slot;
+    }
+
+    /// True if `slot` exists, is deleted and no user ID maps to it (it was released).
+    bool is_free(NodeId slot) const {
+        if (slot >= to_external_.size() || !deleted_[slot]) return false;
+        auto it = to_internal_.find(to_external_[slot]);
+        return it == to_internal_.end() || it->second != slot;
+    }
+
+    /// Gives a free slot a new user ID (slot reuse). Throws std::logic_error if
+    /// the slot is not free, std::invalid_argument if the ID is already in use.
+    /// All-or-nothing: if it throws, nothing changed.
+    void bind(NodeId slot, std::uint64_t external) {
+        if (!is_free(slot)) throw std::logic_error("slot is not free");
+        auto [it, inserted] = to_internal_.try_emplace(external, slot);  // strong guarantee
+        if (!inserted) throw std::invalid_argument("external id already exists");
+        to_external_[slot] = external;
+        deleted_[slot] = 0;
+    }
+
+    /// Moves slot `from`'s entry into slot `to` (used by swap-with-last removal).
+    /// `to` must have been released. Never throws.
+    void move_slot(NodeId from, NodeId to) noexcept {
+        const std::uint64_t external = to_external_[from];
+        auto it = to_internal_.find(external);
+        if (it != to_internal_.end() && it->second == from) it->second = to;
+        to_external_[to] = external;
+        deleted_[to] = deleted_[from];
+    }
+
+    /// Removes the last slot, which must already be released or moved. Never throws.
+    void pop_back_slot() noexcept {
+        to_external_.pop_back();
+        deleted_.pop_back();
+    }
+
     std::size_t size() const { return to_external_.size(); }
 
 private:

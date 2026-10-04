@@ -24,17 +24,23 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector) {
 }
 
 bool FlatIndex::remove(std::uint64_t id) {
-    auto node = ids_.find(id);
-    if (!node || ids_.is_deleted(*node)) return false;
-    ids_.mark_deleted(*node);  // tombstone: memory stays, search skips it
+    const auto node = ids_.find(id);
+    if (!node) return false;
+    // Swap-with-last: move the last vector into the freed slot, then shrink by one.
+    // Every step below is non-allocating and cannot throw.
+    const auto last = static_cast<NodeId>(vectors_.size() - 1);
+    ids_.release(id);
+    if (*node != last) {
+        vectors_.move_row(last, *node);
+        ids_.move_slot(last, *node);
+    }
+    ids_.pop_back_slot();
+    vectors_.pop_back();
     --live_;
     return true;
 }
 
-bool FlatIndex::contains(std::uint64_t id) const {
-    auto node = ids_.find(id);
-    return node && !ids_.is_deleted(*node);
-}
+bool FlatIndex::contains(std::uint64_t id) const { return ids_.find(id).has_value(); }
 
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k) const {
     PreparedVector q(dim());
@@ -42,18 +48,16 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
     if (k == 0 || live_ == 0) return {};
     k = std::min(k, live_);  // asking for more than exists returns everything
 
-    // Compare the query with every live vector, keeping the k closest.
+    // Compare the query with every vector, keeping the k closest.
     TopK top(k);
     const std::size_t count = vectors_.size(), stride = vectors_.stride();
-    for (NodeId node = 0; node < count; ++node) {
-        if (ids_.is_deleted(node)) continue;  // one byte read, cheaper than a distance
+    for (NodeId node = 0; node < count; ++node)
         top.push({ordered_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride)), node});
-    }
 
     // Translate internal numbers to the user's IDs.
     std::vector<SearchResult> results;
-    for (const Candidate& c : top.take_sorted())
-        results.push_back({ids_.external(c.id), c.distance});
+    results.reserve(k);
+    for (const Candidate& c : top.take_sorted()) results.push_back({ids_.external(c.id), c.distance});
     return results;
 }
 

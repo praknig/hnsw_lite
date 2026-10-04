@@ -100,6 +100,25 @@ public:
     std::size_t M() const { return M_; }
     std::size_t M0() const { return M0_; }
 
+    /// Clears node `id` and gives it a new top level (slot reuse). Every list
+    /// becomes empty. A higher level than before gets a new arena block; a lower
+    /// or equal level reuses the old one. Throws on an invalid level or node,
+    /// or if memory runs out; in every case nothing has changed.
+    void reset_node(NodeId id, int level) {
+        if (level < 0 || level > 255) throw std::invalid_argument("bad level");
+        if (id >= levels_.size()) throw std::out_of_range("unknown node");
+        NodeId* upper = upper_[id];
+        if (level > levels_[id])  // may throw; nothing changed yet
+            upper = arena_.allocate_array<NodeId>(std::size_t(level) * M_);
+        auto* base = reinterpret_cast<NodeId*>(layer0_[std::size_t(id) >> shelf_bits_].data());
+        std::fill_n(base + (std::size_t(id) & mask_) * M0_, M0_, kEmpty);
+        if (level > 0) {
+            std::fill_n(upper, std::size_t(level) * M_, kEmpty);
+            upper_[id] = upper;
+        }
+        levels_[id] = static_cast<std::uint8_t>(level);
+    }
+
 private:
     std::size_t M_, M0_;
     unsigned shelf_bits_;
