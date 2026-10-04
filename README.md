@@ -78,13 +78,13 @@ The engine is built as three layers. Each layer only depends on the ones below i
 
 ```mermaid
 flowchart TB
-    A["Your application"] --> B["Layer 3: FlatIndex"]
-    A --> C["Layer 3: HnswIndex"]
-    B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
-    C --> D
-    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
-    C --> E
-    D --> E
+  A["Your application"] --> B["Layer 3: FlatIndex"]
+  A --> C["Layer 3: HnswIndex"]
+  B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
+  C --> D
+  B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+  C --> E
+  D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -97,43 +97,43 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    S["storage.h"] --> I["id_map.h"]
-    S --> V["vector_store.h"]
-    S --> G["graph_storage.h"]
-    G --> AR["arena.h"]
-    V --> AB["aligned_block.h"]
-    G --> AB
-    AR --> AB
-    AB --> C["common.h"]
-    I --> C
+  S["storage.h"] --> I["id_map.h"]
+  S --> V["vector_store.h"]
+  S --> G["graph_storage.h"]
+  G --> AR["arena.h"]
+  V --> AB["aligned_block.h"]
+  G --> AB
+  AR --> AB
+  AB --> C["common.h"]
+  I --> C
 ```
 
 ### Layer 2 file dependencies
 
 ```mermaid
 flowchart TB
-    D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
-    DP --> K["src/kernels.h"]
-    K --> SC["distance_scalar.cpp<br/>any CPU"]
-    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
-    K --> A5["distance_avx512.cpp<br/>-mavx512f"]
-    K --> NE["distance_neon.cpp<br/>64-bit ARM"]
+  D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
+  DP --> K["src/kernels.h"]
+  K --> SC["distance_scalar.cpp<br/>any CPU"]
+  K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
+  K --> A5["distance_avx512.cpp<br/>-mavx512f"]
+  K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
 
 ### Layer 3 file dependencies
 
 ```mermaid
 flowchart TB
-    F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
-    F --> TK["search_result.h<br/>TopK"]
-    H["hnsw_index.h / .cpp"] --> PV
-    H --> TK
-    H --> VL["visited_list.h"]
-    F --> L1A["Layer 1: VectorStore, IdMap"]
-    H --> L1B["Layer 1: Storage"]
-    PV --> L2["Layer 2: distance.h"]
-    F --> L2
-    H --> L2
+  F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
+  F --> TK["search_result.h<br/>TopK"]
+  H["hnsw_index.h / .cpp"] --> PV
+  H --> TK
+  H --> VL["visited_list.h"]
+  F --> L1A["Layer 1: VectorStore, IdMap"]
+  H --> L1B["Layer 1: Storage"]
+  PV --> L2["Layer 2: distance.h"]
+  F --> L2
+  H --> L2
 ```
 
 ## Project structure
@@ -167,13 +167,7 @@ hnsw-lite/
 │   ├── flat_index.cpp          # FlatIndex implementation
 │   └── hnsw_index.cpp          # HnswIndex implementation
 ├── tests/
-│   ├── check.h                 # Shared CHECK macro, throws() and throws_as<E>()
-│   ├── test_layer1.cpp         # Tests for Layer 1
-│   ├── test_distance.cpp       # Tests for Layer 2
-│   ├── test_search_helpers.cpp # Tests for TopK, PreparedVector, VisitedList
-│   ├── test_flat.cpp           # Tests for FlatIndex
-│   ├── test_hnsw.cpp           # Tests for HnswIndex (graph validity, recall)
-│   └── test_comprehensive.cpp  # All 216 scenarios with a built-in runner
+│   └── test_comprehensive.cpp  # All 216 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -200,7 +194,7 @@ Supported CPUs: any x86-64 or 64-bit ARM processor. SIMD versions are used autom
 1. Open the `hnsw-lite` folder.
 2. Run **Tools → CMake → Reset Cache and Reload Project**.
 3. Choose **All CTest** from the run configuration dropdown and click **Run** to run every test.
-4. For the benchmarks, add a **Release** profile (Settings → Build, Execution, Deployment → CMake), select it, and run `bench_distance` or `bench_search`. Debug builds turn off optimizations, so their timings are meaningless (and `test_hnsw` takes about 10 seconds instead of 1).
+4. For the benchmarks, add a **Release** profile (Settings → Build, Execution, Deployment → CMake), select it, and run `bench_distance` or `bench_search`. Debug builds turn off optimizations, so their timings are meaningless (and the test suite takes about a minute instead of 4 seconds).
 
 ### Command line: Linux and macOS
 
@@ -690,28 +684,21 @@ TEST(flat, my_new_case) {
 
 ### CTest
 
-CTest runs the five per-layer test programs plus one entry per comprehensive group, 13 entries in total:
+CTest runs the comprehensive suite as one entry per group, 8 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/13 Test  #1: test_layer1 ......................   Passed
- 2/13 Test  #2: test_distance ....................   Passed
- 3/13 Test  #3: test_search_helpers ..............   Passed
- 4/13 Test  #4: test_flat ........................   Passed
- 5/13 Test  #5: test_hnsw ........................   Passed
- 6/13 Test  #6: comprehensive.layer1 .............   Passed
- 7/13 Test  #7: comprehensive.layer2 .............   Passed
- 8/13 Test  #8: comprehensive.helpers ............   Passed
- 9/13 Test  #9: comprehensive.flat ...............   Passed
-10/13 Test #10: comprehensive.hnsw ...............   Passed
-11/13 Test #11: comprehensive.robustness .........   Passed
-12/13 Test #12: comprehensive.concurrency ........   Passed
-13/13 Test #13: comprehensive.e2e ................   Passed
-100% tests passed, 0 tests failed out of 13
+1/8 Test #1: comprehensive.layer1 .............   Passed
+2/8 Test #2: comprehensive.layer2 .............   Passed
+3/8 Test #3: comprehensive.helpers ............   Passed
+4/8 Test #4: comprehensive.flat ...............   Passed
+5/8 Test #5: comprehensive.hnsw ...............   Passed
+6/8 Test #6: comprehensive.robustness .........   Passed
+7/8 Test #7: comprehensive.concurrency ........   Passed
+8/8 Test #8: comprehensive.e2e ................   Passed
+100% tests passed, 0 tests failed out of 8
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
-
-The per-layer programs (`test_layer1`, `test_distance`, `test_search_helpers`, `test_flat`, `test_hnsw`) are small, quick checks of normal behavior, one per layer. Every scenario they contain is also in the comprehensive suite.
 
 In a Debug build the comprehensive suite takes about a minute, and several times longer with sanitizers, because it builds many indexes with optimizations off.
 

@@ -10,7 +10,7 @@ option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux
 # ---------------------------------------------------------------------------
 # Library: Layer 1 headers, Layer 2 kernels, Layer 3 indexes
 # ---------------------------------------------------------------------------
-file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h tests/*.h)
+file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
         src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
         src/flat_index.cpp src/hnsw_index.cpp                            # Layer 3
@@ -47,12 +47,11 @@ endfunction()
 hnsw_lite_setup(hnsw_lite)
 
 # ---------------------------------------------------------------------------
-# Tests and benchmark
+# Tests and benchmarks
 # ---------------------------------------------------------------------------
 enable_testing()
-
-# Comprehensive suite: one program containing every scenario. Each group is also
-# registered as its own CTest entry, e.g. "ctest -R comprehensive.hnsw".
+# One test program containing every test. Each group is registered as its own
+# CTest entry (its own process), e.g. "ctest -R comprehensive.hnsw".
 find_package(Threads REQUIRED)
 add_executable(test_comprehensive tests/test_comprehensive.cpp)
 target_link_libraries(test_comprehensive PRIVATE hnsw_lite Threads::Threads)
