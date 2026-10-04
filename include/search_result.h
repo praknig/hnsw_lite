@@ -57,6 +57,15 @@ struct Candidate {
 };
 
 /**
+ * @brief What compact() did: how many vectors it kept and how many slots of
+ *        removed vectors it reclaimed.
+ */
+struct CompactStats {
+    std::size_t kept;
+    std::size_t reclaimed;
+};
+
+/**
  * @brief Keeps the k best (closest) candidates seen so far.
  *
  * How it works:

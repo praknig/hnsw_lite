@@ -73,6 +73,25 @@ public:
     /// Undoes the most recent add(). Used to roll back a failed insert. The row
     /// is simply reused by the next add(); its padding is still zero.
     void undo_last_add() noexcept { --count_; }
+
+    /// Removes the last row (used by swap-with-last removal). Its memory is
+    /// reused by the next add(), without allocating; its padding stays zero.
+    void pop_back() noexcept { --count_; }
+
+    /// Replaces the values of row `id` (slot reuse). Padding stays zero and the
+    /// address does not change. Throws on a wrong dimension or unknown id,
+    /// before changing anything.
+    void overwrite(NodeId id, std::span<const float> v) {
+        if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
+        std::copy(v.begin(), v.end(), row(check(id)));
+    }
+
+    /// Copies row `from` over row `to`, padding included (used by swap-with-last
+    /// removal). Throws std::out_of_range for an unknown row, before changing anything.
+    void move_row(NodeId from, NodeId to) {
+        const float* src = row(check(from));
+        std::copy_n(src, stride_, row(check(to)));
+    }
     std::size_t rows_per_shelf() const { return mask_ + 1; }
     std::size_t dim() const { return dim_; }
     std::size_t stride() const { return stride_; }

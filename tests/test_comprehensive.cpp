@@ -16,7 +16,7 @@
  *   test_comprehensive --fail-fast          stop at the first failing test
  *   test_comprehensive --help               show this help
  *
- * Groups: layer1, layer2, helpers, flat, hnsw, robustness, concurrency, e2e
+ * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -40,6 +40,7 @@
 #include <cstring>
 #include <initializer_list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -331,18 +332,28 @@ void check_results(const Index& index, const Results& results) {
 
 /// Checks every structural rule of an HNSW graph, and that at least
 /// `min_reachable` of the live nodes can be reached from the entry point.
+/// Removed nodes are skipped. Stale links (to a node whose level is now below
+/// the link's level, left behind by slot reuse; searches skip them) are allowed
+/// but must be rare.
 void check_graph(const HnswIndex& index, double min_reachable) {
     const Storage& st = index.storage();
     const GraphStorage& g = st.graph();
+    const IdMap& ids = st.ids();
     const std::size_t n = st.size();
-    if (n == 0) {
+    std::size_t live = 0;
+    for (NodeId node = 0; node < n; ++node) live += !ids.is_deleted(node);
+    CHECK(live == index.size());
+    if (live == 0) {
         CHECK(index.entry_point() == kEmpty && index.max_level() == -1);
         return;
     }
     REQUIRE(index.entry_point() < n);
+    CHECK(!ids.is_deleted(index.entry_point()));
     CHECK(g.level(index.entry_point()) == index.max_level());
     bool structure_ok = true;
+    std::size_t links = 0, stale = 0;
     for (NodeId node = 0; node < n; ++node) {
+        if (ids.is_deleted(node)) continue;
         if (g.level(node) > index.max_level()) structure_ok = false;
         for (int level = 0; level <= g.level(node); ++level) {
             auto slots = g.links(node, level);
@@ -351,14 +362,16 @@ void check_graph(const HnswIndex& index, double min_reachable) {
             std::set<NodeId> seen;
             for (std::size_t i = 0; i < count; ++i) {
                 const NodeId nb = slots[i];
-                if (nb >= n || nb == node || g.level(nb) < level || !seen.insert(nb).second)
-                    structure_ok = false;
+                ++links;
+                if (nb >= n || nb == node || !seen.insert(nb).second) structure_ok = false;
+                else if (g.level(nb) < level) ++stale;
             }
             for (std::size_t i = count; i < slots.size(); ++i)
                 if (slots[i] != kEmpty) structure_ok = false;
         }
     }
     CHECK(structure_ok);
+    CHECK(stale <= links / 50);  // at most 2% of links stale
 
     // Reachability of LIVE nodes on level 0 (the walk may pass removed nodes).
     std::vector<bool> reached(n, false);
@@ -375,13 +388,19 @@ void check_graph(const HnswIndex& index, double min_reachable) {
             }
         }
     }
-    std::size_t live = 0, live_reached = 0;
-    for (NodeId node = 0; node < n; ++node) {
-        if (st.ids().is_deleted(node)) continue;
-        ++live;
-        live_reached += reached[node];
-    }
-    if (live > 0) CHECK(double(live_reached) / double(live) >= min_reachable);
+    std::size_t live_reached = 0;
+    for (NodeId node = 0; node < n; ++node)
+        if (!ids.is_deleted(node)) live_reached += reached[node];
+    CHECK(double(live_reached) / double(live) >= min_reachable);
+}
+
+/// Results sorted by distance, then user ID: lets two result lists be compared
+/// when equal distances may come back in a different order.
+Results tie_sorted(Results r) {
+    std::sort(r.begin(), r.end(), [](const SearchResult& a, const SearchResult& b) {
+        return a.distance < b.distance || (a.distance == b.distance && a.id < b.id);
+    });
+    return r;
 }
 
 /// Exact reference search: every distance (same kernel), sorted, first k.
@@ -1669,12 +1688,15 @@ TEST(flat, duplicate_rejected) {
     CHECK(f.search(std::vector<float>{0, 0}, 1)[0].distance == 0.0f);  // original kept
 }
 
-TEST(flat, removed_id_not_reusable) {
+TEST(flat, removed_id_reusable) {
+    // Changed by real deletion: a removed ID can be added again.
     FlatIndex f(2, Metric::L2);
     f.add(7, std::vector<float>{0, 0});
     f.remove(7);
-    CHECK_THROWS_AS(std::invalid_argument, f.add(7, std::vector<float>{1, 1}));
-    CHECK(f.size() == 0);
+    CHECK_NOTHROW(f.add(7, std::vector<float>{5, 5}));
+    CHECK(f.size() == 1 && f.contains(7));
+    auto r = f.search(std::vector<float>{5, 5}, 1);
+    CHECK(r[0].id == 7 && r[0].distance == 0.0f);
 }
 
 TEST(flat, remove_semantics) {
@@ -1702,7 +1724,8 @@ TEST(flat, removed_never_returned) {
     CHECK(f.size() == 200 - 67);
     for (const auto& q : queries) {
         auto got = f.search(q, 20);
-        CHECK(same_results(got, reference_search(data, removed, q, Metric::L2, 20, 1000)));
+        // Swap-with-last reorders internal positions, so compare tie-tolerantly.
+        CHECK(same_results(tie_sorted(got), tie_sorted(reference_search(data, removed, q, Metric::L2, 20, 1000))));
         check_results(f, got);
     }
 }
@@ -1842,11 +1865,16 @@ TEST(hnsw, duplicate_rejected) {
     CHECK(h.search(std::vector<float>{0, 0}, 1)[0].distance == 0.0f);
 }
 
-TEST(hnsw, removed_id_not_reusable) {
+TEST(hnsw, removed_id_reusable) {
+    // Changed by real deletion: a removed ID can be added again.
     HnswIndex h(2, Metric::L2);
     h.add(7, std::vector<float>{0, 0});
+    h.add(8, std::vector<float>{9, 9});
     h.remove(7);
-    CHECK_THROWS_AS(std::invalid_argument, h.add(7, std::vector<float>{1, 1}));
+    CHECK_NOTHROW(h.add(7, std::vector<float>{5, 5}));
+    CHECK(h.size() == 2 && h.contains(7));
+    auto r = h.search(std::vector<float>{5, 5}, 1);
+    CHECK(r[0].id == 7 && r[0].distance == 0.0f);
 }
 
 TEST(hnsw, failed_inserts_keep_graph_identical) {
@@ -2138,7 +2166,9 @@ TEST(hnsw, remove_semantics) {
     CHECK(h.remove(1));
     CHECK(!h.contains(1) && h.contains(2) && h.size() == 1);
     CHECK(!h.remove(1) && !h.remove(999));
-    CHECK(h.storage().size() == 2);  // still stored, only flagged
+    CHECK(h.capacity() == 2 && h.deleted_count() == 1);  // slot kept for reuse
+    h.add(3, std::vector<float>{2, 2});
+    CHECK(h.capacity() == 2 && h.deleted_count() == 0);  // ...and reused
 }
 
 TEST(hnsw, removed_never_returned) {
@@ -2196,28 +2226,37 @@ TEST(hnsw, remove_all_then_add) {
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     for (std::uint64_t i = 0; i < 200; ++i) h.remove(i);
     CHECK(h.size() == 0 && h.search(data[0], 5).empty());
+    CHECK(h.entry_point() == kEmpty && h.max_level() == -1);  // as in a new index
+    CHECK(h.capacity() == 200);                               // slots kept for reuse
     h.add(5000, data[0]);
     h.add(5001, data[1]);
+    CHECK(h.capacity() == 200);  // reused, not appended
     auto r = h.search(data[0], 5, 100);
     CHECK(r.size() == 2 && r[0].id == 5000);
     check_graph(h, 1.0);
 }
 
 TEST(hnsw, new_nodes_do_not_link_to_removed) {
-    auto data = clustered(600, 16, 6, 74);
+    // Rewritten for slot reuse: new vectors take freed slots, so they are found
+    // through their user IDs. 100 removed, 50 slots reused, 50 stay removed.
+    auto data = clustered(350, 16, 6, 74);
     HnswIndex h(16, Metric::L2);
     for (std::size_t i = 0; i < 300; ++i) h.add(i, data[i]);
     for (std::size_t i = 0; i < 300; i += 3) h.remove(i);
-    for (std::size_t i = 300; i < 600; ++i) h.add(i, data[i]);
+    for (std::size_t i = 300; i < 350; ++i) h.add(i, data[i]);
+    CHECK(h.capacity() == 300 && h.deleted_count() == 50);
     const Storage& st = h.storage();
     bool ok = true;
-    for (NodeId node = 300; node < 600; ++node)  // nodes inserted after the removals
+    for (std::uint64_t id = 300; id < 350; ++id) {
+        const NodeId node = *st.ids().find(id);
         for (int l = 0; l <= st.graph().level(node); ++l)
             for (NodeId nb : st.graph().links(node, l)) {
                 if (nb == kEmpty) break;
                 ok = ok && !st.ids().is_deleted(nb);
             }
+    }
     CHECK(ok);
+    check_graph(h, 0.99);
 }
 
 TEST(hnsw, remove_and_readd_recall) {
@@ -2350,9 +2389,10 @@ TEST(robustness, max_level_stays_reasonable) {
 namespace {
 
 /// Runs `op` with allocation n failing, for n = 0, 1, 2, ... After each injected
-/// failure that reaches the caller, `verify` checks the object is still sound.
-/// Stops when `op` completes without any injected failure firing. Returns the
-/// number of allocation points tried, or -1 if `op` never completed.
+/// failure, `verify` checks the object is still sound. Stops when `op` completes
+/// without any injected failure. Returns the number of allocation points tried,
+/// or -1 on a problem (an exception other than bad_alloc, or a failure that the
+/// operation swallowed instead of reporting).
 template <class Op, class Verify>
 long sweep_allocation_failures(Op op, Verify verify, long max_points = 5000) {
     for (long n = 0; n < max_points; ++n) {
@@ -2372,10 +2412,16 @@ long sweep_allocation_failures(Op op, Verify verify, long max_points = 5000) {
         alloc_hook::disarm();
         if (threw) {
             verify();
-        } else if (!alloc_hook::fired) {
+        } else if (alloc_hook::fired) {
+            // The operation hid an allocation failure and still completed. Code
+            // that silently swallows failures is a bug, and the object may have
+            // changed, so later points could not be checked against it anyway.
+            report(false, __LINE__, "an allocation failure was swallowed instead of reported");
+            std::printf("        (at allocation point %ld)\n", n);
+            return -1;
+        } else {
             return n;  // completed with no failure injected: every point was tried
         }
-        // A failure fired but was handled internally: keep going.
     }
     return -1;
 }
@@ -2502,13 +2548,9 @@ TEST(robustness, oom_hnsw_add_keeps_index_consistent) {
     auto queries = clustered(5, 8, 4, 86);
     HnswIndex h(8, Metric::L2);
     for (std::size_t i = 0; i < 300; ++i) h.add(i, data[i]);
-    std::uint64_t next_id = 10000;  // a failed insert may keep its ID taken, so use a new one each try
-    std::uint64_t last_id = 0;
+    const std::uint64_t last_id = 10000;  // a failed insert frees its ID, so retry the same one
     const long points = sweep_allocation_failures(
-        [&] {
-            last_id = next_id++;
-            h.add(last_id, data[300]);
-        },
+        [&] { h.add(last_id, data[300]); },
         [&] {
             CHECK(h.size() == 300);          // the failed vector is not counted...
             CHECK(!h.contains(last_id));     // ...and never visible
@@ -2549,6 +2591,799 @@ TEST(robustness, oom_visited_pool) {
         CHECK(pool.idle_count() <= 1);
     });
     CHECK(points > 0 && pool.idle_count() == 1);
+}
+
+// ===========================================================================
+// Real deletion (docs/core-capabilities-test-plan.md, scenarios D1-D66).
+// Test names start with the scenario ID.
+// ===========================================================================
+
+namespace {
+
+/// Points around `clusters` centers, also returning each point's cluster.
+std::pair<Vectors, std::vector<std::size_t>> clustered_labeled(std::size_t count, std::size_t dim,
+                                                               std::size_t clusters, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> center(-1.0f, 1.0f);
+    std::normal_distribution<float> noise(0.0f, 0.15f);
+    Vectors centers(clusters, std::vector<float>(dim));
+    for (auto& c : centers)
+        for (float& x : c) x = center(rng);
+    Vectors out(count, std::vector<float>(dim));
+    std::vector<std::size_t> label(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        label[i] = i % clusters;
+        for (std::size_t d = 0; d < dim; ++d) out[i][d] = centers[label[i]][d] + noise(rng);
+    }
+    return {out, label};
+}
+
+/// Exact top-k over a map of live vectors, sorted by distance then user ID.
+Results brute_force(const std::map<std::uint64_t, std::vector<float>>& live,
+                    const std::vector<float>& query, Metric m, std::size_t k) {
+    const std::size_t dim = query.size();
+    PreparedVector q(dim), row(dim);
+    q.prepare(query, m);
+    DistanceFn fn = get_distance(m);
+    Results all;
+    for (const auto& [id, v] : live) {
+        row.prepare(v, m);
+        all.push_back({id, fn(q.data(), row.data(), q.stride())});
+    }
+    all = tie_sorted(all);
+    if (all.size() > k) all.resize(k);
+    return all;
+}
+
+/// Removes and re-adds vectors one at a time (M = 4, so levels vary a lot) and
+/// reports whether a reused slot ever got a higher, and a lower, level.
+struct LevelChange { bool higher = false, lower = false, same_slot = true; };
+LevelChange reuse_levels(HnswIndex& h, const Vectors& replacement) {
+    LevelChange seen;
+    std::uint64_t next = 100000;
+    for (std::uint64_t i = 0; i < replacement.size() && !(seen.higher && seen.lower); ++i) {
+        const NodeId slot = *h.storage().ids().find(i);
+        const int old_level = h.storage().graph().level(slot);
+        h.remove(i);
+        h.add(next, replacement[i]);
+        const NodeId reused = *h.storage().ids().find(next++);
+        seen.same_slot = seen.same_slot && reused == slot;  // last in, first out
+        const int new_level = h.storage().graph().level(reused);
+        seen.higher = seen.higher || new_level > old_level;
+        seen.lower = seen.lower || new_level < old_level;
+    }
+    return seen;
+}
+
+}  // namespace
+
+// ---- Layer 1 building blocks ----------------------------------------------
+
+TEST(deletion, d01_id_map_release_keeps_slot) {
+    IdMap m;
+    m.add(10);
+    m.add(11);
+    auto slot = m.release(10);
+    CHECK(slot.has_value() && *slot == 0);
+    CHECK(!m.find(10).has_value() && m.size() == 2);
+    CHECK(m.is_deleted(0) && m.is_free(0));
+    CHECK(*m.find(11) == 1 && !m.is_free(1));
+}
+
+TEST(deletion, d02_id_map_release_unknown) {
+    IdMap m;
+    m.add(1);
+    CHECK(!m.release(99).has_value());
+    CHECK(m.release(1).has_value());
+    CHECK(!m.release(1).has_value());  // already released
+    CHECK(m.size() == 1);
+}
+
+TEST(deletion, d03_id_map_bind_free_slot) {
+    IdMap m;
+    m.add(10);
+    m.release(10);
+    m.bind(0, 20);
+    CHECK(*m.find(20) == 0 && m.external(0) == 20);
+    CHECK(!m.is_deleted(0) && !m.is_free(0) && !m.find(10).has_value());
+}
+
+TEST(deletion, d04_id_map_bind_duplicate_rejected) {
+    IdMap m;
+    m.add(10);
+    m.add(11);
+    m.release(10);
+    CHECK_THROWS_AS(std::invalid_argument, m.bind(0, 11));
+    CHECK(m.is_free(0) && *m.find(11) == 1);
+}
+
+TEST(deletion, d05_id_map_bind_non_free_rejected) {
+    IdMap m;
+    m.add(10);
+    CHECK_THROWS_AS(std::logic_error, m.bind(0, 20));   // live slot
+    m.mark_deleted(0);                                   // tombstone: ID still mapped
+    CHECK_THROWS_AS(std::logic_error, m.bind(0, 20));
+    CHECK_THROWS_AS(std::logic_error, m.bind(5, 20));   // no such slot
+    CHECK(!m.find(20).has_value() && *m.find(10) == 0);
+}
+
+TEST(deletion, d06_free_list_last_in_first_out) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 5; ++i) h.add(i, std::vector<float>{float(i), 0});
+    h.remove(1);
+    h.remove(3);
+    h.add(100, std::vector<float>{7, 7});
+    h.add(101, std::vector<float>{8, 8});
+    h.add(102, std::vector<float>{9, 9});
+    const IdMap& ids = h.storage().ids();
+    CHECK(*ids.find(100) == 3);  // freed last, reused first
+    CHECK(*ids.find(101) == 1);
+    CHECK(*ids.find(102) == 5);  // free list empty: appended
+}
+
+TEST(deletion, d07_vector_store_overwrite) {
+    VectorStore s(5);
+    s.add(std::vector<float>{1, 2, 3, 4, 5});
+    const float* address = s.get(0).data();
+    s.overwrite(0, std::vector<float>{9, 9, 9, 9, 9});
+    CHECK(s.get(0).data() == address && s.get(0)[0] == 9.0f && s.get(0)[4] == 9.0f);
+    bool zero = true;
+    for (std::size_t i = 5; i < s.stride(); ++i) zero = zero && s.get_padded(0)[i] == 0.0f;
+    CHECK(zero);
+}
+
+TEST(deletion, d08_vector_store_overwrite_rejected) {
+    VectorStore s(3);
+    s.add(std::vector<float>{1, 2, 3});
+    CHECK_THROWS_AS(std::invalid_argument, s.overwrite(0, std::vector<float>{9, 9}));
+    CHECK_THROWS_AS(std::out_of_range, s.overwrite(1, std::vector<float>{9, 9, 9}));
+    CHECK(s.get(0)[0] == 1.0f && s.get(0)[2] == 3.0f);
+}
+
+TEST(deletion, d09_vector_store_move_row) {
+    VectorStore s(5);
+    s.add(std::vector<float>{1, 1, 1, 1, 1});
+    s.add(std::vector<float>{2, 3, 4, 5, 6});
+    s.move_row(1, 0);
+    CHECK(s.get(0)[0] == 2.0f && s.get(0)[4] == 6.0f);
+    bool zero = true;
+    for (std::size_t i = 5; i < s.stride(); ++i) zero = zero && s.get_padded(0)[i] == 0.0f;
+    CHECK(zero);
+    CHECK_THROWS_AS(std::out_of_range, s.move_row(5, 0));
+    CHECK(s.get(0)[0] == 2.0f);
+}
+
+TEST(deletion, d10_vector_store_pop_back_reuses_row) {
+    VectorStore s(4, 2);  // 4 rows per shelf
+    for (int i = 0; i < 4; ++i) s.add(std::vector<float>(4, float(i)));
+    const float* last = s.get(3).data();
+    s.pop_back();
+    CHECK(s.size() == 3);
+    s.add(std::vector<float>(4, 7.0f));
+    CHECK(s.size() == 4 && s.get(3).data() == last && s.get(3)[0] == 7.0f);  // same row, no new shelf
+}
+
+TEST(deletion, d11_graph_reset_same_level) {
+    GraphStorage g(16);
+    NodeId n = g.add_node(2);
+    for (int l = 0; l <= 2; ++l) g.set_links(n, l, std::vector<NodeId>{1, 2, 3});
+    g.reset_node(n, 2);
+    bool empty = true;
+    for (int l = 0; l <= 2; ++l) empty = empty && GraphStorage::count(g.links(n, l)) == 0;
+    CHECK(empty && g.level(n) == 2);
+}
+
+TEST(deletion, d12_graph_reset_higher_level) {
+    GraphStorage g(16);
+    NodeId n = g.add_node(1);
+    g.set_links(n, 0, std::vector<NodeId>{4, 5});
+    g.set_links(n, 1, std::vector<NodeId>{6});
+    g.reset_node(n, 3);
+    CHECK(g.level(n) == 3 && g.links(n, 3).size() == 16);
+    bool empty = true;
+    for (int l = 0; l <= 3; ++l) empty = empty && GraphStorage::count(g.links(n, l)) == 0;
+    CHECK(empty);
+}
+
+TEST(deletion, d13_graph_reset_lower_level) {
+    GraphStorage g(16);
+    NodeId n = g.add_node(3);
+    g.reset_node(n, 1);
+    CHECK(g.level(n) == 1);
+    CHECK_THROWS_AS(std::out_of_range, g.links(n, 2));
+    CHECK(GraphStorage::count(g.links(n, 1)) == 0);
+}
+
+TEST(deletion, d14_graph_reset_invalid) {
+    GraphStorage g(16);
+    NodeId n = g.add_node(1);
+    g.set_links(n, 0, std::vector<NodeId>{7});
+    CHECK_THROWS_AS(std::invalid_argument, g.reset_node(n, -1));
+    CHECK_THROWS_AS(std::invalid_argument, g.reset_node(n, 256));
+    CHECK_THROWS_AS(std::out_of_range, g.reset_node(99, 0));
+    CHECK(g.level(n) == 1 && g.links(n, 0)[0] == 7);  // unchanged
+}
+
+TEST(deletion, d15_oom_building_blocks) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    IdMap m;
+    for (std::uint64_t i = 0; i < 50; ++i) m.add(i);
+    m.release(7);
+    CHECK(sweep_allocation_failures([&] { m.bind(7, 5000); },
+                                    [&] { CHECK(m.is_free(7) && !m.find(5000).has_value()); }) >= 0);
+    CHECK(*m.find(5000) == 7);
+
+    GraphStorage g(16);
+    NodeId n = g.add_node(0);  // level 0: the arena has no block yet, so reset must allocate
+    g.set_links(n, 0, std::vector<NodeId>{9});
+    CHECK(sweep_allocation_failures([&] { g.reset_node(n, 4); },
+                                    [&] { CHECK(g.level(n) == 0 && g.links(n, 0)[0] == 9); }) > 0);
+    CHECK(g.level(n) == 4);
+
+    Storage st(4);
+    for (std::uint64_t i = 0; i < 3; ++i) st.insert(i, std::vector<float>(4, float(i)), 0);
+    st.ids().release(1);
+    CHECK(sweep_allocation_failures([&] { st.insert_into(1, 99, std::vector<float>(4, 9.0f), 3); }, [&] {
+        CHECK(st.ids().is_free(1) && !st.ids().find(99).has_value() && st.size() == 3);
+    }) > 0);
+    CHECK(*st.ids().find(99) == 1 && st.graph().level(1) == 3 && st.vectors().get(1)[0] == 9.0f);
+}
+
+// ---- FlatIndex: swap-with-last removal -------------------------------------
+
+TEST(deletion, d20_flat_remove_middle) {
+    auto data = random_vectors(100, 8, 201);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(1000 + i, data[i]);
+    std::vector<bool> removed(100, false);
+    CHECK(f.remove(1050));
+    removed[50] = true;
+    for (const auto& q : random_vectors(5, 8, 202))
+        CHECK(same_results(tie_sorted(f.search(q, 100)), tie_sorted(reference_search(data, removed, q, Metric::L2, 100, 1000))));
+}
+
+TEST(deletion, d21_flat_remove_last_moves_nothing) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});
+    f.add(2, std::vector<float>{1, 1});
+    f.add(3, std::vector<float>{2, 2});
+    CHECK(f.remove(3));
+    auto r = f.search(std::vector<float>{0, 0}, 5);
+    CHECK(r.size() == 2 && r[0].id == 1 && r[1].id == 2 && f.capacity() == 2);
+}
+
+TEST(deletion, d22_flat_remove_only_then_add) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});
+    CHECK(f.remove(1) && f.size() == 0 && f.capacity() == 0);
+    CHECK(f.search(std::vector<float>{0, 0}, 3).empty());
+    f.add(2, std::vector<float>{1, 1});
+    CHECK(f.search(std::vector<float>{0, 0}, 3)[0].id == 2);
+}
+
+TEST(deletion, d23_flat_remove_all_random_then_readd) {
+    auto data = random_vectors(300, 8, 203);
+    FlatIndex f(8, Metric::L2), fresh(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    std::vector<std::uint64_t> order(300);
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), std::mt19937(204));
+    for (auto id : order) CHECK(f.remove(id));
+    CHECK(f.size() == 0 && f.capacity() == 0);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        f.add(i, data[i]);
+        fresh.add(i, data[i]);
+    }
+    bool same = true;
+    for (const auto& q : random_vectors(10, 8, 205)) same = same && same_results(tie_sorted(f.search(q, 20)), tie_sorted(fresh.search(q, 20)));
+    CHECK(same);
+}
+
+TEST(deletion, d24_flat_remove_moved_vector) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});   // slot 0
+    f.add(2, std::vector<float>{5, 5});   // slot 1
+    f.add(3, std::vector<float>{9, 9});   // slot 2
+    CHECK(f.remove(1));                   // 3 moves into slot 0
+    CHECK(f.remove(3));                   // remove the moved vector
+    auto r = f.search(std::vector<float>{5, 5}, 5);
+    CHECK(r.size() == 1 && r[0].id == 2 && r[0].distance == 0.0f);
+}
+
+TEST(deletion, d25_flat_reuse_id_many_times) {
+    FlatIndex f(2, Metric::L2);
+    f.add(99, std::vector<float>{100, 100});
+    bool ok = true;
+    for (int i = 0; i < 10; ++i) {
+        f.add(7, std::vector<float>{float(i), 0});
+        auto r = f.search(std::vector<float>{float(i), 0}, 1);
+        ok = ok && r[0].id == 7 && r[0].distance == 0.0f;
+        ok = ok && f.remove(7);
+    }
+    CHECK(ok && f.size() == 1);
+}
+
+TEST(deletion, d26_flat_remove_return_values) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});
+    CHECK(!f.remove(2));
+    CHECK(f.remove(1) && !f.contains(1));
+    CHECK(!f.remove(1));
+}
+
+TEST(deletion, d27_flat_has_no_tombstones) {
+    auto data = random_vectors(200, 4, 206);
+    FlatIndex f(4, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    for (std::size_t i = 0; i < 200; i += 3) f.remove(i);
+    CHECK(f.capacity() == f.size() && f.deleted_count() == 0);
+}
+
+TEST(deletion, d28_flat_churn_against_map) {
+    auto pool = random_vectors(4000, 8, 207);
+    std::mt19937 rng(208);
+    FlatIndex f(8, Metric::L2);
+    std::map<std::uint64_t, std::vector<float>> live;
+    std::vector<std::uint64_t> ids;
+    std::size_t next = 0;
+    bool sizes = true, results = true;
+    for (int step = 0; step < 10000; ++step) {
+        if ((rng() % 2 == 0 || ids.empty()) && next < pool.size()) {
+            f.add(next, pool[next]);
+            live[next] = pool[next];
+            ids.push_back(next++);
+        } else if (!ids.empty()) {
+            const std::size_t pos = rng() % ids.size();
+            const std::uint64_t id = ids[pos];
+            ids[pos] = ids.back();
+            ids.pop_back();
+            results = results && f.remove(id);
+            live.erase(id);
+        }
+        sizes = sizes && f.size() == live.size() && f.capacity() == live.size();
+        if (step % 50 == 0) {
+            const auto& q = pool[rng() % pool.size()];
+            results = results && same_results(tie_sorted(f.search(q, 10)), brute_force(live, q, Metric::L2, 10));
+        }
+    }
+    CHECK(sizes);
+    CHECK(results);
+}
+
+TEST(deletion, d29_flat_extreme_ids_reused) {
+    FlatIndex f(2, Metric::L2);
+    f.add(0, std::vector<float>{0, 0});
+    f.add(kMaxId, std::vector<float>{1, 1});
+    CHECK(f.remove(0) && f.remove(kMaxId));
+    f.add(kMaxId, std::vector<float>{3, 3});
+    f.add(0, std::vector<float>{4, 4});
+    CHECK(f.search(std::vector<float>{3, 3}, 1)[0].id == kMaxId);
+    CHECK(f.search(std::vector<float>{4, 4}, 1)[0].id == 0);
+}
+
+TEST(deletion, d30_flat_remove_never_allocates) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(50, 4, 209);
+    FlatIndex f(4, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    const long points = sweep_allocation_failures([&] { f.remove(20); }, [&] { CHECK(f.contains(20)); });
+    CHECK(points == 0);  // completed on the first try: no allocation at all
+    CHECK(!f.contains(20) && f.size() == 49);
+}
+
+// ---- HnswIndex: free list, repair, slot reuse ------------------------------
+
+TEST(deletion, d40_hnsw_reused_id_gets_new_vector) {
+    auto data = clustered(300, 8, 4, 210);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    h.remove(5);
+    h.add(5, std::vector<float>(8, 10.0f));  // far from everything
+    bool old_gone = true;
+    for (const auto& x : h.search(data[5], 10, 100)) old_gone = old_gone && x.id != 5;
+    CHECK(old_gone);
+    auto r = h.search(std::vector<float>(8, 10.0f), 1, 100);
+    CHECK(r[0].id == 5 && r[0].distance == 0.0f);
+}
+
+TEST(deletion, d41_hnsw_insert_reuses_slot) {
+    auto data = clustered(200, 8, 4, 211);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 50; ++i) h.remove(i);
+    for (std::uint64_t i = 0; i < 50; ++i) h.add(1000 + i, data[i]);
+    CHECK(h.capacity() == 200 && h.deleted_count() == 0 && h.size() == 200);
+}
+
+TEST(deletion, d42_hnsw_reused_slot_higher_level) {
+    auto data = clustered(300, 8, 4, 212);
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 3});
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 213));
+    CHECK(seen.higher && seen.same_slot);
+    check_graph(h, 0.95);
+    for (const auto& q : clustered(10, 8, 4, 214)) check_results(h, h.search(q, 10, 64));
+}
+
+TEST(deletion, d43_hnsw_reused_slot_lower_level) {
+    auto data = clustered(300, 8, 4, 215);
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 5});
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 216));
+    CHECK(seen.lower && seen.same_slot);
+    check_graph(h, 0.95);
+    for (const auto& q : clustered(10, 8, 4, 217)) check_results(h, h.search(q, 10, 64));
+}
+
+TEST(deletion, d44_hnsw_repair_unlinks_removed) {
+    auto data = clustered(500, 8, 4, 218);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Storage& st = h.storage();
+    const NodeId x = *st.ids().find(10);
+    std::vector<std::pair<NodeId, int>> former;  // (neighbor, level)
+    for (int l = 0; l <= st.graph().level(x); ++l)
+        for (NodeId nb : st.graph().links(x, l)) {
+            if (nb == kEmpty) break;
+            former.push_back({nb, l});
+        }
+    REQUIRE(!former.empty());
+    h.remove(10);
+    bool unlinked = true;
+    for (auto [nb, l] : former)
+        for (NodeId c : st.graph().links(nb, l)) {
+            if (c == kEmpty) break;
+            unlinked = unlinked && c != x;
+        }
+    CHECK(unlinked);
+    check_graph(h, 0.99);
+}
+
+TEST(deletion, d45_hnsw_reachable_after_removing_30_percent) {
+    auto data = clustered(2000, 16, 10, 219);
+    auto queries = clustered(40, 16, 10, 220);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    std::vector<std::uint64_t> order(2000);
+    std::iota(order.begin(), order.end(), 0);
+    std::shuffle(order.begin(), order.end(), std::mt19937(221));
+    for (std::size_t i = 0; i < 600; ++i) {
+        h.remove(order[i]);
+        f.remove(order[i]);
+    }
+    check_graph(h, 0.99);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.95);
+}
+
+TEST(deletion, d46_hnsw_repair_disabled) {
+    auto data = clustered(2000, 16, 10, 219);
+    auto queries = clustered(40, 16, 10, 220);
+    HnswParams p;
+    p.repair_on_remove = false;
+    HnswIndex h(16, Metric::L2, p);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::uint64_t i = 0; i < 2000; i += 3) {
+        h.remove(i);
+        f.remove(i);
+    }
+    check_graph(h, 0.98);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.90);
+}
+
+TEST(deletion, d47_hnsw_remove_entry_point_repeatedly) {
+    auto data = clustered(500, 8, 4, 222);
+    auto queries = clustered(20, 8, 4, 223);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    bool valid = true;
+    for (int i = 0; i < 20; ++i) {
+        const std::uint64_t entry_id = h.storage().ids().external(h.entry_point());
+        h.remove(entry_id);
+        f.remove(entry_id);
+        int highest = -1;
+        for (NodeId n = 0; n < h.capacity(); ++n)
+            if (!h.storage().ids().is_deleted(n)) highest = std::max(highest, h.storage().graph().level(n));
+        valid = valid && !h.storage().ids().is_deleted(h.entry_point()) && h.max_level() == highest;
+    }
+    CHECK(valid);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.95);
+}
+
+TEST(deletion, d48_hnsw_remove_everything_state) {
+    auto data = clustered(100, 8, 4, 224);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 100; ++i) h.remove(i);
+    CHECK(h.entry_point() == kEmpty && h.max_level() == -1);
+    CHECK(h.size() == 0 && h.capacity() == 100 && h.deleted_count() == 100);
+    CHECK(h.search(data[0], 5).empty());
+    h.add(777, data[3]);
+    const NodeId slot = *h.storage().ids().find(777);
+    CHECK(h.capacity() == 100);  // reused a slot
+    CHECK(h.entry_point() == slot && h.max_level() == h.storage().graph().level(slot));
+    check_graph(h, 1.0);
+}
+
+TEST(deletion, d49_hnsw_remove_all_readd_same_ids) {
+    auto data = clustered(800, 16, 8, 225);
+    auto queries = clustered(30, 16, 8, 226);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::uint64_t i = 0; i < 800; ++i) h.remove(i);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    CHECK(h.capacity() == 800 && h.size() == 800);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.95);
+    check_graph(h, 0.99);
+}
+
+namespace {
+
+/// Churn: `cycles` rounds of removing 20% of live vectors and adding as many
+/// new ones, checking recall, graph and memory after every round.
+void churn(Metric m, std::size_t count, int cycles, double min_recall, double min_reach, unsigned seed) {
+    const std::size_t dim = 16;
+    auto pool = clustered(count * std::size_t(cycles), dim, 10, seed);
+    auto queries = clustered(30, dim, 10, seed + 1);
+    HnswIndex h(dim, m);
+    FlatIndex f(dim, m);
+    std::vector<std::uint64_t> live;
+    std::size_t next = 0;
+    for (; next < count; ++next) {
+        h.add(next, pool[next]);
+        f.add(next, pool[next]);
+        live.push_back(next);
+    }
+    std::mt19937 rng(seed + 2);
+    double worst = 1.0;
+    bool memory_bounded = true;
+    for (int c = 0; c < cycles; ++c) {
+        std::shuffle(live.begin(), live.end(), rng);
+        const std::size_t drop = count / 5;
+        for (std::size_t i = 0; i < drop; ++i) {
+            h.remove(live.back());
+            f.remove(live.back());
+            live.pop_back();
+        }
+        for (std::size_t i = 0; i < drop && next < pool.size(); ++i, ++next) {
+            h.add(next, pool[next]);
+            f.add(next, pool[next]);
+            live.push_back(next);
+        }
+        memory_bounded = memory_bounded && h.capacity() <= count;
+        worst = std::min(worst, recall(h, f, queries, 10, 100));
+        check_graph(h, min_reach);
+    }
+    CHECK(memory_bounded);
+    CHECK(worst >= min_recall);
+}
+
+}  // namespace
+
+TEST(deletion, d50_hnsw_churn_l2) { churn(Metric::L2, 1000, 20, 0.95, 0.99, 227); }
+
+TEST(deletion, d51_hnsw_remove_whole_cluster) {
+    auto [data, label] = clustered_labeled(1200, 16, 8, 228);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::size_t i = 0; i < data.size(); ++i)
+        if (label[i] == 3) {
+            h.remove(i);
+            f.remove(i);
+        }
+    Vectors queries;
+    for (std::size_t i = 0; i < data.size() && queries.size() < 20; ++i)
+        if (label[i] == 3) queries.push_back(data[i]);  // search where the cluster was
+    for (const auto& q : queries)
+        for (const auto& r : h.search(q, 10, 100)) CHECK(label[r.id] != 3);
+    CHECK(recall(h, f, queries, 10, 200) >= 0.90);
+    check_graph(h, 0.99);
+}
+
+TEST(deletion, d52_hnsw_churn_ip_and_cosine) {
+    churn(Metric::Cosine, 800, 8, 0.95, 0.99, 229);
+    churn(Metric::InnerProduct, 800, 8, 0.80, 0.95, 230);
+}
+
+TEST(deletion, d53_hnsw_remove_some_identical_copies) {
+    HnswIndex h(8, Metric::L2);
+    std::vector<float> same(8, 0.5f);
+    auto noise = random_vectors(200, 8, 231);
+    for (std::uint64_t i = 0; i < 100; ++i) h.add(i, same);
+    for (std::uint64_t i = 0; i < 200; ++i) h.add(1000 + i, noise[i]);
+    for (std::uint64_t i = 0; i < 100; i += 2) h.remove(i);  // remove half the copies
+    // Not every copy stays reachable (fixed link slots), so check that copies are
+    // found first, and that every result at distance 0 is a live (odd) copy.
+    auto r = h.search(same, 10, 100);
+    REQUIRE(!r.empty());
+    CHECK(r[0].distance == 0.0f);
+    bool live_copies = true;
+    for (const auto& x : r)
+        if (x.distance == 0.0f) live_copies = live_copies && x.id < 100 && x.id % 2 == 1;
+    CHECK(live_copies);
+    bool found = true;
+    for (std::uint64_t i = 0; i < 200; ++i) found = found && h.search(noise[i], 1, 100)[0].id == 1000 + i;
+    CHECK(found);
+}
+
+TEST(deletion, d54_hnsw_remove_with_minimal_M) {
+    auto data = clustered(400, 8, 4, 232);
+    HnswIndex h(8, Metric::L2, HnswParams{2, 100, 1});
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 400; i += 4) h.remove(i);
+    check_graph(h, 0.70);
+    for (const auto& q : clustered(10, 8, 4, 233)) check_results(h, h.search(q, 10, 64));
+}
+
+TEST(deletion, d55_hnsw_deletion_deterministic) {
+    auto data = clustered(700, 8, 4, 234);
+    HnswIndex a(8, Metric::L2), b(8, Metric::L2);
+    for (HnswIndex* h : {&a, &b}) {
+        for (std::size_t i = 0; i < 500; ++i) h->add(i, data[i]);
+        for (std::uint64_t i = 0; i < 500; i += 3) h->remove(i);
+        for (std::size_t i = 500; i < 700; ++i) h->add(i, data[i]);
+    }
+    CHECK(a.entry_point() == b.entry_point() && a.max_level() == b.max_level());
+    bool same = true;
+    for (std::size_t i = 0; i < 30; ++i) same = same && same_results(a.search(data[i], 10), b.search(data[i], 10));
+    CHECK(same);
+}
+
+TEST(deletion, d56_oom_hnsw_remove) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 8, 4, 235);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const long points = sweep_allocation_failures([&] { h.remove(5); }, [&] {
+        CHECK(h.contains(5) && h.size() == 300 && h.deleted_count() == 0);  // still stored...
+        check_graph(h, 0.99);                                               // ...graph still valid
+    });
+    CHECK(points > 0);
+    CHECK(!h.contains(5) && h.size() == 299 && h.deleted_count() == 1);
+}
+
+TEST(deletion, d57_oom_hnsw_insert_into_reused_slot) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(301, 8, 4, 236);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    h.remove(5);
+    const long points = sweep_allocation_failures([&] { h.add(9999, data[300]); }, [&] {
+        CHECK(!h.contains(9999) && h.size() == 299 && h.deleted_count() == 1);  // slot still free
+        check_graph(h, 0.99);
+    });
+    CHECK(points > 0);
+    CHECK(h.contains(9999) && h.deleted_count() == 0 && h.capacity() == 300);
+}
+
+// ---- compact() and statistics -----------------------------------------------
+
+TEST(deletion, d60_hnsw_compact_keeps_live) {
+    auto data = clustered(1000, 16, 8, 237);
+    auto queries = clustered(30, 16, 8, 238);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::uint64_t i = 0; i < 1000; i += 10) {
+        for (std::uint64_t j = i; j < i + 3; ++j) {
+            h.remove(j);
+            f.remove(j);
+        }
+    }
+    const CompactStats stats = h.compact();
+    CHECK(stats.kept == 700 && stats.reclaimed == 300);
+    bool ids_ok = true;
+    for (std::uint64_t i = 0; i < 1000; ++i) ids_ok = ids_ok && h.contains(i) == (i % 10 >= 3);
+    CHECK(ids_ok);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.95);
+    check_graph(h, 0.99);
+}
+
+TEST(deletion, d61_hnsw_compact_is_dense) {
+    auto data = clustered(400, 8, 4, 239);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 400; i += 2) h.remove(i);
+    h.compact();
+    CHECK(h.capacity() == 200 && h.size() == 200 && h.deleted_count() == 0);
+    bool dense = true;
+    for (std::uint64_t i = 1; i < 400; i += 2) dense = dense && *h.storage().ids().find(i) < 200;
+    CHECK(dense);
+}
+
+TEST(deletion, d62_hnsw_compact_edge_cases) {
+    HnswIndex empty(4, Metric::L2);
+    CompactStats s = empty.compact();
+    CHECK(s.kept == 0 && s.reclaimed == 0 && empty.entry_point() == kEmpty);
+
+    // No deletions: same seed and insertion order rebuild exactly the same graph.
+    auto data = clustered(300, 8, 4, 240);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    std::vector<Results> before;
+    for (std::size_t i = 0; i < 20; ++i) before.push_back(h.search(data[i], 10));
+    s = h.compact();
+    CHECK(s.kept == 300 && s.reclaimed == 0);
+    bool same = true;
+    for (std::size_t i = 0; i < 20; ++i) same = same && same_results(before[i], h.search(data[i], 10));
+    CHECK(same);
+
+    // Everything deleted.
+    for (std::uint64_t i = 0; i < 300; ++i) h.remove(i);
+    s = h.compact();
+    CHECK(s.kept == 0 && s.reclaimed == 300 && h.capacity() == 0);
+    CHECK(h.entry_point() == kEmpty && h.max_level() == -1);
+    h.add(1, data[0]);
+    CHECK(h.search(data[0], 1)[0].id == 1);
+}
+
+TEST(deletion, d63_compact_statistics) {
+    auto data = clustered(200, 8, 4, 241);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 50; ++i) h.remove(i);
+    CompactStats first = h.compact();
+    CompactStats second = h.compact();
+    CHECK(first.kept == 150 && first.reclaimed == 50);
+    CHECK(second.kept == 150 && second.reclaimed == 0);
+}
+
+TEST(deletion, d64_oom_hnsw_compact) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(200, 8, 4, 242);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 200; i += 4) h.remove(i);
+    const Results before = h.search(data[1], 10);
+    const long points = sweep_allocation_failures([&] { h.compact(); }, [&] {
+        CHECK(h.size() == 150 && h.capacity() == 200);              // old index intact
+        CHECK(same_results(h.search(data[1], 10), before));
+    });
+    CHECK(points > 0);
+    CHECK(h.capacity() == 150 && h.deleted_count() == 0);
+}
+
+TEST(deletion, d65_flat_compact_is_noop) {
+    auto data = random_vectors(10, 4, 243);
+    FlatIndex f(4, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 3; ++i) f.remove(i);
+    const Results before = f.search(data[5], 7);
+    const CompactStats s = f.compact();
+    CHECK(s.kept == 7 && s.reclaimed == 0);
+    CHECK(same_results(f.search(data[5], 7), before));
+}
+
+TEST(deletion, d66_statistics_consistent) {
+    auto pool = clustered(1500, 8, 6, 244);
+    std::mt19937 rng(245);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    std::vector<std::uint64_t> live;
+    std::size_t next = 0, peak = 0;
+    bool ok = true;
+    for (int step = 0; step < 3000 && next < pool.size(); ++step) {
+        if (rng() % 3 != 0 || live.empty()) {
+            h.add(next, pool[next]);
+            f.add(next, pool[next]);
+            live.push_back(next++);
+        } else {
+            const std::size_t pos = rng() % live.size();
+            h.remove(live[pos]);
+            f.remove(live[pos]);
+            live[pos] = live.back();
+            live.pop_back();
+        }
+        peak = std::max(peak, live.size());
+        ok = ok && h.size() == live.size() && f.size() == live.size();
+        ok = ok && h.capacity() == h.size() + h.deleted_count() && h.capacity() <= peak;
+        ok = ok && f.capacity() == f.size() && f.deleted_count() == 0;
+    }
+    CHECK(ok);
 }
 
 // ===========================================================================
@@ -2760,7 +3595,7 @@ void print_usage() {
         "  --fail-fast         stop after the first failing test\n"
         "  --help              show this help\n"
         "\n"
-        "Groups: layer1, layer2, helpers, flat, hnsw, robustness, concurrency, e2e\n"
+        "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
