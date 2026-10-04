@@ -1,5 +1,7 @@
 # hnsw-lite
 
+[![CI](https://github.com/praknig/hnsw_lite/actions/workflows/ci.yml/badge.svg)](https://github.com/praknig/hnsw_lite/actions/workflows/ci.yml)
+
 A minimal, in-memory vector search engine written in modern C++20, built from scratch to show how libraries like hnswlib, Faiss, Qdrant and Milvus work under the hood.
 
 The engine stores high-dimensional vectors (embeddings) and finds the nearest neighbors of a query vector using two indexes: an exact brute-force **Flat** index and an approximate **HNSW** (Hierarchical Navigable Small World) graph.
@@ -22,6 +24,7 @@ The engine stores high-dimensional vectors (embeddings) and finds the nearest ne
 - [Layer 3 design: indexes](#layer-3-design-indexes)
 - [API reference](#api-reference)
 - [Testing](#testing)
+- [Continuous integration](#continuous-integration)
 - [Benchmarks](#benchmarks)
 - [Limitations](#limitations)
 - [Roadmap](#roadmap)
@@ -78,13 +81,13 @@ The engine is built as three layers. Each layer only depends on the ones below i
 
 ```mermaid
 flowchart TB
-  A["Your application"] --> B["Layer 3: FlatIndex"]
-  A --> C["Layer 3: HnswIndex"]
-  B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
-  C --> D
-  B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
-  C --> E
-  D --> E
+    A["Your application"] --> B["Layer 3: FlatIndex"]
+    A --> C["Layer 3: HnswIndex"]
+    B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
+    C --> D
+    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+    C --> E
+    D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -97,49 +100,52 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-  S["storage.h"] --> I["id_map.h"]
-  S --> V["vector_store.h"]
-  S --> G["graph_storage.h"]
-  G --> AR["arena.h"]
-  V --> AB["aligned_block.h"]
-  G --> AB
-  AR --> AB
-  AB --> C["common.h"]
-  I --> C
+    S["storage.h"] --> I["id_map.h"]
+    S --> V["vector_store.h"]
+    S --> G["graph_storage.h"]
+    G --> AR["arena.h"]
+    V --> AB["aligned_block.h"]
+    G --> AB
+    AR --> AB
+    AB --> C["common.h"]
+    I --> C
 ```
 
 ### Layer 2 file dependencies
 
 ```mermaid
 flowchart TB
-  D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
-  DP --> K["src/kernels.h"]
-  K --> SC["distance_scalar.cpp<br/>any CPU"]
-  K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
-  K --> A5["distance_avx512.cpp<br/>-mavx512f"]
-  K --> NE["distance_neon.cpp<br/>64-bit ARM"]
+    D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
+    DP --> K["src/kernels.h"]
+    K --> SC["distance_scalar.cpp<br/>any CPU"]
+    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
+    K --> A5["distance_avx512.cpp<br/>-mavx512f"]
+    K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
 
 ### Layer 3 file dependencies
 
 ```mermaid
 flowchart TB
-  F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
-  F --> TK["search_result.h<br/>TopK"]
-  H["hnsw_index.h / .cpp"] --> PV
-  H --> TK
-  H --> VL["visited_list.h"]
-  F --> L1A["Layer 1: VectorStore, IdMap"]
-  H --> L1B["Layer 1: Storage"]
-  PV --> L2["Layer 2: distance.h"]
-  F --> L2
-  H --> L2
+    F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
+    F --> TK["search_result.h<br/>TopK"]
+    H["hnsw_index.h / .cpp"] --> PV
+    H --> TK
+    H --> VL["visited_list.h"]
+    F --> L1A["Layer 1: VectorStore, IdMap"]
+    H --> L1B["Layer 1: Storage"]
+    PV --> L2["Layer 2: distance.h"]
+    F --> L2
+    H --> L2
 ```
 
 ## Project structure
 
 ```
 hnsw-lite/
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # GitHub Actions: build and test on every PR
 ├── .gitignore                  # Ignores IDE settings and build output
 ├── CMakeLists.txt              # Builds the library, tests and benchmark
 ├── README.md                   # This file
@@ -713,7 +719,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
   | Emulated Intel Nehalem (2008) | scalar | scalar |
   | Emulated 64-bit ARM | scalar, NEON | NEON |
 
-- **Compilers:** all tests pass with GCC 13 and Clang 18. The MSVC-specific CPU-detection code has not yet been compiled, since no MSVC was available; a Windows CI job would close that gap.
+- **Compilers:** all tests pass with GCC 13 and Clang 18. MSVC, MinGW on Windows and Apple Clang are covered by the [CI pipeline](#continuous-integration), which also runs the suite on real ARM hardware.
 - **Sanitizers:** all tests pass with AddressSanitizer and UndefinedBehaviorSanitizer (the out-of-memory tests are skipped there), and the threaded groups pass under ThreadSanitizer with no data races reported.
 - **Warnings:** none with `-Wall -Wextra -Wpedantic`, nor with `-Wconversion -Wshadow` (which approximate MSVC's `/W4` conversion warnings), under both GCC and Clang.
 - **Comparison with hnswlib:** where results looked low, the same data and operations were run through the reference hnswlib library. Inner-product recall on the lifecycle data is 0.898 / 0.905 / 0.860 (add / remove / re-add) against hnswlib's 0.887 / 0.900 / 0.853, confirming that lower inner-product numbers come from the metric, not this implementation.
@@ -729,6 +735,34 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 7. `VectorStore` always allocated blocks of 65,536 rows, so storing a single 1,536-dimension vector allocated and zeroed 400 MB (a test took 609 ms). Blocks are now capped at 8 MB, and the test takes 4.6 ms.
 8. **Running out of memory corrupted indexes.** `IdMap::add` registered the user ID before growing its arrays, so a failure left a stale ID that broke every later insert; `Storage::insert` had no rollback if a later step failed; and a half-linked HNSW vector stayed visible after a failure. Inserts are now all-or-nothing in `IdMap`, `VectorStore`, `GraphStorage`, `Storage` and `FlatIndex`, and a failed HNSW insert hides its half-linked vector. Run against the old code, 4 of the out-of-memory tests fail.
 9. Huge finite values could make an inner product overflow to NaN (+∞ plus −∞), which breaks the ordering every heap and sort relies on. NaN distances now count as +∞, so such pairs sort last.
+
+## Continuous integration
+
+Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+
+**When it runs:**
+
+- On every **pull request into `master`**, and again on every new push to that pull request, so changes are checked before they are merged.
+- On every **push to `master`**, to confirm the merged result.
+- **Manually**, from the Actions tab with "Run workflow".
+
+It does not run on pushes to a branch without a pull request; that would run everything twice once a pull request exists. To get feedback early, open a **draft pull request** as soon as the branch is created. A newer run for the same branch cancels an older one that is still running.
+
+**What it runs (7 jobs in parallel):**
+
+| Job | Build | What it adds |
+|---|---|---|
+| Linux / GCC | Release | Full test suite, plus both benchmarks as a smoke test |
+| Linux / Clang | Release | Full test suite with a second compiler |
+| macOS ARM / Apple Clang | Release | Full test suite on **real ARM hardware** (Apple Silicon), using the NEON kernels |
+| Windows / MSVC | Release | Full test suite with Microsoft's compiler, including the MSVC-specific CPU detection |
+| Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
+| Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency and helper groups |
+
+Each job fails on its own, so one broken platform never hides the results of the others.
+
+**Protecting `master`.** To make passing CI a requirement for merging: on GitHub, open **Settings → Branches → Add branch protection rule** for `master`, enable **Require status checks to pass before merging**, and select the CI jobs. Together with **Require a pull request before merging**, nothing reaches `master` without passing every platform.
 
 ## Benchmarks
 
@@ -790,6 +824,7 @@ These are deliberate for the current stage:
 - [x] **Layer 3a:** Flat index with top-k heap, used as ground truth
 - [x] **Layer 3b:** HNSW index: random levels, insertion, neighbor heuristic, beam search, visited lists
 - [x] Search benchmark on synthetic data (recall@10 vs. queries per second)
+- [x] Continuous integration: Linux (GCC, Clang, sanitizers), Windows (MSVC, MinGW) and macOS on ARM
 - [ ] Benchmarks on SIFT1M and GloVe
 - [ ] Parallel HNSW construction
 - [ ] Thread-safe insertion
