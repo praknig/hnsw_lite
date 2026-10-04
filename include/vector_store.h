@@ -52,10 +52,11 @@ public:
     }
 
     // Copies a vector in and returns its number (0, 1, 2, ...).
+    // All-or-nothing: if it throws, nothing changed.
     NodeId add(std::span<const float> v) {
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
         if (count_ >= kEmpty) throw std::length_error("too many vectors");
-        if ((count_ & mask_) == 0)  // first row of a new shelf
+        if ((count_ >> shelf_bits_) >= shelves_.size())  // row lies past the last shelf
             shelves_.emplace_back((mask_ + 1) * stride_ * sizeof(float));
         std::copy(v.begin(), v.end(), row(count_));  // padding stays zero
         return static_cast<NodeId>(count_++);
@@ -68,6 +69,10 @@ public:
     std::span<const float> get_padded(NodeId id) const { return {row(check(id)), stride_}; }
 
     std::size_t size() const { return count_; }
+
+    /// Undoes the most recent add(). Used to roll back a failed insert. The row
+    /// is simply reused by the next add(); its padding is still zero.
+    void undo_last_add() noexcept { --count_; }
     std::size_t rows_per_shelf() const { return mask_ + 1; }
     std::size_t dim() const { return dim_; }
     std::size_t stride() const { return stride_; }

@@ -67,7 +67,9 @@ public:
     /// Inserts a vector under the user's `id`.
     /// Throws std::invalid_argument on a wrong dimension, NaN or infinity, or an
     /// ID already used (IDs cannot be reused, even after remove()); the index
-    /// is then unchanged.
+    /// is then unchanged. If memory runs out (std::bad_alloc), the index stays
+    /// consistent and `id` is not contained; if the vector was already stored,
+    /// its ID stays taken.
     void add(std::uint64_t id, std::span<const float> vector);
 
     /// Marks `id` as removed. Returns false if it does not exist or was already removed.
@@ -125,6 +127,10 @@ private:
     /// an exact copy of one, up to `max`.
     std::vector<NodeId> select_neighbors(const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
+
+    /// Steps 4 to 6 of add(): finds neighbors on every level, links the new node
+    /// both ways, and makes it the entry point if it is the highest node.
+    void link_new_node(NodeId node, int level);
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.

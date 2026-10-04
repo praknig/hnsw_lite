@@ -13,6 +13,19 @@
 namespace vecdb {
 
 /**
+ * @brief Turns a NaN distance into +infinity, so it sorts last instead of
+ *        breaking the heap order.
+ *
+ * Indexes reject NaN and infinite input, but two vectors with huge finite
+ * values (around 1e19 or more) can still overflow inside an inner product:
+ * +inf and -inf partial sums add up to NaN. Such a pair is treated as "as far
+ * apart as possible".
+ */
+inline float ordered_distance(float d) {
+    return d != d ? std::numeric_limits<float>::infinity() : d;  // only NaN differs from itself
+}
+
+/**
  * @brief One search result as the user sees it.
  *
  * `id` is the user's own ID (not the internal NodeId). `distance` follows the

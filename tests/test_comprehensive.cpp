@@ -16,7 +16,7 @@
  *   test_comprehensive --fail-fast          stop at the first failing test
  *   test_comprehensive --help               show this help
  *
- * Groups: layer1, layer2, helpers, flat, hnsw, concurrency, e2e
+ * Groups: layer1, layer2, helpers, flat, hnsw, robustness, concurrency, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -24,6 +24,10 @@
  *    failure and stops the current test. Both work from any thread.
  *  - CHECK_THROWS_AS(Type, statement) checks that the statement throws
  *    exactly that exception type (or a type derived from it).
+ *  - SKIP(reason) ends a test early as skipped (for example, out-of-memory
+ *    tests under AddressSanitizer, which installs its own allocator).
+ *  - Out-of-memory tests replace the global allocator with one that can be
+ *    told to fail the Nth allocation, then try every N through an operation.
  *  - Each test reports PASS or FAIL with its time; a summary lists failures.
  *  - The exit code is 0 only if every selected test passed.
  */
@@ -34,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -50,6 +55,102 @@
 #include "storage.h"
 
 using namespace vecdb;
+
+// ===========================================================================
+// Allocation-failure injection (for the out-of-memory tests)
+// ===========================================================================
+//
+// This program replaces the global operator new/delete. Normally they behave
+// like the standard ones. After alloc_hook::fail_after(n), the allocation that
+// comes after n more successful ones throws std::bad_alloc, exactly once.
+// Sanitizers install their own allocator, so the hook is disabled under them.
+// Define HNSW_TEST_NO_ALLOC_HOOK to disable it manually.
+
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__) || defined(HNSW_TEST_NO_ALLOC_HOOK)
+#define HNSW_ALLOC_HOOK 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer)
+#define HNSW_ALLOC_HOOK 0
+#endif
+#endif
+#ifndef HNSW_ALLOC_HOOK
+#define HNSW_ALLOC_HOOK 1
+#endif
+
+namespace alloc_hook {
+
+std::atomic<long> countdown{-1};  ///< -1: never fail; n >= 0: fail after n more allocations
+std::atomic<bool> fired{false};   ///< set when an injected failure was thrown
+
+/// Arms the hook: the allocation after `n` more successful ones will fail.
+void fail_after(long n) {
+    fired = false;
+    countdown = n;
+}
+
+/// Disarms the hook.
+void disarm() { countdown = -1; }
+
+/// Called by every allocation; throws std::bad_alloc when the countdown hits 0.
+inline void maybe_fail() {
+    const long c = countdown.load(std::memory_order_relaxed);
+    if (c < 0) return;
+    if (c == 0) {
+        countdown = -1;  // fail exactly once, so cleanup code can still allocate
+        fired = true;
+        throw std::bad_alloc();
+    }
+    countdown = c - 1;
+}
+
+}  // namespace alloc_hook
+
+#if HNSW_ALLOC_HOOK
+#include <cstdlib>
+#include <new>
+#ifdef _WIN32
+#include <malloc.h>
+#endif
+
+static void* hook_alloc(std::size_t n) {
+    alloc_hook::maybe_fail();
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+
+static void* hook_alloc_aligned(std::size_t n, std::size_t align) {
+    alloc_hook::maybe_fail();
+    if (n == 0) n = 1;
+#ifdef _WIN32
+    void* p = _aligned_malloc(n, align);
+#else
+    void* p = std::aligned_alloc(align, (n + align - 1) / align * align);
+#endif
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+
+static void hook_free_aligned(void* p) noexcept {
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+void* operator new(std::size_t n) { return hook_alloc(n); }
+void* operator new[](std::size_t n) { return hook_alloc(n); }
+void* operator new(std::size_t n, std::align_val_t a) { return hook_alloc_aligned(n, std::size_t(a)); }
+void* operator new[](std::size_t n, std::align_val_t a) { return hook_alloc_aligned(n, std::size_t(a)); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { hook_free_aligned(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { hook_free_aligned(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { hook_free_aligned(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { hook_free_aligned(p); }
+#endif
 
 // ===========================================================================
 // Test runner
@@ -83,6 +184,11 @@ std::atomic<int> g_failures{0};  ///< failed checks in the current test
 /// Thrown by REQUIRE to stop the current test.
 struct RequireFailed {};
 
+/// Thrown by SKIP to end the current test as skipped.
+struct TestSkipped {
+    std::string reason;
+};
+
 /// Records one check result; prints the first few failures of a test.
 void report(bool ok, int line, const char* expr) {
     ++g_checks;
@@ -100,6 +206,9 @@ void report(bool ok, int line, const char* expr) {
     [[maybe_unused]] static const bool registered_##group##_##name =         \
         register_test(#group, #name, &test_##group##_##name);                \
     static void test_##group##_##name()
+
+/// Ends the current test as skipped, with a reason.
+#define SKIP(reason) throw TestSkipped{reason}
 
 /// Records a failure if `cond` is false and continues the test.
 #define CHECK(cond) report(static_cast<bool>(cond), __LINE__, #cond)
@@ -445,7 +554,7 @@ TEST(layer1, arena_no_overlap) {
 
 TEST(layer1, arena_all_alignments) {
     Arena a(256);
-    for (std::size_t align : {1, 2, 4, 8, 16, 32, 64}) {
+    for (std::size_t align : std::initializer_list<std::size_t>{1, 2, 4, 8, 16, 32, 64}) {
         void* p = a.allocate(3, align);
         CHECK(reinterpret_cast<std::uintptr_t>(p) % align == 0);
     }
@@ -484,7 +593,7 @@ TEST(layer1, arena_many_blocks_stable) {
     CHECK(a.block_count() > 1);
     bool intact = true;
     for (int i = 0; i < 100; ++i)
-        for (int j = 0; j < 50; ++j) intact = intact && arrays[i][j] == i;
+        for (std::size_t j = 0; j < 50; ++j) intact = intact && arrays[std::size_t(i)][j] == i;
     CHECK(intact);
 }
 
@@ -891,7 +1000,7 @@ TEST(layer2, kernels_match_reference) {
     std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
     for (Isa isa : kIsas) {
         if (!isa_supported(isa)) continue;
-        for (std::size_t n : {16, 32, 48, 64, 80, 112, 128, 768, 1536}) {
+        for (std::size_t n : std::initializer_list<std::size_t>{16, 32, 48, 64, 80, 112, 128, 768, 1536}) {
             std::vector<float> a(n), b(n);
             for (std::size_t i = 0; i < n; ++i) a[i] = dist(rng), b[i] = dist(rng);
             for (Metric m : kMetrics) {
@@ -978,7 +1087,7 @@ TEST(layer2, kernels_symmetric) {
     auto r = random_vectors(2, 4096, 11);
     for (Isa isa : kIsas) {
         if (!isa_supported(isa)) continue;
-        for (std::size_t n : {16, 48, 80, 4096})
+        for (std::size_t n : std::initializer_list<std::size_t>{16, 48, 80, 4096})
             for (Metric m : kMetrics) {
                 auto fn = get_distance(m, isa);
                 CHECK(fn(r[0].data(), r[1].data(), n) == fn(r[1].data(), r[0].data(), n));
@@ -1459,7 +1568,7 @@ TEST(flat, matches_reference_all_metrics) {
         FlatIndex f(dim, m);
         for (std::size_t i = 0; i < data.size(); ++i) f.add(1000 + i, data[i]);
         for (const auto& q : queries)
-            for (std::size_t k : {1, 10, 50, 500})
+            for (std::size_t k : std::initializer_list<std::size_t>{1, 10, 50, 500})
                 CHECK(same_results(f.search(q, k), reference_search(data, removed, q, m, k, 1000)));
     }
 }
@@ -2134,6 +2243,315 @@ TEST(hnsw, remove_and_readd_recall) {
 }
 
 // ===========================================================================
+// Robustness: numeric extremes
+// ===========================================================================
+
+TEST(robustness, ip_overflow_flat_has_no_nan) {
+    // Finite but huge values: an inner product can overflow to +inf and -inf,
+    // whose sum is NaN. Such a pair must sort last instead of breaking the order.
+    FlatIndex f(2, Metric::InnerProduct);
+    f.add(1, std::vector<float>{1, 1});
+    f.add(2, std::vector<float>{3e38f, -3e38f});  // with the query: +inf + -inf = NaN
+    f.add(3, std::vector<float>{2, 2});
+    auto r = f.search(std::vector<float>{3e38f, 3e38f}, 3);
+    REQUIRE(r.size() == 3);
+    for (const auto& x : r) CHECK(!std::isnan(x.distance));
+    CHECK(r[2].id == 2 && std::isinf(r[2].distance) && r[2].distance > 0);
+    check_results(f, r);
+}
+
+TEST(robustness, ip_overflow_hnsw_has_no_nan) {
+    HnswIndex h(2, Metric::InnerProduct);
+    auto data = random_vectors(200, 2, 81);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 20; ++i)
+        h.add(1000 + i, std::vector<float>{3e38f, (i % 2 ? 1.0f : -1.0f) * 3e38f});
+    for (float s : {1.0f, -1.0f}) {
+        auto r = h.search(std::vector<float>{3e38f, s * 3e38f}, 30, 100);
+        bool no_nan = true;
+        for (const auto& x : r) no_nan = no_nan && !std::isnan(x.distance);
+        CHECK(no_nan);
+        check_results(h, r);
+    }
+    check_graph(h, 0.90);
+}
+
+TEST(robustness, l2_overflow_sorted_as_infinity) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{-3e38f, 0});
+    f.add(2, std::vector<float>{3e38f, 1});  // close to the query: distance 1
+    f.add(3, std::vector<float>{-3e38f, 1});
+    auto r = f.search(std::vector<float>{3e38f, 0}, 3);
+    REQUIRE(r.size() == 3);
+    CHECK(r[0].id == 2 && r[0].distance == 1.0f);
+    CHECK(r[1].id == 1 && std::isinf(r[1].distance));  // infinities tie: insertion order
+    CHECK(r[2].id == 3 && std::isinf(r[2].distance));
+}
+
+TEST(robustness, cosine_huge_values) {
+    FlatIndex f(3, Metric::Cosine);
+    HnswIndex h(3, Metric::Cosine);
+    f.add(1, std::vector<float>{1e30f, 1e30f, 0});
+    f.add(2, std::vector<float>{0, 1e30f, 1e30f});
+    h.add(1, std::vector<float>{1e30f, 1e30f, 0});
+    h.add(2, std::vector<float>{0, 1e30f, 1e30f});
+    for (const Results& r : {f.search(std::vector<float>{2, 2, 0}, 2), h.search(std::vector<float>{2, 2, 0}, 2)}) {
+        REQUIRE(r.size() == 2);
+        CHECK(r[0].id == 1 && std::fabs(r[0].distance) < 1e-6f);
+        CHECK(std::fabs(r[1].distance - 0.5f) < 1e-6f);  // 60 degrees apart
+    }
+}
+
+TEST(robustness, tiny_values_all_metrics) {
+    const float t = std::numeric_limits<float>::denorm_min();
+    for (Metric m : kMetrics) {
+        FlatIndex f(2, m);
+        HnswIndex h(2, m);
+        for (std::uint64_t i = 0; i < 20; ++i) {
+            std::vector<float> v{t * float(i), t};
+            f.add(i, v);
+            h.add(i, v);
+        }
+        for (const Results& r : {f.search(std::vector<float>{t, t}, 5), h.search(std::vector<float>{t, t}, 5)}) {
+            CHECK(r.size() == 5);
+            bool finite = true;
+            for (const auto& x : r) finite = finite && std::isfinite(x.distance);
+            CHECK(finite);
+        }
+    }
+}
+
+TEST(robustness, negative_zero_equals_zero) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0.0f, 0.0f});
+    f.add(2, std::vector<float>{-0.0f, -0.0f});
+    auto r = f.search(std::vector<float>{0.0f, -0.0f}, 2);
+    REQUIRE(r.size() == 2);
+    CHECK(r[0].distance == 0.0f && r[1].distance == 0.0f);
+}
+
+TEST(robustness, ordered_distance_helper) {
+    CHECK(std::isinf(ordered_distance(kNaN)) && ordered_distance(kNaN) > 0);
+    CHECK(ordered_distance(1.5f) == 1.5f);
+    CHECK(ordered_distance(-kInf) == -kInf && ordered_distance(kInf) == kInf);
+}
+
+TEST(robustness, max_level_stays_reasonable) {
+    HnswIndex h(8, Metric::L2, HnswParams{16, 16, 11});
+    auto data = random_vectors(5000, 8, 82);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    CHECK(h.max_level() >= 1 && h.max_level() <= 8);  // expected about log16(5000) = 3
+}
+
+// ===========================================================================
+// Robustness: running out of memory
+// ===========================================================================
+
+namespace {
+
+/// Runs `op` with allocation n failing, for n = 0, 1, 2, ... After each injected
+/// failure that reaches the caller, `verify` checks the object is still sound.
+/// Stops when `op` completes without any injected failure firing. Returns the
+/// number of allocation points tried, or -1 if `op` never completed.
+template <class Op, class Verify>
+long sweep_allocation_failures(Op op, Verify verify, long max_points = 5000) {
+    for (long n = 0; n < max_points; ++n) {
+        alloc_hook::fail_after(n);
+        bool threw = false;
+        try {
+            op();
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        } catch (const std::exception& e) {
+            // Any other exception means an earlier failure corrupted the object.
+            alloc_hook::disarm();
+            report(false, __LINE__, "operation threw something other than bad_alloc after an earlier failure");
+            std::printf("        (at allocation point %ld: %s)\n", n, e.what());
+            return -1;
+        }
+        alloc_hook::disarm();
+        if (threw) {
+            verify();
+        } else if (!alloc_hook::fired) {
+            return n;  // completed with no failure injected: every point was tried
+        }
+        // A failure fired but was handled internally: keep going.
+    }
+    return -1;
+}
+
+}  // namespace
+
+TEST(robustness, oom_hook_works) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    alloc_hook::fail_after(0);
+    CHECK_THROWS_AS(std::bad_alloc, auto p = std::make_unique<int>(1));
+    CHECK(alloc_hook::fired);
+    CHECK_NOTHROW(auto p = std::make_unique<int>(2));  // fails only once
+    alloc_hook::fail_after(2);
+    auto a = std::make_unique<int>(1), b = std::make_unique<int>(2);
+    CHECK_THROWS_AS(std::bad_alloc, auto c = std::make_unique<int>(3));
+    alloc_hook::disarm();
+}
+
+TEST(robustness, oom_id_map_add_all_or_nothing) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    // Sweep every add from 0 to 300 entries, so failures also hit the moments
+    // when the internal arrays and hash table grow.
+    IdMap m;
+    bool all_completed = true;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        const long points = sweep_allocation_failures([&] { m.add(1000 + i); }, [&] {
+            CHECK(m.size() == i && !m.find(1000 + i).has_value());
+        });
+        all_completed = all_completed && points > 0;
+        if (m.size() != i + 1) break;
+    }
+    CHECK(all_completed);
+    REQUIRE(m.size() == 300);
+    bool consistent = true;
+    for (std::uint64_t i = 0; i < 300; ++i) consistent = consistent && *m.find(1000 + i) == i && m.external(NodeId(i)) == 1000 + i;
+    CHECK(consistent);
+}
+
+TEST(robustness, oom_vector_store_add_all_or_nothing) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    VectorStore s(8, 2);  // 4 rows per shelf: the 5th add needs a new shelf
+    for (int i = 0; i < 4; ++i) s.add(std::vector<float>(8, float(i)));
+    const long points = sweep_allocation_failures([&] { s.add(std::vector<float>(8, 9.0f)); }, [&] {
+        CHECK(s.size() == 4 && s.get(3)[0] == 3.0f);
+    });
+    CHECK(points > 0);
+    CHECK(s.size() == 5 && s.get(4)[7] == 9.0f && aligned(s.get(4).data()));
+}
+
+TEST(robustness, oom_graph_add_node_all_or_nothing) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    GraphStorage g(16, 2);
+    for (int i = 0; i < 4; ++i) g.add_node(0);
+    const long points = sweep_allocation_failures([&] { g.add_node(3); }, [&] {
+        CHECK(g.size() == 4);
+    });
+    CHECK(points > 0);
+    CHECK(g.size() == 5 && g.level(4) == 3);
+    bool empty = true;
+    for (int l = 0; l <= 3; ++l) empty = empty && GraphStorage::count(g.links(4, l)) == 0;
+    CHECK(empty);
+}
+
+TEST(robustness, oom_storage_insert_all_or_nothing) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    for (std::size_t existing : std::initializer_list<std::size_t>{0, 1, 64}) {  // first insert allocates the most
+        Storage st(8, 4);
+        for (std::size_t i = 0; i < existing; ++i) st.insert(i, std::vector<float>(8, 1.0f), int(i % 3));
+        const long points = sweep_allocation_failures(
+            [&] { st.insert(777, std::vector<float>(8, 2.0f), 2); },
+            [&] {
+                CHECK(st.size() == existing && st.ids().size() == existing && st.graph().size() == existing);
+                CHECK(!st.ids().find(777).has_value());
+            });
+        CHECK(points > 0);
+        REQUIRE(st.size() == existing + 1);
+        const NodeId id = *st.ids().find(777);
+        CHECK(st.vectors().get(id)[0] == 2.0f && st.graph().level(id) == 2);
+        CHECK(st.ids().size() == st.graph().size());
+    }
+}
+
+TEST(robustness, oom_flat_add_all_or_nothing) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(51, 8, 83);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 50; ++i) f.add(i, data[i]);
+    const Results before = f.search(data[0], 10);
+    const long points = sweep_allocation_failures([&] { f.add(999, data[50]); }, [&] {
+        CHECK(f.size() == 50 && !f.contains(999));
+        CHECK(same_results(f.search(data[0], 10), before));
+    });
+    CHECK(points > 0);
+    CHECK(f.size() == 51 && f.contains(999));  // the same ID works after failures
+    CHECK(f.search(data[50], 1)[0].id == 999);
+}
+
+TEST(robustness, oom_flat_search_harmless) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(100, 8, 84);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    const Results before = f.search(data[7], 10);
+    Results got;
+    const long points = sweep_allocation_failures([&] { got = f.search(data[7], 10); }, [&] {
+        CHECK(same_results(f.search(data[7], 10), before));
+    });
+    CHECK(points > 0 && same_results(got, before));
+}
+
+TEST(robustness, oom_hnsw_first_insert) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    HnswIndex h(4, Metric::L2);
+    const long points = sweep_allocation_failures([&] { h.add(1, std::vector<float>{1, 2, 3, 4}); }, [&] {
+        CHECK(h.size() == 0 && h.entry_point() == kEmpty && h.storage().size() == 0);
+    });
+    CHECK(points > 0);
+    CHECK(h.size() == 1 && h.contains(1) && h.entry_point() == 0);
+}
+
+TEST(robustness, oom_hnsw_add_keeps_index_consistent) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 4, 85);
+    auto queries = clustered(5, 8, 4, 86);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    std::uint64_t next_id = 10000;  // a failed insert may keep its ID taken, so use a new one each try
+    std::uint64_t last_id = 0;
+    const long points = sweep_allocation_failures(
+        [&] {
+            last_id = next_id++;
+            h.add(last_id, data[300]);
+        },
+        [&] {
+            CHECK(h.size() == 300);          // the failed vector is not counted...
+            CHECK(!h.contains(last_id));     // ...and never visible
+            check_graph(h, 0.99);
+            for (const auto& q : queries) check_results(h, h.search(q, 10, 64));
+        });
+    CHECK(points > 0);
+    CHECK(h.size() == 301 && h.contains(last_id));
+    CHECK(h.search(data[300], 1, 64)[0].id == last_id);
+    for (std::size_t i = 301; i < 400; ++i) h.add(i, data[i]);  // keeps working afterwards
+    check_graph(h, 0.99);
+}
+
+TEST(robustness, oom_hnsw_search_harmless) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 8, 4, 87);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Results before = h.search(data[5], 10, 64);
+    Results got;
+    const long points = sweep_allocation_failures([&] { got = h.search(data[5], 10, 64); }, [&] {
+        CHECK(same_results(h.search(data[5], 10, 64), before));
+    });
+    CHECK(points > 0 && same_results(got, before));
+}
+
+TEST(robustness, oom_index_construction) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    long p1 = sweep_allocation_failures([] { HnswIndex h(16, Metric::L2); h.add(1, std::vector<float>(16, 1.0f)); }, [] {});
+    long p2 = sweep_allocation_failures([] { FlatIndex f(16, Metric::L2); f.add(1, std::vector<float>(16, 1.0f)); }, [] {});
+    CHECK(p1 > 0 && p2 > 0);
+}
+
+TEST(robustness, oom_visited_pool) {
+    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    VisitedListPool pool;
+    const long points = sweep_allocation_failures([&] { auto h = pool.acquire(1000); h->visit(999); }, [&] {
+        CHECK(pool.idle_count() <= 1);
+    });
+    CHECK(points > 0 && pool.idle_count() == 1);
+}
+
+// ===========================================================================
 // Concurrency
 // ===========================================================================
 
@@ -2342,7 +2760,7 @@ void print_usage() {
         "  --fail-fast         stop after the first failing test\n"
         "  --help              show this help\n"
         "\n"
-        "Groups: layer1, layer2, helpers, flat, hnsw, concurrency, e2e\n"
+        "Groups: layer1, layer2, helpers, flat, hnsw, robustness, concurrency, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -2416,7 +2834,7 @@ int main(int argc, char** argv) {
     const auto run_start = Clock::now();
     std::vector<std::string> failed;
     std::string current_group;
-    std::size_t run = 0;
+    std::size_t run = 0, skipped = 0;
 
     for (const TestCase* t : selected) {
         ++run;
@@ -2425,19 +2843,30 @@ int main(int argc, char** argv) {
             std::printf("[%s]\n", current_group.c_str());
         }
         g_failures = 0;
-        std::string error;
+        alloc_hook::disarm();
+        std::string error, skip_reason;
+        bool was_skipped = false;
         const auto start = Clock::now();
         try {
             t->fn();
         } catch (const RequireFailed&) {
             // already reported
+        } catch (const TestSkipped& s) {
+            was_skipped = true;
+            skip_reason = s.reason;
         } catch (const std::exception& e) {
             error = std::string("unexpected exception: ") + e.what();
         } catch (...) {
             error = "unexpected non-standard exception";
         }
+        alloc_hook::disarm();  // a test that exits early must not leave the hook armed
         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
         const bool ok = g_failures == 0 && error.empty();
+        if (was_skipped && ok) {
+            ++skipped;
+            std::printf("  SKIP  %-45s %8.1f ms  (%s)\n", t->name.c_str(), ms, skip_reason.c_str());
+            continue;
+        }
         std::printf("  %s  %-45s %8.1f ms\n", ok ? "PASS" : "FAIL", t->name.c_str(), ms);
         if (!error.empty()) std::printf("        %s\n", error.c_str());
         if (!ok) {
@@ -2447,8 +2876,9 @@ int main(int argc, char** argv) {
     }
 
     const double total = std::chrono::duration<double>(Clock::now() - run_start).count();
-    std::printf("\n%zu passed, %zu failed, %zu not run, %ld checks, %.2f s\n", run - failed.size(),
-                failed.size(), selected.size() - run, g_checks.load(), total);
+    std::printf("\n%zu passed, %zu failed, %zu skipped, %zu not run, %ld checks, %.2f s\n",
+                run - failed.size() - skipped, failed.size(), skipped, selected.size() - run,
+                g_checks.load(), total);
     if (!failed.empty()) {
         std::printf("Failed tests:\n");
         for (const auto& name : failed) std::printf("  %s\n", name.c_str());

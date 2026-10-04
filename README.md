@@ -173,7 +173,7 @@ hnsw-lite/
 │   ├── test_search_helpers.cpp # Tests for TopK, PreparedVector, VisitedList
 │   ├── test_flat.cpp           # Tests for FlatIndex
 │   ├── test_hnsw.cpp           # Tests for HnswIndex (graph validity, recall)
-│   └── test_comprehensive.cpp  # Edge cases and negative scenarios, all layers
+│   └── test_comprehensive.cpp  # All 216 scenarios with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -330,7 +330,7 @@ Because every memory block starts on a 64-byte boundary and every row is a whole
 
 ### Chunked storage
 
-Rows are stored in fixed-size blocks of `2^shelf_bits` rows (65,536 by default). New blocks are added when needed; existing blocks never move or grow. Finding vector `N`:
+Rows are stored in fixed-size blocks of `2^shelf_bits` rows. By default a block holds up to 65,536 rows but at most 8 MB (for example, 16,384 rows at 128 dimensions and 1,024 rows at 1,536 dimensions), so small indexes of long vectors stay small. New blocks are added when needed; existing blocks never move or grow. Finding vector `N`:
 
 ```
 block   = N >> shelf_bits
@@ -444,6 +444,8 @@ Only one change was needed in the lower layers: `GraphStorage::set_links`, which
 - **Tombstone removal.** `remove()` only sets the `IdMap` flag. Flat skips flagged vectors; HNSW still travels through them but never returns them.
 - **Errors leave the index unchanged.** A wrong dimension, a NaN or infinite value, or a duplicate ID throws `std::invalid_argument` before anything is modified (and, in HNSW, before a random level is drawn, so later inserts build exactly the same graph). IDs cannot be reused, even after removal.
 - **Only finite values.** `PreparedVector` rejects NaN and infinity, because one such value would corrupt every distance computed against that vector. Layer 1 itself stores any float.
+- **Inserts survive running out of memory.** `IdMap`, `VectorStore`, `GraphStorage`, `Storage` and `FlatIndex` inserts are all-or-nothing: they grow their containers before changing anything, and `Storage` undoes earlier steps if a later one fails. An HNSW insert that fails while linking marks its half-linked vector as removed, so the index stays consistent; that vector's ID stays taken.
+- **NaN distances sort last.** Inputs are finite, but an inner product of huge values can still overflow to NaN; `ordered_distance` turns it into +∞.
 - **Oversized requests are capped.** A `k` larger than the index returns everything; HNSW's `ef` is raised to at least `k` and capped at the number of nodes.
 
 ### FlatIndex
@@ -515,11 +517,13 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Member | Description |
 |---|---|
-| `VectorStore(dim, shelf_bits = 16)` | Creates a store for vectors of `dim` floats |
+| `VectorStore(dim, shelf_bits = auto)` | Creates a store for vectors of `dim` floats; blocks default to at most 65,536 rows and 8 MB |
 | `add(span<const float>)` | Copies a vector in, returns its `NodeId` |
 | `get(id)` | Read-only `span` of `dim` floats (no copy) |
 | `get_padded(id)` | Read-only `span` of `stride` floats, including padding |
 | `size()`, `dim()`, `stride()` | Number of vectors, dimension, padded row length |
+| `rows_per_shelf()` | Rows per memory block |
+| `undo_last_add()` | Undoes the most recent `add`; used to roll back a failed insert |
 
 ### `IdMap`
 
@@ -529,6 +533,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `find(external)` | `std::optional<NodeId>` for a user ID |
 | `external(id)` | User ID of a `NodeId` |
 | `mark_deleted(id)`, `is_deleted(id)` | Sets or checks the deletion flag |
+| `undo_last_add(external)` | Undoes the most recent `add`; used to roll back a failed insert |
 | `size()` | Number of registered IDs |
 
 ### `GraphStorage`
@@ -540,6 +545,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `links(id, level)` | Writable `span` of the node's slots on that level; throws if the node does not reach it |
 | `count(slots)` | Number of used slots (static) |
 | `set_links(id, level, neighbors)` | Replaces the node's list on that level and marks the remaining slots empty |
+| `undo_last_add()` | Undoes the most recent `add_node`, before any links were written |
 | `level(id)` | Top level of a node |
 | `size()`, `M()`, `M0()` | Number of nodes and list capacities |
 
@@ -576,6 +582,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `TopK::push(c)` | Adds `c` if there is room or it beats the worst kept; returns whether it was kept |
 | `TopK::full()`, `size()`, `worst_distance()` | Heap state; `worst_distance()` is infinity when empty |
 | `TopK::take_sorted()` | Empties the heap and returns candidates closest first |
+| `ordered_distance(d)` | Returns +∞ for NaN, `d` otherwise, so overflowed distances sort last |
 
 ### `PreparedVector`
 
@@ -623,80 +630,108 @@ Not copyable, movable. Frees its memory in the destructor.
 
 ## Testing
 
-All six test programs are registered with CTest and run together as one suite. They share a tiny `CHECK` macro and `throws_as<E>()` helper in `tests/check.h`, so no external test framework is needed.
+### The comprehensive suite
+
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 216 individually named tests** in 8 groups, with a built-in runner. It needs no external test framework.
+
+| Group | Tests | What it covers |
+|---|---|---|
+| `layer1` | 56 | `round_up`; AlignedBlock (alignment, fill, size rounding, moves); Arena (every alignment, exact fill, oversized requests, 100 arrays staying intact); VectorStore (strides, padding, stable addresses, block size limit, 10,000 vectors, special float values); IdMap (extreme IDs, unknown IDs, removed IDs staying taken); GraphStorage (capacities, level limits, `set_links` at, below and above capacity); Storage (staying in sync after every kind of rejected insert) |
+| `layer2` | 31 | Dispatch consistency; every kernel on every supported CPU version: double-precision reference at 9 lengths, known values, length 0, zero vectors, overflow, NaN propagation, exact symmetry, unaligned input, padding, 8,192 dimensions, exact identities (`cos = 1 + ip`, L2 scaling by 4), versions agreeing; `normalize` on tiny, huge, zero, negative and empty vectors |
+| `helpers` | 31 | Candidate ordering; TopK (ties, k = 0, 1 and 2⁶⁴−1, infinity, reuse, matching a full sort of 10,000 candidates); PreparedVector (NaN and ±∞ rejected while keeping old contents, padding after reuse, tiny and extreme values); VisitedList (growth, epoch wrap-around, 1,000 resets); VisitedListPool (reuse, return after exceptions, 8 threads) |
+| `flat` | 24 | Exact match with a reference for all metrics and k up to 500; ties ordered by insertion; empty index, k = 0, k > size, huge k; wrong dimension, NaN, ∞ and duplicates rejected; removal; inner-product order; cosine with zero vectors; extreme IDs; 1,536 dimensions; 5,000 vectors |
+| `hnsw` | 44 | Parameter and input validation; rejected inserts leaving the later graph bit-identical; 1 to 10 vectors matching Flat exactly; k and ef limits; results sorted, unique and live; distances equal to Flat's; determinism; graph validity and recall for every metric; recall at k = 1, 10 and 50; level distribution; `M = 2`, `ef_construction = 1`, `M = 64`, other seeds; identical vectors; removing the entry point, a quarter, all but one, and everything; new nodes never linking to removed ones |
+| `robustness` | 20 | **Numeric extremes:** inner-product overflow (+∞ plus −∞ = NaN) sorting last instead of breaking the order, L2 overflow, huge values with cosine, denormals, −0 versus 0. **Out of memory:** every allocation in an `IdMap`, `VectorStore`, `GraphStorage` and `Storage` insert, a Flat add and search, and an HNSW first insert, insert and search is made to fail in turn, checking after each failure that nothing is corrupted and the object still works |
+| `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
+| `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
+
+Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 4 seconds in Release.
+
+**Running tests at will:**
 
 ```
-1/6 Test #1: test_layer1 ..............   Passed
-2/6 Test #2: test_distance ............   Passed
-3/6 Test #3: test_search_helpers ......   Passed
-4/6 Test #4: test_flat ................   Passed
-5/6 Test #5: test_hnsw ................   Passed
-6/6 Test #6: test_comprehensive .......   Passed
-100% tests passed, 0 tests failed out of 6
+test_comprehensive                      # run every test
+test_comprehensive --list               # list all 216 test names
+test_comprehensive --group hnsw         # run one group (repeatable)
+test_comprehensive recall               # every test whose "group.name" contains "recall"
+test_comprehensive flat.k_zero          # a single test
+test_comprehensive --exclude e2e        # skip matching tests (repeatable)
+test_comprehensive --fail-fast          # stop at the first failing test
+test_comprehensive --help               # show all options
 ```
 
-In a Debug build, `test_hnsw` and `test_comprehensive` take 10 to 25 seconds each, because they build many indexes with optimizations off; in Release the whole suite takes a few seconds.
+On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the same options in the `test_comprehensive` run configuration's **Program arguments** field.
 
-**`tests/test_layer1.cpp`** checks that:
+**Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
-- Memory blocks start on 64-byte boundaries and start as zero.
-- Arena pieces are aligned, do not overlap, and oversized requests work.
-- Vectors read back correctly, every row is aligned and padding stays zero.
-- Vector addresses never change after new blocks are added.
-- User IDs translate both ways, duplicates are rejected and deletion flags work.
-- New neighbor lists are empty, links can be written and read, and levels are enforced.
-- A rejected insert leaves the storage unchanged.
-- `set_links` replaces a list, clears leftover slots and rejects lists that are too long.
+```
+hnsw-lite comprehensive tests | kernel: avx512 | 216 of 216 tests selected
 
-**`tests/test_distance.cpp`** checks that:
+[layer1]
+  PASS  round_up_boundaries                                0.0 ms
+  PASS  constants                                          0.0 ms
+  ...
+216 passed, 0 failed, 0 skipped, 0 not run, 10720 checks, 3.71 s
+All selected tests passed.
+```
 
-- Every version the CPU supports matches a double-precision reference on random vectors of 9 lengths (16 to 1536), chosen to exercise both the main and leftover loops. Unsupported versions are skipped and reported.
-- Exact cases hold: `[1, 2]` vs. `[4, 6]` gives L2 = 25 and inner product distance = −16; identical vectors give L2 = 0; parallel and perpendicular unit vectors give cosine distance 0 and 1.
-- Zero padding from `VectorStore` does not change results.
-- `normalize()` gives length 1 and leaves a zero vector unchanged.
-- Dispatch always returns a usable kernel, and `nullptr` exactly for unsupported versions.
+**Writing a new test** takes one block; it is registered automatically:
 
-Results differ slightly between versions because SIMD adds numbers in a different order, so comparisons allow a small rounding tolerance scaled to the size of the values.
+```cpp
+TEST(flat, my_new_case) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});
+    CHECK(f.size() == 1);
+    CHECK_THROWS_AS(std::invalid_argument, f.add(1, std::vector<float>{1, 1}));
+}
+```
 
-**`tests/test_search_helpers.cpp`** checks that:
+**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 12 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
 
-- `TopK` keeps exactly the k best, breaks ties by id, and returns them sorted.
-- `PreparedVector` is aligned, keeps padding zero across reuse, normalizes only for cosine, and rejects wrong dimensions.
-- `VisitedList` tracks visits per search, grows when nodes are added, and survives epoch wrap-around.
-- `VisitedListPool` reuses lists and gets them back even when a search throws.
+### CTest
 
-**`tests/test_flat.cpp`** checks that:
+CTest runs the five per-layer test programs plus one entry per comprehensive group, 13 entries in total:
 
-- Results exactly match a reference (every distance computed, sorted, first k) for all three metrics and several k values.
-- Removed vectors never appear; `remove`, `contains` and `size` behave correctly.
-- Cosine works on un-normalized input.
-- Edge cases: empty index, k = 0, k larger than the index, wrong dimensions, duplicate IDs and reuse of removed IDs.
+```
+ 1/13 Test  #1: test_layer1 ......................   Passed
+ 2/13 Test  #2: test_distance ....................   Passed
+ 3/13 Test  #3: test_search_helpers ..............   Passed
+ 4/13 Test  #4: test_flat ........................   Passed
+ 5/13 Test  #5: test_hnsw ........................   Passed
+ 6/13 Test  #6: comprehensive.layer1 .............   Passed
+ 7/13 Test  #7: comprehensive.layer2 .............   Passed
+ 8/13 Test  #8: comprehensive.helpers ............   Passed
+ 9/13 Test  #9: comprehensive.flat ...............   Passed
+10/13 Test #10: comprehensive.hnsw ...............   Passed
+11/13 Test #11: comprehensive.robustness .........   Passed
+12/13 Test #12: comprehensive.concurrency ........   Passed
+13/13 Test #13: comprehensive.e2e ................   Passed
+100% tests passed, 0 tests failed out of 13
+```
 
-**`tests/test_hnsw.cpp`** checks that:
+Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
 
-- **The graph is valid:** every link points to a real node on that level, with no self-links, no duplicates and no list over capacity; unused slots are empty; the entry point is on the top level; at least 99% of nodes are reachable from it on level 0.
-- **Recall@10 is at least 0.95** against `FlatIndex` on clustered data, for all three metrics (measured: 0.998 to 0.999).
-- Stored vectors find themselves at distance 0, and results are sorted.
-- **Removal:** with a quarter of the vectors and the entry point removed, results contain only live vectors and recall stays at least 0.95; inserts still work afterwards.
-- **Determinism:** two indexes built with the same seed give identical results.
-- **Level distribution:** about 1 in M nodes reach level 1.
-- Edge cases: empty index, a single vector, k = 0, k > size, `ef` < k, wrong dimensions, duplicate IDs, everything removed, and invalid parameters.
+The per-layer programs (`test_layer1`, `test_distance`, `test_search_helpers`, `test_flat`, `test_hnsw`) are small, quick checks of normal behavior, one per layer. Every scenario they contain is also in the comprehensive suite.
 
-**`tests/test_comprehensive.cpp`** pushes every class to its limits (about 500,000 checks, many inside loops) and checks that invalid input is rejected with the **exact exception type** and leaves everything unchanged:
+In a Debug build the comprehensive suite takes about a minute, and several times longer with sanitizers, because it builds many indexes with optimizations off.
 
-| Area | What is tested |
-|---|---|
-| Layer 1 | `round_up` boundaries; zero-size, custom-fill and self-moved `AlignedBlock`s; every arena alignment, exact block fill, zero-byte and oversized requests, 100 arrays staying intact; strides for 1 to 33 dimensions, one row per shelf, special float values; extreme user IDs (0 and 2⁶⁴−1); `M = 1`, level 255, levels −1 and 256; `set_links` at, below and above capacity; `Storage` staying in sync after every kind of rejected insert |
-| Layer 2 | Every kernel on every supported CPU version: length 0, zero vectors, overflow to infinity, NaN propagation, exact symmetry, L2 ≥ 0, length 4096, and unaligned input giving bit-identical results; `normalize` on empty, negative, tiny (10⁻⁴⁰), huge (10³⁰) and zero vectors; dispatch consistency |
-| Layer 3 helpers | `TopK` with k = 1, ties at the boundary, infinity, k = 2⁶⁴−1 and reuse; `PreparedVector` rejecting NaN, +∞ and −∞ while keeping its old contents; 1,000 consecutive visited-list resets; several pool handles at once |
-| FlatIndex | 1 dimension, ties by insertion order, 10 identical vectors, huge k, NaN/∞/dimension/duplicate rejection, negative inner-product distances, cosine with zero vectors, extreme IDs, removing everything and adding again |
-| HnswIndex | Invalid parameters; rejected inserts leaving the later graph bit-identical; 1, 2 and 3 vectors matching Flat exactly; 1 dimension; huge k and ef; ef = 0; `M = 2`, `ef_construction = 1`, `M = 64` and another seed; 200 identical vectors not harming the rest; inner-product ordering; cosine ignoring length; reported distances equal to Flat's; removing all but one (including the entry point); refilling after removing everything |
-| Concurrency | 8 threads searching HNSW and Flat at once, 3 rounds each; every answer must match the single-threaded result |
-| End to end | For each metric: add 1,000, remove 300, add 600 more, checking recall, result validity and graph structure after every step |
+### Verification
 
-The concurrency test also passes under **ThreadSanitizer** with no data races reported.
+- **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
-**Bugs found by these tests, and fixed:**
+  | CPU | Kernel versions tested | Version chosen |
+    |---|---|---|
+  | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
+  | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
+  | Emulated Intel Nehalem (2008) | scalar | scalar |
+  | Emulated 64-bit ARM | scalar, NEON | NEON |
+
+- **Compilers:** all tests pass with GCC 13 and Clang 18. The MSVC-specific CPU-detection code has not yet been compiled, since no MSVC was available; a Windows CI job would close that gap.
+- **Sanitizers:** all tests pass with AddressSanitizer and UndefinedBehaviorSanitizer (the out-of-memory tests are skipped there), and the threaded groups pass under ThreadSanitizer with no data races reported.
+- **Warnings:** none with `-Wall -Wextra -Wpedantic`, nor with `-Wconversion -Wshadow` (which approximate MSVC's `/W4` conversion warnings), under both GCC and Clang.
+- **Comparison with hnswlib:** where results looked low, the same data and operations were run through the reference hnswlib library. Inner-product recall on the lifecycle data is 0.898 / 0.905 / 0.860 (add / remove / re-add) against hnswlib's 0.887 / 0.900 / 0.853, confirming that lower inner-product numbers come from the metric, not this implementation.
+
+### Bugs found by testing, and fixed
 
 1. `Storage::insert` with an invalid level stored the ID and vector but not the graph node, leaving the three parts out of sync. Levels are now validated first.
 2. `normalize` on very small vectors produced infinity and NaN, because the scale factor overflowed a float. It now scales in double.
@@ -704,21 +739,9 @@ The concurrency test also passes under **ThreadSanitizer** with no data races re
 4. A very large `k` crashed searches by reserving memory for `k` results. `k` and `ef` are now capped.
 5. Many identical vectors made unrelated vectors unreachable. The neighbor heuristic now skips exact copies.
 6. HNSW inserts chose removed nodes as neighbors, wasting link slots: after removals and re-adds, inner-product recall was 0.792 versus hnswlib's 0.853 on identical data. Removed nodes are now skipped when choosing neighbors, giving 0.860.
-
-**Comparison with hnswlib.** Where results looked low, the same data and operations were run through the reference hnswlib library. Inner-product recall on this data is 0.898 / 0.905 / 0.860 (add / remove / re-add) against hnswlib's 0.887 / 0.900 / 0.853, which confirmed that the lower inner-product numbers come from the metric, not from this implementation.
-
-**CPUs tested:**
-
-All six test programs pass on every CPU type below. Because each kernel rounds slightly differently, each CPU builds a slightly different graph, so this also shows the HNSW tests do not depend on one exact graph.
-
-| CPU | Kernel versions tested | Version chosen |
-|---|---|---|
-| Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
-| Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
-| Emulated Intel Nehalem (2008) | scalar | scalar |
-| Emulated 64-bit ARM | scalar, NEON | NEON |
-
-They also pass with AddressSanitizer and UndefinedBehaviorSanitizer enabled, with no compiler warnings.
+7. `VectorStore` always allocated blocks of 65,536 rows, so storing a single 1,536-dimension vector allocated and zeroed 400 MB (a test took 609 ms). Blocks are now capped at 8 MB, and the test takes 4.6 ms.
+8. **Running out of memory corrupted indexes.** `IdMap::add` registered the user ID before growing its arrays, so a failure left a stale ID that broke every later insert; `Storage::insert` had no rollback if a later step failed; and a half-linked HNSW vector stayed visible after a failure. Inserts are now all-or-nothing in `IdMap`, `VectorStore`, `GraphStorage`, `Storage` and `FlatIndex`, and a failed HNSW insert hides its half-linked vector. Run against the old code, 4 of the out-of-memory tests fail.
+9. Huge finite values could make an inner product overflow to NaN (+∞ plus −∞), which breaks the ordering every heap and sort relies on. NaN distances now count as +∞, so such pairs sort last.
 
 ## Benchmarks
 
@@ -766,6 +789,7 @@ These are deliberate for the current stage:
 - **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
 - **No memory reclamation.** Removed vectors are only flagged; their memory is recovered only by rebuilding.
 - **User IDs are 64-bit integers only.**
+- **A failed HNSW insert can use up its ID.** If memory runs out after the vector was stored, it is hidden rather than removed, so adding the same ID again is rejected; use a new ID.
 - **Exact duplicates cannot all stay reachable.** Each node has a fixed number of link slots, and once one copy of a point is linked, further copies add nothing, so some copies become unreachable (with 200 identical vectors, about 60% stay reachable). They no longer harm other vectors, but deduplicate data if every copy must be returned.
 - **Inner product is harder than L2 and cosine.** It is not a true distance, so recall is lower on un-normalized data (about 0.86 to 0.90 at `ef = 100` in tests, versus 0.997 or higher for L2 and cosine), and a small fraction of short vectors may become unreachable. This matches hnswlib. Use cosine, or normalize vectors, when possible.
 - **Very small `M` builds a sparse graph.** `M = 2` works but leaves about 10% of nodes unreachable in tests; use `M >= 8`.

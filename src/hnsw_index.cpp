@@ -50,7 +50,7 @@ int HnswIndex::random_level() {
 }
 
 float HnswIndex::distance_to(const float* query, NodeId node) const {
-    return distance_(query, storage_.vectors().get_padded(node).data(), stride_);
+    return ordered_distance(distance_(query, storage_.vectors().get_padded(node).data(), stride_));
 }
 
 float HnswIndex::distance_between(NodeId a, NodeId b) const {
@@ -178,6 +178,18 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector) {
         return;
     }
 
+    try {
+        link_new_node(node, level);
+    } catch (...) {
+        // Out of memory while linking: the node may be half-linked. Hide it so the
+        // index stays consistent (it is never returned); its ID stays taken.
+        storage_.ids().mark_deleted(node);
+        --live_;
+        throw;
+    }
+}
+
+void HnswIndex::link_new_node(NodeId node, int level) {
     // 4. Greedy descent through the levels above the new node's level.
     const float* query = scratch_.data();
     Candidate current{distance_to(query, entry_), entry_};
