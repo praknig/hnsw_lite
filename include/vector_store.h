@@ -18,6 +18,8 @@ namespace vecdb {
  *    starts on a 64-byte boundary. The padding is always zero.
  *  - Rows live in fixed-size blocks of 2^shelf_bits rows. Blocks are added
  *    when needed and never moved, so returned spans stay valid.
+ *  - By default a block holds up to 65,536 rows but at most 8 MiB, so a small
+ *    index of long vectors does not allocate hundreds of megabytes up front.
  *
  * Finding vector N (arithmetic only):
  *  - block = N >> shelf_bits, row = N & mask
@@ -30,10 +32,23 @@ namespace vecdb {
  */
 class VectorStore {
 public:
-    explicit VectorStore(std::size_t dim, unsigned shelf_bits = 16)
+    /// Pass as shelf_bits to choose the block size automatically.
+    static constexpr unsigned kAutoShelfBits = ~0u;
+
+    /// Creates a store for vectors of `dim` floats. `shelf_bits` sets the rows
+    /// per block (2^shelf_bits); by default it is chosen from the vector size.
+    explicit VectorStore(std::size_t dim, unsigned shelf_bits = kAutoShelfBits)
         : dim_(dim), stride_(round_up(dim, kFloatsPerLine)),
-          shelf_bits_(shelf_bits), mask_((std::size_t{1} << shelf_bits) - 1) {
+          shelf_bits_(shelf_bits == kAutoShelfBits ? auto_shelf_bits(stride_) : shelf_bits),
+          mask_((std::size_t{1} << shelf_bits_) - 1) {
         if (dim == 0) throw std::invalid_argument("dim must be > 0");
+    }
+
+    /// Rows per block: up to 65,536, but at most 8 MiB per block.
+    static unsigned auto_shelf_bits(std::size_t stride) {
+        unsigned bits = 16;
+        while (bits > 0 && (std::size_t{1} << bits) * stride * sizeof(float) > (std::size_t{8} << 20)) --bits;
+        return bits;
     }
 
     // Copies a vector in and returns its number (0, 1, 2, ...).
@@ -53,6 +68,7 @@ public:
     std::span<const float> get_padded(NodeId id) const { return {row(check(id)), stride_}; }
 
     std::size_t size() const { return count_; }
+    std::size_t rows_per_shelf() const { return mask_ + 1; }
     std::size_t dim() const { return dim_; }
     std::size_t stride() const { return stride_; }
 

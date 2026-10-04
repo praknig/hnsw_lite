@@ -12,9 +12,9 @@ option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux
 # ---------------------------------------------------------------------------
 file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h tests/*.h)
 add_library(hnsw_lite STATIC
-            src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
-            src/flat_index.cpp src/hnsw_index.cpp                            # Layer 3
-            ${HNSW_LITE_HEADERS})
+        src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
+        src/flat_index.cpp src/hnsw_index.cpp                            # Layer 3
+        ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 
 # Each SIMD file gets only its own CPU flags; dispatch.cpp checks the CPU at runtime.
@@ -50,16 +50,16 @@ hnsw_lite_setup(hnsw_lite)
 # Tests and benchmark
 # ---------------------------------------------------------------------------
 enable_testing()
-foreach(name test_layer1 test_distance test_search_helpers test_flat test_hnsw test_comprehensive)
-  add_executable(${name} tests/${name}.cpp)
-  target_link_libraries(${name} PRIVATE hnsw_lite)
-  hnsw_lite_setup(${name})
-  add_test(NAME ${name} COMMAND ${name})
-endforeach()
 
-# The comprehensive test runs searches on several threads at once.
+# Comprehensive suite: one program containing every scenario. Each group is also
+# registered as its own CTest entry, e.g. "ctest -R comprehensive.hnsw".
 find_package(Threads REQUIRED)
-target_link_libraries(test_comprehensive PRIVATE Threads::Threads)
+add_executable(test_comprehensive tests/test_comprehensive.cpp)
+target_link_libraries(test_comprehensive PRIVATE hnsw_lite Threads::Threads)
+hnsw_lite_setup(test_comprehensive)
+foreach(group layer1 layer2 helpers flat hnsw concurrency e2e)
+  add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
+endforeach()
 
 foreach(name bench_distance bench_search)
   add_executable(${name} bench/${name}.cpp)
