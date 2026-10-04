@@ -162,8 +162,9 @@ void normalize(std::span<float> v) {
     double sum = 0.0;  // double avoids rounding error on long vectors
     for (float x : v) sum += static_cast<double>(x) * x;
     if (sum == 0.0) return;
-    const auto inv_len = static_cast<float>(1.0 / std::sqrt(sum));
-    for (float& x : v) x *= inv_len;
+    // Scale in double: for tiny vectors 1/length exceeds the float range.
+    const double inv_len = 1.0 / std::sqrt(sum);
+    for (float& x : v) x = static_cast<float>(x * inv_len);
 }
 
 }  // namespace vecdb

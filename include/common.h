@@ -11,6 +11,7 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <algorithm>
 #include <limits>
 
 namespace vecdb {
@@ -28,6 +29,14 @@ namespace vecdb {
     // Rounds n up to the next multiple of m. Example: round_up(100, 16) == 112.
     constexpr std::size_t round_up(std::size_t n, std::size_t m) {
         return (n + m - 1) / m * m;
+    }
+
+    // Makes sure `v` can take one more push_back without allocating, growing its
+    // capacity geometrically. Calling this first makes the push_back itself unable
+    // to throw, which lets callers change several containers all-or-nothing.
+    template <class Vector>
+    void reserve_one_more(Vector& v) {
+        if (v.size() == v.capacity()) v.reserve(std::max<std::size_t>(16, v.capacity() * 2));
     }
 
 }  // namespace vecdb

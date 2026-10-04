@@ -40,18 +40,21 @@ public:
     }
 
     // Registers the next node (its id is size()) with the given top level.
+    // All-or-nothing: if it throws, nothing visible changed.
     NodeId add_node(int level) {
         if (level < 0 || level > 255) throw std::invalid_argument("bad level");
         auto id = static_cast<NodeId>(levels_.size());
-        if ((id & mask_) == 0)  // new shelf, every byte 0xFF == every slot kEmpty
+        // Everything that can throw happens first, so a failure changes nothing.
+        if ((std::size_t(id) >> shelf_bits_) >= layer0_.size())  // new shelf: 0xFF bytes = kEmpty slots
             layer0_.emplace_back((mask_ + 1) * M0_ * sizeof(NodeId), 0xFF);
-
+        reserve_one_more(levels_);
+        reserve_one_more(upper_);
         NodeId* upper = nullptr;
         if (level > 0) {
             upper = arena_.allocate_array<NodeId>(std::size_t(level) * M_);
             std::fill_n(upper, std::size_t(level) * M_, kEmpty);
         }
-        levels_.push_back(static_cast<std::uint8_t>(level));
+        levels_.push_back(static_cast<std::uint8_t>(level));  // cannot throw: reserved
         upper_.push_back(upper);
         return id;
     }
@@ -75,7 +78,24 @@ public:
         return std::size_t(std::find(slots.begin(), slots.end(), kEmpty) - slots.begin());
     }
 
+    /// Replaces node `id`'s list on `level` with `neighbors`, then marks every
+    /// remaining slot kEmpty. Throws if `neighbors` does not fit in the slots.
+    /// `neighbors` must not point into the slots being replaced.
+    void set_links(NodeId id, int level, std::span<const NodeId> neighbors) {
+        std::span<NodeId> slots = links(id, level);
+        if (neighbors.size() > slots.size()) throw std::length_error("too many neighbors");
+        auto end = std::copy(neighbors.begin(), neighbors.end(), slots.begin());
+        std::fill(end, slots.end(), kEmpty);
+    }
+
     int level(NodeId id) const { return levels_.at(id); }
+
+    /// Undoes the most recent add_node(), before any links were written. Used to
+    /// roll back a failed insert; the node's level-0 slots are still all kEmpty.
+    void undo_last_add() noexcept {
+        levels_.pop_back();
+        upper_.pop_back();  // its arena block (if any) is simply left unused
+    }
     std::size_t size() const { return levels_.size(); }
     std::size_t M() const { return M_; }
     std::size_t M0() const { return M0_; }
