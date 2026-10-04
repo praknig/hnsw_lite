@@ -1,6 +1,7 @@
 # hnsw-lite
 
 [![CI](https://github.com/praknig/hnsw_lite/actions/workflows/ci.yml/badge.svg)](https://github.com/praknig/hnsw_lite/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A minimal, in-memory vector search engine written in modern C++20, built from scratch to show how libraries like hnswlib, Faiss, Qdrant and Milvus work under the hood.
 
@@ -147,6 +148,7 @@ hnsw-lite/
 │   └── workflows/
 │       └── ci.yml              # GitHub Actions: build and test on every PR
 ├── .gitignore                  # Ignores IDE settings and build output
+├── LICENSE                     # MIT License
 ├── CMakeLists.txt              # Builds the library, tests and benchmark
 ├── README.md                   # This file
 ├── include/                    # Public headers (namespace vecdb)
@@ -856,4 +858,4 @@ hnsw-lite focuses on the in-memory core that these systems share, and leaves out
 
 ## License
 
-Not yet chosen. Add a `LICENSE` file (for example MIT or Apache-2.0) before publishing.
+Released under the [MIT License](LICENSE).
