@@ -19,15 +19,9 @@
 #include "distance.h"
 #include "vector_store.h"
 
-using namespace vecdb;
+#include "check.h"
 
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("FAILED line %d: %s\n", __LINE__, #cond);            \
-            std::exit(1);                                                    \
-        }                                                                    \
-    } while (0)
+using namespace vecdb;
 
 static const Isa kAllIsas[] = {Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon};
 static const Metric kAllMetrics[] = {Metric::L2, Metric::InnerProduct, Metric::Cosine};

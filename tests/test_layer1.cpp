@@ -15,25 +15,13 @@
 #include <cstdlib>
 #include <numeric>
 
-#include "../include/storage.h"
+#include "storage.h"
+
+#include "check.h"
 
 using namespace vecdb;
 
-#define CHECK(cond)                                                          \
-    do {                                                                     \
-        if (!(cond)) {                                                       \
-            std::printf("FAILED line %d: %s\n", __LINE__, #cond);            \
-            std::exit(1);                                                    \
-        }                                                                    \
-    } while (0)
-
 static bool aligned(const void* p) { return reinterpret_cast<std::uintptr_t>(p) % kAlign == 0; }
-
-template <class F>
-static bool throws(F f) {
-    try { f(); } catch (...) { return true; }
-    return false;
-}
 
 static void test_aligned_block() {
     AlignedBlock b(100);
@@ -105,6 +93,16 @@ static void test_graph_storage() {
     CHECK(GraphStorage::count(g.links(a, 0)) == 2);
     CHECK(g.links(b, 2)[0] == a);
     CHECK(GraphStorage::count(g.links(b, 1)) == 0);  // level 1 untouched
+
+    // set_links replaces the whole list and clears the leftover slots.
+    std::vector<NodeId> three{2, 3, 4};
+    g.set_links(a, 0, three);
+    CHECK(GraphStorage::count(g.links(a, 0)) == 3);
+    CHECK(g.links(a, 0)[2] == 4 && g.links(a, 0)[3] == kEmpty);
+    std::vector<NodeId> one{5};
+    g.set_links(a, 0, one);  // shorter list: old entries must disappear
+    CHECK(GraphStorage::count(g.links(a, 0)) == 1 && g.links(a, 0)[0] == 5);
+    CHECK(throws([&] { g.set_links(b, 1, std::vector<NodeId>(17, 0)); }));  // only 16 slots
 }
 
 static void test_storage() {

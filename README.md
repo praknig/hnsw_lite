@@ -2,9 +2,9 @@
 
 A minimal, in-memory vector search engine written in modern C++20, built from scratch to show how libraries like hnswlib, Faiss, Qdrant and Milvus work under the hood.
 
-The engine stores high-dimensional vectors (embeddings) and will find the nearest neighbors of a query vector using two indexes: an exact brute-force **Flat** index and an approximate **HNSW** (Hierarchical Navigable Small World) graph.
+The engine stores high-dimensional vectors (embeddings) and finds the nearest neighbors of a query vector using two indexes: an exact brute-force **Flat** index and an approximate **HNSW** (Hierarchical Navigable Small World) graph.
 
-> **Status:** Layer 1 (memory and storage) and Layer 2 (SIMD distance kernels) are complete and tested. Layer 3 (indexes) is next. See the [Roadmap](#roadmap).
+> **Status:** Layers 1 to 3 are complete and tested: memory and storage, SIMD distance kernels, and the Flat and HNSW indexes. On 50,000 vectors, HNSW answers queries about 14x faster than exact search at 99.8% recall. See the [Roadmap](#roadmap).
 
 ---
 
@@ -19,6 +19,7 @@ The engine stores high-dimensional vectors (embeddings) and will find the neares
 - [Usage example](#usage-example)
 - [Layer 1 design: memory and storage](#layer-1-design-memory-and-storage)
 - [Layer 2 design: distance kernels](#layer-2-design-distance-kernels)
+- [Layer 3 design: indexes](#layer-3-design-indexes)
 - [API reference](#api-reference)
 - [Testing](#testing)
 - [Benchmarks](#benchmarks)
@@ -54,31 +55,41 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 - 7x to 12x faster than scalar code on x86 (see [Benchmarks](#benchmarks)).
 - Tested on real and emulated x86 CPUs from 2008 onward, and on 64-bit ARM.
 
+**Layer 3: indexes (done)**
+
+- `FlatIndex`: exact search over every vector; the ground truth for measuring recall.
+- `HnswIndex`: multi-level graph with random levels, greedy descent, beam search on level 0, and the HNSW neighbor-selection heuristic.
+- Add, remove (tombstones) and search on both, with results in the user's own IDs.
+- Automatic cosine normalization for inserts and queries.
+- Reproducible graphs: the same seed and inserts always build the same graph, on every compiler.
+- Concurrent searches are safe when no writer is active (thread-safe visited-list pool).
+- Recall@10 of 0.998 or higher in tests, on every CPU type.
+
 **Planned**
 
-- Flat (brute-force) index with top-k selection.
-- HNSW index: insertion, neighbor-selection heuristic and layered beam search.
-- Recall vs. queries-per-second benchmarks on standard datasets.
+- Recall vs. queries-per-second benchmarks on standard datasets (SIFT1M, GloVe).
+- Thread-safe insertion and persistence to disk.
 
 ## Architecture
 
-The engine is built as four layers. Each layer only depends on the one below it.
+The engine is built as three layers. Each layer only depends on the ones below it.
 
 ```mermaid
 flowchart TB
-    A["Query API<br/>search(query, k, ef)"] --> B["Flat index"]
-    A --> C["HNSW graph"]
+    A["Your application"] --> B["Layer 3: FlatIndex"]
+    A --> C["Layer 3: HnswIndex"]
     B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
     C --> D
-    D --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+    C --> E
+    D --> E
 ```
 
 | Layer | Purpose | Status |
 |---|---|---|
 | 1. Memory | Stores vectors and neighbor lists; finds them by arithmetic | Done |
 | 2. Distance kernels | Measures how close two vectors are, using SIMD | Done |
-| 3. Indexes | Flat (exact) and HNSW (approximate) search | Planned |
-| 4. Query API | Public `search(query, k, ef)` interface | Planned |
+| 3. Indexes | Flat (exact) and HNSW (approximate) search | Done |
 
 ### Layer 1 file dependencies
 
@@ -107,6 +118,22 @@ flowchart TB
     K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
 
+### Layer 3 file dependencies
+
+```mermaid
+flowchart TB
+    F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
+    F --> TK["search_result.h<br/>TopK"]
+    H["hnsw_index.h / .cpp"] --> PV
+    H --> TK
+    H --> VL["visited_list.h"]
+    F --> L1A["Layer 1: VectorStore, IdMap"]
+    H --> L1B["Layer 1: Storage"]
+    PV --> L2["Layer 2: distance.h"]
+    F --> L2
+    H --> L2
+```
+
 ## Project structure
 
 ```
@@ -122,22 +149,34 @@ hnsw-lite/
 │   ├── id_map.h                # Layer 1: IdMap, user ID <-> internal ID
 │   ├── graph_storage.h         # Layer 1: GraphStorage, HNSW neighbor lists
 │   ├── storage.h               # Layer 1: Storage, single entry point
-│   └── distance.h              # Layer 2: Metric, get_distance(), normalize()
-├── src/                        # Layer 2 implementation
+│   ├── distance.h              # Layer 2: Metric, get_distance(), normalize()
+│   ├── search_result.h         # Layer 3: SearchResult, Candidate, TopK
+│   ├── prepared_vector.h       # Layer 3: PreparedVector, padded/normalized input
+│   ├── visited_list.h          # Layer 3: VisitedList, VisitedListPool
+│   ├── flat_index.h            # Layer 3: FlatIndex
+│   └── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
+├── src/                        # Compiled code (Layers 2 and 3)
 │   ├── kernels.h               # Internal declarations of all kernels
 │   ├── dispatch.cpp            # CPU detection, kernel selection, normalize()
 │   ├── distance_scalar.cpp     # Plain loops, any CPU (reference version)
 │   ├── distance_avx2.cpp       # AVX2 + FMA, 8 floats per instruction
 │   ├── distance_avx512.cpp     # AVX-512F, 16 floats per instruction
-│   └── distance_neon.cpp       # NEON, 4 floats per instruction (ARM only)
+│   ├── distance_neon.cpp       # NEON, 4 floats per instruction (ARM only)
+│   ├── flat_index.cpp          # FlatIndex implementation
+│   └── hnsw_index.cpp          # HnswIndex implementation
 ├── tests/
+│   ├── check.h                 # Shared CHECK macro and throws() helper
 │   ├── test_layer1.cpp         # Tests for Layer 1
-│   └── test_distance.cpp       # Tests for Layer 2
+│   ├── test_distance.cpp       # Tests for Layer 2
+│   ├── test_search_helpers.cpp # Tests for TopK, PreparedVector, VisitedList
+│   ├── test_flat.cpp           # Tests for FlatIndex
+│   └── test_hnsw.cpp           # Tests for HnswIndex (graph validity, recall)
 └── bench/
-    └── bench_distance.cpp      # Speed of every kernel version
+    ├── bench_distance.cpp      # Speed of every kernel version
+    └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
 ```
 
-Layer 1 is header-only. Layer 2 is compiled into a static library (`hnsw_lite`), because each SIMD file needs its own compiler flags.
+Layer 1 and the Layer 3 helpers are header-only. Layer 2's kernels and Layer 3's indexes are compiled into a static library (`hnsw_lite`); the SIMD files need their own compiler flags, and the indexes contain real logic.
 
 ## Requirements
 
@@ -158,7 +197,7 @@ Supported CPUs: any x86-64 or 64-bit ARM processor. SIMD versions are used autom
 1. Open the `hnsw-lite` folder.
 2. Run **Tools → CMake → Reset Cache and Reload Project**.
 3. Choose **All CTest** from the run configuration dropdown and click **Run** to run every test.
-4. For the benchmark, add a **Release** profile (Settings → Build, Execution, Deployment → CMake), select it, and run `bench_distance`. Debug builds turn off optimizations, so their timings are meaningless.
+4. For the benchmarks, add a **Release** profile (Settings → Build, Execution, Deployment → CMake), select it, and run `bench_distance` or `bench_search`. Debug builds turn off optimizations, so their timings are meaningless (and `test_hnsw` takes about 10 seconds instead of 1).
 
 ### Command line: Linux and macOS
 
@@ -167,6 +206,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 ./build/bench_distance
+./build/bench_search
 ```
 
 ### Command line: Windows with GCC (MinGW / w64devkit)
@@ -176,6 +216,7 @@ cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
 .\build\bench_distance.exe
+.\build\bench_search.exe
 ```
 
 ### Command line: Windows with MSVC
@@ -213,46 +254,48 @@ target_link_libraries(your_target PRIVATE hnsw_lite)
 #include <cstdio>
 #include <vector>
 
-#include "distance.h"
-#include "storage.h"
+#include "flat_index.h"
+#include "hnsw_index.h"
 
 int main() {
-    vecdb::Storage db(/*dim=*/4, /*M=*/16);
+    const std::size_t dim = 4;
+    vecdb::HnswIndex index(dim, vecdb::Metric::Cosine);  // M = 16, ef_construction = 200
+    vecdb::FlatIndex exact(dim, vecdb::Metric::Cosine);
 
-    std::vector<float> a{0.1f, 0.2f, 0.3f, 0.4f};
-    std::vector<float> b{0.5f, 0.6f, 0.7f, 0.8f};
+    std::vector<std::vector<float>> docs = {
+        {0.9f, 0.1f, 0.0f, 0.0f},
+        {0.8f, 0.2f, 0.1f, 0.0f},
+        {0.0f, 0.1f, 0.9f, 0.2f},
+        {0.1f, 0.0f, 0.8f, 0.3f},
+    };
+    for (std::size_t i = 0; i < docs.size(); ++i) {
+        index.add(/*user id=*/100 + i, docs[i]);  // vectors are normalized automatically
+        exact.add(100 + i, docs[i]);
+    }
 
-    // Cosine distance needs vectors of length 1, so normalize before storing.
-    vecdb::normalize(a);
-    vecdb::normalize(b);
+    std::vector<float> query{1.0f, 0.15f, 0.05f, 0.0f};
+    for (const auto& r : index.search(query, /*k=*/2, /*ef=*/64))
+        std::printf("hnsw : id %llu, distance %.4f\n", (unsigned long long)r.id, r.distance);
+    for (const auto& r : exact.search(query, /*k=*/2))
+        std::printf("exact: id %llu, distance %.4f\n", (unsigned long long)r.id, r.distance);
 
-    // Layer 1: store the vectors and connect them on level 0.
-    vecdb::NodeId ia = db.insert(/*user id=*/1001, a, /*level=*/0);
-    vecdb::NodeId ib = db.insert(/*user id=*/1002, b, /*level=*/1);
-    db.graph().links(ia, 0)[0] = ib;
-    db.graph().links(ib, 0)[0] = ia;
-
-    // Layer 2: get the fastest cosine kernel for this CPU and use it.
-    vecdb::DistanceFn cosine = vecdb::get_distance(vecdb::Metric::Cosine);
-    const auto& vs = db.vectors();
-    float d = cosine(vs.get_padded(ia).data(), vs.get_padded(ib).data(), vs.stride());
-
-    std::printf("kernel in use: %s\n", vecdb::isa_name(vecdb::active_isa()));
-    std::printf("cosine distance between %u and %u: %.4f\n", ia, ib, d);
-    std::printf("vector %u has %zu neighbor(s)\n", ia,
-                vecdb::GraphStorage::count(db.graph().links(ia, 0)));
+    index.remove(100);
+    std::printf("after removing 100, closest is %llu\n",
+                (unsigned long long)index.search(query, 1)[0].id);
 }
 ```
 
-Output on a CPU with AVX-512:
+Output:
 
 ```
-kernel in use: avx512
-cosine distance between 0 and 1: 0.0311
-vector 0 has 1 neighbor(s)
+hnsw : id 100, distance 0.0020
+hnsw : id 101, distance 0.0071
+exact: id 100, distance 0.0020
+exact: id 101, distance 0.0071
+after removing 100, closest is 101
 ```
 
-Note that the kernel is given the **padded** row and the **stride**, not the dimension. For now, levels and neighbors are set by hand; once Layer 3 is built, the HNSW index will choose them automatically.
+Both indexes take plain, unpadded vectors and return the user's own IDs, closest first. Padding, alignment, normalization and kernel selection all happen inside. The lower layers can still be used directly: `Storage`, `VectorStore` and `get_distance()` are public.
 
 ## Layer 1 design: memory and storage
 
@@ -370,7 +413,63 @@ Every `DistanceFn` expects:
 - `n` to be a multiple of 16 (pass `VectorStore::stride()`, not `dim()`);
 - values beyond the real dimension to be zero (`VectorStore` guarantees this).
 
-Queries from users are not padded, so Layer 3 will copy each query into a padded, aligned buffer once per search.
+Vectors from users are not padded, so Layer 3's `PreparedVector` copies each query (and each new vector) into a padded, aligned buffer first.
+
+## Layer 3 design: indexes
+
+Layer 3 decides **which** vectors to compare and in what order. It never manages memory (Layer 1) or computes distances itself (Layer 2).
+
+### Components
+
+| Component | Responsibility | Uses from Layer 1 | Uses from Layer 2 |
+|---|---|---|---|
+| `PreparedVector` | Copies a user vector into a padded, aligned buffer; normalizes it for cosine | `AlignedBlock`, `round_up` | `normalize`, `Metric` |
+| `TopK`, `Candidate`, `SearchResult` | Keeps the k best candidates in a bounded max-heap | `NodeId` | none |
+| `VisitedList`, `VisitedListPool` | Marks visited nodes in O(1); reuses lists across searches | `NodeId` | none |
+| `FlatIndex` | Exact search over every vector | `VectorStore`, `IdMap` | `get_distance`, `DistanceFn` |
+| `HnswIndex` | Approximate search over a multi-level graph | `Storage` (all three parts), `kEmpty` | `get_distance`, `DistanceFn` |
+
+`FlatIndex` uses `VectorStore` and `IdMap` directly instead of `Storage`, so it does not pay for 128 bytes of unused neighbor slots per vector. `HnswIndex` uses `Storage`, whose `insert(id, vector, level)` keeps a vector, its neighbor lists and its user ID under the same number.
+
+Only one change was needed in the lower layers: `GraphStorage::set_links`, which replaces a node's neighbor list and clears the leftover slots.
+
+### Shared rules
+
+- **Internal numbers inside, user IDs at the edges.** Every loop works with `NodeId`s, which index Layer 1's arrays directly. User IDs are translated only when an add or remove arrives and when results are returned.
+- **Kernel chosen once.** Each index stores its `DistanceFn` when it is created, so search loops make direct calls.
+- **One preparation path.** Inserts and queries both go through `PreparedVector`, so cosine normalization cannot be forgotten in one of them.
+- **Tombstone removal.** `remove()` only sets the `IdMap` flag. Flat skips flagged vectors; HNSW still travels through them but never returns them.
+- **Errors leave the index unchanged.** A wrong dimension or a duplicate ID throws before anything is modified. IDs cannot be reused, even after removal.
+
+### FlatIndex
+
+- **add:** prepare the vector, register the ID in `IdMap`, store the values in `VectorStore`.
+- **search:** prepare the query; for every vector, skip it if removed, otherwise compute the distance and offer it to a `TopK` of size k; return the sorted results with user IDs.
+
+Cost: one distance per stored vector. Exact, with equal distances ordered by insertion.
+
+### HnswIndex
+
+**Structure.** Every vector is a node on level 0 with up to `2M` links. A node's top level is drawn at random as `floor(-ln(u) / ln(M))`, so about 1 in M nodes reach level 1, 1 in M² reach level 2, and so on. The entry point is a node on the highest level. The random numbers are converted to doubles by hand rather than with `std::uniform_real_distribution`, so graphs are identical across compilers.
+
+**Search** (`search(query, k, ef)`):
+
+1. Prepare the query. Raise `ef` to at least `k`.
+2. **Greedy descent:** from the entry point, on each level from the top down to 1, keep moving to any neighbor that is closer to the query.
+3. **Beam search on level 0:** a min-heap of candidates to expand and a `TopK` of the best `ef` results. Repeatedly expand the closest candidate; stop when it is farther than the worst result. A borrowed `VisitedList` prevents checking a node twice.
+4. Return the best k, skipping removed nodes, with user IDs.
+
+**Insert** (`add(id, vector)`):
+
+1. Validate and prepare the vector; reject duplicates before drawing a random level.
+2. Draw the level and store everything with `Storage::insert`. The first node becomes the entry point.
+3. Greedy descent from the entry point down to the level just above the new node's level.
+4. On each level from the new node's level (or the current top, if lower) down to 0: beam search with `ef_construction`, choose up to M neighbors with the heuristic, and link both ways. The best nodes found become the starting points for the next level.
+5. If the new node is higher than every other node, it becomes the entry point.
+
+**Neighbor heuristic.** Candidates are considered closest first; one is kept only if it is closer to the base node than to every neighbor already kept. This keeps links pointing in different directions instead of into one cluster, which keeps the graph navigable. When a neighbor's list is full, the heuristic re-selects that list from its old links plus the new node. These choices match hnswlib.
+
+**Threading.** One writer at a time, with no searches running. Several searches may run at once when no writer is active; each borrows its own `VisitedList` from a mutex-protected pool, and returns it automatically through an RAII handle.
 
 ## API reference
 
@@ -433,6 +532,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `add_node(level)` | Adds the next node with the given top level (0 to 255), returns its `NodeId` |
 | `links(id, level)` | Writable `span` of the node's slots on that level; throws if the node does not reach it |
 | `count(slots)` | Number of used slots (static) |
+| `set_links(id, level, neighbors)` | Replaces the node's list on that level and marks the remaining slots empty |
 | `level(id)` | Top level of a node |
 | `size()`, `M()`, `M0()` | Number of nodes and list capacities |
 
@@ -459,14 +559,72 @@ Not copyable, movable. Frees its memory in the destructor.
 | `isa_name(isa)` | `"scalar"`, `"avx2"`, `"avx512"` or `"neon"` |
 | `normalize(span<float>)` | Scales a vector to length 1 in place; a zero vector is left unchanged |
 
+### `search_result.h`
+
+| Name | Description |
+|---|---|
+| `SearchResult { id, distance }` | One result for the user: their 64-bit ID and the distance |
+| `Candidate { distance, id }` | Internal result with a `NodeId`; ordered by distance, then id |
+| `TopK(k)` | Keeps the k closest candidates |
+| `TopK::push(c)` | Adds `c` if there is room or it beats the worst kept; returns whether it was kept |
+| `TopK::full()`, `size()`, `worst_distance()` | Heap state; `worst_distance()` is infinity when empty |
+| `TopK::take_sorted()` | Empties the heap and returns candidates closest first |
+
+### `PreparedVector`
+
+| Member | Description |
+|---|---|
+| `PreparedVector(dim)` | Creates a zeroed, 64-byte-aligned buffer of `stride` floats |
+| `prepare(vector, metric)` | Copies `vector` in and normalizes it for cosine; throws on a wrong dimension |
+| `data()` | Start of the padded row, for a `DistanceFn` |
+| `values()`, `padded()` | Spans of `dim` or `stride` floats |
+| `dim()`, `stride()` | Sizes |
+
+### `VisitedList` and `VisitedListPool`
+
+| Member | Description |
+|---|---|
+| `VisitedList::reset(node_count)` | Starts a new search; grows the array if needed |
+| `VisitedList::visit(id)` | Marks `id`; returns true on the first visit in this search |
+| `VisitedList::visited(id)` | Whether `id` was visited in this search |
+| `VisitedListPool::acquire(node_count)` | Borrows a reset list inside a `Handle` that returns it automatically |
+| `VisitedListPool::idle_count()` | Lists currently waiting in the pool |
+
+### `FlatIndex`
+
+| Member | Description |
+|---|---|
+| `FlatIndex(dim, metric)` | Creates an empty exact index |
+| `add(id, vector)` | Stores a vector; throws on a wrong dimension or a used ID |
+| `remove(id)` | Marks it removed; returns false if unknown or already removed |
+| `contains(id)` | Stored and not removed |
+| `search(query, k)` | Up to k exact closest live vectors, closest first |
+| `size()`, `dim()`, `metric()` | Live count and settings |
+
+### `HnswIndex`
+
+| Member | Description |
+|---|---|
+| `HnswParams { M = 16, ef_construction = 200, seed = 42 }` | Graph settings; `M >= 2`, `ef_construction >= 1` |
+| `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
+| `add(id, vector)` | Inserts into the graph; throws on a wrong dimension or a used ID |
+| `remove(id)` | Marks it removed (kept in the graph for navigation) |
+| `contains(id)` | Stored and not removed |
+| `search(query, k, ef = 64)` | Up to k approximate closest live vectors; `ef` below k is raised to k |
+| `size()`, `dim()`, `metric()`, `params()` | Live count and settings |
+| `max_level()`, `entry_point()`, `storage()` | Graph inspection, mainly for tests |
+
 ## Testing
 
-Both test programs are registered with CTest and run together as one suite:
+All five test programs are registered with CTest and run together as one suite. They share a tiny `CHECK` macro in `tests/check.h`, so no external test framework is needed.
 
 ```
-1/2 Test #1: test_layer1 ......   Passed
-2/2 Test #2: test_distance ....   Passed
-100% tests passed, 0 tests failed out of 2
+1/5 Test #1: test_layer1 ..............   Passed
+2/5 Test #2: test_distance ............   Passed
+3/5 Test #3: test_search_helpers ......   Passed
+4/5 Test #4: test_flat ................   Passed
+5/5 Test #5: test_hnsw ................   Passed
+100% tests passed, 0 tests failed out of 5
 ```
 
 **`tests/test_layer1.cpp`** checks that:
@@ -478,6 +636,7 @@ Both test programs are registered with CTest and run together as one suite:
 - User IDs translate both ways, duplicates are rejected and deletion flags work.
 - New neighbor lists are empty, links can be written and read, and levels are enforced.
 - A rejected insert leaves the storage unchanged.
+- `set_links` replaces a list, clears leftover slots and rejects lists that are too long.
 
 **`tests/test_distance.cpp`** checks that:
 
@@ -489,16 +648,46 @@ Both test programs are registered with CTest and run together as one suite:
 
 Results differ slightly between versions because SIMD adds numbers in a different order, so comparisons allow a small rounding tolerance scaled to the size of the values.
 
+**`tests/test_search_helpers.cpp`** checks that:
+
+- `TopK` keeps exactly the k best, breaks ties by id, and returns them sorted.
+- `PreparedVector` is aligned, keeps padding zero across reuse, normalizes only for cosine, and rejects wrong dimensions.
+- `VisitedList` tracks visits per search, grows when nodes are added, and survives epoch wrap-around.
+- `VisitedListPool` reuses lists and gets them back even when a search throws.
+
+**`tests/test_flat.cpp`** checks that:
+
+- Results exactly match a reference (every distance computed, sorted, first k) for all three metrics and several k values.
+- Removed vectors never appear; `remove`, `contains` and `size` behave correctly.
+- Cosine works on un-normalized input.
+- Edge cases: empty index, k = 0, k larger than the index, wrong dimensions, duplicate IDs and reuse of removed IDs.
+
+**`tests/test_hnsw.cpp`** checks that:
+
+- **The graph is valid:** every link points to a real node on that level, with no self-links, no duplicates and no list over capacity; unused slots are empty; the entry point is on the top level; at least 99% of nodes are reachable from it on level 0.
+- **Recall@10 is at least 0.95** against `FlatIndex` on clustered data, for all three metrics (measured: 0.998 to 0.999).
+- Stored vectors find themselves at distance 0, and results are sorted.
+- **Removal:** with a quarter of the vectors and the entry point removed, results contain only live vectors and recall stays at least 0.95; inserts still work afterwards.
+- **Determinism:** two indexes built with the same seed give identical results.
+- **Level distribution:** about 1 in M nodes reach level 1.
+- Edge cases: empty index, a single vector, k = 0, k > size, `ef` < k, wrong dimensions, duplicate IDs, everything removed, and invalid parameters.
+
 **CPUs tested:**
 
-| CPU | Versions tested | Version chosen |
+All five test programs pass on every CPU type below. Because each kernel rounds slightly differently, each CPU builds a slightly different graph, so this also shows the HNSW tests do not depend on one exact graph.
+
+| CPU | Kernel versions tested | Version chosen |
 |---|---|---|
 | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
 | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
 | Emulated Intel Nehalem (2008) | scalar | scalar |
 | Emulated 64-bit ARM | scalar, NEON | NEON |
 
+They also pass with AddressSanitizer and UndefinedBehaviorSanitizer enabled, with no compiler warnings.
+
 ## Benchmarks
+
+### Distance kernels
 
 `bench/bench_distance.cpp` measures nanoseconds per squared-L2 call for each supported version. The vectors fit in the CPU cache, so this measures the math itself rather than memory speed. Build in Release mode before running it.
 
@@ -512,13 +701,35 @@ Example results on an x86-64 machine with AVX-512 (your numbers will differ):
 
 The speedups come from two sources: wider instructions, and the 4 independent running sums, which the scalar loop cannot use because the compiler is not allowed to reorder float additions on its own.
 
+### Search: Flat vs. HNSW
+
+`bench/bench_search.cpp` builds both indexes on clustered synthetic data, uses `FlatIndex` results as ground truth, and measures queries per second and recall@10 for several `ef` values.
+
+Example results: 50,000 vectors, 128 dimensions, L2, `M = 16`, `ef_construction = 200`, one CPU core with AVX-512 (your numbers will differ):
+
+| Index | ef | Queries/s | Recall@10 | Speedup vs. Flat |
+|---|---|---|---|---|
+| Flat | - | 672 | 1.000 | 1.0x |
+| HNSW | 10 | 40,965 | 0.788 | 61.0x |
+| HNSW | 20 | 29,619 | 0.921 | 44.1x |
+| HNSW | 40 | 13,749 | 0.984 | 20.5x |
+| HNSW | 80 | 9,156 | 0.998 | 13.6x |
+| HNSW | 160 | 7,059 | 0.999 | 10.5x |
+| HNSW | 320 | 5,057 | 1.000 | 7.5x |
+
+Build time: 0.02 s for Flat, 8.6 s for HNSW.
+
+`ef` is the speed–accuracy dial: small values are very fast but miss some neighbors; around `ef = 80` HNSW is over 13x faster than exact search while finding 99.8% of the true neighbors. The gap grows with the number of vectors, because Flat's cost grows linearly while HNSW's grows roughly logarithmically.
+
 ## Limitations
 
 These are deliberate for the current stage:
 
-- **Not thread-safe for writes.** Concurrent inserts will need per-node locks and an atomic arena. Reading and kernel dispatch are already safe from several threads.
+- **One writer at a time.** `add` and `remove` must not run alongside anything else. Concurrent searches are safe when no writer is active. Concurrent inserts will need per-node locks and an atomic arena.
+- **IDs cannot be reused after removal**, because the removed vector keeps its entry in `IdMap`.
+- **HNSW build speed.** Building is single-threaded, and every access is bounds-checked for safety. Parallel construction and unchecked accessors in the hot loops are future optimizations.
 - **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
-- **No memory reclamation.** Deleted vectors are only flagged; their memory is recovered only by rebuilding.
+- **No memory reclamation.** Removed vectors are only flagged; their memory is recovered only by rebuilding.
 - **User IDs are 64-bit integers only.**
 - **Kernels compare one pair of vectors at a time.** Batched query-vs-many kernels and matrix-multiplication-based flat search are possible future optimizations.
 - **On some older Intel CPUs, heavy AVX-512 use lowers the clock speed.** If the AVX2 version benchmarks faster on your machine, that is why.
@@ -527,10 +738,11 @@ These are deliberate for the current stage:
 
 - [x] **Layer 1:** aligned vector store, arena allocator, graph storage, ID mapping, tests
 - [x] **Layer 2:** SIMD distance kernels (scalar, AVX2, AVX-512, NEON), runtime dispatch, tests, benchmark
-- [ ] **Layer 3a:** Flat index with top-k heap, used as ground truth
-- [ ] **Layer 3b:** HNSW index: random levels, insertion, neighbor heuristic, beam search, visited lists
-- [ ] **Layer 4:** public search API
-- [ ] Benchmarks on SIFT1M and GloVe (recall@10 vs. queries per second)
+- [x] **Layer 3a:** Flat index with top-k heap, used as ground truth
+- [x] **Layer 3b:** HNSW index: random levels, insertion, neighbor heuristic, beam search, visited lists
+- [x] Search benchmark on synthetic data (recall@10 vs. queries per second)
+- [ ] Benchmarks on SIFT1M and GloVe
+- [ ] Parallel HNSW construction
 - [ ] Thread-safe insertion
 - [ ] Persistence to disk
 
@@ -543,6 +755,7 @@ These are deliberate for the current stage:
 | Vector layout | Separate aligned rows | Interleaved with level-0 links | Separate flat storage | Segments, memory-mapped | Via its Knowhere engine |
 | Upper-level links | One arena allocation per node | One `malloc` per node | One shared array with offsets | Own implementation | Via Knowhere |
 | SIMD selection | Runtime CPU detection | Compile-time flags with runtime checks | Separate builds per instruction set | Runtime CPU detection | Via Knowhere |
+| Deletion | Tombstones | Tombstones (optional slot reuse) | Depends on index type; not for HNSW | Yes | Yes |
 | Quantization | No | No | Yes (PQ, SQ, IVF) | Yes | Yes |
 | Filtering, persistence, distribution | No | Limited | Limited | Yes | Yes |
 

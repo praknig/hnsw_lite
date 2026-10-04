@@ -75,6 +75,16 @@ public:
         return std::size_t(std::find(slots.begin(), slots.end(), kEmpty) - slots.begin());
     }
 
+    /// Replaces node `id`'s list on `level` with `neighbors`, then marks every
+    /// remaining slot kEmpty. Throws if `neighbors` does not fit in the slots.
+    /// `neighbors` must not point into the slots being replaced.
+    void set_links(NodeId id, int level, std::span<const NodeId> neighbors) {
+        std::span<NodeId> slots = links(id, level);
+        if (neighbors.size() > slots.size()) throw std::length_error("too many neighbors");
+        auto end = std::copy(neighbors.begin(), neighbors.end(), slots.begin());
+        std::fill(end, slots.end(), kEmpty);
+    }
+
     int level(NodeId id) const { return levels_.at(id); }
     std::size_t size() const { return levels_.size(); }
     std::size_t M() const { return M_; }
