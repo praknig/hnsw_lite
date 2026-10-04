@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <functional>
 #include <queue>
 #include <stdexcept>
@@ -54,6 +55,12 @@ float HnswIndex::distance_to(const float* query, NodeId node) const {
 
 float HnswIndex::distance_between(NodeId a, NodeId b) const {
     return distance_to(storage_.vectors().get_padded(a).data(), b);
+}
+
+bool HnswIndex::same_vector(NodeId a, NodeId b) const {
+    // For different vectors memcmp stops at the first differing byte, so this is cheap.
+    const VectorStore& vs = storage_.vectors();
+    return std::memcmp(vs.get(a).data(), vs.get(b).data(), vs.dim() * sizeof(float)) == 0;
 }
 
 Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int level) const {
@@ -115,11 +122,13 @@ std::vector<NodeId> HnswIndex::select_neighbors(const std::vector<Candidate>& so
     kept.reserve(max);
     for (const Candidate& c : sorted) {
         if (kept.size() >= max) break;
-        // Skip c if an already-kept neighbor is closer to it than the base node is:
-        // c is then reachable through that neighbor, so a link to it adds little.
+        // Skip c if an already-kept neighbor is closer to it than the base node is
+        // (c is then reachable through that neighbor), or is an exact copy of it.
+        // Without the copy check, identical vectors (all at distance 0, a tie)
+        // would fill every list near them and cut links to the rest of the graph.
         bool diverse = true;
         for (NodeId k : kept) {
-            if (distance_between(c.id, k) < c.distance) {
+            if (same_vector(c.id, k) || distance_between(c.id, k) < c.distance) {
                 diverse = false;
                 break;
             }
@@ -178,8 +187,13 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector) {
     auto visited = visited_pool_.acquire(storage_.size());
     std::vector<Candidate> entries{current};
     for (int l = std::min(level, max_level_); l >= 0; --l) {
+        // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
+        // so new nodes do not waste link slots on them.
         std::vector<Candidate> found =
-            search_level(query, entries, params_.ef_construction, l, *visited, false);
+            search_level(query, entries, params_.ef_construction, l, *visited, true);
+        if (found.empty())  // every nearby node is removed: link to them anyway,
+            found = search_level(query, entries, params_.ef_construction, l, *visited, false);
+                            // so the new node stays reachable from the entry point
         connect(node, select_neighbors(found, params_.M), l);
         entries = std::move(found);  // best nodes here start the next level down
     }
@@ -210,7 +224,8 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     if (k == 0 || live_ == 0) return {};
-    ef = std::max(ef, k);
+    k = std::min(k, live_);                          // cannot return more than exists
+    ef = std::min(std::max(ef, k), storage_.size());  // at least k, at most every node
 
     // Greedy descent from the entry point to level 1.
     Candidate current{distance_to(q.data(), entry_), entry_};

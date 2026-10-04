@@ -61,9 +61,11 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 - `HnswIndex`: multi-level graph with random levels, greedy descent, beam search on level 0, and the HNSW neighbor-selection heuristic.
 - Add, remove (tombstones) and search on both, with results in the user's own IDs.
 - Automatic cosine normalization for inserts and queries.
+- Invalid input (wrong dimension, NaN, infinity, duplicate IDs) is rejected with `std::invalid_argument` and leaves the index unchanged.
+- Robust to exact duplicate vectors: copies cannot crowd unrelated vectors out of the graph.
 - Reproducible graphs: the same seed and inserts always build the same graph, on every compiler.
 - Concurrent searches are safe when no writer is active (thread-safe visited-list pool).
-- Recall@10 of 0.998 or higher in tests, on every CPU type.
+- Recall@10 of 0.998 or higher in tests, on every CPU type; inner-product recall matches the reference hnswlib on identical data.
 
 **Planned**
 
@@ -165,12 +167,13 @@ hnsw-lite/
 │   ├── flat_index.cpp          # FlatIndex implementation
 │   └── hnsw_index.cpp          # HnswIndex implementation
 ├── tests/
-│   ├── check.h                 # Shared CHECK macro and throws() helper
+│   ├── check.h                 # Shared CHECK macro, throws() and throws_as<E>()
 │   ├── test_layer1.cpp         # Tests for Layer 1
 │   ├── test_distance.cpp       # Tests for Layer 2
 │   ├── test_search_helpers.cpp # Tests for TopK, PreparedVector, VisitedList
 │   ├── test_flat.cpp           # Tests for FlatIndex
-│   └── test_hnsw.cpp           # Tests for HnswIndex (graph validity, recall)
+│   ├── test_hnsw.cpp           # Tests for HnswIndex (graph validity, recall)
+│   └── test_comprehensive.cpp  # Edge cases and negative scenarios, all layers
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -439,7 +442,9 @@ Only one change was needed in the lower layers: `GraphStorage::set_links`, which
 - **Kernel chosen once.** Each index stores its `DistanceFn` when it is created, so search loops make direct calls.
 - **One preparation path.** Inserts and queries both go through `PreparedVector`, so cosine normalization cannot be forgotten in one of them.
 - **Tombstone removal.** `remove()` only sets the `IdMap` flag. Flat skips flagged vectors; HNSW still travels through them but never returns them.
-- **Errors leave the index unchanged.** A wrong dimension or a duplicate ID throws before anything is modified. IDs cannot be reused, even after removal.
+- **Errors leave the index unchanged.** A wrong dimension, a NaN or infinite value, or a duplicate ID throws `std::invalid_argument` before anything is modified (and, in HNSW, before a random level is drawn, so later inserts build exactly the same graph). IDs cannot be reused, even after removal.
+- **Only finite values.** `PreparedVector` rejects NaN and infinity, because one such value would corrupt every distance computed against that vector. Layer 1 itself stores any float.
+- **Oversized requests are capped.** A `k` larger than the index returns everything; HNSW's `ef` is raised to at least `k` and capped at the number of nodes.
 
 ### FlatIndex
 
@@ -464,10 +469,12 @@ Cost: one distance per stored vector. Exact, with equal distances ordered by ins
 1. Validate and prepare the vector; reject duplicates before drawing a random level.
 2. Draw the level and store everything with `Storage::insert`. The first node becomes the entry point.
 3. Greedy descent from the entry point down to the level just above the new node's level.
-4. On each level from the new node's level (or the current top, if lower) down to 0: beam search with `ef_construction`, choose up to M neighbors with the heuristic, and link both ways. The best nodes found become the starting points for the next level.
+4. On each level from the new node's level (or the current top, if lower) down to 0: beam search with `ef_construction`, choose up to M neighbors with the heuristic, and link both ways. The best nodes found become the starting points for the next level. Removed nodes are traveled through but not chosen as neighbors, so new nodes do not waste link slots on them; only if every nearby node is removed does the new node link to them, so it can never end up unreachable.
 5. If the new node is higher than every other node, it becomes the entry point.
 
 **Neighbor heuristic.** Candidates are considered closest first; one is kept only if it is closer to the base node than to every neighbor already kept. This keeps links pointing in different directions instead of into one cluster, which keeps the graph navigable. When a neighbor's list is full, the heuristic re-selects that list from its old links plus the new node. These choices match hnswlib.
+
+One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an already-kept neighbor is skipped. Identical vectors are all at distance 0 from each other, a tie, so the plain rule keeps every copy, and lists near a cluster of duplicates fill up with copies of one point. In testing with 200 identical vectors among 200 random ones, this cut links to the rest of the graph and made 44 of the random vectors unreachable; with the copy check, every random vector stays reachable. The check uses `memcmp`, which stops at the first differing byte, so it costs almost nothing, and on data without duplicates the graph is unchanged.
 
 **Threading.** One writer at a time, with no searches running. Several searches may run at once when no writer is active; each borrows its own `VisitedList` from a mutex-protected pool, and returns it automatically through an RAII handle.
 
@@ -541,7 +548,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | Member | Description |
 |---|---|
 | `Storage(dim, M = 16)` | Creates all Layer 1 parts |
-| `insert(external, vector, level)` | Validates input, then adds the vector to `IdMap`, `VectorStore` and `GraphStorage`; returns its `NodeId` |
+| `insert(external, vector, level)` | Validates the dimension and level (0 to 255), then adds the vector to `IdMap`, `VectorStore` and `GraphStorage`; returns its `NodeId`. On error nothing is added |
 | `vectors()`, `graph()`, `ids()` | Access to the parts |
 | `size()` | Number of stored vectors |
 
@@ -557,7 +564,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `isa_supported(isa)` | True if `isa` is compiled in and this CPU can run it |
 | `active_isa()` | The version `get_distance(metric)` uses |
 | `isa_name(isa)` | `"scalar"`, `"avx2"`, `"avx512"` or `"neon"` |
-| `normalize(span<float>)` | Scales a vector to length 1 in place; a zero vector is left unchanged |
+| `normalize(span<float>)` | Scales a vector to length 1 in place, computing in double so very small vectors work; a zero vector is left unchanged |
 
 ### `search_result.h`
 
@@ -565,7 +572,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `SearchResult { id, distance }` | One result for the user: their 64-bit ID and the distance |
 | `Candidate { distance, id }` | Internal result with a `NodeId`; ordered by distance, then id |
-| `TopK(k)` | Keeps the k closest candidates |
+| `TopK(k)` | Keeps the k closest candidates (reserves memory for at most 1024 up front, so any k is safe) |
 | `TopK::push(c)` | Adds `c` if there is room or it beats the worst kept; returns whether it was kept |
 | `TopK::full()`, `size()`, `worst_distance()` | Heap state; `worst_distance()` is infinity when empty |
 | `TopK::take_sorted()` | Empties the heap and returns candidates closest first |
@@ -575,7 +582,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | Member | Description |
 |---|---|
 | `PreparedVector(dim)` | Creates a zeroed, 64-byte-aligned buffer of `stride` floats |
-| `prepare(vector, metric)` | Copies `vector` in and normalizes it for cosine; throws on a wrong dimension |
+| `prepare(vector, metric)` | Copies `vector` in and normalizes it for cosine; throws on a wrong dimension, NaN or infinity, leaving the previous contents unchanged |
 | `data()` | Start of the padded row, for a `DistanceFn` |
 | `values()`, `padded()` | Spans of `dim` or `stride` floats |
 | `dim()`, `stride()` | Sizes |
@@ -595,37 +602,40 @@ Not copyable, movable. Frees its memory in the destructor.
 | Member | Description |
 |---|---|
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
-| `add(id, vector)` | Stores a vector; throws on a wrong dimension or a used ID |
+| `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `remove(id)` | Marks it removed; returns false if unknown or already removed |
 | `contains(id)` | Stored and not removed |
-| `search(query, k)` | Up to k exact closest live vectors, closest first |
+| `search(query, k)` | Up to k exact closest live vectors, closest first; k above `size()` returns all |
 | `size()`, `dim()`, `metric()` | Live count and settings |
 
 ### `HnswIndex`
 
 | Member | Description |
 |---|---|
-| `HnswParams { M = 16, ef_construction = 200, seed = 42 }` | Graph settings; `M >= 2`, `ef_construction >= 1` |
+| `HnswParams { M = 16, ef_construction = 200, seed = 42 }` | Graph settings; `M >= 2` and `ef_construction >= 1` are required, `M >= 8` is recommended |
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
-| `add(id, vector)` | Inserts into the graph; throws on a wrong dimension or a used ID |
+| `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `remove(id)` | Marks it removed (kept in the graph for navigation) |
 | `contains(id)` | Stored and not removed |
-| `search(query, k, ef = 64)` | Up to k approximate closest live vectors; `ef` below k is raised to k |
+| `search(query, k, ef = 64)` | Up to k approximate closest live vectors; `ef` is raised to at least k and capped at the number of nodes |
 | `size()`, `dim()`, `metric()`, `params()` | Live count and settings |
 | `max_level()`, `entry_point()`, `storage()` | Graph inspection, mainly for tests |
 
 ## Testing
 
-All five test programs are registered with CTest and run together as one suite. They share a tiny `CHECK` macro in `tests/check.h`, so no external test framework is needed.
+All six test programs are registered with CTest and run together as one suite. They share a tiny `CHECK` macro and `throws_as<E>()` helper in `tests/check.h`, so no external test framework is needed.
 
 ```
-1/5 Test #1: test_layer1 ..............   Passed
-2/5 Test #2: test_distance ............   Passed
-3/5 Test #3: test_search_helpers ......   Passed
-4/5 Test #4: test_flat ................   Passed
-5/5 Test #5: test_hnsw ................   Passed
-100% tests passed, 0 tests failed out of 5
+1/6 Test #1: test_layer1 ..............   Passed
+2/6 Test #2: test_distance ............   Passed
+3/6 Test #3: test_search_helpers ......   Passed
+4/6 Test #4: test_flat ................   Passed
+5/6 Test #5: test_hnsw ................   Passed
+6/6 Test #6: test_comprehensive .......   Passed
+100% tests passed, 0 tests failed out of 6
 ```
+
+In a Debug build, `test_hnsw` and `test_comprehensive` take 10 to 25 seconds each, because they build many indexes with optimizations off; in Release the whole suite takes a few seconds.
 
 **`tests/test_layer1.cpp`** checks that:
 
@@ -672,9 +682,34 @@ Results differ slightly between versions because SIMD adds numbers in a differen
 - **Level distribution:** about 1 in M nodes reach level 1.
 - Edge cases: empty index, a single vector, k = 0, k > size, `ef` < k, wrong dimensions, duplicate IDs, everything removed, and invalid parameters.
 
+**`tests/test_comprehensive.cpp`** pushes every class to its limits (about 500,000 checks, many inside loops) and checks that invalid input is rejected with the **exact exception type** and leaves everything unchanged:
+
+| Area | What is tested |
+|---|---|
+| Layer 1 | `round_up` boundaries; zero-size, custom-fill and self-moved `AlignedBlock`s; every arena alignment, exact block fill, zero-byte and oversized requests, 100 arrays staying intact; strides for 1 to 33 dimensions, one row per shelf, special float values; extreme user IDs (0 and 2⁶⁴−1); `M = 1`, level 255, levels −1 and 256; `set_links` at, below and above capacity; `Storage` staying in sync after every kind of rejected insert |
+| Layer 2 | Every kernel on every supported CPU version: length 0, zero vectors, overflow to infinity, NaN propagation, exact symmetry, L2 ≥ 0, length 4096, and unaligned input giving bit-identical results; `normalize` on empty, negative, tiny (10⁻⁴⁰), huge (10³⁰) and zero vectors; dispatch consistency |
+| Layer 3 helpers | `TopK` with k = 1, ties at the boundary, infinity, k = 2⁶⁴−1 and reuse; `PreparedVector` rejecting NaN, +∞ and −∞ while keeping its old contents; 1,000 consecutive visited-list resets; several pool handles at once |
+| FlatIndex | 1 dimension, ties by insertion order, 10 identical vectors, huge k, NaN/∞/dimension/duplicate rejection, negative inner-product distances, cosine with zero vectors, extreme IDs, removing everything and adding again |
+| HnswIndex | Invalid parameters; rejected inserts leaving the later graph bit-identical; 1, 2 and 3 vectors matching Flat exactly; 1 dimension; huge k and ef; ef = 0; `M = 2`, `ef_construction = 1`, `M = 64` and another seed; 200 identical vectors not harming the rest; inner-product ordering; cosine ignoring length; reported distances equal to Flat's; removing all but one (including the entry point); refilling after removing everything |
+| Concurrency | 8 threads searching HNSW and Flat at once, 3 rounds each; every answer must match the single-threaded result |
+| End to end | For each metric: add 1,000, remove 300, add 600 more, checking recall, result validity and graph structure after every step |
+
+The concurrency test also passes under **ThreadSanitizer** with no data races reported.
+
+**Bugs found by these tests, and fixed:**
+
+1. `Storage::insert` with an invalid level stored the ID and vector but not the graph node, leaving the three parts out of sync. Levels are now validated first.
+2. `normalize` on very small vectors produced infinity and NaN, because the scale factor overflowed a float. It now scales in double.
+3. NaN and infinity were accepted into indexes, silently corrupting distances. They are now rejected.
+4. A very large `k` crashed searches by reserving memory for `k` results. `k` and `ef` are now capped.
+5. Many identical vectors made unrelated vectors unreachable. The neighbor heuristic now skips exact copies.
+6. HNSW inserts chose removed nodes as neighbors, wasting link slots: after removals and re-adds, inner-product recall was 0.792 versus hnswlib's 0.853 on identical data. Removed nodes are now skipped when choosing neighbors, giving 0.860.
+
+**Comparison with hnswlib.** Where results looked low, the same data and operations were run through the reference hnswlib library. Inner-product recall on this data is 0.898 / 0.905 / 0.860 (add / remove / re-add) against hnswlib's 0.887 / 0.900 / 0.853, which confirmed that the lower inner-product numbers come from the metric, not from this implementation.
+
 **CPUs tested:**
 
-All five test programs pass on every CPU type below. Because each kernel rounds slightly differently, each CPU builds a slightly different graph, so this also shows the HNSW tests do not depend on one exact graph.
+All six test programs pass on every CPU type below. Because each kernel rounds slightly differently, each CPU builds a slightly different graph, so this also shows the HNSW tests do not depend on one exact graph.
 
 | CPU | Kernel versions tested | Version chosen |
 |---|---|---|
@@ -731,6 +766,9 @@ These are deliberate for the current stage:
 - **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
 - **No memory reclamation.** Removed vectors are only flagged; their memory is recovered only by rebuilding.
 - **User IDs are 64-bit integers only.**
+- **Exact duplicates cannot all stay reachable.** Each node has a fixed number of link slots, and once one copy of a point is linked, further copies add nothing, so some copies become unreachable (with 200 identical vectors, about 60% stay reachable). They no longer harm other vectors, but deduplicate data if every copy must be returned.
+- **Inner product is harder than L2 and cosine.** It is not a true distance, so recall is lower on un-normalized data (about 0.86 to 0.90 at `ef = 100` in tests, versus 0.997 or higher for L2 and cosine), and a small fraction of short vectors may become unreachable. This matches hnswlib. Use cosine, or normalize vectors, when possible.
+- **Very small `M` builds a sparse graph.** `M = 2` works but leaves about 10% of nodes unreachable in tests; use `M >= 8`.
 - **Kernels compare one pair of vectors at a time.** Batched query-vs-many kernels and matrix-multiplication-based flat search are possible future optimizations.
 - **On some older Intel CPUs, heavy AVX-512 use lowers the clock speed.** If the AVX2 version benchmarks faster on your machine, that is why.
 

@@ -9,7 +9,7 @@ namespace vecdb {
      * @brief Single entry point to Layer 1; keeps IdMap, VectorStore and GraphStorage in sync.
      *
      * insert() does, in order:
-     *  1. Checks the vector size.
+     *  1. Checks the vector size and the level (0..255).
      *  2. Gets a new NodeId from IdMap (fails on a duplicate user ID).
      *  3. Stores the vector in VectorStore.
      *  4. Creates the node's neighbor slots in GraphStorage.
@@ -27,6 +27,7 @@ namespace vecdb {
         // `level` will be chosen randomly by the HNSW layer later.
         NodeId insert(std::uint64_t external, std::span<const float> v, int level) {
             if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
+            if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");
             NodeId id = ids_.add(external);  // throws on duplicates before anything changes
             vectors_.add(v);
             graph_.add_node(level);

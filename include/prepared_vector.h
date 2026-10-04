@@ -4,6 +4,7 @@
  */
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <span>
 #include <stdexcept>
 
@@ -25,6 +26,8 @@ namespace vecdb {
  *  - Owns one AlignedBlock of `stride` floats, zeroed when created.
  *  - prepare() writes only the first `dim` values, so the padding stays zero
  *    across any number of calls.
+ *  - NaN and infinity are rejected: one such value would corrupt every
+ *    distance computed against this vector.
  *
  * Not thread-safe: each thread or search should use its own object.
  */
@@ -38,9 +41,12 @@ public:
     }
 
     /// Copies `v` in and normalizes it if `metric` is Cosine.
-    /// Throws std::invalid_argument if `v` does not have `dim` values.
+    /// Throws std::invalid_argument if `v` does not have `dim` values or contains
+    /// NaN or infinity. On error the previous contents are left unchanged.
     void prepare(std::span<const float> v, Metric metric) {
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
+        if (!std::all_of(v.begin(), v.end(), [](float x) { return std::isfinite(x); }))
+            throw std::invalid_argument("vector contains NaN or infinity");
         float* dst = mutable_data();
         std::copy(v.begin(), v.end(), dst);
         if (metric == Metric::Cosine) normalize({dst, dim_});

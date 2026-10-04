@@ -57,7 +57,8 @@ struct Candidate {
 class TopK {
 public:
     /// Creates an empty heap that keeps at most `k` candidates.
-    explicit TopK(std::size_t k) : k_(k) { heap_.reserve(k); }
+    /// Memory is reserved for at most 1024 up front, so a huge k is safe.
+    explicit TopK(std::size_t k) : k_(k) { heap_.reserve(std::min<std::size_t>(k, 1024)); }
 
     /// Offers a candidate. Returns true if it was kept.
     bool push(Candidate c) {

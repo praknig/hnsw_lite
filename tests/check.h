@@ -6,9 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 
-/// Stops the test program with the line number if `cond` is false.
+/// Number of CHECKs executed so far (tests may print it at the end).
+inline long g_check_count = 0;
+
+/// Stops the test program with the file and line if `cond` is false.
 #define CHECK(cond)                                                          \
     do {                                                                     \
+        ++g_check_count;                                                     \
         if (!(cond)) {                                                       \
             std::printf("FAILED %s:%d: %s\n", __FILE__, __LINE__, #cond);    \
             std::exit(1);                                                    \
@@ -22,6 +26,19 @@ bool throws(F f) {
         f();
     } catch (...) {
         return true;
+    }
+    return false;
+}
+
+/// True only if calling `f` throws an exception of type E (or derived from E).
+template <class E, class F>
+bool throws_as(F f) {
+    try {
+        f();
+    } catch (const E&) {
+        return true;
+    } catch (...) {
+        return false;
     }
     return false;
 }

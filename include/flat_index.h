@@ -47,8 +47,8 @@ public:
     FlatIndex(std::size_t dim, Metric metric);
 
     /// Stores a vector under the user's `id`.
-    /// Throws std::invalid_argument on a wrong dimension or an ID already used
-    /// (IDs cannot be reused, even after remove()).
+    /// Throws std::invalid_argument on a wrong dimension, NaN or infinity, or an
+    /// ID already used (IDs cannot be reused, even after remove()).
     void add(std::uint64_t id, std::span<const float> vector);
 
     /// Marks `id` as removed. Returns false if it does not exist or was already removed.
@@ -57,8 +57,10 @@ public:
     /// True if `id` is stored and not removed.
     bool contains(std::uint64_t id) const;
 
-    /// Returns up to `k` closest live vectors, closest first.
-    /// Throws std::invalid_argument if `query` has the wrong dimension.
+    /// Returns up to `k` closest live vectors, closest first. A `k` larger than
+    /// size() returns every live vector.
+    /// Throws std::invalid_argument if `query` has the wrong dimension or
+    /// contains NaN or infinity.
     std::vector<SearchResult> search(std::span<const float> query, std::size_t k) const;
 
     /// Number of live (not removed) vectors.

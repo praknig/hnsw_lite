@@ -4,6 +4,8 @@
  */
 #include "flat_index.h"
 
+#include <algorithm>
+
 namespace vecdb {
 
     FlatIndex::FlatIndex(std::size_t dim, Metric metric)
@@ -33,6 +35,7 @@ namespace vecdb {
         PreparedVector q(dim());
         q.prepare(query, metric_);  // validates even when the index is empty
         if (k == 0 || live_ == 0) return {};
+        k = std::min(k, live_);  // asking for more than exists returns everything
 
         // Compare the query with every live vector, keeping the k closest.
         TopK top(k);

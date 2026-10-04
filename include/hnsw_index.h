@@ -52,7 +52,8 @@ struct HnswParams {
  *  - Layer 2: the DistanceFn for `metric`, looked up once in the constructor.
  *
  * Removal: nodes are only flagged. Searches still travel THROUGH removed nodes
- * (so the graph stays connected) but never return them.
+ * (so the graph stays connected) but never return them. Inserts also skip them
+ * when choosing neighbors, unless every nearby node is removed.
  *
  * Threading: one writer (add/remove) at a time, with no searches running.
  * Several search() calls may run at the same time when no writer is active;
@@ -64,8 +65,9 @@ public:
     HnswIndex(std::size_t dim, Metric metric, HnswParams params = {});
 
     /// Inserts a vector under the user's `id`.
-    /// Throws std::invalid_argument on a wrong dimension or an ID already used
-    /// (IDs cannot be reused, even after remove()); the index is then unchanged.
+    /// Throws std::invalid_argument on a wrong dimension, NaN or infinity, or an
+    /// ID already used (IDs cannot be reused, even after remove()); the index
+    /// is then unchanged.
     void add(std::uint64_t id, std::span<const float> vector);
 
     /// Marks `id` as removed. Returns false if it does not exist or was already removed.
@@ -75,8 +77,10 @@ public:
     bool contains(std::uint64_t id) const;
 
     /// Returns up to `k` approximate closest live vectors, closest first.
-    /// `ef` is the beam width on level 0; values below k are raised to k.
-    /// Throws std::invalid_argument if `query` has the wrong dimension.
+    /// `ef` is the beam width on level 0; it is raised to at least k and capped
+    /// at the number of nodes. A `k` larger than size() is capped at size().
+    /// Throws std::invalid_argument if `query` has the wrong dimension or
+    /// contains NaN or infinity.
     std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
                                      std::size_t ef = 64) const;
 
@@ -104,6 +108,9 @@ private:
     /// Distance between two stored nodes.
     float distance_between(NodeId a, NodeId b) const;
 
+    /// True if two stored nodes hold bit-identical vectors.
+    bool same_vector(NodeId a, NodeId b) const;
+
     /// Greedy walk on one level: moves to any closer neighbor until none is closer.
     Candidate greedy_closest(const float* query, Candidate start, int level) const;
 
@@ -114,7 +121,8 @@ private:
                                         bool skip_removed) const;
 
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
-    /// is closer to the base node than to every already-kept neighbor, up to `max`.
+    /// is closer to the base node than to every already-kept neighbor and is not
+    /// an exact copy of one, up to `max`.
     std::vector<NodeId> select_neighbors(const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
 
