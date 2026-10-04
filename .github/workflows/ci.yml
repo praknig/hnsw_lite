@@ -1,0 +1,145 @@
+# Continuous integration for hnsw-lite.
+#
+# Runs on every pull request into master (including each new push to it), on
+# every push to master, and manually from the Actions tab ("Run workflow").
+# A newer run for the same branch cancels an older one still in progress.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Release build and full test suite on every major platform and compiler.
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false  # one failing platform must not hide results from the others
+      matrix:
+        include:
+          - name: Linux / GCC
+            os: ubuntu-24.04
+            cxx: g++
+          - name: Linux / Clang
+            os: ubuntu-24.04
+            cxx: clang++
+          - name: macOS ARM / Apple Clang (NEON)
+            os: macos-14
+            cxx: clang++
+          - name: Windows / MSVC
+            os: windows-2022
+            cxx: ""  # use the default Visual Studio generator and compiler
+    env:
+      CXX: ${{ matrix.cxx }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show compiler and CPU
+        shell: bash
+        run: |
+          echo "Runner: $RUNNER_OS $(uname -m)"
+          if [ -n "$CXX" ]; then $CXX --version; fi
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: Benchmarks (smoke test)
+        if: matrix.name == 'Linux / GCC'
+        run: |
+          ./build/bench_distance
+          ./build/bench_search
+
+  # The toolchain used for local development on Windows (MinGW-w64 GCC).
+  windows-mingw:
+    name: Windows / MinGW GCC
+    runs-on: windows-2022
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Memory errors and undefined behavior. The out-of-memory tests report SKIP
+  # here, because AddressSanitizer installs its own allocator.
+  address-sanitizer:
+    name: Linux / ASan + UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DHNSW_LITE_SANITIZE=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # Data races in the groups that use several threads.
+  thread-sanitizer:
+    name: Linux / ThreadSanitizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Allow ThreadSanitizer on this kernel
+        # Newer kernels randomize memory addresses more than TSan supports.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS=-fsanitize=thread
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+
+      - name: Build
+        run: cmake --build build --parallel --target test_comprehensive
+
+      - name: Test threaded groups
+        run: ./build/test_comprehensive --group concurrency --group helpers

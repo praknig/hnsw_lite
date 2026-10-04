@@ -2383,7 +2383,7 @@ long sweep_allocation_failures(Op op, Verify verify, long max_points = 5000) {
 }  // namespace
 
 TEST(robustness, oom_hook_works) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     alloc_hook::fail_after(0);
     CHECK_THROWS_AS(std::bad_alloc, auto p = std::make_unique<int>(1));
     CHECK(alloc_hook::fired);
@@ -2395,7 +2395,7 @@ TEST(robustness, oom_hook_works) {
 }
 
 TEST(robustness, oom_id_map_add_all_or_nothing) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     // Sweep every add from 0 to 300 entries, so failures also hit the moments
     // when the internal arrays and hash table grow.
     IdMap m;
@@ -2415,7 +2415,7 @@ TEST(robustness, oom_id_map_add_all_or_nothing) {
 }
 
 TEST(robustness, oom_vector_store_add_all_or_nothing) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     VectorStore s(8, 2);  // 4 rows per shelf: the 5th add needs a new shelf
     for (int i = 0; i < 4; ++i) s.add(std::vector<float>(8, float(i)));
     const long points = sweep_allocation_failures([&] { s.add(std::vector<float>(8, 9.0f)); }, [&] {
@@ -2426,7 +2426,7 @@ TEST(robustness, oom_vector_store_add_all_or_nothing) {
 }
 
 TEST(robustness, oom_graph_add_node_all_or_nothing) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     GraphStorage g(16, 2);
     for (int i = 0; i < 4; ++i) g.add_node(0);
     const long points = sweep_allocation_failures([&] { g.add_node(3); }, [&] {
@@ -2440,7 +2440,7 @@ TEST(robustness, oom_graph_add_node_all_or_nothing) {
 }
 
 TEST(robustness, oom_storage_insert_all_or_nothing) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     for (std::size_t existing : std::initializer_list<std::size_t>{0, 1, 64}) {  // first insert allocates the most
         Storage st(8, 4);
         for (std::size_t i = 0; i < existing; ++i) st.insert(i, std::vector<float>(8, 1.0f), int(i % 3));
@@ -2459,7 +2459,7 @@ TEST(robustness, oom_storage_insert_all_or_nothing) {
 }
 
 TEST(robustness, oom_flat_add_all_or_nothing) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     auto data = random_vectors(51, 8, 83);
     FlatIndex f(8, Metric::L2);
     for (std::size_t i = 0; i < 50; ++i) f.add(i, data[i]);
@@ -2474,7 +2474,7 @@ TEST(robustness, oom_flat_add_all_or_nothing) {
 }
 
 TEST(robustness, oom_flat_search_harmless) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     auto data = random_vectors(100, 8, 84);
     FlatIndex f(8, Metric::Cosine);
     for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
@@ -2487,7 +2487,7 @@ TEST(robustness, oom_flat_search_harmless) {
 }
 
 TEST(robustness, oom_hnsw_first_insert) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     HnswIndex h(4, Metric::L2);
     const long points = sweep_allocation_failures([&] { h.add(1, std::vector<float>{1, 2, 3, 4}); }, [&] {
         CHECK(h.size() == 0 && h.entry_point() == kEmpty && h.storage().size() == 0);
@@ -2497,7 +2497,7 @@ TEST(robustness, oom_hnsw_first_insert) {
 }
 
 TEST(robustness, oom_hnsw_add_keeps_index_consistent) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     auto data = clustered(400, 8, 4, 85);
     auto queries = clustered(5, 8, 4, 86);
     HnswIndex h(8, Metric::L2);
@@ -2523,7 +2523,7 @@ TEST(robustness, oom_hnsw_add_keeps_index_consistent) {
 }
 
 TEST(robustness, oom_hnsw_search_harmless) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     auto data = clustered(300, 8, 4, 87);
     HnswIndex h(8, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
@@ -2536,14 +2536,14 @@ TEST(robustness, oom_hnsw_search_harmless) {
 }
 
 TEST(robustness, oom_index_construction) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     long p1 = sweep_allocation_failures([] { HnswIndex h(16, Metric::L2); h.add(1, std::vector<float>(16, 1.0f)); }, [] {});
     long p2 = sweep_allocation_failures([] { FlatIndex f(16, Metric::L2); f.add(1, std::vector<float>(16, 1.0f)); }, [] {});
     CHECK(p1 > 0 && p2 > 0);
 }
 
 TEST(robustness, oom_visited_pool) {
-    if (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     VisitedListPool pool;
     const long points = sweep_allocation_failures([&] { auto h = pool.acquire(1000); h->visit(999); }, [&] {
         CHECK(pool.idle_count() <= 1);
