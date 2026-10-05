@@ -72,20 +72,20 @@ X86Features detect_x86() {
     const bool fma = l1.c & (1u << 12);
     const bool osxsave = l1.c & (1u << 27);  // OS lets us call xgetbv
     const bool avx = l1.c & (1u << 28);
-    if (!osxsave || !avx || max_leaf < 7) return f;
+    if (!osxsave || !avx || max_leaf < 7) return f;  // GCOVR_EXCL_BR_LINE: CPU-dependent (emulated CPU runs)
 
     const unsigned long long xcr0 = read_xcr0();
     const bool os_saves_ymm = (xcr0 & 0x06) == 0x06;  // 128- and 256-bit registers
     const bool os_saves_zmm = (xcr0 & 0xE6) == 0xE6;  // plus all 512-bit state
     const CpuidRegs l7 = cpuid(7, 0);
-    f.avx2_fma = os_saves_ymm && fma && (l7.b & (1u << 5));
-    f.avx512f = os_saves_zmm && (l7.b & (1u << 16));
+    f.avx2_fma = os_saves_ymm && fma && (l7.b & (1u << 5));  // GCOVR_EXCL_BR_LINE: CPU-dependent
+    f.avx512f = os_saves_zmm && (l7.b & (1u << 16));         // GCOVR_EXCL_BR_LINE: CPU-dependent
     return f;
 }
 
 /// Cached result of detect_x86(); runs the detection only once.
 const X86Features& x86_features() {
-    static const X86Features f = detect_x86();
+    static const X86Features f = detect_x86();  // GCOVR_EXCL_BR_LINE: one-time initialization guard
     return f;
 }
 #endif
@@ -130,10 +130,10 @@ bool isa_supported(Isa isa) {
 Isa active_isa() {
     // Fastest first. Detected once, then reused.
     static const Isa best = [] {
-        for (Isa isa : {Isa::Avx512, Isa::Avx2, Isa::Neon})
-            if (isa_supported(isa)) return isa;
-        return Isa::Scalar;
-    }();
+        for (Isa isa : {Isa::Avx512, Isa::Avx2, Isa::Neon})  // GCOVR_EXCL_BR_LINE: CPU-dependent
+            if (isa_supported(isa)) return isa;              // GCOVR_EXCL_BR_LINE: CPU-dependent
+        return Isa::Scalar;                                  // GCOVR_EXCL_LINE: only on CPUs without SIMD
+    }();                                                     // GCOVR_EXCL_BR_LINE: initialization guard
     return best;
 }
 

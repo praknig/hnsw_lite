@@ -83,13 +83,13 @@ The engine is built as three layers. Each layer only depends on the ones below i
 
 ```mermaid
 flowchart TB
-    A["Your application"] --> B["Layer 3: FlatIndex"]
-    A --> C["Layer 3: HnswIndex"]
-    B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
-    C --> D
-    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
-    C --> E
-    D --> E
+  A["Your application"] --> B["Layer 3: FlatIndex"]
+  A --> C["Layer 3: HnswIndex"]
+  B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
+  C --> D
+  B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+  C --> E
+  D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -102,43 +102,43 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    S["storage.h"] --> I["id_map.h"]
-    S --> V["vector_store.h"]
-    S --> G["graph_storage.h"]
-    G --> AR["arena.h"]
-    V --> AB["aligned_block.h"]
-    G --> AB
-    AR --> AB
-    AB --> C["common.h"]
-    I --> C
+  S["storage.h"] --> I["id_map.h"]
+  S --> V["vector_store.h"]
+  S --> G["graph_storage.h"]
+  G --> AR["arena.h"]
+  V --> AB["aligned_block.h"]
+  G --> AB
+  AR --> AB
+  AB --> C["common.h"]
+  I --> C
 ```
 
 ### Layer 2 file dependencies
 
 ```mermaid
 flowchart TB
-    D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
-    DP --> K["src/kernels.h"]
-    K --> SC["distance_scalar.cpp<br/>any CPU"]
-    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
-    K --> A5["distance_avx512.cpp<br/>-mavx512f"]
-    K --> NE["distance_neon.cpp<br/>64-bit ARM"]
+  D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
+  DP --> K["src/kernels.h"]
+  K --> SC["distance_scalar.cpp<br/>any CPU"]
+  K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
+  K --> A5["distance_avx512.cpp<br/>-mavx512f"]
+  K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
 
 ### Layer 3 file dependencies
 
 ```mermaid
 flowchart TB
-    F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
-    F --> TK["search_result.h<br/>TopK"]
-    H["hnsw_index.h / .cpp"] --> PV
-    H --> TK
-    H --> VL["visited_list.h"]
-    F --> L1A["Layer 1: VectorStore, IdMap"]
-    H --> L1B["Layer 1: Storage"]
-    PV --> L2["Layer 2: distance.h"]
-    F --> L2
-    H --> L2
+  F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
+  F --> TK["search_result.h<br/>TopK"]
+  H["hnsw_index.h / .cpp"] --> PV
+  H --> TK
+  H --> VL["visited_list.h"]
+  F --> L1A["Layer 1: VectorStore, IdMap"]
+  H --> L1B["Layer 1: Storage"]
+  PV --> L2["Layer 2: distance.h"]
+  F --> L2
+  H --> L2
 ```
 
 ## Project structure
@@ -648,17 +648,17 @@ Not copyable, movable. Frees its memory in the destructor.
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 267 individually named tests** in 9 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 277 individually named tests** in 9 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
-| `layer1` | 56 | `round_up`; AlignedBlock (alignment, fill, size rounding, moves); Arena (every alignment, exact fill, oversized requests, 100 arrays staying intact); VectorStore (strides, padding, stable addresses, block size limit, 10,000 vectors, special float values); IdMap (extreme IDs, unknown IDs, removed IDs staying taken); GraphStorage (capacities, level limits, `set_links` at, below and above capacity); Storage (staying in sync after every kind of rejected insert) |
+| `layer1` | 58 | `round_up`; AlignedBlock (alignment, fill, size rounding, moves); Arena (every alignment, exact fill, oversized requests, 100 arrays staying intact); VectorStore (strides, padding, stable addresses, block size limit, 10,000 vectors, special float values); IdMap (extreme IDs, unknown IDs, removed IDs staying taken); GraphStorage (capacities, level limits, `set_links` at, below and above capacity); Storage (staying in sync after every kind of rejected insert) |
 | `layer2` | 31 | Dispatch consistency; every kernel on every supported CPU version: double-precision reference at 9 lengths, known values, length 0, zero vectors, overflow, NaN propagation, exact symmetry, unaligned input, padding, 8,192 dimensions, exact identities (`cos = 1 + ip`, L2 scaling by 4), versions agreeing; `normalize` on tiny, huge, zero, negative and empty vectors |
 | `helpers` | 31 | Candidate ordering; TopK (ties, k = 0, 1 and 2⁶⁴−1, infinity, reuse, matching a full sort of 10,000 candidates); PreparedVector (NaN and ±∞ rejected while keeping old contents, padding after reuse, tiny and extreme values); VisitedList (growth, epoch wrap-around, 1,000 resets); VisitedListPool (reuse, return after exceptions, 8 threads) |
 | `flat` | 24 | Exact match with a reference for all metrics and k up to 500; ties ordered by insertion; empty index, k = 0, k > size, huge k; wrong dimension, NaN, ∞ and duplicates rejected; removal; inner-product order; cosine with zero vectors; extreme IDs; 1,536 dimensions; 5,000 vectors |
 | `hnsw` | 44 | Parameter and input validation; rejected inserts leaving the later graph bit-identical; 1 to 10 vectors matching Flat exactly; k and ef limits; results sorted, unique and live; distances equal to Flat's; determinism; graph validity and recall for every metric; recall at k = 1, 10 and 50; level distribution; `M = 2`, `ef_construction = 1`, `M = 64`, other seeds; identical vectors; removing the entry point, a quarter, all but one, and everything; new nodes never linking to removed ones |
 | `robustness` | 20 | **Numeric extremes:** inner-product overflow (+∞ plus −∞ = NaN) sorting last instead of breaking the order, L2 overflow, huge values with cosine, denormals, −0 versus 0. **Out of memory:** every allocation in an `IdMap`, `VectorStore`, `GraphStorage` and `Storage` insert, a Flat add and search, and an HNSW first insert, insert and search is made to fail in turn, checking after each failure that nothing is corrupted and the object still works |
-| `deletion` | 51 | Scenarios D1 to D66 from the [test plan](docs/core-capabilities-test-plan.md); each test name starts with its scenario ID. Layer 1 building blocks (release, bind, overwrite, move, node reset); Flat swap-with-last removal checked against a `std::map` reference over 10,000 random operations; HNSW slot reuse at higher and lower levels, graph repair, entry-point reassignment, removing everything, 20-cycle churn for every metric, removing a whole cluster; `compact()`; statistics; out-of-memory sweeps for every new operation |
+| `deletion` | 59 | Scenarios D1 to D66 from the [test plan](docs/core-capabilities-test-plan.md), each test named after its scenario ID, plus 8 tests added by the coverage audit. Layer 1 building blocks (release, bind, overwrite, move, node reset); Flat swap-with-last removal checked against a `std::map` reference over 10,000 random operations; HNSW slot reuse at higher and lower levels, graph repair, entry-point reassignment, removing everything, 20-cycle churn for every metric, removing a whole cluster; `compact()`; statistics; out-of-memory sweeps for every new operation |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
 
@@ -668,7 +668,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 267 test names
+test_comprehensive --list               # list all 277 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -682,13 +682,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 267 of 267 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 277 of 277 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-267 passed, 0 failed, 0 skipped, 0 not run, 16590 checks, 10.57 s
+277 passed, 0 failed, 0 skipped, 0 not run, 17736 checks, 7.68 s
 All selected tests passed.
 ```
 
@@ -704,6 +704,33 @@ TEST(flat, my_new_case) {
 ```
 
 **How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 17 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
+
+### Code coverage
+
+Coverage is measured with gcov and gcovr. On the library code:
+
+| Measure | Covered |
+|---|---|
+| Lines | **100%** (730 of 730) |
+| Branches | **99 to 100%** (522 or 523 of 523; see below) |
+
+Excluded from measurement, each marked in the source with a `GCOVR_EXCL` comment that states the reason:
+
+- **CPU-dependent branches** in `dispatch.cpp` (what happens on CPUs without AVX2 or AVX-512). They can only run on such CPUs; the emulated Nehalem and Haswell runs cover them.
+- **Untestable code:** the arena's `assert`, the 4-billion-vector limit, the visited-list pool's safety-net `catch` (unreachable since room is reserved in advance), a gcov artifact on a closing brace, and three purely defensive branches (unique entry lists, a never-empty result, self-links that cannot exist).
+
+The NEON kernel file is excluded on x86 because it compiles to nothing there. When the concurrency tests run, plain gcov counters race between threads and can move a branch count by one, which is why the branch figure can read 99% locally; the CI coverage job uses `-fprofile-update=atomic` for exact counts.
+
+**Running it locally (Linux):**
+
+```bash
+cmake -B build-cov -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_FLAGS=--coverage -O0 -fno-inline -fprofile-update=atomic" -DCMAKE_EXE_LINKER_FLAGS=--coverage
+cmake --build build-cov --target test_comprehensive
+./build-cov/test_comprehensive
+gcovr -r . build-cov --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" --exclude-unreachable-branches --exclude-throw-branches --html-details coverage.html
+```
+
+**What the coverage audit found.** The first measurement showed 99% of lines and 94% of branches. Each gap was either tested, or excluded with a reason. Closing them added 10 tests and found one real bug (number 11 below): with graph repair turned off and nearly everything removed, a search could start in a region of the graph that reaches no live vector and return nothing at all.
 
 ### CTest
 
@@ -754,6 +781,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 8. **Running out of memory corrupted indexes.** `IdMap::add` registered the user ID before growing its arrays, so a failure left a stale ID that broke every later insert; `Storage::insert` had no rollback if a later step failed; and a half-linked HNSW vector stayed visible after a failure. Inserts are now all-or-nothing in `IdMap`, `VectorStore`, `GraphStorage`, `Storage` and `FlatIndex`, and a failed HNSW insert hides its half-linked vector. Run against the old code, 4 of the out-of-memory tests fail.
 9. Huge finite values could make an inner product overflow to NaN (+∞ plus −∞), which breaks the ordering every heap and sort relies on. NaN distances now count as +∞, so such pairs sort last.
 10. **A visited list could be silently dropped.** Returning a borrowed list to the pool used `push_back`, which can allocate; a failure there was swallowed (as a destructor path must) and the list discarded. Room is now reserved when each list is created, so returning one never allocates. The out-of-memory harness also became strict: a failure that an operation swallows is now reported as a test failure.
+11. **A search could return nothing while live vectors existed** (found by the coverage audit). Links are one-directional, so after many removals without graph repair, the greedy descent could end on a removed node whose links lead only to other removed nodes; the search then found no live vector. Searches that find fewer than k results, and inserts that find no live neighbor, now retry with the entry point (always live) as an extra starting point. The insert retry replaces the old fallback of linking new vectors to removed nodes.
 
 ## Continuous integration
 
@@ -767,7 +795,7 @@ Every change is built and tested automatically by GitHub Actions ([`.github/work
 
 It does not run on pushes to a branch without a pull request; that would run everything twice once a pull request exists. To get feedback early, open a **draft pull request** as soon as the branch is created. A newer run for the same branch cancels an older one that is still running.
 
-**What it runs (7 jobs in parallel):**
+**What it runs (8 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
@@ -777,7 +805,8 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Windows / MSVC | Release | Full test suite with Microsoft's compiler, including the MSVC-specific CPU detection |
 | Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
-| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency and helper groups |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers and deletion groups |
+| Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 98% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.
 

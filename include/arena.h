@@ -32,7 +32,7 @@ public:
 
     // Returns `bytes` of memory starting at a multiple of `align`.
     void* allocate(std::size_t bytes, std::size_t align = alignof(std::max_align_t)) {
-        assert(align <= kAlign && (align & (align - 1)) == 0);
+        assert(align <= kAlign && (align & (align - 1)) == 0);  // GCOVR_EXCL_BR_LINE: failing aborts
         std::size_t start = round_up(used_, align);
         if (blocks_.empty() || start + bytes > blocks_.back().size()) {
             // Current block is full: grab a new one (bigger if the request is huge).

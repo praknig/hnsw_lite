@@ -63,6 +63,10 @@ struct HnswParams {
  *  - Links from other nodes to a removed or reused slot may remain ("stale"
  *    links). Searches skip any link to a node whose level is below the level
  *    being searched, and inserts and repairs drop stale links they encounter.
+ *  - Links are one-directional, so after many removals a search can start in
+ *    a region that reaches few live nodes. A search that finds fewer than k
+ *    results, or an insert that finds no live neighbor, retries with the entry
+ *    point (always live) as an extra starting point.
  *  - compact() rebuilds a dense index from the live vectors.
  *
  * Layers used:
@@ -142,12 +146,12 @@ private:
     /// closer. Never steps onto `exclude` or onto a node below `level`.
     Candidate greedy_closest(const float* query, Candidate start, int level, NodeId exclude) const;
 
-    /// Beam search on one level. Returns up to `ef` closest nodes, closest first.
-    /// With `skip_removed`, removed nodes are traversed but not returned.
-    /// `exclude` (a node being inserted) is never visited.
+    /// Beam search on one level. Returns up to `ef` closest live nodes, closest
+    /// first. Removed nodes are traversed but never returned. `exclude` (a node
+    /// being inserted) is never visited.
     std::vector<Candidate> search_level(const float* query, const std::vector<Candidate>& entries,
                                         std::size_t ef, int level, VisitedList& visited,
-                                        bool skip_removed, NodeId exclude) const;
+                                        NodeId exclude) const;
 
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
     /// is closer to the base node than to every already-kept neighbor and is not

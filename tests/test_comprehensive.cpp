@@ -334,8 +334,8 @@ void check_results(const Index& index, const Results& results) {
 /// `min_reachable` of the live nodes can be reached from the entry point.
 /// Removed nodes are skipped. Stale links (to a node whose level is now below
 /// the link's level, left behind by slot reuse; searches skip them) are allowed
-/// but must be rare.
-void check_graph(const HnswIndex& index, double min_reachable) {
+/// but must be rare: at most `max_stale` of all links (2% by default).
+void check_graph(const HnswIndex& index, double min_reachable, double max_stale = 0.02) {
     const Storage& st = index.storage();
     const GraphStorage& g = st.graph();
     const IdMap& ids = st.ids();
@@ -371,7 +371,7 @@ void check_graph(const HnswIndex& index, double min_reachable) {
         }
     }
     CHECK(structure_ok);
-    CHECK(stale <= links / 50);  // at most 2% of links stale
+    CHECK(double(stale) <= max_stale * double(links));
 
     // Reachability of LIVE nodes on level 0 (the walk may pass removed nodes).
     std::vector<bool> reached(n, false);
@@ -964,6 +964,34 @@ TEST(layer1, storage_level_lists_created) {
     CHECK_THROWS_AS(std::out_of_range, st.graph().links(id, 4));
 }
 
+TEST(layer1, storage_insert_into_validation) {
+    // Found by the coverage audit: insert_into's own checks had no test.
+    Storage st(4);
+    std::vector<float> v{1, 2, 3, 4};
+    st.insert(10, v, 0);
+    st.insert(11, v, 0);
+    st.ids().release(11);  // slot 1 is free
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_into(1, 20, std::vector<float>(3), 0));
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_into(1, 20, v, -1));
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_into(1, 20, v, 256));
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_into(1, 10, v, 0));  // ID in use
+    CHECK_THROWS_AS(std::logic_error, st.insert_into(0, 20, v, 0));       // live slot
+    CHECK_THROWS_AS(std::logic_error, st.insert_into(9, 20, v, 0));       // no such slot
+    CHECK(st.ids().is_free(1) && !st.ids().find(20).has_value() && st.size() == 2);
+    CHECK(st.insert_into(1, 20, std::vector<float>{5, 6, 7, 8}, 2) == 1);
+    CHECK(st.vectors().get(1)[3] == 8.0f && st.graph().level(1) == 2);
+}
+
+TEST(layer1, vector_store_huge_dimension) {
+    // Rows over 8 MiB: each block holds a single row (found by the coverage audit).
+    VectorStore s(3000000);
+    CHECK(s.rows_per_shelf() == 1);
+    s.add(std::vector<float>(3000000, 1.5f));
+    s.add(std::vector<float>(3000000, 2.5f));
+    CHECK(s.get(0)[2999999] == 1.5f && s.get(1)[0] == 2.5f);
+    CHECK(aligned(s.get(0).data()) && aligned(s.get(1).data()));
+}
+
 // ===========================================================================
 // Layer 2: dispatch
 // ===========================================================================
@@ -1286,6 +1314,7 @@ TEST(helpers, candidate_ordering) {
     CHECK(!(Candidate{1.0f, 2} < Candidate{1.0f, 2}));  // not less than itself
     CHECK((Candidate{2.0f, 0} > Candidate{1.0f, 9}));
     CHECK((Candidate{-1.0f, 9} < Candidate{0.0f, 0}));  // negative distances (inner product)
+    CHECK(!(Candidate{1.0f, 5} < Candidate{1.0f, 3}));  // equal distance, larger id
 }
 
 TEST(helpers, topk_keeps_best_sorted) {
@@ -3384,6 +3413,236 @@ TEST(deletion, d66_statistics_consistent) {
         ok = ok && f.capacity() == f.size() && f.deleted_count() == 0;
     }
     CHECK(ok);
+}
+
+// ---- Added by the coverage audit (beyond the test plan) -------------------
+
+namespace {
+
+/// Portable uniform float in [-1, 1): built from the generator's raw bits,
+/// because std::uniform_real_distribution differs between standard libraries.
+float portable_uniform(std::mt19937& rng) {
+    return float(rng() >> 8) * (1.0f / 16777216.0f) * 2.0f - 1.0f;
+}
+
+}  // namespace
+
+TEST(deletion, insert_next_to_removed_nodes_stays_findable) {
+    // Found by the coverage audit: in sparse graphs where nearly everything was
+    // removed without repair, a search could start in a region that reaches no
+    // live node and return nothing. Searches and inserts now retry from the
+    // entry point. Sweeps small graphs (repair off, M 2-4) where this occurs.
+    bool findable = true;
+    for (unsigned seed = 1; seed <= 150; ++seed) {
+        std::mt19937 rng(seed);
+        HnswParams p;
+        p.M = 2 + seed % 3;
+        p.ef_construction = 1 + seed % 4;
+        p.repair_on_remove = false;
+        p.seed = seed;
+        HnswIndex h(2, Metric::L2, p);
+        const int n = 20 + int(seed % 30);
+        for (int i = 0; i < n; ++i) h.add(std::uint64_t(i), std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        const std::uint64_t entry = h.storage().ids().external(h.entry_point());
+        for (int i = 0; i < n; ++i)
+            if (std::uint64_t(i) != entry) h.remove(std::uint64_t(i));
+        for (std::uint64_t i = 0; i < 5; ++i) {
+            std::vector<float> v{portable_uniform(rng), portable_uniform(rng)};
+            h.add(1000 + i, v);
+            auto r = h.search(v, 1, h.capacity());
+            findable = findable && !r.empty() && r[0].id == 1000 + i && r[0].distance == 0.0f;
+        }
+        check_graph(h, 0.0, 1.0);  // structure only: tiny, mostly reused graphs have many stale links
+    }
+    CHECK(findable);
+}
+
+TEST(deletion, search_starting_from_removed_node) {
+    // With repair off, the greedy descent can end on a removed node; the level-0
+    // search must start there without ever returning it.
+    auto data = clustered(600, 8, 4, 246);
+    HnswParams p;
+    p.repair_on_remove = false;
+    HnswIndex h(8, Metric::L2, p);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    const Storage& st = h.storage();
+    // Targets linked from the entry point on the top level: a search for one of
+    // them moves there in its first greedy step, so it ends on a removed node.
+    std::vector<std::uint64_t> targets;
+    for (NodeId n : st.graph().links(h.entry_point(), h.max_level())) {
+        if (n == kEmpty) break;
+        targets.push_back(st.ids().external(n));
+    }
+    for (NodeId n = 0; n < st.size() && targets.size() < 10; ++n)  // plus other upper-level nodes
+        if (st.graph().level(n) >= 1 && n != h.entry_point() &&
+            std::find(targets.begin(), targets.end(), st.ids().external(n)) == targets.end())
+            targets.push_back(st.ids().external(n));
+    REQUIRE(!targets.empty());
+    Vectors queries;
+    for (std::uint64_t id : targets) {
+        queries.push_back(data[id]);
+        h.remove(id);
+        f.remove(id);
+    }
+    bool never_returned = true;
+    for (std::size_t i = 0; i < targets.size(); ++i)
+        for (const auto& r : h.search(queries[i], 10, 100)) never_returned = never_returned && r.id != targets[i];
+    CHECK(never_returned);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.90);
+    h.add(9999, queries[0]);  // an insert that starts its search from removed nodes
+    CHECK(h.search(queries[0], 1, 100)[0].id == 9999);
+}
+
+TEST(deletion, repair_skips_already_removed_links) {
+    // Removing Y does not unlink X -> Y when Y does not link back to X. Removing
+    // X afterwards must repair around it while ignoring the dead link to Y.
+    auto data = clustered(1000, 8, 4, 247);
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});  // small lists fill up and get pruned
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Storage& st = h.storage();
+    NodeId x = kEmpty, y = kEmpty;
+    for (NodeId a = 0; a < st.size() && x == kEmpty; ++a)
+        for (NodeId b : st.graph().links(a, 0)) {
+            if (b == kEmpty) break;
+            auto back = st.graph().links(b, 0);
+            if (std::find(back.begin(), back.end(), a) == back.end()) {  // a -> b only
+                x = a;
+                y = b;
+                break;
+            }
+        }
+    REQUIRE(x != kEmpty);
+    const std::uint64_t x_id = st.ids().external(x), y_id = st.ids().external(y);
+    std::vector<NodeId> x_neighbors;
+    for (NodeId nb : st.graph().links(x, 0)) {
+        if (nb == kEmpty) break;
+        if (nb != y) x_neighbors.push_back(nb);
+    }
+    CHECK(h.remove(y_id));
+    auto still = st.graph().links(x, 0);
+    CHECK(std::find(still.begin(), still.end(), y) != still.end());  // dead link remains
+    CHECK(h.remove(x_id));
+    bool clean = true;
+    for (NodeId nb : x_neighbors)
+        for (NodeId c : st.graph().links(nb, 0)) {
+            if (c == kEmpty) break;
+            clean = clean && c != x && c != y;  // neither removed node is linked
+        }
+    CHECK(clean);
+    check_graph(h, 0.99);
+}
+
+TEST(deletion, id_map_move_released_slot) {
+    // move_slot from a slot that was itself released keeps the destination free.
+    IdMap m;
+    m.add(1);
+    m.add(2);
+    m.add(3);
+    m.release(1);  // slot 0
+    m.release(3);  // slot 2, the last one
+    m.move_slot(2, 0);
+    m.pop_back_slot();
+    CHECK(m.size() == 2 && m.is_free(0) && *m.find(2) == 1);
+    CHECK(!m.find(1).has_value() && !m.find(3).has_value());
+
+    // A released slot whose old user ID now belongs to another slot: moving it
+    // must not touch that other slot's mapping.
+    IdMap n;
+    n.add(1);      // slot 0
+    n.add(2);      // slot 1
+    n.add(3);      // slot 2
+    n.release(1);  // slot 0 free
+    n.release(3);  // slot 2 free (its old ID is 3)
+    n.bind(0, 3);  // ID 3 now lives in slot 0
+    n.release(2);  // slot 1 free
+    n.move_slot(2, 1);
+    CHECK(*n.find(3) == 0 && n.is_free(1));
+}
+
+TEST(deletion, repair_skips_stale_links) {
+    // A removed node's own list can hold a stale link: to a slot that was reused
+    // at a lower level. Repair must ignore it. Built deliberately: find a one-way
+    // upper-level link A -> S, reuse S until its level drops, then remove A.
+    auto data = clustered(1000, 8, 4, 252);
+    auto extra = clustered(200, 8, 4, 253);
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Storage& st = h.storage();
+    NodeId a = kEmpty, s = kEmpty;
+    int level = 0;
+    for (NodeId x = 0; x < st.size() && a == kEmpty; ++x)
+        for (int l = 1; l <= st.graph().level(x) && a == kEmpty; ++l)
+            for (NodeId y : st.graph().links(x, l)) {
+                if (y == kEmpty) break;
+                auto back = st.graph().links(y, l);
+                if (std::find(back.begin(), back.end(), x) == back.end()) {  // x -> y only
+                    a = x;
+                    s = y;
+                    level = l;
+                    break;
+                }
+            }
+    REQUIRE(a != kEmpty);
+    std::uint64_t s_id = st.ids().external(s);
+    for (std::size_t i = 0; i < extra.size() && st.graph().level(s) >= level; ++i) {
+        h.remove(s_id);           // frees slot s (a still links to it: one-way)
+        s_id = 50000 + i;
+        h.add(s_id, extra[i]);    // last in, first out: reuses slot s with a new level
+        REQUIRE(*st.ids().find(s_id) == s);
+    }
+    REQUIRE(st.graph().level(s) < level);  // a's level-`level` link to s is now stale
+    CHECK(h.remove(st.ids().external(a)));
+    check_graph(h, 0.95);
+    for (const auto& q : clustered(10, 8, 4, 254)) check_results(h, h.search(q, 10, 64));
+}
+
+TEST(deletion, compact_cosine_index) {
+    auto data = clustered(500, 16, 6, 248);
+    auto queries = clustered(20, 16, 6, 249);
+    HnswIndex h(16, Metric::Cosine);
+    FlatIndex f(16, Metric::Cosine);
+    fill(h, f, data);
+    for (std::uint64_t i = 0; i < 500; i += 2) {
+        h.remove(i);
+        f.remove(i);
+    }
+    h.compact();  // stored vectors are already normalized; normalizing again is harmless
+    CHECK(h.capacity() == 250 && h.size() == 250);
+    CHECK(recall(h, f, queries, 10, 100) >= 0.95);
+    bool self = true;
+    for (std::size_t i = 1; i < 500; i += 50) self = self && h.search(data[i], 1, 64)[0].id == i;
+    CHECK(self);
+}
+
+TEST(deletion, add_after_compact_appends) {
+    auto data = clustered(110, 8, 4, 250);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 100; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 20; ++i) h.remove(i);
+    h.compact();
+    CHECK(h.capacity() == 80 && h.deleted_count() == 0);
+    for (std::size_t i = 100; i < 110; ++i) h.add(i, data[i]);  // no free slots: appended
+    CHECK(h.capacity() == 90 && h.size() == 90);
+    check_graph(h, 0.99);
+}
+
+TEST(deletion, remove_high_level_node_keeps_top_level) {
+    // Removing an upper-level node that is not the entry point leaves the
+    // entry point and the top level unchanged.
+    auto data = clustered(800, 8, 4, 251);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const NodeId entry = h.entry_point();
+    const int top = h.max_level();
+    const Storage& st = h.storage();
+    std::uint64_t target = kMaxId;
+    for (NodeId n = 0; n < st.size() && target == kMaxId; ++n)
+        if (n != entry && st.graph().level(n) >= 1) target = st.ids().external(n);
+    REQUIRE(target != kMaxId);
+    CHECK(h.remove(target));
+    CHECK(h.entry_point() == entry && h.max_level() == top);
+    check_graph(h, 0.99);
 }
 
 // ===========================================================================
