@@ -7,7 +7,7 @@ A minimal, in-memory vector search engine written in modern C++20, built from sc
 
 The engine stores high-dimensional vectors (embeddings) and finds the nearest neighbors of a query vector using two indexes: an exact brute-force **Flat** index and an approximate **HNSW** (Hierarchical Navigable Small World) graph.
 
-> **Status:** Layers 1 to 3 are complete and tested: memory and storage, SIMD distance kernels, and the Flat and HNSW indexes, now with real deletion (reusable IDs, slot reuse, graph repair, `compact()`). On 50,000 vectors, HNSW answers queries about 14x faster than exact search at 99.8% recall. See the [Roadmap](#roadmap).
+> **Status:** Layers 1 to 3 are complete and tested: memory and storage, SIMD distance kernels, and the Flat and HNSW indexes, now with real deletion (reusable IDs, slot reuse, graph repair, `compact()`) and search features: metadata, filtered search with a query planner, batch search and range search. On 50,000 vectors, HNSW answers queries about 14x faster than exact search at 99.8% recall. See the [Roadmap](#roadmap).
 
 ---
 
@@ -23,6 +23,7 @@ The engine stores high-dimensional vectors (embeddings) and finds the nearest ne
 - [Layer 1 design: memory and storage](#layer-1-design-memory-and-storage)
 - [Layer 2 design: distance kernels](#layer-2-design-distance-kernels)
 - [Layer 3 design: indexes](#layer-3-design-indexes)
+- [Search features design](#search-features-design)
 - [API reference](#api-reference)
 - [Testing](#testing)
 - [Continuous integration](#continuous-integration)
@@ -72,6 +73,15 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 - Concurrent searches are safe when no writer is active (thread-safe visited-list pool).
 - Recall@10 of 0.998 or higher in tests, on every CPU type; inner-product recall matches the reference hnswlib on identical data.
 
+**Search features (done)**
+
+- **Metadata:** integer, float, boolean, keyword and tag-set fields per vector, stored in columns with a string dictionary; strict or dynamic schemas.
+- **Filtered search:** conditions like `Filter::eq("category", "news") && Filter::ge("year", 2020)`, plus custom C++ predicates; no result ever violates the filter.
+- **Query planner:** chooses exact search over the matching vectors or a filtered graph search, from sampled or exactly counted selectivity; reports its decision in `SearchStats`.
+- **Payload index:** exact per-value counts for keyword, boolean and tag-set fields.
+- **Batch search:** many queries in one call on a thread pool; tiled for Flat. Results identical to separate searches.
+- **Range search:** every vector within a radius; exact for Flat, region growing for HNSW.
+
 **Planned**
 
 - Recall vs. queries-per-second benchmarks on standard datasets (SIFT1M, GloVe).
@@ -83,13 +93,13 @@ The engine is built as three layers. Each layer only depends on the ones below i
 
 ```mermaid
 flowchart TB
-  A["Your application"] --> B["Layer 3: FlatIndex"]
-  A --> C["Layer 3: HnswIndex"]
-  B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
-  C --> D
-  B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
-  C --> E
-  D --> E
+    A["Your application"] --> B["Layer 3: FlatIndex"]
+    A --> C["Layer 3: HnswIndex"]
+    B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
+    C --> D
+    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+    C --> E
+    D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -102,43 +112,43 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-  S["storage.h"] --> I["id_map.h"]
-  S --> V["vector_store.h"]
-  S --> G["graph_storage.h"]
-  G --> AR["arena.h"]
-  V --> AB["aligned_block.h"]
-  G --> AB
-  AR --> AB
-  AB --> C["common.h"]
-  I --> C
+    S["storage.h"] --> I["id_map.h"]
+    S --> V["vector_store.h"]
+    S --> G["graph_storage.h"]
+    G --> AR["arena.h"]
+    V --> AB["aligned_block.h"]
+    G --> AB
+    AR --> AB
+    AB --> C["common.h"]
+    I --> C
 ```
 
 ### Layer 2 file dependencies
 
 ```mermaid
 flowchart TB
-  D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
-  DP --> K["src/kernels.h"]
-  K --> SC["distance_scalar.cpp<br/>any CPU"]
-  K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
-  K --> A5["distance_avx512.cpp<br/>-mavx512f"]
-  K --> NE["distance_neon.cpp<br/>64-bit ARM"]
+    D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
+    DP --> K["src/kernels.h"]
+    K --> SC["distance_scalar.cpp<br/>any CPU"]
+    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
+    K --> A5["distance_avx512.cpp<br/>-mavx512f"]
+    K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
 
 ### Layer 3 file dependencies
 
 ```mermaid
 flowchart TB
-  F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
-  F --> TK["search_result.h<br/>TopK"]
-  H["hnsw_index.h / .cpp"] --> PV
-  H --> TK
-  H --> VL["visited_list.h"]
-  F --> L1A["Layer 1: VectorStore, IdMap"]
-  H --> L1B["Layer 1: Storage"]
-  PV --> L2["Layer 2: distance.h"]
-  F --> L2
-  H --> L2
+    F["flat_index.h / .cpp"] --> PV["prepared_vector.h"]
+    F --> TK["search_result.h<br/>TopK"]
+    H["hnsw_index.h / .cpp"] --> PV
+    H --> TK
+    H --> VL["visited_list.h"]
+    F --> L1A["Layer 1: VectorStore, IdMap"]
+    H --> L1B["Layer 1: Storage"]
+    PV --> L2["Layer 2: distance.h"]
+    F --> L2
+    H --> L2
 ```
 
 ## Project structure
@@ -168,7 +178,11 @@ hnsw-lite/
 │   ├── prepared_vector.h       # Layer 3: PreparedVector, padded/normalized input
 │   ├── visited_list.h          # Layer 3: VisitedList, VisitedListPool
 │   ├── flat_index.h            # Layer 3: FlatIndex
-│   └── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
+│   ├── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
+│   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
+│   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
+│   ├── payload_index.h         # Search: ValueCounts (exact value counts)
+│   └── thread_pool.h           # Search: ThreadPool, SharedPool (batch search)
 ├── src/                        # Compiled code (Layers 2 and 3)
 │   ├── kernels.h               # Internal declarations of all kernels
 │   ├── dispatch.cpp            # CPU detection, kernel selection, normalize()
@@ -177,9 +191,10 @@ hnsw-lite/
 │   ├── distance_avx512.cpp     # AVX-512F, 16 floats per instruction
 │   ├── distance_neon.cpp       # NEON, 4 floats per instruction (ARM only)
 │   ├── flat_index.cpp          # FlatIndex implementation
-│   └── hnsw_index.cpp          # HnswIndex implementation
+│   ├── hnsw_index.cpp          # HnswIndex implementation
+│   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 216 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 396 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -486,6 +501,66 @@ One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an 
 
 **Threading.** One writer at a time, with no searches running. Several searches may run at once when no writer is active; each borrows its own `VisitedList` from a mutex-protected pool, and returns it automatically through an RAII handle.
 
+## Search features design
+
+### Metadata
+
+Each vector can carry fields of five types: integer (`int64`), float (`double`, finite only), boolean, keyword (string) and tag set (strings). Metadata is attached with a small builder:
+
+```cpp
+index.add(id, vector, Metadata().set("category", "news").set("year", 2024)
+                                .set("in_stock", true).set_tags("tags", {"ai", "chips"}));
+```
+
+**Schemas.** Each index chooses its schema mode:
+
+| Mode | Unknown field at insert | Unknown field in a filter |
+|---|---|---|
+| `Schema::strict({...})` | Rejected | Error (catches typos) |
+| `Schema::dynamic({...})` (default) | Created, with the type of its first value | Matches nothing (the field may not exist yet) |
+
+In both modes a field keeps one type; a value of another type is rejected (an integer is accepted for a float field). Invalid metadata throws `std::invalid_argument` and changes nothing; a failed insert never leaves a newly created field behind.
+
+**Storage.** `MetadataStore` keeps one column per field, indexed by slot like vectors and links: `int64`, `double`, a byte per boolean, a 4-byte dictionary ID per keyword, a list of dictionary IDs per tag set, plus a "has a value" byte. Strings are stored once in a dictionary, so keyword and tag comparisons are integer comparisons. Columns grow only to the highest slot written. Metadata follows its vector through every slot operation: Flat's swap-with-last moves the row, HNSW slot reuse overwrites it, removal clears it, `compact()` copies it. Writes are all-or-nothing: fields and strings are created and columns grown before anything visible changes.
+
+### Filters
+
+```cpp
+Filter::eq("category", "news") && (Filter::ge("year", 2020) || Filter::has_tag("tags", "ai"))
+```
+
+Available conditions: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between` (inclusive), `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, combined with `&&`, `||` and `!`.
+
+**Rules:**
+- **Missing fields:** comparisons never match a vector without the field, including `ne` (as in SQL). `!` negates the whole condition, so `!Filter::eq("category", "news")` does match vectors without a category. `exists` tests presence.
+- **Numbers:** integers and floats compare exactly with each other, even beyond the precision of a double.
+- Keywords support `eq`, `ne`, `in`; booleans `eq`, `ne`, `in`; tag sets the `has_*` conditions. `between` with low above high, and an empty `in` list, match nothing. NaN values are rejected.
+
+Filters are checked against each index's schema when used (type errors throw `std::invalid_argument`) and compiled to a flat form: field names become column numbers, strings become dictionary IDs. A compiled filter evaluates a slot with a few column reads and no memory allocation.
+
+**Custom predicates.** `SearchOptions::predicate` accepts any `bool(user_id)` function, for conditions that live outside the index, such as permissions. Combined with a filter, both must pass, with the filter checked first. In batch search a predicate may be called from several threads at once, so it must be safe to call concurrently.
+
+### The query planner
+
+A filtered HNSW search can either scan the matching vectors exactly, or search the graph while treating non-matching vectors like removed ones (traveled through, never returned). The planner chooses per query:
+
+1. **Estimate the number of matches:** exactly from the payload index when the filter allows it (and there is no predicate), exactly by checking every slot when the index is smaller than the sample size, otherwise from a deterministic sample of 256 live vectors.
+2. **Choose:** exact search if the expected matches are at most `max_exact_matches` (default 2,000) **or** their fraction is at most `max_exact_fraction` (default 1%); otherwise graph search, with `ef` widened by 1 / selectivity, up to `max_ef_multiplier` (32) times.
+
+Settings live in `PlannerParams`, per index (`set_planner_params`) or per query (`SearchOptions::planner`). `Strategy::ForceExact` and `Strategy::ForceGraph` override the choice. `SearchStats` reports the strategy, the reason, the estimate, the beam width, and the work done. On very large indexes lower `max_exact_fraction`: 1% of 100 million vectors is a million exact distance computations.
+
+**Payload index.** `create_payload_index(field)` keeps exact per-value counts for a keyword, boolean or tag-set field, which the planner uses instead of sampling. This first version keeps counts only; posting lists (letting exact search read only the matching vectors) are a later step.
+
+### Batch search
+
+`search_batch(queries, k, ...)` takes the queries back to back in one buffer and returns one result list per query. Every query is validated before any work. HNSW spreads queries over a reusable thread pool. Flat uses **tiling**: a block of 256 stored vectors is compared with a chunk of 16 queries, so each vector loaded into the cache serves 16 queries instead of one. Results are identical to separate `search` calls, whatever the thread count.
+
+### Range search
+
+`search_range(query, radius, max_results)` returns every eligible vector with distance at or below `radius`, closest first. The radius uses each metric's "smaller is closer" distance, so **for L2 it is a squared distance**; `l2_radius(r)` converts an ordinary radius. `max_results` is optional (no limit by default; 0 returns nothing).
+
+Flat scans exactly. HNSW **grows a region**: a normal search finds the nearest vectors, then every vector inside the radius has its neighbors visited, continuing outward. `SearchOptions::range_expand_outside` (default 1) lets the growth cross that many vectors outside the radius, so a narrow gap does not cut a region in two. It is approximate; `Strategy::ForceExact` scans instead.
+
 ## API reference
 
 All code is in the `vecdb` namespace. Invalid input throws `std::invalid_argument`, `std::out_of_range` or `std::length_error`.
@@ -644,11 +719,47 @@ Not copyable, movable. Frees its memory in the destructor.
 | `size()`, `dim()`, `metric()`, `params()` | Live count and settings |
 | `max_level()`, `entry_point()`, `storage()` | Graph inspection, mainly for tests |
 
+### `metadata.h`
+
+| Name | Description |
+|---|---|
+| `FieldType` | `Int`, `Float`, `Bool`, `Keyword`, `Tags` |
+| `Value::from(x)` | Builds a value; the type comes from the C++ type of `x` |
+| `Metadata().set(name, value)`, `set_tags(name, tags)`, `unset(name)` | Builds the fields of one vector; `unset` clears a field in `set_metadata` |
+| `Schema::strict(fields)`, `Schema::dynamic(fields = {})` | Schema modes; empty or duplicate names throw |
+| `MetadataStore` | Column storage: `validate`, `write`, `update`, `clear`, `move_row`, `read`, `index_field`, `value_count`, `present_count`, fast column accessors |
+
+### `filter.h`
+
+| Name | Description |
+|---|---|
+| `Filter::eq/ne/lt/le/gt/ge(field, value)`, `between`, `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, `all()` | Conditions; combine with `&&`, `\|\|`, `!` |
+| `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
+| `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |
+| `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
+| `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32 }` | Planner settings |
+| `SearchStats` | Strategy, reason, selectivity, estimated matches, `ef`, nodes visited, distances computed |
+
+### New index methods (`FlatIndex` and `HnswIndex`)
+
+| Member | Description |
+|---|---|
+| `FlatIndex(dim, metric, schema)`, `HnswIndex(dim, metric, params, schema)` | The schema is optional (dynamic by default) |
+| `add(id, vector, metadata = {})` | Stores a vector with optional metadata |
+| `set_metadata(id, metadata)`, `get_metadata(id)` | Changes given fields only / reads a vector's metadata |
+| `create_payload_index(field)` | Exact value counts for a keyword, boolean or tag-set field |
+| `search(query, k, options)` (Flat), `search(query, k, ef, options)` (HNSW) | Filtered search |
+| `search_batch(queries, k, threads, options)` (Flat), `search_batch(queries, k, ef, threads, options)` (HNSW) | Batch search |
+| `search_range(query, radius, max_results = kNoLimit, options)` | Range search |
+| `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings |
+
+`thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller) and `SharedPool`; `search_result.h` adds `kNoLimit` and `l2_radius`.
+
 ## Testing
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 277 individually named tests** in 9 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 396 individually named tests** in 16 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -659,16 +770,23 @@ Not copyable, movable. Frees its memory in the destructor.
 | `hnsw` | 44 | Parameter and input validation; rejected inserts leaving the later graph bit-identical; 1 to 10 vectors matching Flat exactly; k and ef limits; results sorted, unique and live; distances equal to Flat's; determinism; graph validity and recall for every metric; recall at k = 1, 10 and 50; level distribution; `M = 2`, `ef_construction = 1`, `M = 64`, other seeds; identical vectors; removing the entry point, a quarter, all but one, and everything; new nodes never linking to removed ones |
 | `robustness` | 20 | **Numeric extremes:** inner-product overflow (+∞ plus −∞ = NaN) sorting last instead of breaking the order, L2 overflow, huge values with cosine, denormals, −0 versus 0. **Out of memory:** every allocation in an `IdMap`, `VectorStore`, `GraphStorage` and `Storage` insert, a Flat add and search, and an HNSW first insert, insert and search is made to fail in turn, checking after each failure that nothing is corrupted and the object still works |
 | `deletion` | 59 | Scenarios D1 to D66 from the [test plan](docs/core-capabilities-test-plan.md), each test named after its scenario ID, plus 8 tests added by the coverage audit. Layer 1 building blocks (release, bind, overwrite, move, node reset); Flat swap-with-last removal checked against a `std::map` reference over 10,000 random operations; HNSW slot reuse at higher and lower levels, graph repair, entry-point reassignment, removing everything, 20-cycle churn for every metric, removing a whole cluster; `compact()`; statistics; out-of-memory sweeps for every new operation |
+| `metadata` | 31 | MD scenarios: every type round-trips; strict and dynamic schemas; type errors; extreme values (64-bit limits, 1 MB strings, UTF-8, 1,000 tags); `set_metadata` and `unset`; metadata following slots through swap-with-last, reuse and `compact()`; 3,000 random operations against a reference; out-of-memory sweeps, including no field left behind by a failed insert |
+| `filter` | 30 | FL scenarios: every condition, and 1,000 random nested filters, checked against an independent reference evaluator; missing-field and exact integer/float rules; type errors; Flat exact against brute force; HNSW never violating a filter across 1,000 random filters, recall at 50% to 5% selectivity, matches clustered or scattered, entry point failing the filter; predicates alone, combined, throwing, and called from 8 threads |
+| `planner` | 16 | PL scenarios: sampled selectivity accuracy; exact payload counts; each threshold and its inclusive boundary; per-query overrides; forced strategies; exact strategy equal to Flat; tiny, empty and all-removed indexes; determinism; consistent statistics; invalid settings; recall at 1% to 100% selectivity |
+| `payload` | 6 | PI scenarios: counts exact after 2,000 random operations; identical results with or without the index; backfill equal to incremental; unsupported types rejected; out of memory; kept by `compact()` |
+| `batch` | 15 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
+| `range` | 15 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
+| `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
 
-Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 10 seconds in Release.
+Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 15 seconds in Release.
 
 **Running tests at will:**
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 277 test names
+test_comprehensive --list               # list all 396 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -682,13 +800,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 277 of 277 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 396 of 396 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-277 passed, 0 failed, 0 skipped, 0 not run, 17736 checks, 7.68 s
+396 passed, 0 failed, 0 skipped, 0 not run, 25976 checks, 14.24 s
 All selected tests passed.
 ```
 
@@ -703,7 +821,7 @@ TEST(flat, my_new_case) {
 }
 ```
 
-**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 17 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
+**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 24 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
 
 ### Code coverage
 
@@ -719,7 +837,7 @@ Excluded from measurement, each marked in the source with a `GCOVR_EXCL` comment
 - **CPU-dependent branches** in `dispatch.cpp` (what happens on CPUs without AVX2 or AVX-512). They can only run on such CPUs; the emulated Nehalem and Haswell runs cover them.
 - **Untestable code:** the arena's `assert`, the 4-billion-vector limit, the visited-list pool's safety-net `catch` (unreachable since room is reserved in advance), a gcov artifact on a closing brace, and three purely defensive branches (unique entry lists, a never-empty result, self-links that cannot exist).
 
-The NEON kernel file is excluded on x86 because it compiles to nothing there. When the concurrency tests run, plain gcov counters race between threads and can move a branch count by one, which is why the branch figure can read 99% locally; the CI coverage job uses `-fprofile-update=atomic` for exact counts.
+The NEON kernel file is excluded on x86 because it compiles to nothing there. Likewise, the CI coverage job excludes any SIMD kernel its runner's CPU cannot execute (GitHub's Linux runners usually lack AVX-512); those kernels are still tested on any machine that supports them. When the concurrency tests run, plain gcov counters race between threads and can move a branch count by one, which is why the branch figure can read 99% locally; the CI coverage job uses `-fprofile-update=atomic` for exact counts.
 
 **Running it locally (Linux):**
 
@@ -734,19 +852,26 @@ gcovr -r . build-cov --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$P
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 9 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 16 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
-1/9 Test #1: comprehensive.layer1 .............   Passed
-2/9 Test #2: comprehensive.layer2 .............   Passed
-3/9 Test #3: comprehensive.helpers ............   Passed
-4/9 Test #4: comprehensive.flat ...............   Passed
-5/9 Test #5: comprehensive.hnsw ...............   Passed
-6/9 Test #6: comprehensive.robustness .........   Passed
-7/9 Test #7: comprehensive.deletion ...........   Passed
-8/9 Test #8: comprehensive.concurrency ........   Passed
-9/9 Test #9: comprehensive.e2e ................   Passed
-100% tests passed, 0 tests failed out of 9
+ 1/16 Test # 1: comprehensive.layer1 ................   Passed
+ 2/16 Test # 2: comprehensive.layer2 ................   Passed
+ 3/16 Test # 3: comprehensive.helpers ...............   Passed
+ 4/16 Test # 4: comprehensive.flat ..................   Passed
+ 5/16 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/16 Test # 6: comprehensive.robustness ............   Passed
+ 7/16 Test # 7: comprehensive.deletion ..............   Passed
+ 8/16 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/16 Test # 9: comprehensive.metadata ..............   Passed
+10/16 Test #10: comprehensive.filter ................   Passed
+11/16 Test #11: comprehensive.planner ...............   Passed
+12/16 Test #12: comprehensive.payload ...............   Passed
+13/16 Test #13: comprehensive.batch .................   Passed
+14/16 Test #14: comprehensive.range .................   Passed
+15/16 Test #15: comprehensive.search_e2e ............   Passed
+16/16 Test #16: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 16
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -782,6 +907,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 9. Huge finite values could make an inner product overflow to NaN (+∞ plus −∞), which breaks the ordering every heap and sort relies on. NaN distances now count as +∞, so such pairs sort last.
 10. **A visited list could be silently dropped.** Returning a borrowed list to the pool used `push_back`, which can allocate; a failure there was swallowed (as a destructor path must) and the list discarded. Room is now reserved when each list is created, so returning one never allocates. The out-of-memory harness also became strict: a failure that an operation swallows is now reported as a test failure.
 11. **A search could return nothing while live vectors existed** (found by the coverage audit). Links are one-directional, so after many removals without graph repair, the greedy descent could end on a removed node whose links lead only to other removed nodes; the search then found no live vector. Searches that find fewer than k results, and inserts that find no live neighbor, now retry with the entry point (always live) as an extra starting point. The insert retry replaces the old fallback of linking new vectors to removed nodes.
+12. **A failed HNSW insert could leave a new metadata field behind** (found by the search-feature tests). If memory ran out while linking a vector, after its metadata had been written, the failure handler cleared the row but kept any dynamic field or dictionary string that insert had created. It now undoes the metadata write completely.
 
 ## Continuous integration
 
@@ -857,6 +983,10 @@ These are deliberate for the current stage:
 - **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
+- **The payload index keeps counts, not posting lists.** It makes the planner's estimates exact, but exact filtered search still checks every vector's metadata (a fast column read) rather than reading only the matching ones.
+- **Filter-aware graph construction is not implemented.** Very selective filters go to exact search; between roughly 1% and 10% selectivity the planner's thresholds matter most, and may need tuning per dataset.
+- **HNSW range search is approximate**, like k-nearest search; use `Strategy::ForceExact` when every vector in the radius must be found.
+- **Custom predicates must be thread-safe** when used with batch search, and the planner can only estimate them by sampling.
 - **Exact duplicates cannot all stay reachable.** Each node has a fixed number of link slots, and once one copy of a point is linked, further copies add nothing, so some copies become unreachable (with 200 identical vectors, about 60% stay reachable). They no longer harm other vectors, but deduplicate data if every copy must be returned.
 - **Inner product is harder than L2 and cosine.** It is not a true distance, so recall is lower on un-normalized data (about 0.86 to 0.90 at `ef = 100` in tests, versus 0.997 or higher for L2 and cosine), and a small fraction of short vectors may become unreachable. This matches hnswlib. Use cosine, or normalize vectors, when possible.
 - **Very small `M` builds a sparse graph.** `M = 2` works but leaves about 10% of nodes unreachable in tests; use `M >= 8`.
@@ -875,6 +1005,8 @@ These are deliberate for the current stage:
 - [ ] Updating vectors: `update` and `upsert`
 - [ ] Saving and loading indexes
 - [ ] Concurrent inserts, including parallel HNSW construction (`add_batch`)
+- [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
+- [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe
 
 The next four core capabilities (real deletion, updating vectors, saving and loading, concurrent inserts) are planned in [docs/core-capabilities-plan.md](docs/core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](docs/core-capabilities-test-plan.md).

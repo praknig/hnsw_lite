@@ -56,6 +56,13 @@ struct Candidate {
     friend bool operator>(const Candidate& a, const Candidate& b) { return b < a; }
 };
 
+/// "No limit" for the number of results of a range search.
+inline constexpr std::size_t kNoLimit = std::numeric_limits<std::size_t>::max();
+
+/// Range search with L2 compares squared distances: converts an ordinary
+/// (Euclidean) radius into the squared radius search_range() expects.
+inline float l2_radius(float euclidean_radius) { return euclidean_radius * euclidean_radius; }
+
 /**
  * @brief What compact() did: how many vectors it kept and how many slots of
  *        removed vectors it reclaimed.
