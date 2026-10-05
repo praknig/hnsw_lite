@@ -114,7 +114,7 @@ public:
         heap_.clear();
         std::sort_heap(out.begin(), out.end());
         return out;
-    }
+    }  // GCOVR_EXCL_LINE: gcov counts this brace separately (return value optimization)
 
 private:
     std::size_t k_;

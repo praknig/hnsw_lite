@@ -129,8 +129,10 @@ private:
         try {
             std::lock_guard<std::mutex> lock(mutex_);
             idle_.push_back(std::move(list));
+            // GCOVR_EXCL_START: unreachable, capacity was reserved in acquire()
         } catch (...) {
         }
+        // GCOVR_EXCL_STOP
     }
 
     mutable std::mutex mutex_;

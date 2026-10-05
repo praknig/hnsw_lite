@@ -55,7 +55,7 @@ public:
     // All-or-nothing: if it throws, nothing changed.
     NodeId add(std::span<const float> v) {
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
-        if (count_ >= kEmpty) throw std::length_error("too many vectors");
+        if (count_ >= kEmpty) throw std::length_error("too many vectors");  // GCOVR_EXCL_BR_LINE: needs 4 billion vectors
         if ((count_ >> shelf_bits_) >= shelves_.size())  // row lies past the last shelf
             shelves_.emplace_back((mask_ + 1) * stride_ * sizeof(float));
         std::copy(v.begin(), v.end(), row(count_));  // padding stays zero

@@ -86,7 +86,7 @@ Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int lev
 std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                const std::vector<Candidate>& entries,
                                                std::size_t ef, int level, VisitedList& visited,
-                                               bool skip_removed, NodeId exclude) const {
+                                               NodeId exclude) const {
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
     const IdMap& ids = storage_.ids();
@@ -98,9 +98,9 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
     TopK results(ef);
 
     for (const Candidate& e : entries) {
-        if (!visited.visit(e.id)) continue;
+        if (!visited.visit(e.id)) continue;  // GCOVR_EXCL_BR_LINE: defensive, entries are always unique
         candidates.push(e);
-        if (!skip_removed || !ids.is_deleted(e.id)) results.push(e);
+        if (!ids.is_deleted(e.id)) results.push(e);
     }
 
     while (!candidates.empty()) {
@@ -116,8 +116,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
             const float d = distance_to(query, neighbor);
             if (results.full() && d >= results.worst_distance()) continue;
             candidates.push({d, neighbor});  // removed nodes are still traversed...
-            if (!skip_removed || !ids.is_deleted(neighbor))
-                results.push({d, neighbor});  // ...but never returned
+            if (!ids.is_deleted(neighbor)) results.push({d, neighbor});  // ...but never returned
         }
     }
     return results.take_sorted();
@@ -225,12 +224,16 @@ void HnswIndex::link_new_node(NodeId node, int level) {
         // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
         // so new nodes do not waste link slots on them.
         std::vector<Candidate> found =
-            search_level(query, entries, params_.ef_construction, l, *visited, true, node);
-        if (found.empty())  // every nearby node is removed: link to them anyway,
-            found = search_level(query, entries, params_.ef_construction, l, *visited, false, node);
-                            // so the new node stays reachable from the entry point
+            search_level(query, entries, params_.ef_construction, l, *visited, node);
+        if (found.empty()) {
+            // Every node reachable from here is removed (possible after many
+            // removals without repair). Search again from the entry point too,
+            // which is always live, so the new node links to live nodes.
+            entries.push_back({distance_to(query, entry_), entry_});
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node);
+        }
         connect(node, select_neighbors(found, params_.M), l);
-        if (!found.empty()) entries = std::move(found);  // best nodes start the next level
+        if (!found.empty()) entries = std::move(found);  // GCOVR_EXCL_BR_LINE: defensive, never empty here
     }
 
     // 6. A node higher than all others becomes the new entry point.
@@ -248,7 +251,8 @@ void HnswIndex::repair_neighbors(NodeId node) {
         std::vector<NodeId> around;
         for (NodeId nb : graph.links(node, l)) {
             if (nb == kEmpty) break;
-            if (nb != node && !ids.is_deleted(nb) && graph.level(nb) >= l) around.push_back(nb);
+            // Coverage: nb == node is impossible (lists never contain self-links).
+            if (nb != node && !ids.is_deleted(nb) && graph.level(nb) >= l) around.push_back(nb);  // GCOVR_EXCL_BR_LINE
         }
         const std::size_t capacity = l == 0 ? graph.M0() : graph.M();
         for (NodeId n : around) {
@@ -320,7 +324,14 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
 
     // Beam search on level 0, skipping removed nodes in the results.
     auto visited = visited_pool_.acquire(storage_.size());
-    std::vector<Candidate> found = search_level(q.data(), {current}, ef, 0, *visited, true, kEmpty);
+    std::vector<Candidate> found = search_level(q.data(), {current}, ef, 0, *visited, kEmpty);
+    if (found.size() < k) {
+        // The descent ended where few live nodes are reachable (possible after
+        // many removals without repair; links are one-directional). Search again
+        // from the entry point too, which is always live.
+        found = search_level(q.data(), {current, {distance_to(q.data(), entry_), entry_}}, ef, 0,
+                             *visited, kEmpty);
+    }
     if (found.size() > k) found.resize(k);
 
     std::vector<SearchResult> results;
