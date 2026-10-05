@@ -146,8 +146,19 @@ jobs:
       - name: Coverage report
         run: |
           mkdir -p coverage
+          # A SIMD kernel can only run on a CPU that supports it, so kernels this
+          # runner cannot execute are excluded (GitHub's runners usually lack
+          # AVX-512). They are still tested wherever the hardware supports them.
+          SKIP_KERNELS=""
+          for isa in avx512f avx2; do
+            if ! grep -qw "$isa" /proc/cpuinfo; then
+              file="src/distance_${isa%f}.cpp"
+              echo "This runner's CPU has no $isa: excluding $file from coverage"
+              SKIP_KERNELS="$SKIP_KERNELS --exclude $PWD/$file"
+            fi
+          done
           gcovr -r . build \
-            --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" \
+            --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" $SKIP_KERNELS \
             --exclude-unreachable-branches --exclude-throw-branches \
             --gcov-ignore-parse-errors=negative_hits.warn_once_per_file \
             --print-summary --html-details coverage/index.html \
