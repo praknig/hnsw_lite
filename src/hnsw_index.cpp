@@ -32,7 +32,7 @@ constexpr int kMaxLevel = 255;
 
 }  // namespace
 
-HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params)
+HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params, Schema schema)
     : metric_(metric),
       distance_(get_distance(metric)),
       params_(validated(params)),
@@ -40,7 +40,8 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params)
       storage_(dim, params.M),
       stride_(storage_.vectors().stride()),
       scratch_(dim),
-      rng_(params.seed) {}
+      rng_(params.seed),
+      metadata_(std::move(schema)) {}
 
 int HnswIndex::random_level() {
     // Uniform in [0, 1) from the top 53 bits. Done by hand instead of with
@@ -86,38 +87,45 @@ Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int lev
 std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                const std::vector<Candidate>& entries,
                                                std::size_t ef, int level, VisitedList& visited,
-                                               NodeId exclude) const {
+                                               NodeId exclude, const Eligibility& eligible,
+                                               SearchStats* stats) const {
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
-    const IdMap& ids = storage_.ids();
     const GraphStorage& graph = storage_.graph();
 
     // candidates: nodes to expand, closest on top (min-heap).
-    // results:    best `ef` nodes found, worst on top (TopK).
+    // results:    best `ef` eligible nodes found, worst on top (TopK).
     std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> candidates;
     TopK results(ef);
 
     for (const Candidate& e : entries) {
         if (!visited.visit(e.id)) continue;  // GCOVR_EXCL_BR_LINE: defensive, entries are always unique
         candidates.push(e);
-        if (!ids.is_deleted(e.id)) results.push(e);
+        if (eligible(e.id)) results.push(e);
     }
 
+    std::size_t expanded = 0, computed = 0;
     while (!candidates.empty()) {
         const Candidate current = candidates.top();
         // Nothing left can beat the current results: stop.
         if (results.full() && current.distance > results.worst_distance()) break;
         candidates.pop();
+        ++expanded;
 
         for (NodeId neighbor : graph.links(current.id, level)) {
             if (neighbor == kEmpty) break;
             if (graph.level(neighbor) < level) continue;  // stale link to a reused slot
             if (!visited.visit(neighbor)) continue;
             const float d = distance_to(query, neighbor);
+            ++computed;
             if (results.full() && d >= results.worst_distance()) continue;
-            candidates.push({d, neighbor});  // removed nodes are still traversed...
-            if (!ids.is_deleted(neighbor)) results.push({d, neighbor});  // ...but never returned
+            candidates.push({d, neighbor});                       // ineligible nodes are traversed...
+            if (eligible(neighbor)) results.push({d, neighbor});  // ...but never returned
         }
+    }
+    if (stats) {
+        stats->nodes_visited += expanded;
+        stats->distance_computations += computed;
     }
     return results.take_sorted();
 }
@@ -174,21 +182,29 @@ void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int l
     }
 }
 
-void HnswIndex::add(std::uint64_t id, std::span<const float> vector) {
+void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything (or drawing a random level).
     scratch_.prepare(vector, metric_);
+    metadata_.validate(metadata);
     if (storage_.ids().find(id)) throw std::invalid_argument("external id already exists");
     reserve_one_more(free_slots_);  // so a failed insert can always hand its slot back
 
-    // 2. Store the vector and its empty neighbor lists, reusing a free slot if any.
+    // 2. Metadata first (into the slot the vector will take), then the vector and
+    //    its empty neighbor lists, reusing a free slot if any. All-or-nothing.
+    const NodeId slot = free_slots_.empty() ? static_cast<NodeId>(storage_.size()) : free_slots_.back();
+    const auto undo = metadata_.write(slot, metadata);
     const int level = random_level();
     NodeId node;
-    if (!free_slots_.empty()) {
-        node = free_slots_.back();
-        storage_.insert_into(node, id, scratch_.values(), level);  // all-or-nothing
-        free_slots_.pop_back();
-    } else {
-        node = storage_.insert(id, scratch_.values(), level);  // all-or-nothing
+    try {
+        if (!free_slots_.empty()) {
+            node = storage_.insert_into(slot, id, scratch_.values(), level);
+            free_slots_.pop_back();
+        } else {
+            node = storage_.insert(id, scratch_.values(), level);
+        }
+    } catch (...) {
+        metadata_.undo_write(slot, undo);
+        throw;
     }
     ++live_;
 
@@ -203,8 +219,11 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector) {
         link_new_node(node, level);
     } catch (...) {
         // Out of memory while linking: the node may be half-linked. Remove it
-        // like any other vector: free its ID and put its slot back on the free list.
+        // like any other vector: free its ID and put its slot back on the free
+        // list. Undo the metadata write fully, including any field or string it
+        // created (linking never touches metadata, so this write is the latest).
         storage_.ids().release(id);
+        metadata_.undo_write(node, undo);
         --live_;
         free_slots_.push_back(node);  // cannot throw: capacity reserved in step 1
         throw;
@@ -224,13 +243,13 @@ void HnswIndex::link_new_node(NodeId node, int level) {
         // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
         // so new nodes do not waste link slots on them.
         std::vector<Candidate> found =
-            search_level(query, entries, params_.ef_construction, l, *visited, node);
+            search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
         if (found.empty()) {
             // Every node reachable from here is removed (possible after many
             // removals without repair). Search again from the entry point too,
             // which is always live, so the new node links to live nodes.
             entries.push_back({distance_to(query, entry_), entry_});
-            found = search_level(query, entries, params_.ef_construction, l, *visited, node);
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
         }
         connect(node, select_neighbors(found, params_.M), l);
         if (!found.empty()) entries = std::move(found);  // GCOVR_EXCL_BR_LINE: defensive, never empty here
@@ -302,6 +321,7 @@ bool HnswIndex::remove(std::uint64_t id) {
 
     // From here on nothing can throw.
     ids.release(id);
+    metadata_.clear(*node);
     --live_;
     free_slots_.push_back(*node);
     if (*node == entry_) choose_new_entry();
@@ -310,27 +330,99 @@ bool HnswIndex::remove(std::uint64_t id) {
 
 bool HnswIndex::contains(std::uint64_t id) const { return storage_.ids().find(id).has_value(); }
 
+bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
+    const auto node = storage_.ids().find(id);
+    if (!node) return false;
+    metadata_.update(*node, metadata);
+    return true;
+}
+
+std::optional<Metadata> HnswIndex::get_metadata(std::uint64_t id) const {
+    const auto node = storage_.ids().find(id);
+    if (!node) return std::nullopt;
+    return metadata_.read(*node);
+}
+
 std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k,
                                             std::size_t ef) const {
+    return search(query, k, ef, SearchOptions{});
+}
+
+Eligibility HnswIndex::eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const {
+    if (options.planner) validate(*options.planner);
+    if (options.filter && !options.filter->is_all()) holder.emplace(*options.filter, metadata_);
+    return Eligibility{&storage_.ids(), holder ? &*holder : nullptr,
+                       options.predicate ? &options.predicate : nullptr};
+}
+
+std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t ef,
+                                            const SearchOptions& options) const {
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
+    std::optional<CompiledFilter> compiled;
+    const Eligibility eligible = eligibility(options, compiled);
+    SearchStats stats;
+    auto results = search_impl(q.data(), k, ef, eligible, options.strategy,
+                               options.planner ? *options.planner : planner_, stats);
+    if (options.stats) *options.stats = stats;
+    return results;
+}
+
+std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, const Eligibility& eligible,
+                                             SearchStats& stats) const {
+    TopK top(k);
+    for (NodeId n = 0; n < storage_.size(); ++n) {
+        if (!eligible(n)) continue;
+        ++stats.distance_computations;
+        top.push({distance_to(query, n), n});
+    }
+    stats.nodes_visited += storage_.size();
+    return top.take_sorted();
+}
+
+std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t k, std::size_t ef,
+                                                 const Eligibility& eligible, Strategy strategy,
+                                                 const PlannerParams& params, SearchStats& stats) const {
     if (k == 0 || live_ == 0) return {};
     k = std::min(k, live_);                          // cannot return more than exists
     ef = std::min(std::max(ef, k), storage_.size());  // at least k, at most every node
 
-    // Greedy descent from the entry point to level 1.
-    Candidate current{distance_to(q.data(), entry_), entry_};
-    for (int l = max_level_; l > 0; --l) current = greedy_closest(q.data(), current, l, kEmpty);
+    // Plan: no filter means a plain graph search unless exact search is forced.
+    Strategy run = strategy == Strategy::ForceExact ? Strategy::ForceExact : Strategy::ForceGraph;
+    stats.reason = strategy == Strategy::Auto ? PlanReason::NoFilter : PlanReason::Forced;
+    if (eligible.filtered()) {
+        const std::optional<std::size_t> counted =
+            (eligible.filter && !eligible.predicate) ? eligible.filter->exact_count() : std::nullopt;
+        const PlanDecision d = plan_search(storage_.size(), live_, eligible, counted, ef, strategy, params);
+        run = d.strategy;
+        stats.reason = d.reason;
+        stats.selectivity = d.selectivity;
+        stats.estimated_matches = d.estimated_matches;
+        stats.exact_count = d.exact_count;
+        ef = std::max(ef, d.ef);
+    }
+    stats.strategy = run;
 
-    // Beam search on level 0, skipping removed nodes in the results.
-    auto visited = visited_pool_.acquire(storage_.size());
-    std::vector<Candidate> found = search_level(q.data(), {current}, ef, 0, *visited, kEmpty);
-    if (found.size() < k) {
-        // The descent ended where few live nodes are reachable (possible after
-        // many removals without repair; links are one-directional). Search again
-        // from the entry point too, which is always live.
-        found = search_level(q.data(), {current, {distance_to(q.data(), entry_), entry_}}, ef, 0,
-                             *visited, kEmpty);
+    std::vector<Candidate> found;
+    if (run == Strategy::ForceExact) {
+        found = exact_scan(query, k, eligible, stats);
+    } else {
+        stats.ef = ef;
+        // Greedy descent from the entry point to level 1.
+        Candidate current{distance_to(query, entry_), entry_};
+        for (int l = max_level_; l > 0; --l) current = greedy_closest(query, current, l, kEmpty);
+
+        // Beam search on level 0, returning only eligible nodes.
+        auto visited = visited_pool_.acquire(storage_.size());
+        found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats);
+        if (found.size() < k) {
+            // The descent ended where few eligible nodes are reachable (possible
+            // after many removals without repair, or with a selective filter; links
+            // are one-directional). Search again from the entry point too, which is
+            // always live.
+            found = search_level(query, {current, {distance_to(query, entry_), entry_}}, ef, 0,
+                                 *visited, kEmpty, eligible, &stats);
+        }
     }
     if (found.size() > k) found.resize(k);
 
@@ -340,21 +432,120 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
     return results;
 }
 
+std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const float> queries, std::size_t k,
+                                                               std::size_t ef, std::size_t threads,
+                                                               const SearchOptions& options) const {
+    const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
+    std::optional<CompiledFilter> compiled;
+    const Eligibility eligible = eligibility(options, compiled);
+    const PlannerParams& params = options.planner ? *options.planner : planner_;
+    std::vector<std::vector<SearchResult>> results(nq);
+    auto one = [&](std::size_t i) {
+        PreparedVector q(dim());
+        q.prepare(queries.subspan(i * dim(), dim()), metric_);
+        SearchStats stats;
+        results[i] = search_impl(q.data(), k, ef, eligible, options.strategy, params, stats);
+    };
+    if (threads == 1 || nq <= 1) {
+        for (std::size_t i = 0; i < nq; ++i) one(i);
+    } else {
+        pool_.get(threads)->parallel_for(nq, one);
+    }
+    return results;
+}
+
+std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, float radius,
+                                                  std::size_t max_results, const SearchOptions& options) const {
+    PreparedVector q(dim());
+    q.prepare(query, metric_);
+    if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
+    std::optional<CompiledFilter> compiled;
+    const Eligibility eligible = eligibility(options, compiled);
+    SearchStats stats;
+    std::vector<Candidate> hits;
+
+    if (max_results > 0 && live_ > 0) {
+        if (options.strategy == Strategy::ForceExact) {
+            stats.strategy = Strategy::ForceExact;
+            stats.reason = PlanReason::Forced;
+            for (NodeId n = 0; n < storage_.size(); ++n) {
+                if (!eligible(n)) continue;
+                ++stats.distance_computations;
+                const float d = distance_to(q.data(), n);
+                if (d <= radius) hits.push_back({d, n});
+            }
+            stats.nodes_visited = storage_.size();
+        } else {
+            stats.strategy = Strategy::ForceGraph;
+            stats.reason = options.strategy == Strategy::Auto ? PlanReason::Graph : PlanReason::Forced;
+            // 1. Seeds: the nearest live vectors, ignoring the filter (vectors that
+            //    fail it still connect the region).
+            const std::size_t seeds_ef = std::min<std::size_t>(storage_.size(), 64);
+            Candidate current{distance_to(q.data(), entry_), entry_};
+            for (int l = max_level_; l > 0; --l) current = greedy_closest(q.data(), current, l, kEmpty);
+            //    The entry point (always live) is always a starting point too: links
+            //    are one-directional, so after many removals the descent can end in
+            //    a region that reaches only some of the live vectors.
+            auto visited = visited_pool_.acquire(storage_.size());
+            std::vector<Candidate> starts{current};
+            if (current.id != entry_) starts.push_back({distance_to(q.data(), entry_), entry_});
+            std::vector<Candidate> seeds =
+                search_level(q.data(), starts, seeds_ef, 0, *visited, kEmpty, live_only(), &stats);
+
+            // 2. Grow the region: from every vector inside the radius, visit its
+            //    neighbors; vectors outside may be crossed for up to
+            //    `range_expand_outside` hops to reach more of the region.
+            visited->reset(storage_.size());
+            std::vector<std::pair<NodeId, std::size_t>> queue;  // (node, hops outside the radius)
+            auto consider = [&](NodeId n, float d, std::size_t parent_hops) {
+                const bool inside = d <= radius;
+                if (inside && eligible(n)) hits.push_back({d, n});
+                const std::size_t hops = inside ? 0 : parent_hops + 1;
+                if (hops <= options.range_expand_outside) queue.push_back({n, hops});
+            };
+            for (const Candidate& s : seeds)
+                if (visited->visit(s.id)) consider(s.id, s.distance, 0);  // GCOVR_EXCL_BR_LINE: seeds are unique
+            const GraphStorage& graph = storage_.graph();
+            for (std::size_t head = 0; head < queue.size(); ++head) {
+                const auto [node, hops] = queue[head];
+                ++stats.nodes_visited;
+                for (NodeId nb : graph.links(node, 0)) {
+                    if (nb == kEmpty) break;
+                    if (!visited->visit(nb)) continue;
+                    ++stats.distance_computations;
+                    consider(nb, distance_to(q.data(), nb), hops);
+                }
+            }
+        }
+        std::sort(hits.begin(), hits.end());
+        if (hits.size() > max_results) hits.resize(max_results);
+    }
+    if (options.stats) *options.stats = stats;
+    std::vector<SearchResult> results;
+    results.reserve(hits.size());
+    for (const Candidate& c : hits) results.push_back({storage_.ids().external(c.id), c.distance});
+    return results;
+}
+
 CompactStats HnswIndex::compact() {
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
-    HnswIndex fresh(dim(), metric_, params_);
+    HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());
+    for (const std::string& field : metadata_.indexed_fields()) fresh.metadata_.index_field(field);
+    fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
     for (NodeId n = 0; n < storage_.size(); ++n)
-        if (!ids.is_deleted(n)) fresh.add(ids.external(n), storage_.vectors().get(n));
+        if (!ids.is_deleted(n)) fresh.add(ids.external(n), storage_.vectors().get(n), metadata_.read(n));
 
     // Commit: moves only, nothing can throw.
     storage_ = std::move(fresh.storage_);
+    metadata_ = std::move(fresh.metadata_);
     rng_ = fresh.rng_;
     entry_ = fresh.entry_;
     max_level_ = fresh.max_level_;
     live_ = fresh.live_;
     free_slots_ = std::move(fresh.free_slots_);
+    visited_pool_.clear();  // pooled lists were sized for the old, larger index
     return {live_, reclaimed};
 }
 

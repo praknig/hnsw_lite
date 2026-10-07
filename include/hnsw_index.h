@@ -10,9 +10,12 @@
 #include <vector>
 
 #include "distance.h"
+#include "filter.h"
+#include "metadata.h"
 #include "prepared_vector.h"
 #include "search_result.h"
 #include "storage.h"
+#include "thread_pool.h"
 #include "visited_list.h"
 
 namespace vecdb {
@@ -69,6 +72,16 @@ struct HnswParams {
  *    point (always live) as an extra starting point.
  *  - compact() rebuilds a dense index from the live vectors.
  *
+ * Metadata and filters:
+ *  - Each vector can carry metadata (MetadataStore); it follows the vector's
+ *    slot through reuse, removal and compact().
+ *  - A filtered search asks the query planner (plan_search) whether to scan the
+ *    matching vectors exactly or search the graph. A graph search treats
+ *    vectors failing the filter like removed ones: traveled through, never
+ *    returned. With no filter, eligibility is exactly "not removed".
+ *  - search_batch() runs queries on a thread pool; search_range() grows a
+ *    region from the nearest vectors outward through graph links.
+ *
  * Layers used:
  *  - Layer 1: Storage (VectorStore + GraphStorage + IdMap kept in sync).
  *  - Layer 2: the DistanceFn for `metric`, looked up once in the constructor.
@@ -79,14 +92,15 @@ struct HnswParams {
  */
 class HnswIndex {
 public:
-    /// Creates an empty index. Throws std::invalid_argument on invalid params.
-    HnswIndex(std::size_t dim, Metric metric, HnswParams params = {});
+    /// Creates an empty index. `schema` defines the metadata fields (dynamic by
+    /// default). Throws std::invalid_argument on invalid params.
+    HnswIndex(std::size_t dim, Metric metric, HnswParams params = {}, Schema schema = Schema::dynamic());
 
-    /// Inserts a vector under the user's `id`.
-    /// Throws std::invalid_argument on a wrong dimension, NaN or infinity, or an
-    /// ID that is currently stored; the index is then unchanged. If memory runs
+    /// Inserts a vector, with optional metadata, under the user's `id`.
+    /// Throws std::invalid_argument on a wrong dimension, NaN or infinity, an
+    /// ID that is currently stored, or invalid metadata; the index is then unchanged. If memory runs
     /// out (std::bad_alloc), the index stays consistent and `id` is not stored.
-    void add(std::uint64_t id, std::span<const float> vector);
+    void add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata = {});
 
     /// Deletes `id` for real: repairs the graph around it (if enabled), frees
     /// the ID for reuse and puts its slot on the free list. Returns false if the
@@ -104,6 +118,49 @@ public:
     /// contains NaN or infinity.
     std::vector<SearchResult> search(std::span<const float> query, std::size_t k,
                                      std::size_t ef = 64) const;
+
+    /// Same, with a filter, predicate, strategy and statistics (see SearchOptions).
+    /// With a filter or predicate, the planner chooses exact or graph search.
+    std::vector<SearchResult> search(std::span<const float> query, std::size_t k, std::size_t ef,
+                                     const SearchOptions& options) const;
+
+    /// Searches many queries at once (`dim` floats each, back to back), on
+    /// `threads` threads (0 = one per hardware thread). Results are identical to
+    /// separate search() calls. Every query is validated before any work.
+    std::vector<std::vector<SearchResult>> search_batch(std::span<const float> queries, std::size_t k,
+                                                        std::size_t ef = 64, std::size_t threads = 0,
+                                                        const SearchOptions& options = {}) const;
+
+    /// Approximate: every eligible vector with distance <= `radius` (for L2, a
+    /// squared distance: see l2_radius()), closest first, at most `max_results`.
+    /// Grows a region from the nearest vectors through graph links; see
+    /// SearchOptions::range_expand_outside. Strategy::ForceExact scans instead.
+    /// Throws std::invalid_argument for a NaN radius.
+    std::vector<SearchResult> search_range(std::span<const float> query, float radius,
+                                           std::size_t max_results = kNoLimit,
+                                           const SearchOptions& options = {}) const;
+
+    /// Replaces the given metadata fields of `id` (unset() clears one). Returns
+    /// false if `id` is not stored. Throws std::invalid_argument on invalid
+    /// metadata. All-or-nothing; the vector and graph are untouched.
+    bool set_metadata(std::uint64_t id, const Metadata& metadata);
+
+    /// The metadata of `id`, or nothing if `id` is not stored.
+    std::optional<Metadata> get_metadata(std::uint64_t id) const;
+
+    /// Keeps exact value counts for a keyword, boolean or tag-set field, so the
+    /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
+    void create_payload_index(std::string_view field) { metadata_.index_field(field); }
+
+    /// The index's planner settings (per-query settings in SearchOptions override them).
+    void set_planner_params(const PlannerParams& p) {
+        validate(p);
+        planner_ = p;
+    }
+    const PlannerParams& planner_params() const { return planner_; }
+    const MetadataStore& metadata() const { return metadata_; }
+    /// Visited lists kept for reuse by searches (released by compact()).
+    std::size_t pooled_visited_lists() const { return visited_pool_.idle_count(); }
 
     /// Rebuilds the index from the live vectors only, with dense internal
     /// numbers and no free slots. User IDs are kept. The new index is built
@@ -146,12 +203,29 @@ private:
     /// closer. Never steps onto `exclude` or onto a node below `level`.
     Candidate greedy_closest(const float* query, Candidate start, int level, NodeId exclude) const;
 
-    /// Beam search on one level. Returns up to `ef` closest live nodes, closest
-    /// first. Removed nodes are traversed but never returned. `exclude` (a node
-    /// being inserted) is never visited.
+    /// Beam search on one level. Returns up to `ef` closest eligible nodes,
+    /// closest first. Ineligible nodes (removed, or failing the filter) are
+    /// traversed but never returned. `exclude` (a node being inserted) is never
+    /// visited. Counts work in `stats` if given.
     std::vector<Candidate> search_level(const float* query, const std::vector<Candidate>& entries,
                                         std::size_t ef, int level, VisitedList& visited,
-                                        NodeId exclude) const;
+                                        NodeId exclude, const Eligibility& eligible,
+                                        SearchStats* stats = nullptr) const;
+
+    /// Eligibility with no filter: "not removed".
+    Eligibility live_only() const { return Eligibility{&storage_.ids()}; }
+
+    /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
+    Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;
+
+    /// The search itself for one prepared query: plans, then runs exact or graph search.
+    std::vector<SearchResult> search_impl(const float* query, std::size_t k, std::size_t ef,
+                                          const Eligibility& eligible, Strategy strategy,
+                                          const PlannerParams& params, SearchStats& stats) const;
+
+    /// Exact top-k over every eligible node.
+    std::vector<Candidate> exact_scan(const float* query, std::size_t k, const Eligibility& eligible,
+                                      SearchStats& stats) const;
 
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
     /// is closer to the base node than to every already-kept neighbor and is not
@@ -187,7 +261,10 @@ private:
     int max_level_ = -1;
     std::size_t live_ = 0;
     std::vector<NodeId> free_slots_;  // slots of removed vectors, reused last in first out
+    MetadataStore metadata_;
+    PlannerParams planner_;
     mutable VisitedListPool visited_pool_;
+    mutable SharedPool pool_;
 };
 
 }  // namespace vecdb

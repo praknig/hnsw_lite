@@ -13,7 +13,7 @@ option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux
 file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
         src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
-        src/flat_index.cpp src/hnsw_index.cpp                            # Layer 3
+        src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp      # Layer 3
         ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 
@@ -56,7 +56,8 @@ find_package(Threads REQUIRED)
 add_executable(test_comprehensive tests/test_comprehensive.cpp)
 target_link_libraries(test_comprehensive PRIVATE hnsw_lite Threads::Threads)
 hnsw_lite_setup(test_comprehensive)
-foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency e2e)
+foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
+        metadata filter planner payload batch range search_e2e stress e2e)
   add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
 endforeach()
 

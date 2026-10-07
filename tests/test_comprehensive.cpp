@@ -16,7 +16,8 @@
  *   test_comprehensive --fail-fast          stop at the first failing test
  *   test_comprehensive --help               show this help
  *
- * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency, e2e
+ * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
+ *         metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -54,6 +55,7 @@
 #include "flat_index.h"
 #include "hnsw_index.h"
 #include "storage.h"
+#include "thread_pool.h"
 
 using namespace vecdb;
 
@@ -3717,6 +3719,2147 @@ TEST(concurrency, mixed_indexes_and_ef) {
 }
 
 // ===========================================================================
+// Search features: shared helpers
+// ===========================================================================
+
+namespace {
+
+const char* const kCategories[] = {"news", "sports", "tech", "music", "food"};
+
+/// The five-field schema used by most search-feature tests.
+std::vector<FieldSpec> search_fields() {
+    return {{"category", FieldType::Keyword}, {"year", FieldType::Int}, {"price", FieldType::Float},
+            {"in_stock", FieldType::Bool}, {"tags", FieldType::Tags}};
+}
+
+/// Deterministic metadata for vector `id`; every 11th vector has only a category.
+Metadata meta_for(std::uint64_t id) {
+    if (id % 11 == 0) return Metadata().set("category", kCategories[id % 5]);
+    std::vector<std::string> tags;
+    if (id % 2) tags.push_back("a");
+    if (id % 3 == 0) tags.push_back("b");
+    if (id % 7 == 0) tags.push_back("c");
+    return Metadata()
+        .set("category", kCategories[id % 5])
+        .set("year", std::int64_t(2000 + id % 25))
+        .set("price", double(id % 100) * 1.5)
+        .set("in_stock", id % 3 == 0)
+        .set_tags("tags", tags);
+}
+
+/// Independent reference for the filter rules (missing field: comparisons are
+/// false; ! negates; has_all_tags with no tags is true when the field exists).
+bool ref_eval(const Filter::Node& n, const Metadata& md) {
+    using K = Filter::Node::Kind;
+    switch (n.kind) {
+        case K::All: return true;
+        case K::And: return ref_eval(*n.children[0], md) && ref_eval(*n.children[1], md);
+        case K::Or: return ref_eval(*n.children[0], md) || ref_eval(*n.children[1], md);
+        case K::Not: return !ref_eval(*n.children[0], md);
+        default: break;
+    }
+    const auto v = md.get(n.field);
+    if (!v) return false;
+    auto num = [](const Value& x) { return x.type == FieldType::Int ? double(x.i) : x.f; };
+    auto equal = [&](const Value& x, const Value& lit) {
+        if (x.type == FieldType::Int || x.type == FieldType::Float) return num(x) == num(lit);
+        if (x.type == FieldType::Keyword) return x.s == lit.s;
+        return x.b == lit.b;
+    };
+    auto has = [&](const std::string& t) { return std::find(v->tags.begin(), v->tags.end(), t) != v->tags.end(); };
+    switch (n.kind) {
+        case K::Exists: return true;
+        case K::Compare:
+            switch (n.op) {
+                case CompareOp::Eq: return equal(*v, n.a);
+                case CompareOp::Ne: return !equal(*v, n.a);
+                case CompareOp::Lt: return num(*v) < num(n.a);
+                case CompareOp::Le: return num(*v) <= num(n.a);
+                case CompareOp::Gt: return num(*v) > num(n.a);
+                default: return num(*v) >= num(n.a);
+            }
+        case K::Between: return num(*v) >= num(n.a) && num(*v) <= num(n.b);
+        case K::In:
+            for (const Value& x : n.values)
+                if (equal(*v, x)) return true;
+            return false;
+        case K::HasTag: return has(n.tags[0]);
+        case K::HasAnyTag:
+            for (const auto& t : n.tags)
+                if (has(t)) return true;
+            return false;
+        case K::HasAllTags:
+            for (const auto& t : n.tags)
+                if (!has(t)) return false;
+            return true;
+        default: return false;
+    }
+}
+
+/// A random, valid filter over the five search fields, up to `depth` levels deep.
+Filter random_filter(std::mt19937& rng, int depth) {
+    const auto pick = static_cast<unsigned>(rng() % (depth > 0 ? 12 : 9));
+    const int year = 2000 + int(rng() % 25);
+    switch (pick) {
+        case 0: return Filter::eq("category", kCategories[rng() % 5]);
+        case 1: return Filter::ne("category", kCategories[rng() % 5]);
+        case 2: return Filter::ge("year", year);
+        case 3: return Filter::lt("price", double(rng() % 150));
+        case 4: return Filter::between("year", year, year + int(rng() % 10));
+        case 5: return Filter::eq("in_stock", rng() % 2 == 0);
+        case 6: return Filter::has_tag("tags", rng() % 2 ? "a" : "c");
+        case 7: return Filter::in("category", {kCategories[rng() % 5], kCategories[rng() % 5]});
+        case 8: return Filter::exists("year");
+        case 9: return random_filter(rng, depth - 1) && random_filter(rng, depth - 1);
+        case 10: return random_filter(rng, depth - 1) || random_filter(rng, depth - 1);
+        default: return !random_filter(rng, depth - 1);
+    }
+}
+
+/// Search options with just a filter.
+SearchOptions with_filter(Filter f, Strategy s = Strategy::Auto) {
+    SearchOptions o;
+    o.filter = std::move(f);
+    o.strategy = s;
+    return o;
+}
+
+/// Flattens queries into one buffer for batch search.
+std::vector<float> flatten(const Vectors& queries) {
+    std::vector<float> out;
+    for (const auto& q : queries) out.insert(out.end(), q.begin(), q.end());
+    return out;
+}
+
+/// Recall of filtered HNSW results against filtered Flat results.
+double filtered_recall(const HnswIndex& h, const FlatIndex& f, const Vectors& queries, std::size_t k,
+                       std::size_t ef, const SearchOptions& options) {
+    double total = 0.0;
+    std::size_t counted = 0;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : f.search(q, k, options)) truth.insert(r.id);
+        if (truth.empty()) continue;
+        std::size_t hits = 0;
+        for (const auto& r : h.search(q, k, ef, options)) hits += truth.count(r.id);
+        total += double(hits) / double(truth.size());
+        ++counted;
+    }
+    return counted ? total / double(counted) : 1.0;
+}
+
+/// A shared HNSW + Flat pair with metadata (3000 x 16), plus a "bucket" field
+/// (id % 100) for filters of known selectivity. Built once, then reused.
+struct MetaFixture {
+    Vectors data, queries;
+    std::unique_ptr<HnswIndex> hnsw;
+    std::unique_ptr<FlatIndex> flat;
+};
+const MetaFixture& meta_fixture() {
+    static std::unique_ptr<MetaFixture> fx;
+    if (!fx) {
+        fx = std::make_unique<MetaFixture>();
+        fx->data = clustered(3000, 16, 12, 301);
+        fx->queries = clustered(40, 16, 12, 302);
+        auto fields = search_fields();
+        fields.push_back({"bucket", FieldType::Int});
+        fx->hnsw = std::make_unique<HnswIndex>(16, Metric::L2, HnswParams{}, Schema::strict(fields));
+        fx->flat = std::make_unique<FlatIndex>(16, Metric::L2, Schema::strict(fields));
+        for (std::size_t i = 0; i < fx->data.size(); ++i) {
+            Metadata md = meta_for(i).set("bucket", std::int64_t(i % 100));
+            fx->hnsw->add(i, fx->data[i], md);
+            fx->flat->add(i, fx->data[i], md);
+        }
+    }
+    return *fx;
+}
+
+}  // namespace
+
+// ===========================================================================
+// Metadata (MD1-MD52)
+// ===========================================================================
+
+TEST(metadata, md01_all_types_roundtrip) {
+    FlatIndex f(2, Metric::L2, Schema::strict(search_fields()));
+    Metadata md = Metadata().set("category", "news").set("year", 2024).set("price", 9.5)
+                      .set("in_stock", true).set_tags("tags", {"ai", "chips"});
+    f.add(1, std::vector<float>{0, 0}, md);
+    auto got = f.get_metadata(1);
+    REQUIRE(got.has_value());
+    CHECK(*got == md);
+}
+
+TEST(metadata, md02_missing_fields_have_no_value) {
+    HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    h.add(1, std::vector<float>{0, 0}, Metadata().set("year", 1999));
+    auto got = h.get_metadata(1);
+    REQUIRE(got.has_value());
+    CHECK(got->size() == 1 && got->get("year")->i == 1999 && !got->get("category").has_value());
+}
+
+TEST(metadata, md03_strict_unknown_field_rejected) {
+    FlatIndex f(2, Metric::L2, Schema::strict(search_fields()));
+    HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(1, std::vector<float>{0, 0}, Metadata().set("colour", "red")));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, std::vector<float>{0, 0}, Metadata().set("colour", "red")));
+    CHECK(f.size() == 0 && h.size() == 0 && h.capacity() == 0 && !f.contains(1) && !h.contains(1));
+}
+
+TEST(metadata, md04_wrong_type_rejected) {
+    HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    std::vector<float> v{0, 0};
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, v, Metadata().set("year", "2024")));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, v, Metadata().set("tags", 5)));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, v, Metadata().set("in_stock", 1)));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, v, Metadata().set("category", true)));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, v, Metadata().set("year", 1.5)));
+    CHECK(h.size() == 0);
+    h.add(1, v, Metadata().set("price", 10));  // an integer is accepted for a float field
+    auto p = h.get_metadata(1)->get("price");
+    CHECK(p->type == FieldType::Float && p->f == 10.0);
+}
+
+TEST(metadata, md05_invalid_schemas_rejected) {
+    CHECK_THROWS_AS(std::invalid_argument, Schema::strict({{"a", FieldType::Int}, {"a", FieldType::Float}}));
+    CHECK_THROWS_AS(std::invalid_argument, Schema::strict({{"", FieldType::Int}}));
+    CHECK_THROWS_AS(std::invalid_argument, Schema::dynamic({{"x", FieldType::Bool}, {"x", FieldType::Bool}}));
+}
+
+TEST(metadata, md06_empty_strict_schema) {
+    FlatIndex f(2, Metric::L2, Schema::strict({}));
+    CHECK_NOTHROW(f.add(1, std::vector<float>{0, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(2, std::vector<float>{0, 0}, Metadata().set("a", 1)));
+    CHECK(f.size() == 1 && f.get_metadata(1)->empty());
+}
+
+TEST(metadata, md10_dynamic_field_created_on_first_use) {
+    FlatIndex f(2, Metric::L2);
+    CHECK(f.metadata().field_count() == 0);
+    f.add(1, std::vector<float>{0, 0}, Metadata().set("colour", "red"));
+    auto field = f.metadata().find_field("colour");
+    REQUIRE(field.has_value());
+    CHECK(f.metadata().field_type(*field) == FieldType::Keyword);
+}
+
+TEST(metadata, md11_dynamic_type_is_fixed) {
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{0, 0}, Metadata().set("colour", "red"));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(2, std::vector<float>{1, 1}, Metadata().set("colour", 5)));
+    CHECK(h.size() == 1 && !h.contains(2));
+}
+
+TEST(metadata, md12_partial_schema_plus_dynamic) {
+    FlatIndex f(2, Metric::L2, Schema::dynamic({{"year", FieldType::Int}}));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(1, std::vector<float>{0, 0}, Metadata().set("year", "x")));
+    CHECK_NOTHROW(f.add(1, std::vector<float>{0, 0}, Metadata().set("year", 2020).set("note", "hi")));
+    CHECK(f.metadata().field_count() == 2);
+}
+
+TEST(metadata, md13_failed_insert_creates_no_field) {
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{0, 0});
+    CHECK_THROWS_AS(std::invalid_argument, h.add(1, std::vector<float>{1, 1}, Metadata().set("zzz", 1)));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(2, std::vector<float>{kNaN, 1}, Metadata().set("yyy", 1)));
+    CHECK(!h.metadata().find_field("zzz").has_value() && !h.metadata().find_field("yyy").has_value());
+    CHECK(h.metadata().field_count() == 0);
+}
+
+TEST(metadata, md14_unused_fields_cost_nothing) {
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) f.add(i, std::vector<float>{float(i), 0});
+    CHECK(f.metadata().field_count() == 0 && f.metadata().dictionary_size() == 0);
+    f.add(5000, std::vector<float>{0, 0}, Metadata().set("late", 1));
+    CHECK(f.metadata().field_count() == 1);
+}
+
+TEST(metadata, md20_integer_extremes) {
+    FlatIndex f(1, Metric::L2);
+    const std::int64_t lo = std::numeric_limits<std::int64_t>::min(), hi = std::numeric_limits<std::int64_t>::max();
+    f.add(1, std::vector<float>{0}, Metadata().set("n", lo));
+    f.add(2, std::vector<float>{1}, Metadata().set("n", hi));
+    f.add(3, std::vector<float>{2}, Metadata().set("n", std::int64_t(0)));
+    f.add(4, std::vector<float>{3}, Metadata().set("n", std::int64_t(-7)));
+    CHECK(f.get_metadata(1)->get("n")->i == lo && f.get_metadata(2)->get("n")->i == hi);
+    CHECK(f.get_metadata(3)->get("n")->i == 0 && f.get_metadata(4)->get("n")->i == -7);
+}
+
+TEST(metadata, md21_float_nan_and_infinity_rejected) {
+    HnswIndex h(1, Metric::L2);
+    h.add(1, std::vector<float>{0}, Metadata().set("price", 1.0));
+    for (double bad : {double(kNaN), double(kInf), -double(kInf)}) {
+        CHECK_THROWS_AS(std::invalid_argument, h.add(2, std::vector<float>{1}, Metadata().set("price", bad)));
+        CHECK_THROWS_AS(std::invalid_argument, h.set_metadata(1, Metadata().set("price", bad)));
+    }
+    CHECK(h.size() == 1 && h.get_metadata(1)->get("price")->f == 1.0);
+}
+
+TEST(metadata, md22_strings) {
+    FlatIndex f(1, Metric::L2);
+    const std::string big(1 << 20, 'x'), utf8 = "na\xc3\xafve \xe2\x98\x95";
+    f.add(1, std::vector<float>{0}, Metadata().set("s", ""));
+    f.add(2, std::vector<float>{1}, Metadata().set("s", big));
+    f.add(3, std::vector<float>{2}, Metadata().set("s", utf8));
+    f.add(4, std::vector<float>{3}, Metadata().set("s", "News"));
+    f.add(5, std::vector<float>{4}, Metadata().set("s", "news"));
+    CHECK(f.get_metadata(1)->get("s")->s.empty() && f.get_metadata(2)->get("s")->s == big);
+    CHECK(f.get_metadata(3)->get("s")->s == utf8);
+    auto r = f.search(std::vector<float>{3}, 5, with_filter(Filter::eq("s", "news")));
+    CHECK(r.size() == 1 && r[0].id == 5);  // case-sensitive
+}
+
+TEST(metadata, md23_tag_sets) {
+    FlatIndex f(1, Metric::L2);
+    std::vector<std::string> many;
+    for (int i = 0; i < 1000; ++i) many.push_back("t" + std::to_string(i));
+    f.add(1, std::vector<float>{0}, Metadata().set_tags("tags", {}));
+    f.add(2, std::vector<float>{1}, Metadata().set_tags("tags", {"x", "y", "x", "x"}));
+    f.add(3, std::vector<float>{2}, Metadata().set_tags("tags", many));
+    CHECK(f.get_metadata(1)->get("tags")->tags.empty());
+    CHECK(f.get_metadata(2)->get("tags")->tags.size() == 2);  // repeats collapse
+    CHECK(f.get_metadata(3)->get("tags")->tags.size() == 1000);
+    CHECK(f.search(std::vector<float>{0}, 5, with_filter(Filter::exists("tags"))).size() == 3);
+    CHECK(f.search(std::vector<float>{0}, 5, with_filter(Filter::has_any_tag("tags", {"x", "t999"}))).size() == 2);
+}
+
+TEST(metadata, md24_booleans) {
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("b", true));
+    f.add(2, std::vector<float>{1}, Metadata().set("b", false));
+    CHECK(f.get_metadata(1)->get("b")->b && !f.get_metadata(2)->get("b")->b);
+    auto r = f.search(std::vector<float>{0}, 5, with_filter(Filter::eq("b", false)));
+    CHECK(r.size() == 1 && r[0].id == 2);
+}
+
+TEST(metadata, md25_strings_stored_once) {
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("category", kCategories[i % 5]));
+    CHECK(f.metadata().dictionary_size() == 5);
+}
+
+TEST(metadata, md30_set_metadata_changes_only_given_fields) {
+    auto data = clustered(300, 8, 4, 303);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    const Results before = h.search(data[3], 10);
+    CHECK(h.set_metadata(1, Metadata().set("category", "food").set("year", 1990)));
+    auto md = *h.get_metadata(1);
+    CHECK(md.get("category")->s == "food" && md.get("year")->i == 1990);
+    CHECK(md.get("tags") == meta_for(1).get("tags"));  // untouched
+    CHECK(same_results(h.search(data[3], 10), before));  // vector and graph untouched
+}
+
+TEST(metadata, md31_unset_clears_a_field) {
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("a", 1).set("b", 2));
+    CHECK(f.set_metadata(1, Metadata().unset("a")));
+    auto md = *f.get_metadata(1);
+    CHECK(!md.get("a").has_value() && md.get("b")->i == 2);
+}
+
+TEST(metadata, md32_set_metadata_unknown_or_removed) {
+    HnswIndex h(1, Metric::L2);
+    h.add(1, std::vector<float>{0});
+    h.remove(1);
+    CHECK(!h.set_metadata(1, Metadata().set("a", 1)));
+    CHECK(!h.set_metadata(99, Metadata().set("a", 1)));
+}
+
+TEST(metadata, md33_set_metadata_invalid_unchanged) {
+    FlatIndex f(1, Metric::L2, Schema::strict({{"a", FieldType::Int}}));
+    f.add(1, std::vector<float>{0}, Metadata().set("a", 5));
+    CHECK_THROWS_AS(std::invalid_argument, f.set_metadata(1, Metadata().set("a", "x")));
+    CHECK_THROWS_AS(std::invalid_argument, f.set_metadata(1, Metadata().set("zz", 1)));
+    CHECK(f.get_metadata(1)->get("a")->i == 5);
+}
+
+TEST(metadata, md34_get_metadata_unknown_or_removed) {
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("a", 1));
+    f.remove(1);
+    CHECK(!f.get_metadata(1).has_value() && !f.get_metadata(42).has_value());
+}
+
+TEST(metadata, md40_flat_swap_moves_metadata) {
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 5; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("n", std::int64_t(i * 10)));
+    f.remove(1);  // vector 4 moves into slot 1
+    for (std::uint64_t i : std::initializer_list<std::uint64_t>{0, 2, 3, 4}) CHECK(f.get_metadata(i)->get("n")->i == std::int64_t(i * 10));
+    auto r = f.search(std::vector<float>{4}, 5, with_filter(Filter::eq("n", 40)));
+    CHECK(r.size() == 1 && r[0].id == 4);
+}
+
+TEST(metadata, md41_reused_slot_does_not_inherit) {
+    HnswIndex h(1, Metric::L2);
+    h.add(1, std::vector<float>{0}, Metadata().set("secret", "yes"));
+    h.add(2, std::vector<float>{5});
+    h.remove(1);
+    h.add(3, std::vector<float>{1});  // reuses slot 0
+    CHECK(*h.storage().ids().find(3) == 0);
+    CHECK(h.get_metadata(3)->empty());
+    CHECK(h.search(std::vector<float>{0}, 5, 64, with_filter(Filter::exists("secret"))).empty());
+}
+
+TEST(metadata, md42_reuse_with_partial_metadata) {
+    HnswIndex h(1, Metric::L2);
+    h.add(1, std::vector<float>{0}, Metadata().set("a", 1).set("b", 2));
+    h.add(2, std::vector<float>{5});
+    h.remove(1);
+    h.add(3, std::vector<float>{1}, Metadata().set("b", 9));
+    auto md = *h.get_metadata(3);
+    CHECK(md.size() == 1 && md.get("b")->i == 9);
+}
+
+TEST(metadata, md43_compact_keeps_metadata) {
+    auto data = clustered(200, 8, 4, 304);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 200; i += 3) h.remove(i);
+    h.compact();
+    bool same = true;
+    for (std::uint64_t i = 0; i < 200; ++i)
+        same = same && (i % 3 == 0 ? !h.get_metadata(i).has_value() : *h.get_metadata(i) == meta_for(i));
+    CHECK(same);
+    CHECK(h.metadata().mode() == SchemaMode::Strict);
+}
+
+TEST(metadata, md44_churn_against_reference) {
+    for (int which = 0; which < 2; ++which) {
+        std::unique_ptr<HnswIndex> h;
+        std::unique_ptr<FlatIndex> f;
+        if (which == 0) h = std::make_unique<HnswIndex>(4, Metric::L2);
+        else f = std::make_unique<FlatIndex>(4, Metric::L2);
+        auto pool = random_vectors(1500, 4, 305);
+        std::map<std::uint64_t, Metadata> ref;
+        std::vector<std::uint64_t> live;
+        std::mt19937 rng(306);
+        std::size_t next = 0;
+        bool ok = true;
+        for (int step = 0; step < 3000 && next < pool.size(); ++step) {
+            const unsigned op = static_cast<unsigned>(rng() % 4);
+            if (op < 2 || live.empty()) {
+                Metadata md = meta_for(next);
+                h ? h->add(next, pool[next], md) : f->add(next, pool[next], md);
+                ref[next] = md;
+                live.push_back(next++);
+            } else if (op == 2) {
+                const std::size_t pos = rng() % live.size();
+                h ? h->remove(live[pos]) : f->remove(live[pos]);
+                ref.erase(live[pos]);
+                live[pos] = live.back();
+                live.pop_back();
+            } else {
+                const std::uint64_t id = live[rng() % live.size()];
+                Metadata change = Metadata().set("year", std::int64_t(rng() % 3000));
+                h ? h->set_metadata(id, change) : f->set_metadata(id, change);
+                ref[id].set("year", *change.get("year"));
+            }
+            if (step % 25 == 0)
+                for (const auto& [id, md] : ref) ok = ok && *(h ? h->get_metadata(id) : f->get_metadata(id)) == md;
+        }
+        for (const auto& [id, md] : ref) ok = ok && *(h ? h->get_metadata(id) : f->get_metadata(id)) == md;
+        CHECK(ok);
+    }
+}
+
+TEST(metadata, md45_removed_vector_never_matches) {
+    FlatIndex f(1, Metric::L2);
+    HnswIndex h(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        f.add(i, std::vector<float>{float(i)}, Metadata().set("k", i == 5 ? "only" : "other"));
+        h.add(i, std::vector<float>{float(i)}, Metadata().set("k", i == 5 ? "only" : "other"));
+    }
+    f.remove(5);
+    h.remove(5);
+    CHECK(f.search(std::vector<float>{5}, 10, with_filter(Filter::eq("k", "only"))).empty());
+    CHECK(h.search(std::vector<float>{5}, 10, 64, with_filter(Filter::eq("k", "only"))).empty());
+    CHECK(!f.get_metadata(5).has_value() && !h.get_metadata(5).has_value());
+}
+
+TEST(metadata, md50_oom_add_with_metadata) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    for (int which = 0; which < 2; ++which) {
+        HnswIndex h(4, Metric::L2);
+        FlatIndex f(4, Metric::L2);
+        for (std::uint64_t i = 0; i < 50; ++i) {
+            h.add(i, std::vector<float>(4, float(i)), Metadata().set("old", 1));
+            f.add(i, std::vector<float>(4, float(i)), Metadata().set("old", 1));
+        }
+        const Metadata md = Metadata().set("brand_new_field", "brand_new_string").set_tags("t", {"x", "y"});
+        const long points = sweep_allocation_failures(
+            [&] { which == 0 ? h.add(999, std::vector<float>(4, 0.5f), md) : f.add(999, std::vector<float>(4, 0.5f), md); },
+            [&] {
+                const MetadataStore& m = which == 0 ? h.metadata() : f.metadata();
+                CHECK(!m.find_field("brand_new_field").has_value() && !m.find_string("brand_new_string").has_value());
+                CHECK((which == 0 ? h.size() : f.size()) == 50);
+            });
+        CHECK(points > 0);
+        CHECK(*(which == 0 ? h.get_metadata(999) : f.get_metadata(999)) == md);
+    }
+}
+
+TEST(metadata, md51_oom_set_metadata) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0}, Metadata().set("a", "x"));
+    const long points = sweep_allocation_failures([&] { f.set_metadata(1, Metadata().set("a", "new").set("b", 2)); }, [&] {
+        CHECK(*f.get_metadata(1) == Metadata().set("a", "x") && f.metadata().field_count() == 1);
+    });
+    CHECK(points > 0);
+    CHECK(f.get_metadata(1)->get("a")->s == "new");
+}
+
+TEST(metadata, md52_oom_reused_slot_with_metadata) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(101, 8, 4, 307);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 100; ++i) h.add(i, data[i], meta_for(i));
+    h.remove(7);
+    const long points = sweep_allocation_failures([&] { h.add(5000, data[100], Metadata().set("fresh", "value")); }, [&] {
+        CHECK(!h.contains(5000) && h.deleted_count() == 1 && !h.metadata().find_field("fresh").has_value());
+        check_graph(h, 0.99);
+    });
+    CHECK(points > 0);
+    CHECK(h.get_metadata(5000)->get("fresh")->s == "value" && h.deleted_count() == 0);
+}
+
+// ===========================================================================
+// Filtered search (FL1-FL50)
+// ===========================================================================
+
+namespace {
+
+/// A small Flat index holding meta_for(i) for i in [0, n), vector = {i}.
+std::unique_ptr<FlatIndex> small_meta_flat(std::size_t n, bool strict = true) {
+    auto f = std::make_unique<FlatIndex>(1, Metric::L2, strict ? Schema::strict(search_fields()) : Schema::dynamic(search_fields()));
+    for (std::uint64_t i = 0; i < n; ++i) f->add(i, std::vector<float>{float(i)}, meta_for(i));
+    return f;
+}
+
+/// IDs the filter matches, in increasing order (via an exhaustive Flat search).
+std::vector<std::uint64_t> matching_ids(const FlatIndex& f, const Filter& filter) {
+    std::vector<std::uint64_t> ids;
+    for (const auto& r : f.search(std::vector<float>{0}, kHuge, with_filter(filter))) ids.push_back(r.id);
+    std::sort(ids.begin(), ids.end());
+    return ids;
+}
+
+/// IDs the reference evaluator says match.
+std::vector<std::uint64_t> reference_ids(std::size_t n, const Filter& filter) {
+    std::vector<std::uint64_t> ids;
+    for (std::uint64_t i = 0; i < n; ++i)
+        if (ref_eval(filter.root(), meta_for(i))) ids.push_back(i);
+    return ids;
+}
+
+}  // namespace
+
+TEST(filter, fl01_comparisons_match_reference) {
+    auto f = small_meta_flat(300);
+    bool ok = true;
+    for (int year : {1999, 2000, 2010, 2024, 2025})
+        for (const Filter& flt : {Filter::eq("year", year), Filter::ne("year", year), Filter::lt("year", year),
+                                  Filter::le("year", year), Filter::gt("year", year), Filter::ge("year", year),
+                                  Filter::between("year", year, year + 5), Filter::lt("price", double(year - 1950)),
+                                  Filter::eq("category", "tech"), Filter::ne("category", "tech"), Filter::eq("in_stock", true),
+                                  Filter::ne("in_stock", true)})
+            ok = ok && matching_ids(*f, flt) == reference_ids(300, flt);
+    CHECK(ok);
+}
+
+TEST(filter, fl02_membership_and_tags_match_reference) {
+    auto f = small_meta_flat(300);
+    bool ok = true;
+    for (const Filter& flt : {Filter::in("category", {"news", "food"}), Filter::in("year", {2001, 2003, 2024}),
+                              Filter::in("in_stock", {false}), Filter::has_tag("tags", "a"),
+                              Filter::has_any_tag("tags", {"b", "c"}), Filter::has_all_tags("tags", {"a", "b"}),
+                              Filter::has_all_tags("tags", {"a", "b", "c"}), Filter::exists("price"),
+                              Filter::exists("category")})
+        ok = ok && matching_ids(*f, flt) == reference_ids(300, flt);
+    CHECK(ok);
+}
+
+TEST(filter, fl03_random_nested_filters_match_reference) {
+    auto f = small_meta_flat(400);
+    std::mt19937 rng(310);
+    bool ok = true;
+    for (int i = 0; i < 1000; ++i) {
+        const Filter flt = random_filter(rng, 4);
+        ok = ok && matching_ids(*f, flt) == reference_ids(400, flt);
+    }
+    CHECK(ok);
+}
+
+TEST(filter, fl04_type_mismatch_rejected) {
+    auto f = small_meta_flat(10);
+    std::vector<float> q{0};
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::eq("year", "2020"))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::lt("category", "m"))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::lt("tags", 3))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::eq("in_stock", 1))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::has_tag("category", "a"))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::in("tags", {"a"}))));
+    CHECK_THROWS_AS(std::invalid_argument, f->search(q, 5, with_filter(Filter::between("category", 1, 2))));
+}
+
+TEST(filter, fl05_unknown_field_strict_and_dynamic) {
+    auto strict = small_meta_flat(20, true);
+    auto dynamic = small_meta_flat(20, false);
+    std::vector<float> q{0};
+    CHECK_THROWS_AS(std::invalid_argument, strict->search(q, 5, with_filter(Filter::eq("colour", "red"))));
+    CHECK(dynamic->search(q, 5, with_filter(Filter::eq("colour", "red"))).empty());
+    CHECK(dynamic->search(q, 5, with_filter(!Filter::exists("colour"))).size() == 5);
+}
+
+TEST(filter, fl06_unknown_string_matches_nothing) {
+    auto f = small_meta_flat(50);
+    CHECK(matching_ids(*f, Filter::eq("category", "nonexistent")).empty());
+    CHECK(matching_ids(*f, Filter::ne("category", "nonexistent")).size() == 50);  // every vector has a category
+    CHECK(matching_ids(*f, Filter::has_tag("tags", "nonexistent")).empty());
+}
+
+TEST(filter, fl07_missing_field_semantics) {
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("category", "news"));
+    f.add(2, std::vector<float>{1}, Metadata().set("category", "tech"));
+    f.add(3, std::vector<float>{2});  // no category
+    CHECK(matching_ids(f, Filter::ne("category", "news")) == std::vector<std::uint64_t>{2});   // ne skips missing
+    CHECK(matching_ids(f, !Filter::eq("category", "news")) == std::vector<std::uint64_t>({2, 3}));  // ! includes it
+    CHECK(matching_ids(f, !Filter::exists("category")) == std::vector<std::uint64_t>{3});
+}
+
+TEST(filter, fl08_empty_and_inverted_ranges) {
+    auto f = small_meta_flat(50);
+    CHECK(matching_ids(*f, Filter::in("category", std::vector<std::string>{})).empty());
+    CHECK(matching_ids(*f, Filter::between("year", 2010, 2005)).empty());
+    CHECK_THROWS_AS(std::invalid_argument, Filter::eq("price", double(kNaN)));
+    CHECK_THROWS_AS(std::invalid_argument, Filter::between("price", 0.0, double(kNaN)));
+    CHECK(matching_ids(*f, Filter::lt("price", double(kInf))) == reference_ids(50, Filter::exists("price")));
+}
+
+TEST(filter, fl09_exact_integer_float_comparison) {
+    FlatIndex f(1, Metric::L2);
+    const std::int64_t big = (std::int64_t(1) << 53) + 1;  // not representable as a double
+    f.add(1, std::vector<float>{0}, Metadata().set("n", big));
+    f.add(2, std::vector<float>{1}, Metadata().set("x", 2.5));
+    CHECK(matching_ids(f, Filter::gt("n", double(std::int64_t(1) << 53))).size() == 1);  // exact, not rounded
+    CHECK(matching_ids(f, Filter::eq("n", double(std::int64_t(1) << 53))).empty());
+    CHECK(matching_ids(f, Filter::lt("x", 3)).size() == 1 && matching_ids(f, Filter::gt("x", 2)).size() == 1);
+    CHECK(matching_ids(f, Filter::eq("x", 2)).empty());
+    CHECK(matching_ids(f, Filter::lt("n", 1e300)).size() == 1);  // beyond the int64 range
+}
+
+TEST(filter, fl10_filter_reusable_across_queries_and_indexes) {
+    const Filter flt = Filter::eq("category", "news") && Filter::ge("year", 2010);
+    auto a = small_meta_flat(100, true);
+    auto b = small_meta_flat(200, false);
+    CHECK(matching_ids(*a, flt) == reference_ids(100, flt));
+    CHECK(matching_ids(*b, flt) == reference_ids(200, flt));
+    CHECK(matching_ids(*a, flt) == reference_ids(100, flt));  // reused again
+    FlatIndex other(1, Metric::L2, Schema::strict({{"category", FieldType::Int}}));  // same name, other type
+    other.add(1, std::vector<float>{0}, Metadata().set("category", 5));
+    CHECK_THROWS_AS(std::invalid_argument, other.search(std::vector<float>{0}, 1, with_filter(flt)));
+}
+
+TEST(filter, fl20_flat_filtered_exact) {
+    auto data = random_vectors(400, 8, 311);
+    auto queries = random_vectors(10, 8, 312);
+    std::mt19937 rng(313);
+    for (Metric m : kMetrics) {
+        FlatIndex f(8, m, Schema::strict(search_fields()));
+        for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i], meta_for(i));
+        for (int t = 0; t < 10; ++t) {
+            const Filter flt = random_filter(rng, 2);
+            std::vector<bool> excluded(data.size());
+            for (std::size_t i = 0; i < data.size(); ++i) excluded[i] = !ref_eval(flt.root(), meta_for(i));
+            for (const auto& q : queries)
+                CHECK(same_results(tie_sorted(f.search(q, 15, with_filter(flt))), tie_sorted(reference_search(data, excluded, q, m, 15, 0))));
+        }
+    }
+}
+
+TEST(filter, fl21_fewer_matches_than_k) {
+    auto f = small_meta_flat(100);
+    const auto r = f->search(std::vector<float>{0}, 50, with_filter(Filter::has_all_tags("tags", {"a", "b", "c"})));
+    CHECK(r.size() == reference_ids(100, Filter::has_all_tags("tags", {"a", "b", "c"})).size() && r.size() < 50);
+}
+
+TEST(filter, fl22_no_matches) {
+    auto f = small_meta_flat(100);
+    CHECK(f->search(std::vector<float>{0}, 10, with_filter(Filter::gt("year", 3000))).empty());
+}
+
+TEST(filter, fl23_match_everything_equals_unfiltered) {
+    auto f = small_meta_flat(100);
+    CHECK(same_results(f->search(std::vector<float>{3}, 20, with_filter(Filter::exists("category"))),
+                       f->search(std::vector<float>{3}, 20)));
+    CHECK(same_results(f->search(std::vector<float>{3}, 20, with_filter(Filter::all())), f->search(std::vector<float>{3}, 20)));
+}
+
+TEST(filter, fl24_filters_with_removals) {
+    auto f = small_meta_flat(200);
+    for (std::uint64_t i = 0; i < 200; i += 4) f->remove(i);
+    const Filter flt = Filter::eq("category", "news");
+    std::vector<std::uint64_t> expected;
+    for (std::uint64_t i : reference_ids(200, flt))
+        if (i % 4 != 0) expected.push_back(i);
+    CHECK(matching_ids(*f, flt) == expected);
+}
+
+TEST(filter, fl30_hnsw_never_violates_filter) {
+    const MetaFixture& fx = meta_fixture();
+    std::mt19937 rng(314);
+    bool ok = true;
+    for (int t = 0; t < 1000; ++t) {
+        const Filter flt = random_filter(rng, 3);
+        for (const auto& r : fx.hnsw->search(fx.queries[std::size_t(t) % fx.queries.size()], 10, 64, with_filter(flt, Strategy::ForceGraph)))
+            ok = ok && ref_eval(flt.root(), meta_for(r.id));
+    }
+    CHECK(ok);
+}
+
+TEST(filter, fl31_hnsw_recall_by_selectivity) {
+    const MetaFixture& fx = meta_fixture();
+    for (int pct : {50, 20, 10, 5}) {
+        const double r = filtered_recall(*fx.hnsw, *fx.flat, fx.queries, 10, 64,
+                                         with_filter(Filter::lt("bucket", pct), Strategy::ForceGraph));
+        CHECK(r >= 0.90);
+    }
+}
+
+TEST(filter, fl32_hnsw_match_everything_equals_unfiltered) {
+    const MetaFixture& fx = meta_fixture();
+    bool same = true;
+    for (std::size_t i = 0; i < 10; ++i)
+        same = same && same_results(fx.hnsw->search(fx.queries[i], 10, 64, with_filter(Filter::exists("category"), Strategy::ForceGraph)),
+                                    fx.hnsw->search(fx.queries[i], 10, 64));
+    CHECK(same);
+}
+
+TEST(filter, fl33_hnsw_match_nothing) {
+    const MetaFixture& fx = meta_fixture();
+    CHECK(fx.hnsw->search(fx.queries[0], 10, 64, with_filter(Filter::gt("year", 3000), Strategy::ForceGraph)).empty());
+    CHECK(fx.hnsw->search(fx.queries[0], 10, 64, with_filter(Filter::gt("year", 3000))).empty());
+}
+
+TEST(filter, fl34_hnsw_fewer_matches_than_k) {
+    const MetaFixture& fx = meta_fixture();
+    const Filter flt = Filter::eq("bucket", 7) && Filter::eq("category", "food");  // a handful of vectors
+    const auto expected = fx.flat->search(fx.queries[0], 100, with_filter(flt));
+    const auto got = fx.hnsw->search(fx.queries[0], 100, 64, with_filter(flt, Strategy::ForceGraph));
+    CHECK(got.size() == expected.size() && expected.size() < 100);
+}
+
+TEST(filter, fl35_clustered_versus_scattered_matches) {
+    auto [data, label] = clustered_labeled(2000, 16, 8, 315);
+    auto queries = clustered(30, 16, 8, 316);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        Metadata md = Metadata().set("cluster", std::int64_t(label[i])).set("scatter", std::int64_t(i % 8));
+        h.add(i, data[i], md);
+        f.add(i, data[i], md);
+    }
+    CHECK(filtered_recall(h, f, queries, 10, 64, with_filter(Filter::eq("cluster", 3), Strategy::ForceGraph)) >= 0.85);
+    CHECK(filtered_recall(h, f, queries, 10, 64, with_filter(Filter::eq("scatter", 3), Strategy::ForceGraph)) >= 0.90);
+}
+
+TEST(filter, fl36_filters_with_removal_and_reuse) {
+    auto data = clustered(1000, 8, 6, 317);
+    auto queries = clustered(20, 8, 6, 318);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (std::uint64_t i = 0; i < 1000; i += 3) {
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 0; i < 1000; i += 6) {  // reuse slots with new metadata
+        h.add(5000 + i, data[i], meta_for(i + 1));
+        f.add(5000 + i, data[i], meta_for(i + 1));
+    }
+    const SearchOptions o = with_filter(Filter::eq("category", "tech") || Filter::has_tag("tags", "c"), Strategy::ForceGraph);
+    CHECK(filtered_recall(h, f, queries, 10, 64, o) >= 0.90);
+    for (const auto& q : queries)
+        for (const auto& r : h.search(q, 10, 64, o)) CHECK(h.contains(r.id) && ref_eval(o.filter->root(), *h.get_metadata(r.id)));
+}
+
+TEST(filter, fl37_entry_point_fails_filter) {
+    auto data = clustered(500, 8, 4, 319);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], Metadata().set("ok", true));
+    const std::uint64_t entry_id = h.storage().ids().external(h.entry_point());
+    h.set_metadata(entry_id, Metadata().set("ok", false));
+    const auto r = h.search(data[0], 10, 64, with_filter(Filter::eq("ok", true), Strategy::ForceGraph));
+    CHECK(r.size() == 10);
+    for (const auto& x : r) CHECK(x.id != entry_id);
+}
+
+TEST(filter, fl40_predicate_alone) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions o;
+    o.predicate = [](std::uint64_t id) { return id % 3 == 0; };
+    for (const auto& q : fx.queries) {
+        const auto got = fx.flat->search(q, 10, o);
+        for (const auto& r : got) CHECK(r.id % 3 == 0);
+        CHECK(got.size() == 10);
+    }
+    o.strategy = Strategy::ForceGraph;
+    CHECK(filtered_recall(*fx.hnsw, *fx.flat, fx.queries, 10, 64, o) >= 0.90);
+}
+
+TEST(filter, fl41_predicate_and_filter_both_apply) {
+    const MetaFixture& fx = meta_fixture();
+    std::atomic<std::size_t> calls{0};
+    SearchOptions o = with_filter(Filter::eq("category", "news"));
+    o.predicate = [&](std::uint64_t id) {
+        ++calls;
+        return id % 2 == 0;
+    };
+    const auto got = fx.flat->search(fx.queries[0], 20, o);
+    for (const auto& r : got) CHECK(r.id % 2 == 0 && r.id % 5 == 0);  // news = id % 5 == 0
+    CHECK(calls.load() < fx.data.size());  // only called for vectors that passed the filter
+}
+
+TEST(filter, fl42_throwing_predicate) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions o;
+    o.predicate = [](std::uint64_t id) -> bool {
+        if (id == 7) throw std::runtime_error("permission service down");
+        return true;
+    };
+    CHECK_THROWS_AS(std::runtime_error, fx.flat->search(fx.queries[0], 10, o));
+    o.strategy = Strategy::ForceExact;
+    CHECK_THROWS_AS(std::runtime_error, fx.hnsw->search(fx.queries[0], 10, 64, o));
+    CHECK(fx.hnsw->search(fx.queries[0], 10).size() == 10);  // still usable
+}
+
+TEST(filter, fl43_constant_predicates) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions none, all;
+    none.predicate = [](std::uint64_t) { return false; };
+    all.predicate = [](std::uint64_t) { return true; };
+    CHECK(fx.hnsw->search(fx.queries[0], 10, 64, none).empty() && fx.flat->search(fx.queries[0], 10, none).empty());
+    CHECK(same_results(tie_sorted(fx.flat->search(fx.queries[0], 10, all)), tie_sorted(fx.flat->search(fx.queries[0], 10))));
+}
+
+TEST(filter, fl44_predicate_called_concurrently) {
+    const MetaFixture& fx = meta_fixture();
+    std::atomic<std::size_t> calls{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t id) {
+        calls.fetch_add(1, std::memory_order_relaxed);
+        return id % 4 != 0;
+    };
+    const auto buffer = flatten(fx.queries);
+    const auto batch = fx.hnsw->search_batch(buffer, 10, 64, 8, o);
+    bool ok = true;
+    for (std::size_t i = 0; i < batch.size(); ++i) ok = ok && same_results(batch[i], fx.hnsw->search(fx.queries[i], 10, 64, o));
+    CHECK(ok && calls.load() > 0);
+}
+
+TEST(filter, fl45_predicate_sees_live_user_ids) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(1'000'000 + i, std::vector<float>{float(i), 0});
+    for (std::uint64_t i = 0; i < 300; i += 2) h.remove(1'000'000 + i);
+    bool only_live = true;
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t id) {
+        only_live = only_live && id >= 1'000'000 && h.contains(id);
+        return true;
+    };
+    o.strategy = Strategy::ForceExact;
+    h.search(std::vector<float>{5, 0}, 10, 64, o);
+    o.strategy = Strategy::ForceGraph;
+    h.search(std::vector<float>{5, 0}, 10, 64, o);
+    CHECK(only_live);
+}
+
+TEST(filter, fl50_oom_filtered_search) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    const MetaFixture& fx = meta_fixture();
+    const SearchOptions o = with_filter(Filter::in("category", {"news", "tech"}) && !Filter::has_tag("tags", "c"));
+    const Results before = fx.hnsw->search(fx.queries[0], 10, 64, o);
+    Results got;
+    const long points = sweep_allocation_failures([&] { got = fx.hnsw->search(fx.queries[0], 10, 64, o); },
+                                                  [&] { CHECK(same_results(fx.hnsw->search(fx.queries[0], 10, 64, o), before)); });
+    CHECK(points > 0 && same_results(got, before));
+}
+
+// ===========================================================================
+// Query planner (PL1-PL16)
+// ===========================================================================
+
+TEST(planner, pl01_sampled_selectivity_is_accurate) {
+    const MetaFixture& fx = meta_fixture();
+    for (int pct : {50, 20, 5}) {
+        SearchStats st;
+        SearchOptions o = with_filter(Filter::lt("bucket", pct));
+        o.stats = &st;
+        fx.hnsw->search(fx.queries[0], 10, 64, o);
+        CHECK(!st.exact_count && std::fabs(st.selectivity - pct / 100.0) < 0.08);
+    }
+}
+
+TEST(planner, pl02_payload_index_gives_exact_count) {
+    auto data = clustered(1000, 8, 4, 320);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    h.create_payload_index("category");
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("category", "music"));
+    o.stats = &st;
+    h.search(data[0], 10, 64, o);
+    CHECK(st.exact_count && st.estimated_matches == reference_ids(1000, Filter::eq("category", "music")).size());
+}
+
+TEST(planner, pl03_few_matches_use_exact_search) {
+    const MetaFixture& fx = meta_fixture();
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::lt("bucket", 5));  // ~150 matches
+    o.stats = &st;
+    fx.hnsw->search(fx.queries[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceExact && st.reason == PlanReason::MatchCount);
+}
+
+TEST(planner, pl04_small_fraction_uses_exact_search) {
+    const MetaFixture& fx = meta_fixture();
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::lt("bucket", 5));
+    o.planner = PlannerParams{10, 0.10, 256, 32.0};
+    o.stats = &st;
+    fx.hnsw->search(fx.queries[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceExact && st.reason == PlanReason::MatchFraction);
+}
+
+TEST(planner, pl05_otherwise_graph_with_wider_beam) {
+    const MetaFixture& fx = meta_fixture();
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::lt("bucket", 25));
+    o.planner = PlannerParams{10, 0.01, 256, 32.0};
+    o.stats = &st;
+    fx.hnsw->search(fx.queries[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceGraph && st.reason == PlanReason::Graph);
+    CHECK(st.ef >= 64 * 3 && st.ef <= 64 * 32);  // about 64 / 0.25
+}
+
+TEST(planner, pl06_limits_are_inclusive) {
+    auto data = clustered(1000, 8, 4, 321);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    h.create_payload_index("category");
+    const std::size_t n = reference_ids(1000, Filter::eq("category", "news")).size();
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("category", "news"));
+    o.stats = &st;
+    o.planner = PlannerParams{n, 0.0, 256, 32.0};
+    h.search(data[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceExact && st.reason == PlanReason::MatchCount);
+    o.planner = PlannerParams{n - 1, 0.0, 256, 32.0};
+    h.search(data[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceGraph);
+    o.planner = PlannerParams{0, double(n) / 1000.0, 256, 32.0};
+    h.search(data[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceExact && st.reason == PlanReason::MatchFraction);
+}
+
+TEST(planner, pl07_per_query_overrides_index_settings) {
+    auto data = clustered(1000, 8, 4, 322);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], Metadata().set("b", std::int64_t(i % 10)));
+    h.set_planner_params(PlannerParams{0, 0.0, 256, 32.0});  // index: never exact
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("b", 1));
+    o.stats = &st;
+    h.search(data[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceGraph);
+    o.planner = PlannerParams{5000, 0.5, 256, 32.0};  // query: always exact here
+    h.search(data[0], 10, 64, o);
+    CHECK(st.strategy == Strategy::ForceExact);
+}
+
+TEST(planner, pl08_forced_strategies) {
+    const MetaFixture& fx = meta_fixture();
+    for (Strategy s : {Strategy::ForceExact, Strategy::ForceGraph}) {
+        SearchStats st;
+        SearchOptions o = with_filter(Filter::lt("bucket", 30), s);
+        o.stats = &st;
+        const auto r = fx.hnsw->search(fx.queries[0], 10, 64, o);
+        CHECK(st.strategy == s && st.reason == PlanReason::Forced && r.size() == 10);
+        check_results(*fx.hnsw, r);
+    }
+}
+
+TEST(planner, pl09_exact_strategy_equals_flat) {
+    auto data = random_vectors(500, 8, 323);
+    for (Metric m : kMetrics) {
+        HnswIndex h(8, m, HnswParams{}, Schema::strict(search_fields()));
+        FlatIndex f(8, m, Schema::strict(search_fields()));
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        const SearchOptions o = with_filter(Filter::ge("year", 2010), Strategy::ForceExact);
+        for (std::size_t i = 0; i < 10; ++i)
+            CHECK(same_results(tie_sorted(h.search(data[i], 10, 64, o)), tie_sorted(f.search(data[i], 10, o))));
+    }
+}
+
+TEST(planner, pl10_tiny_index_counts_every_vector) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) h.add(i, std::vector<float>{float(i), 0}, Metadata().set("b", std::int64_t(i % 4)));
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("b", 1));
+    o.stats = &st;
+    h.search(std::vector<float>{0, 0}, 5, 64, o);
+    CHECK(st.exact_count && st.estimated_matches == 25);
+}
+
+TEST(planner, pl11_empty_or_all_removed) {
+    HnswIndex h(2, Metric::L2);
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("b", 1));
+    o.stats = &st;
+    CHECK(h.search(std::vector<float>{0, 0}, 5, 64, o).empty());
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{float(i), 0}, Metadata().set("b", 1));
+    for (std::uint64_t i = 0; i < 20; ++i) h.remove(i);
+    CHECK(h.search(std::vector<float>{0, 0}, 5, 64, o).empty());
+}
+
+TEST(planner, pl12_predicate_selectivity_sampled) {
+    const MetaFixture& fx = meta_fixture();
+    SearchStats st;
+    SearchOptions o;
+    o.predicate = [](std::uint64_t id) { return id % 4 == 0; };
+    o.stats = &st;
+    fx.hnsw->search(fx.queries[0], 10, 64, o);
+    CHECK(!st.exact_count && std::fabs(st.selectivity - 0.25) < 0.08);
+}
+
+TEST(planner, pl13_planner_is_deterministic) {
+    const MetaFixture& fx = meta_fixture();
+    SearchStats a, b;
+    SearchOptions o = with_filter(Filter::lt("bucket", 40));
+    o.stats = &a;
+    const auto ra = fx.hnsw->search(fx.queries[1], 10, 64, o);
+    o.stats = &b;
+    const auto rb = fx.hnsw->search(fx.queries[1], 10, 64, o);
+    CHECK(same_results(ra, rb) && a.selectivity == b.selectivity && a.strategy == b.strategy && a.ef == b.ef);
+}
+
+TEST(planner, pl14_stats_are_consistent) {
+    const MetaFixture& fx = meta_fixture();
+    for (Strategy s : {Strategy::ForceExact, Strategy::ForceGraph}) {
+        SearchStats st;
+        SearchOptions o = with_filter(Filter::lt("bucket", 30), s);
+        o.stats = &st;
+        const auto r = fx.hnsw->search(fx.queries[2], 10, 64, o);
+        CHECK(st.distance_computations >= r.size() && st.nodes_visited > 0);
+    }
+    SearchStats flat;
+    SearchOptions o = with_filter(Filter::lt("bucket", 30));
+    o.stats = &flat;
+    fx.flat->search(fx.queries[2], 10, o);
+    CHECK(flat.reason == PlanReason::FlatIndex && flat.estimated_matches == 900 && flat.distance_computations == 900);
+}
+
+TEST(planner, pl15_invalid_settings_rejected) {
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{0, 0});
+    CHECK_THROWS_AS(std::invalid_argument, h.set_planner_params(PlannerParams{10, 1.5, 256, 32.0}));
+    CHECK_THROWS_AS(std::invalid_argument, h.set_planner_params(PlannerParams{10, double(kNaN), 256, 32.0}));
+    CHECK_THROWS_AS(std::invalid_argument, h.set_planner_params(PlannerParams{10, 0.1, 0, 32.0}));
+    CHECK_THROWS_AS(std::invalid_argument, h.set_planner_params(PlannerParams{10, 0.1, 256, 0.5}));
+    SearchOptions o;
+    o.planner = PlannerParams{10, -0.1, 256, 32.0};
+    CHECK_THROWS_AS(std::invalid_argument, h.search(std::vector<float>{0, 0}, 1, 64, o));
+}
+
+TEST(planner, pl16_auto_keeps_recall_across_selectivities) {
+    const MetaFixture& fx = meta_fixture();
+    for (int pct : {1, 2, 5, 10, 25, 50, 100}) {
+        const SearchOptions o = with_filter(Filter::lt("bucket", pct));
+        CHECK(filtered_recall(*fx.hnsw, *fx.flat, fx.queries, 10, 64, o) >= 0.90);
+        for (const auto& q : fx.queries)
+            for (const auto& r : fx.hnsw->search(q, 10, 64, o)) CHECK(int(r.id % 100) < pct);
+    }
+}
+
+// ===========================================================================
+// Payload index (PI1-PI6)
+// ===========================================================================
+
+TEST(payload, pi01_counts_match_data_after_churn) {
+    HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    h.create_payload_index("category");
+    h.create_payload_index("tags");
+    h.create_payload_index("in_stock");
+    std::mt19937 rng(324);
+    std::vector<std::uint64_t> live;
+    std::uint64_t next = 0;
+    for (int step = 0; step < 2000; ++step) {
+        const unsigned op = static_cast<unsigned>(rng() % 4);
+        if (op < 2 || live.empty()) {
+            h.add(next, std::vector<float>{float(next), 0}, meta_for(next));
+            live.push_back(next++);
+        } else if (op == 2) {
+            const std::size_t pos = rng() % live.size();
+            h.remove(live[pos]);
+            live[pos] = live.back();
+            live.pop_back();
+        } else {
+            h.set_metadata(live[rng() % live.size()], meta_for(rng() % 1000));
+        }
+    }
+    const MetadataStore& m = h.metadata();
+    bool ok = true;
+    for (const char* cat : kCategories) {
+        std::size_t expected = 0;
+        for (auto id : live) expected += h.get_metadata(id)->get("category")->s == cat;
+        ok = ok && m.value_count(*m.find_field("category"), *m.find_string(cat)) == expected;
+    }
+    for (const char* tag : {"a", "b", "c"}) {
+        std::size_t expected = 0;
+        for (auto id : live) {
+            auto t = h.get_metadata(id)->get("tags");
+            expected += t && std::find(t->tags.begin(), t->tags.end(), tag) != t->tags.end();
+        }
+        ok = ok && m.value_count(*m.find_field("tags"), *m.find_string(tag)) == expected;
+    }
+    std::size_t in_stock = 0;
+    for (auto id : live) {
+        auto v = h.get_metadata(id)->get("in_stock");
+        in_stock += v && v->b;
+    }
+    ok = ok && m.value_count(*m.find_field("in_stock"), 1) == in_stock;
+    CHECK(ok);
+}
+
+TEST(payload, pi02_identical_results_with_and_without_index) {
+    auto data = clustered(1500, 8, 6, 325);
+    HnswIndex a(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    HnswIndex b(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    b.create_payload_index("category");
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        a.add(i, data[i], meta_for(i));
+        b.add(i, data[i], meta_for(i));
+    }
+    const SearchOptions o = with_filter(Filter::eq("category", "food"), Strategy::ForceExact);
+    bool same = true;
+    for (std::size_t i = 0; i < 20; ++i) same = same && same_results(a.search(data[i], 10, 64, o), b.search(data[i], 10, 64, o));
+    CHECK(same);
+}
+
+TEST(payload, pi03_backfill_equals_incremental) {
+    HnswIndex a(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    HnswIndex b(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    a.create_payload_index("category");
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        a.add(i, std::vector<float>{float(i), 0}, meta_for(i));
+        b.add(i, std::vector<float>{float(i), 0}, meta_for(i));
+    }
+    b.create_payload_index("category");  // built over existing data
+    bool same = true;
+    for (const char* cat : kCategories)
+        same = same && a.metadata().value_count(0, *a.metadata().find_string(cat)) ==
+                           b.metadata().value_count(0, *b.metadata().find_string(cat));
+    CHECK(same);
+}
+
+TEST(payload, pi04_unsupported_fields_rejected) {
+    FlatIndex f(2, Metric::L2, Schema::strict(search_fields()));
+    CHECK_THROWS_AS(std::invalid_argument, f.create_payload_index("year"));
+    CHECK_THROWS_AS(std::invalid_argument, f.create_payload_index("price"));
+    CHECK_THROWS_AS(std::invalid_argument, f.create_payload_index("nope"));
+    CHECK_NOTHROW(f.create_payload_index("category"));
+    CHECK_NOTHROW(f.create_payload_index("category"));  // twice is harmless
+}
+
+TEST(payload, pi05_oom_index_updates) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    FlatIndex f(2, Metric::L2, Schema::strict(search_fields()));
+    for (std::uint64_t i = 0; i < 50; ++i) f.add(i, std::vector<float>{float(i), 0}, meta_for(i));
+    CHECK(sweep_allocation_failures([&] { f.create_payload_index("category"); },
+                                    [&] { CHECK(!f.metadata().is_indexed(0)); }) > 0);
+    const std::size_t field = *f.metadata().find_field("tags");
+    f.create_payload_index("tags");
+    CHECK(sweep_allocation_failures([&] { f.add(999, std::vector<float>{0, 0}, Metadata().set_tags("tags", {"zz_new"})); },
+                                    [&] { CHECK(!f.metadata().find_string("zz_new").has_value()); }) > 0);
+    CHECK(f.metadata().value_count(field, *f.metadata().find_string("zz_new")) == 1);
+}
+
+TEST(payload, pi06_compact_keeps_index) {
+    HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    h.create_payload_index("category");
+    for (std::uint64_t i = 0; i < 200; ++i) h.add(i, std::vector<float>{float(i), 0}, meta_for(i));
+    for (std::uint64_t i = 0; i < 200; i += 2) h.remove(i);
+    h.compact();
+    const MetadataStore& m = h.metadata();
+    REQUIRE(m.is_indexed(*m.find_field("category")));
+    std::size_t news = 0;
+    for (std::uint64_t i = 1; i < 200; i += 2) news += i % 5 == 0;
+    CHECK(m.value_count(*m.find_field("category"), *m.find_string("news")) == news);
+}
+
+// ===========================================================================
+// Batch search (BT1-BT15)
+// ===========================================================================
+
+TEST(batch, bt01_hnsw_batch_equals_single_searches) {
+    for (Metric m : kMetrics) {
+        const Fixture& fx = fixture(m);
+        const auto batch = fx.hnsw->search_batch(flatten(fx.queries), 10, 64, 4);
+        bool same = batch.size() == fx.queries.size();
+        for (std::size_t i = 0; same && i < batch.size(); ++i) same = same_results(batch[i], fx.hnsw->search(fx.queries[i], 10, 64));
+        CHECK(same);
+    }
+}
+
+TEST(batch, bt02_flat_tiled_batch_equals_single_searches) {
+    for (Metric m : kMetrics) {
+        const Fixture& fx = fixture(m);
+        const auto batch = fx.flat->search_batch(flatten(fx.queries), 10, 4);
+        bool same = batch.size() == fx.queries.size();
+        for (std::size_t i = 0; same && i < batch.size(); ++i) same = same_results(batch[i], fx.flat->search(fx.queries[i], 10));
+        CHECK(same);
+    }
+}
+
+TEST(batch, bt03_thread_count_does_not_change_results) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 3));
+    const auto h1 = fx.hnsw->search_batch(buffer, 10, 64, 1);
+    const auto f1 = fx.flat->search_batch(buffer, 10, 1);
+    for (std::size_t threads : std::initializer_list<std::size_t>{2, 4, 8, 64}) {  // 64: more threads than queries
+        const auto h = fx.hnsw->search_batch(buffer, 10, 64, threads);
+        const auto f = fx.flat->search_batch(buffer, 10, threads);
+        for (std::size_t i = 0; i < 3; ++i) CHECK(same_results(h[i], h1[i]) && same_results(f[i], f1[i]));
+    }
+}
+
+TEST(batch, bt04_zero_and_one_query) {
+    const Fixture& fx = fixture(Metric::L2);
+    CHECK(fx.hnsw->search_batch(std::vector<float>{}, 10).empty());
+    CHECK(fx.flat->search_batch(std::vector<float>{}, 10).empty());
+    const auto one = fx.hnsw->search_batch(fx.queries[0], 10);
+    CHECK(one.size() == 1 && same_results(one[0], fx.hnsw->search(fx.queries[0], 10, 64)));
+}
+
+TEST(batch, bt05_buffer_not_multiple_of_dimension) {
+    const Fixture& fx = fixture(Metric::L2);
+    std::vector<float> bad(32 * 2 + 5, 0.1f);
+    CHECK_THROWS_AS(std::invalid_argument, fx.hnsw->search_batch(bad, 10));
+    CHECK_THROWS_AS(std::invalid_argument, fx.flat->search_batch(bad, 10));
+}
+
+TEST(batch, bt06_one_invalid_query_rejects_whole_batch) {
+    const Fixture& fx = fixture(Metric::L2);
+    auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 5));
+    buffer[3 * 32 + 7] = kNaN;
+    std::atomic<int> calls{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) { ++calls; return true; };
+    CHECK_THROWS_AS(std::invalid_argument, fx.hnsw->search_batch(buffer, 10, 64, 4, o));
+    CHECK_THROWS_AS(std::invalid_argument, fx.flat->search_batch(buffer, 10, 4, o));
+    CHECK(calls.load() == 0);  // rejected before any work
+}
+
+TEST(batch, bt07_shared_filter_and_predicate) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions o = with_filter(Filter::lt("bucket", 30));
+    o.predicate = [](std::uint64_t id) { return id % 2 == 1; };
+    const auto buffer = flatten(fx.queries);
+    const auto hb = fx.hnsw->search_batch(buffer, 10, 64, 4, o);
+    const auto fb = fx.flat->search_batch(buffer, 10, 4, o);
+    bool same = true;
+    for (std::size_t i = 0; i < fx.queries.size(); ++i)
+        same = same && same_results(hb[i], fx.hnsw->search(fx.queries[i], 10, 64, o)) &&
+               same_results(fb[i], fx.flat->search(fx.queries[i], 10, o));
+    CHECK(same);
+}
+
+TEST(batch, bt08_k_and_ef_extremes) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 3));
+    for (const auto& r : fx.hnsw->search_batch(buffer, 0, 64, 2)) CHECK(r.empty());
+    for (const auto& r : fx.flat->search_batch(buffer, 0, 2)) CHECK(r.empty());
+    for (const auto& r : fx.flat->search_batch(buffer, kHuge, 2)) CHECK(r.size() == 3000);
+    for (const auto& r : fx.hnsw->search_batch(buffer, 5, 0, 2)) CHECK(r.size() == 5);
+    const auto huge = fx.hnsw->search_batch(buffer, 20, kHuge, 2);
+    for (std::size_t i = 0; i < 3; ++i) CHECK(same_results(huge[i], fx.hnsw->search(fx.queries[i], 20, kHuge)));
+}
+
+TEST(batch, bt09_empty_or_all_removed) {
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    const std::vector<float> buffer(8, 0.5f);
+    for (const auto& r : h.search_batch(buffer, 5)) CHECK(r.empty());
+    for (const auto& r : f.search_batch(buffer, 5)) CHECK(r.empty());
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, std::vector<float>(4, float(i)));
+        f.add(i, std::vector<float>(4, float(i)));
+    }
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.remove(i);
+        f.remove(i);
+    }
+    for (const auto& r : h.search_batch(buffer, 5, 64, 2)) CHECK(r.empty());
+    for (const auto& r : f.search_batch(buffer, 5, 2)) CHECK(r.empty());
+}
+
+TEST(batch, bt10_tile_boundaries) {
+    // Flat tiles 256 vectors by 16 queries; test counts around both sizes.
+    for (std::size_t n : std::initializer_list<std::size_t>{1, 255, 256, 257, 600}) {
+        auto data = random_vectors(n, 8, unsigned(330 + n));
+        FlatIndex f(8, Metric::L2);
+        for (std::size_t i = 0; i < n; ++i) f.add(i, data[i]);
+        for (std::size_t nq : std::initializer_list<std::size_t>{1, 15, 16, 17, 40}) {
+            const auto queries = random_vectors(nq, 8, unsigned(340 + nq));
+            const auto batch = f.search_batch(flatten(queries), 7, 3);
+            bool same = batch.size() == nq;
+            for (std::size_t i = 0; same && i < nq; ++i) same = same_results(batch[i], f.search(queries[i], 7));
+            CHECK(same);
+        }
+    }
+}
+
+TEST(batch, bt11_large_batch_and_pool_reuse) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto queries = clustered(10000, 32, 20, 350);
+    const auto buffer = flatten(queries);
+    const auto first = fx.hnsw->search_batch(buffer, 5, 32, 4);
+    const auto second = fx.hnsw->search_batch(buffer, 5, 32, 4);  // reuses the same pool
+    bool same = first.size() == 10000;
+    for (std::size_t i = 0; same && i < first.size(); i += 97) same = same_results(first[i], second[i]) && same_results(first[i], fx.hnsw->search(queries[i], 5, 32));
+    CHECK(same);
+    SharedPool pool;
+    auto a = pool.get(3), b = pool.get(3);
+    CHECK(a == b && a->size() == 3);  // reused, not recreated
+    CHECK(pool.get(2)->size() == 2);  // recreated for a different size
+}
+
+TEST(batch, bt12_failing_task_keeps_pool_usable) {
+    ThreadPool pool(4);
+    CHECK_THROWS_AS(std::runtime_error, pool.parallel_for(100, [](std::size_t i) {
+        if (i == 42) throw std::runtime_error("task failed");
+    }));
+    std::atomic<std::size_t> sum{0};
+    pool.parallel_for(1000, [&](std::size_t i) { sum += i; });
+    CHECK(sum.load() == 1000 * 999 / 2);
+}
+
+TEST(batch, bt13_pool_stress_and_shutdown) {
+    for (int round = 0; round < 50; ++round) {
+        ThreadPool pool(1 + std::size_t(round % 6));
+        std::atomic<std::size_t> count{0};
+        for (int cycle = 0; cycle < 20; ++cycle) pool.parallel_for(37, [&](std::size_t) { ++count; });
+        CHECK(count.load() == 20 * 37);
+    }  // each pool is destroyed here, joining its workers
+    ThreadPool shared(4);
+    std::atomic<std::size_t> total{0};
+    std::vector<std::thread> callers;
+    for (int t = 0; t < 4; ++t)  // several threads use one pool at the same time
+        callers.emplace_back([&] { shared.parallel_for(500, [&](std::size_t) { ++total; }); });
+    for (auto& c : callers) c.join();
+    CHECK(total.load() == 2000);
+}
+
+TEST(batch, bt14_batches_alongside_other_searches) {
+    const Fixture& fx = fixture(Metric::Cosine);
+    std::vector<Results> expected;
+    for (const auto& q : fx.queries) expected.push_back(fx.hnsw->search(q, 10, 64));
+    std::atomic<int> mismatches{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < 3; ++t)
+        threads.emplace_back([&] {
+            const auto batch = fx.hnsw->search_batch(flatten(fx.queries), 10, 64, 3);
+            for (std::size_t i = 0; i < batch.size(); ++i)
+                if (!same_results(batch[i], expected[i])) ++mismatches;
+        });
+    for (int t = 0; t < 3; ++t)
+        threads.emplace_back([&] {
+            for (std::size_t i = 0; i < fx.queries.size(); ++i)
+                if (!same_results(fx.hnsw->search(fx.queries[i], 10, 64), expected[i])) ++mismatches;
+        });
+    for (auto& t : threads) t.join();
+    CHECK(mismatches.load() == 0);
+}
+
+TEST(batch, bt15_oom_batch) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 8, 4, 351);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const auto buffer = flatten(Vectors(data.begin(), data.begin() + 4));
+    const auto hb = h.search_batch(buffer, 5, 64, 1), fb = f.search_batch(buffer, 5, 1);
+    CHECK(sweep_allocation_failures([&] { h.search_batch(buffer, 5, 64, 1); },
+                                    [&] { CHECK(same_results(h.search_batch(buffer, 5, 64, 1)[2], hb[2])); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.search_batch(buffer, 5, 1); },
+                                    [&] { CHECK(same_results(f.search_batch(buffer, 5, 1)[2], fb[2])); }) > 0);
+}
+
+// ===========================================================================
+// Range search (RG1-RG15)
+// ===========================================================================
+
+namespace {
+
+/// Every eligible vector within `radius`, by brute force, sorted by distance then ID.
+Results range_reference(const FlatIndex& f, const std::vector<float>& q, float radius, const SearchOptions& o = {}) {
+    Results all;
+    for (const auto& r : f.search(q, kHuge, o))
+        if (r.distance <= radius) all.push_back(r);
+    return tie_sorted(all);
+}
+
+double range_recall(const HnswIndex& h, const FlatIndex& f, const Vectors& queries, float radius,
+                    const SearchOptions& o = {}) {
+    double total = 0.0;
+    std::size_t counted = 0;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : range_reference(f, q, radius, o)) truth.insert(r.id);
+        if (truth.empty()) continue;
+        std::size_t hits = 0;
+        for (const auto& r : h.search_range(q, radius, kNoLimit, o)) hits += truth.count(r.id);
+        total += double(hits) / double(truth.size());
+        ++counted;
+    }
+    return counted ? total / double(counted) : 1.0;
+}
+
+/// Checks the range invariants: sorted, unique, live, all inside the radius.
+template <class Index>
+void check_range(const Index& index, const Results& r, float radius) {
+    check_results(index, r);
+    bool inside = true;
+    for (const auto& x : r) inside = inside && x.distance <= radius;
+    CHECK(inside);
+}
+
+}  // namespace
+
+TEST(range, rg01_flat_equals_reference) {
+    auto data = random_vectors(500, 8, 360);
+    for (Metric m : kMetrics) {
+        FlatIndex f(8, m);
+        for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+        const float radius = m == Metric::L2 ? 2.0f : (m == Metric::Cosine ? 0.4f : -0.5f);
+        for (std::size_t i = 0; i < 10; ++i) {
+            const auto got = f.search_range(data[i], radius);
+            CHECK(same_results(tie_sorted(got), range_reference(f, data[i], radius)));
+            check_range(f, got, radius);
+        }
+    }
+}
+
+TEST(range, rg02_l2_uses_squared_radius) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{3, 0});  // distance 3, squared 9
+    f.add(2, std::vector<float>{5, 0});  // distance 5, squared 25
+    CHECK(f.search_range(std::vector<float>{0, 0}, 4.0f).empty());  // 4 is a squared radius: distance 2
+    const auto r = f.search_range(std::vector<float>{0, 0}, l2_radius(4.0f));
+    CHECK(r.size() == 1 && r[0].id == 1 && r[0].distance == 9.0f);
+    CHECK(l2_radius(3.0f) == 9.0f);
+}
+
+TEST(range, rg03_radius_zero) {
+    FlatIndex f(2, Metric::L2);
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        f.add(i, std::vector<float>{float(i % 10), 0});
+        h.add(i, std::vector<float>{float(i % 10), 0});
+    }
+    const auto rf = f.search_range(std::vector<float>{3, 0}, 0.0f);
+    const auto rh = h.search_range(std::vector<float>{3, 0}, 0.0f);
+    CHECK(rf.size() == 5 && rh.size() == 5);  // the five exact copies
+    for (const auto& x : rf) CHECK(x.id % 10 == 3 && x.distance == 0.0f);
+}
+
+TEST(range, rg04_negative_radius) {
+    FlatIndex l2(2, Metric::L2), ip(2, Metric::InnerProduct);
+    for (std::uint64_t i = 1; i <= 5; ++i) {
+        l2.add(i, std::vector<float>{float(i), 0});
+        ip.add(i, std::vector<float>{float(i), 0});
+    }
+    CHECK(l2.search_range(std::vector<float>{0, 0}, -1.0f).empty());
+    const auto r = ip.search_range(std::vector<float>{1, 0}, -3.0f);  // dot product >= 3
+    CHECK(r.size() == 3 && r[0].id == 5 && r[2].id == 3);
+}
+
+TEST(range, rg05_everything_without_cap) {
+    const Fixture& fx = fixture(Metric::L2);
+    CHECK(fx.flat->search_range(fx.queries[0], 1e30f).size() == 3000);
+    CHECK(fx.hnsw->search_range(fx.queries[0], 1e30f).size() == 3000);
+}
+
+TEST(range, rg06_max_results_keeps_the_closest) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto all = fx.flat->search_range(fx.queries[0], 1e30f);
+    const auto capped = fx.flat->search_range(fx.queries[0], 1e30f, 25);
+    CHECK(same_results(capped, Results(all.begin(), all.begin() + 25)));
+    const auto hcapped = fx.hnsw->search_range(fx.queries[0], 1e30f, 25);
+    CHECK(hcapped.size() == 25);
+    check_range(*fx.hnsw, hcapped, 1e30f);
+}
+
+TEST(range, rg07_max_results_zero) {
+    const Fixture& fx = fixture(Metric::L2);
+    CHECK(fx.flat->search_range(fx.queries[0], 1e30f, 0).empty());
+    CHECK(fx.hnsw->search_range(fx.queries[0], 1e30f, 0).empty());
+}
+
+TEST(range, rg08_nan_and_infinite_radius) {
+    const Fixture& fx = fixture(Metric::L2);
+    CHECK_THROWS_AS(std::invalid_argument, fx.flat->search_range(fx.queries[0], kNaN));
+    CHECK_THROWS_AS(std::invalid_argument, fx.hnsw->search_range(fx.queries[0], kNaN));
+    CHECK(fx.flat->search_range(fx.queries[0], kInf).size() == 3000);
+    CHECK(fx.hnsw->search_range(fx.queries[0], kInf).size() == 3000);
+}
+
+TEST(range, rg09_hnsw_recall_by_radius) {
+    const Fixture& fx = fixture(Metric::L2);
+    for (float radius : {1.0f, 2.0f, 4.0f}) {
+        CHECK(range_recall(*fx.hnsw, *fx.flat, fx.queries, radius) >= 0.90);
+        for (std::size_t i = 0; i < 10; ++i) check_range(*fx.hnsw, fx.hnsw->search_range(fx.queries[i], radius), radius);
+    }
+}
+
+TEST(range, rg10_crossing_outside_vectors_helps) {
+    const Fixture& fx = fixture(Metric::L2);
+    SearchOptions none, two;
+    none.range_expand_outside = 0;
+    two.range_expand_outside = 2;
+    const double r0 = range_recall(*fx.hnsw, *fx.flat, fx.queries, 3.0f, none);
+    const double r2 = range_recall(*fx.hnsw, *fx.flat, fx.queries, 3.0f, two);
+    CHECK(r2 >= r0 && r2 >= 0.95);
+}
+
+TEST(range, rg11_range_with_filter_and_predicate) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions o = with_filter(Filter::lt("bucket", 50));
+    o.predicate = [](std::uint64_t id) { return id % 2 == 0; };
+    for (std::size_t i = 0; i < 5; ++i) {
+        const auto got = fx.flat->search_range(fx.queries[i], 3.0f, kNoLimit, o);
+        CHECK(same_results(tie_sorted(got), range_reference(*fx.flat, fx.queries[i], 3.0f, o)));
+        for (const auto& r : fx.hnsw->search_range(fx.queries[i], 3.0f, kNoLimit, o)) CHECK(r.id % 100 < 50 && r.id % 2 == 0);
+    }
+    CHECK(range_recall(*fx.hnsw, *fx.flat, fx.queries, 3.0f, o) >= 0.90);
+}
+
+TEST(range, rg12_never_returns_removed) {
+    auto data = clustered(600, 8, 4, 361);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 0; i < 600; i += 2) {
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 0; i < 600; i += 10) {  // reuse some slots
+        h.add(9000 + i, data[i]);
+        f.add(9000 + i, data[i]);
+    }
+    for (std::size_t i = 0; i < 20; ++i) {
+        check_range(h, h.search_range(data[i], 1.0f), 1.0f);
+        check_range(f, f.search_range(data[i], 1.0f), 1.0f);
+    }
+}
+
+TEST(range, rg13_forced_exact_matches_flat) {
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions o;
+    o.strategy = Strategy::ForceExact;
+    for (std::size_t i = 0; i < 10; ++i)
+        CHECK(same_results(tie_sorted(fx.hnsw->search_range(fx.queries[i], 2.5f, kNoLimit, o)),
+                           range_reference(*fx.flat, fx.queries[i], 2.5f)));
+}
+
+TEST(range, rg14_empty_or_all_removed) {
+    HnswIndex h(2, Metric::L2);
+    FlatIndex f(2, Metric::L2);
+    CHECK(h.search_range(std::vector<float>{0, 0}, 10.0f).empty() && f.search_range(std::vector<float>{0, 0}, 10.0f).empty());
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, std::vector<float>{float(i), 0});
+        f.add(i, std::vector<float>{float(i), 0});
+    }
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.remove(i);
+        f.remove(i);
+    }
+    CHECK(h.search_range(std::vector<float>{0, 0}, 1e30f).empty() && f.search_range(std::vector<float>{0, 0}, 1e30f).empty());
+}
+
+TEST(range, rg15_oom_range_search) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 8, 4, 362);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Results before = h.search_range(data[0], 1.0f);
+    CHECK(sweep_allocation_failures([&] { h.search_range(data[0], 1.0f); },
+                                    [&] { CHECK(same_results(h.search_range(data[0], 1.0f), before)); }) > 0);
+}
+
+// ===========================================================================
+// Search features together (IX1-IX6)
+// ===========================================================================
+
+TEST(search_e2e, ix01_lifecycle_with_filters) {
+    auto pool = clustered(2500, 12, 8, 370);
+    auto queries = clustered(20, 12, 8, 371);
+    HnswIndex h(12, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    FlatIndex f(12, Metric::L2, Schema::strict(search_fields()));
+    std::mt19937 rng(372);
+    std::vector<std::uint64_t> live;
+    std::size_t next = 0;
+    const SearchOptions o = with_filter(Filter::eq("category", "tech") || Filter::ge("year", 2020));
+    double worst = 1.0;
+    for (int step = 0; step < 4000 && next < pool.size(); ++step) {
+        const unsigned op = static_cast<unsigned>(rng() % 6);
+        if (op < 3 || live.size() < 50) {
+            h.add(next, pool[next], meta_for(next));
+            f.add(next, pool[next], meta_for(next));
+            live.push_back(next++);
+        } else if (op == 3) {
+            const std::size_t pos = rng() % live.size();
+            h.remove(live[pos]);
+            f.remove(live[pos]);
+            live[pos] = live.back();
+            live.pop_back();
+        } else if (op == 4) {
+            const std::uint64_t id = live[rng() % live.size()];
+            const Metadata md = meta_for(rng() % 5000);
+            h.set_metadata(id, md);
+            f.set_metadata(id, md);
+        } else if (step % 50 == 0) {
+            worst = std::min(worst, filtered_recall(h, f, queries, 10, 64, o));
+            for (const auto& q : queries)
+                for (const auto& r : h.search(q, 10, 64, o)) CHECK(ref_eval(o.filter->root(), *h.get_metadata(r.id)));
+        }
+        if (step == 2000) h.compact();
+    }
+    CHECK(worst >= 0.85);
+    check_graph(h, 0.99);
+}
+
+TEST(search_e2e, ix02_batches_with_filters_during_churn) {
+    auto pool = clustered(1500, 8, 6, 373);
+    auto queries = clustered(16, 8, 6, 374);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 1000; ++i) h.add(i, pool[i], meta_for(i));
+    const SearchOptions o = with_filter(Filter::has_tag("tags", "a"));
+    bool same = true;
+    for (std::size_t round = 0; round < 5; ++round) {
+        for (std::size_t i = 0; i < 100; ++i) h.remove(round * 100 + i);
+        for (std::size_t i = 0; i < 100; ++i) h.add(1000 + round * 100 + i, pool[1000 + round * 100 + i], meta_for(i));
+        const auto batch = h.search_batch(flatten(queries), 10, 64, 4, o);
+        for (std::size_t q = 0; q < queries.size(); ++q) same = same && same_results(batch[q], h.search(queries[q], 10, 64, o));
+    }
+    CHECK(same);
+}
+
+TEST(search_e2e, ix03_filtered_searches_from_many_threads) {
+    const MetaFixture& fx = meta_fixture();
+    const SearchOptions o = with_filter(Filter::lt("bucket", 30) && Filter::ne("category", "food"));
+    std::vector<Results> expected;
+    for (const auto& q : fx.queries) expected.push_back(fx.hnsw->search(q, 10, 64, o));
+    CHECK(parallel_mismatches(fx.queries, expected, 8, 2, [&](const std::vector<float>& q) { return fx.hnsw->search(q, 10, 64, o); }) == 0);
+}
+
+TEST(search_e2e, ix04_every_metric_with_every_feature) {
+    auto data = clustered(800, 8, 4, 375);
+    for (Metric m : kMetrics) {
+        HnswIndex h(8, m, HnswParams{}, Schema::strict(search_fields()));
+        FlatIndex f(8, m, Schema::strict(search_fields()));
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        const SearchOptions o = with_filter(Filter::ge("year", 2005));
+        const Vectors queries(data.begin(), data.begin() + 10);
+        CHECK(filtered_recall(h, f, queries, 10, 64, o) >= (m == Metric::InnerProduct ? 0.80 : 0.90));
+        const auto batch = h.search_batch(flatten(queries), 10, 64, 2, o);
+        for (std::size_t i = 0; i < queries.size(); ++i) CHECK(same_results(batch[i], h.search(queries[i], 10, 64, o)));
+        const float radius = m == Metric::L2 ? 0.5f : (m == Metric::Cosine ? 0.05f : -1.0f);
+        for (std::size_t i = 0; i < 3; ++i) check_range(h, h.search_range(queries[i], radius, kNoLimit, o), radius);
+    }
+}
+
+TEST(search_e2e, ix05_reproducible) {
+    auto data = clustered(700, 8, 4, 376);
+    HnswIndex a(8, Metric::L2), b(8, Metric::L2);
+    for (HnswIndex* h : {&a, &b}) {
+        for (std::size_t i = 0; i < data.size(); ++i) h->add(i, data[i], meta_for(i));
+        for (std::uint64_t i = 0; i < 700; i += 5) h->remove(i);
+    }
+    const SearchOptions o = with_filter(Filter::has_any_tag("tags", {"b", "c"}));
+    bool same = true;
+    for (std::size_t i = 0; i < 20; ++i) {
+        same = same && same_results(a.search(data[i], 10, 64, o), b.search(data[i], 10, 64, o));
+        same = same && same_results(a.search_range(data[i], 0.5f, kNoLimit, o), b.search_range(data[i], 0.5f, kNoLimit, o));
+    }
+    const auto ba = a.search_batch(flatten(data), 5, 64, 3, o), bb = b.search_batch(flatten(data), 5, 64, 1, o);
+    for (std::size_t i = 0; i < ba.size(); ++i) same = same && same_results(ba[i], bb[i]);
+    CHECK(same);
+}
+
+TEST(search_e2e, ix06_large_scale_random_filters) {
+    auto data = clustered(20000, 16, 25, 377);
+    auto queries = clustered(30, 16, 25, 378);
+    HnswIndex h(16, Metric::L2, HnswParams{16, 100, 9}, Schema::strict(search_fields()));
+    FlatIndex f(16, Metric::L2, Schema::strict(search_fields()));
+    h.create_payload_index("category");
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    std::mt19937 rng(379);
+    double total = 0.0;
+    int tested = 0;
+    for (int t = 0; t < 40; ++t) {
+        const SearchOptions o = with_filter(random_filter(rng, 2));
+        for (const auto& r : h.search(queries[std::size_t(t) % queries.size()], 10, 64, o))
+            CHECK(ref_eval(o.filter->root(), meta_for(r.id)));
+        total += filtered_recall(h, f, Vectors(queries.begin(), queries.begin() + 5), 10, 64, o);
+        ++tested;
+    }
+    CHECK(total / tested >= 0.90);
+}
+
+// ===========================================================================
+// Added by the second coverage audit (beyond the test plan)
+// ===========================================================================
+
+TEST(filter, fl60_compile_errors_for_every_type) {
+    auto f = small_meta_flat(10);
+    const std::vector<float> q{0};
+    for (const Filter& bad : {Filter::eq("tags", "a"), Filter::in("in_stock", {"yes"}), Filter::in("year", {"x"}),
+                              Filter::in("category", {1, 2}), Filter::has_all_tags("category", {"a"}),
+                              Filter::between("year", "a", 3), Filter::between("year", 1, "b"), Filter::lt("in_stock", true),
+                              Filter::ne("category", 3), Filter::exists("unknown_field"), Filter::in("price", {true})})
+        CHECK_THROWS_AS(std::invalid_argument, f->search(q, 1, with_filter(bad)));
+}
+
+TEST(filter, fl61_constant_folding) {
+    auto f = small_meta_flat(50, false);  // dynamic: unknown fields match nothing
+    const Filter unknown = Filter::eq("missing", 1), news = Filter::eq("category", "news");
+    CHECK(matching_ids(*f, !Filter::all()).empty());
+    CHECK(matching_ids(*f, !!Filter::all()).size() == 50);
+    CHECK(matching_ids(*f, !unknown).size() == 50);
+    CHECK(matching_ids(*f, unknown && news).empty() && matching_ids(*f, news && unknown).empty());
+    CHECK(matching_ids(*f, unknown || news) == reference_ids(50, news));
+    CHECK(matching_ids(*f, news || unknown) == reference_ids(50, news));
+    CHECK(matching_ids(*f, unknown || unknown).empty());
+    CHECK(matching_ids(*f, !(unknown || unknown)).size() == 50);
+}
+
+TEST(filter, fl62_number_comparison_edges) {
+    FlatIndex f(1, Metric::L2);
+    const std::int64_t lo = std::numeric_limits<std::int64_t>::min();
+    f.add(1, std::vector<float>{0}, Metadata().set("n", std::int64_t(5)));
+    f.add(2, std::vector<float>{1}, Metadata().set("n", std::int64_t(-5)));
+    f.add(3, std::vector<float>{2}, Metadata().set("n", lo));
+    f.add(4, std::vector<float>{3}, Metadata().set("x", -2.5));
+    using V = std::vector<std::uint64_t>;
+    CHECK(matching_ids(f, Filter::lt("n", 9.3e18)) == V({1, 2, 3}));       // beyond 2^63: every int is below
+    CHECK(matching_ids(f, Filter::gt("n", -9.3e18)) == V({1, 2, 3}));      // beyond -2^63: every int is above
+    CHECK(matching_ids(f, Filter::lt("n", 5.5)) == V({1, 2, 3}));          // positive fraction
+    CHECK(matching_ids(f, Filter::gt("n", 4.5)) == V({1}));
+    CHECK(matching_ids(f, Filter::gt("n", -5.5)) == V({1, 2}));            // negative fraction
+    CHECK(matching_ids(f, Filter::lt("n", -4.5)) == V({2, 3}));
+    CHECK(matching_ids(f, Filter::eq("n", 5.0)) == V({1}));                // equal, no fraction
+    CHECK(matching_ids(f, Filter::eq("n", -9223372036854775808.0)) == V({3}));
+    CHECK(matching_ids(f, Filter::gt("x", -3)) == V({4}) && matching_ids(f, Filter::lt("x", -2)) == V({4}));
+    CHECK(matching_ids(f, Filter::in("n", {5.0, 7.5})) == V({1}));         // floats against an int field
+    CHECK(matching_ids(f, Filter::in("x", {-3, -2})).empty());             // ints against a float field
+    CHECK(matching_ids(f, Filter::between("x", -3, -2.0)) == V({4}));     // mixed bounds
+    CHECK(matching_ids(f, Filter::between("n", 6, 5.5)).empty());          // low above high (mixed types)
+}
+
+TEST(filter, fl63_membership_and_tag_variants) {
+    auto f = small_meta_flat(60);
+    CHECK(matching_ids(*f, Filter::in("in_stock", {true})) == reference_ids(60, Filter::eq("in_stock", true)));
+    CHECK(matching_ids(*f, Filter::in("in_stock", {false})) == reference_ids(60, Filter::eq("in_stock", false)));
+    CHECK(matching_ids(*f, Filter::in("in_stock", {true, false})) == reference_ids(60, Filter::exists("in_stock")));
+    CHECK(matching_ids(*f, Filter::in("category", {"news", "news", "nope"})) == reference_ids(60, Filter::eq("category", "news")));
+    CHECK(matching_ids(*f, Filter::in("category", {"nope"})).empty());
+    CHECK(matching_ids(*f, Filter::has_all_tags("tags", {})) == reference_ids(60, Filter::exists("tags")));
+    CHECK(matching_ids(*f, Filter::has_all_tags("tags", {"a", "zz"})).empty());
+    CHECK(matching_ids(*f, Filter::has_any_tag("tags", {"zz", "yy"})).empty());
+    CHECK(matching_ids(*f, Filter::has_any_tag("tags", {"a", "a"})) == reference_ids(60, Filter::has_tag("tags", "a")));
+}
+
+TEST(filter, fl64_options_variants) {
+    // Filter::all() given explicitly, planner settings on Flat, statistics from range search.
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions all = with_filter(Filter::all());
+    all.planner = PlannerParams{};
+    CHECK(same_results(fx.hnsw->search(fx.queries[0], 10, 64, all), fx.hnsw->search(fx.queries[0], 10, 64)));
+    CHECK(same_results(fx.flat->search(fx.queries[0], 10, all), fx.flat->search(fx.queries[0], 10)));
+    CHECK(fx.hnsw->search_batch(flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 2)), 5, 64, 2, all).size() == 2);
+    SearchStats hs, fs;
+    SearchOptions o;
+    o.stats = &hs;
+    o.strategy = Strategy::ForceGraph;
+    fx.hnsw->search_range(fx.queries[0], 2.0f, kNoLimit, o);
+    CHECK(hs.strategy == Strategy::ForceGraph && hs.reason == PlanReason::Forced);
+    o.stats = &fs;
+    fx.flat->search_range(fx.queries[0], 2.0f, kNoLimit, o);
+    CHECK(fs.reason == PlanReason::FlatIndex && fs.distance_computations == 3000);
+    SearchOptions exact = with_filter(Filter::lt("bucket", 10), Strategy::ForceExact);
+    const auto r = fx.hnsw->search_range(fx.queries[0], 4.0f, kNoLimit, exact);
+    for (const auto& x : r) CHECK(x.id % 100 < 10);
+    CHECK(!fx.flat->set_metadata(999999, Metadata().set("year", 1)));
+}
+
+TEST(planner, pl17_exact_counts_for_every_filter_kind) {
+    auto data = clustered(600, 8, 4, 390);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    for (const char* field : {"category", "tags", "in_stock"}) h.create_payload_index(field);
+    auto count = [&](const Filter& flt) {
+        SearchStats st;
+        SearchOptions o = with_filter(flt);
+        o.stats = &st;
+        h.search(data[0], 5, 64, o);
+        return std::pair<bool, std::size_t>{st.exact_count && st.estimated_matches == reference_ids(600, flt).size(), st.exact_count};
+    };
+    for (const Filter& flt : {Filter::eq("category", "tech"), Filter::in("category", {"tech", "food"}),
+                              Filter::eq("in_stock", true), Filter::eq("in_stock", false), Filter::ne("in_stock", true),
+                              Filter::has_tag("tags", "c"), Filter::exists("year"), Filter::between("year", 2010, 2005)})
+        CHECK(count(flt).first);
+    HnswIndex plain(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));  // no payload index
+    for (std::size_t i = 0; i < data.size(); ++i) plain.add(i, data[i], meta_for(i));
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::in("category", {"tech"}));
+    o.stats = &st;
+    plain.search(data[0], 5, 64, o);
+    CHECK(!st.exact_count && std::fabs(st.selectivity - 0.2) < 0.08);  // no payload index: sampled
+    CHECK(h.metadata().value_count(*h.metadata().find_field("category"), 999999) == 0);  // unknown value ID
+}
+
+TEST(planner, pl18_plan_search_directly) {
+    IdMap ids;
+    for (std::uint64_t i = 0; i < 1000; ++i) ids.add(i);
+    for (NodeId i = 0; i < 1000; ++i)
+        if (i % 50 != 0) ids.mark_deleted(i);  // 20 live slots out of 1,000
+    const Eligibility everything{&ids};
+    PlanDecision d = plan_search(1000, 0, everything, std::nullopt, 64, Strategy::Auto, PlannerParams{});
+    CHECK(d.strategy == Strategy::ForceExact && d.estimated_matches == 0);  // no live vectors
+    PlannerParams sparse{0, 0.0, 300, 32.0};  // sample size 300 > live: counted exactly
+    d = plan_search(1000, 20, everything, std::nullopt, 64, Strategy::Auto, sparse);
+    CHECK(d.exact_count && d.estimated_matches == 20);
+    PlannerParams tiny_sample{0, 0.0, 4, 32.0};  // sampling a mostly removed index
+    d = plan_search(1000, 20, everything, std::nullopt, 64, Strategy::Auto, tiny_sample);
+    CHECK(!d.exact_count && d.selectivity == 1.0 && d.strategy == Strategy::ForceGraph);
+    d = plan_search(1000, 20, everything, std::size_t(7), 64, Strategy::ForceGraph, PlannerParams{});
+    CHECK(d.reason == PlanReason::Forced && d.exact_count && d.estimated_matches == 7);
+}
+
+TEST(metadata, md60_every_type_through_every_operation) {
+    MetadataStore m(Schema::dynamic());
+    const Metadata full = Metadata().set("i", 7).set("f", 2.5).set("b", true).set("k", "key").set_tags("t", {"x", "y"});
+    m.write(0, full);
+    m.write(1, Metadata().set("i", 8).set("f", 3).set("b", false).set("k", "other").set_tags("t", {"y"}));
+    for (const char* field : {"b", "k", "t"}) m.index_field(field);
+    CHECK(m.read(0) == full);
+    m.update(1, Metadata().unset("i").unset("never_existed").set("k", "key"));
+    CHECK(!m.read(1).get("i") && m.read(1).get("k")->s == "key" && m.read(1).get("f")->f == 3.0);
+    m.write(5, full);
+    m.move_row(5, 2);  // every type moves
+    CHECK(m.read(2) == full && m.read(5).empty());
+    m.clear(0);
+    m.clear(1);
+    CHECK(m.unused_string_count() == 1);  // "other"
+    CHECK(m.compact_dictionary() && !m.compact_dictionary());
+    CHECK(m.read(2) == full && *m.value_count(*m.find_field("k"), *m.find_string("key")) == 1);
+    CHECK(*m.value_count(*m.find_field("b"), 1) == 1 && *m.value_count(*m.find_field("t"), *m.find_string("y")) == 1);
+    CHECK(m.current_schema().mode() == SchemaMode::Dynamic && m.current_schema().fields().size() == 5);
+    MetadataStore strict(Schema::strict({{"a", FieldType::Int}}));
+    CHECK(strict.current_schema().mode() == SchemaMode::Strict);
+    CHECK(!(Value::of_int(1) == Value::of_float(1.0)) && Value::of_tags({"a", "b"}) == Value::of_tags({"b", "a", "a"}));
+    CHECK_THROWS_AS(std::invalid_argument, m.validate(Metadata().set("", 1)));
+}
+
+TEST(batch, bt16_thread_pool_failures) {
+    ThreadPool pool(3);
+    pool.parallel_for(0, [](std::size_t) { CHECK(false); });  // nothing to do
+    CHECK_THROWS_AS(std::runtime_error, pool.parallel_for(50, [](std::size_t) { throw std::runtime_error("every task fails"); }));
+    if constexpr (!HNSW_ALLOC_HOOK) return;
+    // Running out of memory while starting threads or queuing tasks: clean failure, pool still usable.
+    CHECK(sweep_allocation_failures([] { ThreadPool p(4); }, [] {}) > 0);
+    std::atomic<std::size_t> sum{0};
+    CHECK(sweep_allocation_failures([&] { pool.parallel_for(8, [&](std::size_t i) { sum += i; }); }, [] {}) > 0);
+    sum = 0;
+    pool.parallel_for(100, [&](std::size_t i) { sum += i; });
+    CHECK(sum.load() == 4950);
+}
+
+TEST(range, rg16_range_search_next_to_removed_nodes) {
+    // Sparse, mostly removed graphs (repair off, M 2-4): later inserts can prune
+    // the only links to an earlier vector, making it unreachable for any search,
+    // as the M = 2 tests measure. What range search must guarantee is that it
+    // finds every live vector reachable from the entry point, which it does by
+    // always starting from the entry point as well as from the greedy descent.
+    bool complete = true;
+    for (unsigned seed = 1; seed <= 150; ++seed) {
+        std::mt19937 rng(seed);
+        HnswParams p;
+        p.M = 2 + seed % 3;
+        p.ef_construction = 1 + seed % 4;
+        p.repair_on_remove = false;
+        p.seed = seed;
+        HnswIndex h(2, Metric::L2, p);
+        const int n = 20 + int(seed % 30);
+        for (int i = 0; i < n; ++i) h.add(std::uint64_t(i), std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        const std::uint64_t entry = h.storage().ids().external(h.entry_point());
+        for (int i = 0; i < n; ++i)
+            if (std::uint64_t(i) != entry) h.remove(std::uint64_t(i));
+        for (std::uint64_t i = 0; i < 5; ++i) h.add(1000 + i, std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        const std::vector<float> q{portable_uniform(rng), portable_uniform(rng)};
+
+        // Live vectors reachable from the entry point on level 0 (through removed ones too).
+        const Storage& st = h.storage();
+        std::vector<bool> seen(st.size(), false);
+        std::vector<NodeId> stack{h.entry_point()};
+        seen[h.entry_point()] = true;
+        while (!stack.empty()) {
+            const NodeId a = stack.back();
+            stack.pop_back();
+            for (NodeId b : st.graph().links(a, 0)) {
+                if (b == kEmpty) break;
+                if (!seen[b]) {
+                    seen[b] = true;
+                    stack.push_back(b);
+                }
+            }
+        }
+        std::set<std::uint64_t> found;
+        for (const auto& r : h.search_range(q, kInf)) found.insert(r.id);
+        for (NodeId n2 = 0; n2 < st.size(); ++n2)
+            if (seen[n2] && !st.ids().is_deleted(n2)) complete = complete && found.count(st.ids().external(n2)) == 1;
+        for (std::uint64_t id : found) complete = complete && h.contains(id);
+    }
+    CHECK(complete);
+}
+
+// ===========================================================================
+// Stress: limits, memory growth under long churn, and fixes from the load audit
+// ===========================================================================
+
+TEST(stress, st01_deep_filter_rejected_not_crashing) {
+    // Chaining && in a loop used to overflow the stack (found by the load audit).
+    Filter flt = Filter::eq("n", 1);
+    bool threw = false;
+    try {
+        for (int i = 0; i < 200000; ++i) flt = flt && Filter::eq("n", 1);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw && flt.root().depth == Filter::kMaxDepth);
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("n", 1));
+    CHECK(f.search(std::vector<float>{0}, 1, with_filter(flt)).size() == 1);  // the deepest allowed filter works
+    CHECK_THROWS_AS(std::invalid_argument, !flt);  // one level too deep
+}
+
+TEST(stress, st02_wide_balanced_filter) {
+    // 4,096 conditions as a balanced tree (depth 13) evaluate correctly.
+    std::vector<Filter> level;
+    for (int i = 0; i < 4096; ++i) level.push_back(Filter::eq("n", i));
+    while (level.size() > 1) {
+        std::vector<Filter> next;
+        for (std::size_t i = 0; i < level.size(); i += 2) next.push_back(level[i] || level[i + 1]);
+        level.swap(next);
+    }
+    FlatIndex f(1, Metric::L2);
+    for (std::int64_t i = 0; i < 5000; ++i) f.add(std::uint64_t(i), std::vector<float>{float(i)}, Metadata().set("n", i));
+    CHECK(f.search(std::vector<float>{0}, kHuge, with_filter(level[0])).size() == 4096);
+}
+
+TEST(stress, st03_dictionary_bounded_under_churn) {
+    // Unique strings with few live vectors used to grow the dictionary forever.
+    for (int which = 0; which < 2; ++which) {
+        FlatIndex f(1, Metric::L2);
+        HnswIndex h(1, Metric::L2);
+        std::size_t peak = 0;
+        for (std::uint64_t i = 0; i < 100000; ++i) {
+            const Metadata md = Metadata().set("session", "s" + std::to_string(i)).set_tags("t", {"u" + std::to_string(i)});
+            which == 0 ? f.add(i, std::vector<float>{float(i % 100)}, md) : h.add(i, std::vector<float>{float(i % 100)}, md);
+            if (i >= 10) which == 0 ? f.remove(i - 10) : h.remove(i - 10);
+            peak = std::max(peak, (which == 0 ? f.metadata() : h.metadata()).dictionary_size());
+            if (which == 1 && i == 20000) break;  // HNSW is slower; 20,000 steps suffice
+        }
+        CHECK(peak <= 4200);  // 2 strings per live vector + at most ~2,048 unused before reclaiming
+        const MetadataStore& m = which == 0 ? f.metadata() : h.metadata();
+        const std::uint64_t last = which == 0 ? 99999 : 20000;
+        const auto md = which == 0 ? f.get_metadata(last) : h.get_metadata(last);
+        CHECK(md && md->get("session")->s == "s" + std::to_string(last));  // still correct after renumbering
+        CHECK(m.find_string("s0") == std::nullopt);                           // long-gone strings reclaimed
+    }
+}
+
+TEST(stress, st04_dictionary_compaction_keeps_filters_and_counts) {
+    FlatIndex f(1, Metric::L2, Schema::strict(search_fields()));
+    f.create_payload_index("category");
+    f.create_payload_index("tags");
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        f.add(i, std::vector<float>{float(i)}, Metadata().set("category", "c" + std::to_string(i)).set_tags("tags", {"t" + std::to_string(i % 7)}));
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (i % 10 != 0) f.remove(i);  // 300 left; 2,700 category strings unused
+    CHECK(f.metadata().unused_string_count() == 2700);
+    f.compact();  // explicit compaction
+    const MetadataStore& m = f.metadata();
+    CHECK(m.unused_string_count() == 0 && m.dictionary_size() == 300 + 7);
+    CHECK(matching_ids(f, Filter::eq("category", "c1230")) == std::vector<std::uint64_t>{1230});
+    CHECK(matching_ids(f, Filter::eq("category", "c1231")).empty());
+    CHECK(m.value_count(*m.find_field("category"), *m.find_string("c1230")) == 1);
+    std::size_t t3 = 0;
+    for (std::uint64_t i = 0; i < 3000; i += 10) t3 += i % 7 == 3;
+    CHECK(m.value_count(*m.find_field("tags"), *m.find_string("t3")) == t3);
+    CHECK(matching_ids(f, Filter::has_tag("tags", "t3")).size() == t3);
+}
+
+TEST(stress, st05_thread_count_is_capped) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 4));
+    const auto h = fx.hnsw->search_batch(buffer, 5, 64, 100000);  // used to throw: too many threads
+    const auto f = fx.flat->search_batch(buffer, 5, 100000);
+    for (std::size_t i = 0; i < 4; ++i)
+        CHECK(same_results(h[i], fx.hnsw->search(fx.queries[i], 5, 64)) && same_results(f[i], fx.flat->search(fx.queries[i], 5)));
+    CHECK(effective_threads(100000) <= std::max<std::size_t>(64, 4 * std::max(1u, std::thread::hardware_concurrency())));
+    CHECK(effective_threads(0) >= 1 && effective_threads(3) == 3);
+}
+
+TEST(stress, st06_upper_blocks_recycled_under_churn) {
+    // Reusing a slot at a higher level used to abandon its old link block.
+    auto data = clustered(500, 4, 4, 380);
+    auto pool = clustered(30000, 4, 4, 381);
+    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5});  // M = 4: levels vary a lot
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    std::vector<std::uint64_t> live(500);
+    std::iota(live.begin(), live.end(), 0);
+    std::mt19937 rng(382);
+    std::size_t next = 0, after_warmup = 0;
+    for (int step = 0; step < 30000; ++step) {
+        const std::size_t pos = rng() % live.size();
+        h.remove(live[pos]);
+        h.add(100000 + next, pool[next]);
+        live[pos] = 100000 + next++;
+        if (step == 10000) after_warmup = h.storage().graph().upper_slots_allocated();
+    }
+    const std::size_t final_slots = h.storage().graph().upper_slots_allocated();
+    CHECK(final_slots <= after_warmup + after_warmup / 5);  // essentially flat, not growing with churn
+    CHECK(h.storage().graph().recycled_upper_blocks() > 0);
+    check_graph(h, 0.95);
+}
+
+TEST(stress, st07_compact_releases_visited_lists) {
+    auto data = clustered(2000, 8, 4, 383);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    h.search(data[0], 5);
+    CHECK(h.pooled_visited_lists() >= 1);
+    for (std::uint64_t i = 0; i < 2000; i += 2) h.remove(i);
+    h.compact();
+    CHECK(h.pooled_visited_lists() == 0);
+    CHECK(h.search(data[1], 5)[0].id == 1);  // searches work and create a right-sized list
+    CHECK(h.pooled_visited_lists() == 1);
+}
+
+TEST(stress, st08_unsigned_values_beyond_int64_rejected) {
+    const std::uint64_t too_big = std::uint64_t(1) << 63;
+    CHECK_THROWS_AS(std::invalid_argument, Metadata().set("n", too_big));
+    CHECK_THROWS_AS(std::invalid_argument, Filter::eq("n", too_big));
+    CHECK_NOTHROW(Metadata().set("n", too_big - 1));
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("n", too_big - 1));
+    CHECK(f.get_metadata(1)->get("n")->i == std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(stress, st09_large_in_list) {
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 20000; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("k", "v" + std::to_string(i)));
+    std::vector<std::string> wanted;
+    for (int i = 0; i < 10000; ++i) wanted.push_back("v" + std::to_string(i * 2));
+    const auto ids = matching_ids(f, Filter::in("k", wanted));
+    bool ok = ids.size() == 10000;
+    for (std::size_t i = 0; ok && i < ids.size(); ++i) ok = ids[i] == i * 2;
+    CHECK(ok);
+}
+
+TEST(stress, st10_long_churn_memory_bounded) {
+    // 60,000 mixed operations on ~1,000 live vectors with metadata: slots,
+    // dictionary and link blocks all stay bounded, and results stay correct.
+    auto pool = clustered(40000, 8, 8, 384);
+    auto queries = clustered(10, 8, 8, 385);
+    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3});
+    FlatIndex f(8, Metric::L2);
+    std::vector<std::uint64_t> live;
+    std::mt19937 rng(386);
+    std::size_t next = 0, peak_live = 0, max_dictionary = 0;
+    for (int step = 0; step < 60000 && next < pool.size(); ++step) {
+        if (live.size() < 1000 || rng() % 2 == 0) {
+            const Metadata md = Metadata().set("user", "u" + std::to_string(next)).set("group", std::int64_t(next % 5));
+            h.add(next, pool[next], md);
+            f.add(next, pool[next], md);
+            live.push_back(next++);
+        } else {
+            const std::size_t pos = rng() % live.size();
+            h.remove(live[pos]);
+            f.remove(live[pos]);
+            live[pos] = live.back();
+            live.pop_back();
+        }
+        peak_live = std::max(peak_live, live.size());
+        max_dictionary = std::max(max_dictionary, h.metadata().dictionary_size());
+    }
+    CHECK(h.capacity() <= peak_live && f.capacity() == live.size());
+    CHECK(max_dictionary <= peak_live + 2100);
+    const SearchOptions o = with_filter(Filter::eq("group", 2));
+    CHECK(filtered_recall(h, f, queries, 10, 64, o) >= 0.90);
+    check_graph(h, 0.99);
+}
+
+TEST(stress, st11_oom_during_dictionary_compaction) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("k", "s" + std::to_string(i)));
+    for (std::uint64_t i = 0; i < 2900; ++i) f.remove(i);  // 2,900 unused strings: the next write compacts
+    const std::size_t before = f.metadata().dictionary_size();
+    const long points = sweep_allocation_failures([&] { f.add(5000, std::vector<float>{0}, Metadata().set("k", "fresh")); }, [&] {
+        CHECK(!f.contains(5000) && f.metadata().dictionary_size() <= before && f.size() == 100);
+        CHECK(matching_ids(f, Filter::eq("k", "s2950")) == std::vector<std::uint64_t>{2950});
+    });
+    CHECK(points > 0);
+    CHECK(f.metadata().unused_string_count() == 0 && f.metadata().dictionary_size() == 101);
+    CHECK(matching_ids(f, Filter::eq("k", "fresh")) == std::vector<std::uint64_t>{5000});
+}
+
+TEST(stress, st12_oom_upper_block_recycling) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    GraphStorage g(4);
+    std::vector<NodeId> nodes;
+    for (int i = 0; i < 6; ++i) nodes.push_back(g.add_node(i % 3));
+    CHECK(sweep_allocation_failures([&] { g.reset_node(nodes[1], 5); },
+                                    [&] { CHECK(g.level(nodes[1]) == 1 && g.recycled_upper_blocks() == 0); }) > 0);
+    CHECK(g.level(nodes[1]) == 5 && g.recycled_upper_blocks() == 1);  // its old 1-level block is recycled
+    g.reset_node(nodes[0], 1);  // takes the recycled block: no new arena slots
+    const std::size_t slots = g.upper_slots_allocated();
+    CHECK(g.recycled_upper_blocks() == 0 && g.upper_slots_allocated() == slots);
+}
+
+// ===========================================================================
 // End to end
 // ===========================================================================
 
@@ -3854,7 +5997,8 @@ void print_usage() {
         "  --fail-fast         stop after the first failing test\n"
         "  --help              show this help\n"
         "\n"
-        "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency, e2e\n"
+        "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
