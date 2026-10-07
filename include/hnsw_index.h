@@ -159,6 +159,8 @@ public:
     }
     const PlannerParams& planner_params() const { return planner_; }
     const MetadataStore& metadata() const { return metadata_; }
+    /// Visited lists kept for reuse by searches (released by compact()).
+    std::size_t pooled_visited_lists() const { return visited_pool_.idle_count(); }
 
     /// Rebuilds the index from the live vectors only, with dense internal
     /// numbers and no free slots. User IDs are kept. The new index is built

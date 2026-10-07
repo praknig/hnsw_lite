@@ -116,6 +116,14 @@ public:
         return Handle(*this, std::move(list));
     }
 
+    /// Frees every idle list (for example after compact() shrank the index, so
+    /// pooled lists sized for the old index would only waste memory).
+    void clear() noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        idle_.clear();
+        created_ = 0;
+    }
+
     /// Number of lists currently waiting in the pool.
     std::size_t idle_count() const {
         std::lock_guard<std::mutex> lock(mutex_);

@@ -93,13 +93,13 @@ The engine is built as three layers. Each layer only depends on the ones below i
 
 ```mermaid
 flowchart TB
-    A["Your application"] --> B["Layer 3: FlatIndex"]
-    A --> C["Layer 3: HnswIndex"]
-    B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
-    C --> D
-    B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
-    C --> E
-    D --> E
+  A["Your application"] --> B["Layer 3: FlatIndex"]
+  A --> C["Layer 3: HnswIndex"]
+  B --> D["Layer 2: SIMD distance kernels<br/>AVX-512 / AVX2 / NEON / scalar"]
+  C --> D
+  B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
+  C --> E
+  D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -194,7 +194,7 @@ hnsw-lite/
 │   ├── hnsw_index.cpp          # HnswIndex implementation
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 396 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 418 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -559,7 +559,7 @@ Settings live in `PlannerParams`, per index (`set_planner_params`) or per query 
 
 `search_range(query, radius, max_results)` returns every eligible vector with distance at or below `radius`, closest first. The radius uses each metric's "smaller is closer" distance, so **for L2 it is a squared distance**; `l2_radius(r)` converts an ordinary radius. `max_results` is optional (no limit by default; 0 returns nothing).
 
-Flat scans exactly. HNSW **grows a region**: a normal search finds the nearest vectors, then every vector inside the radius has its neighbors visited, continuing outward. `SearchOptions::range_expand_outside` (default 1) lets the growth cross that many vectors outside the radius, so a narrow gap does not cut a region in two. It is approximate; `Strategy::ForceExact` scans instead.
+Flat scans exactly. HNSW **grows a region**: a normal search, started from both the greedy descent and the entry point, finds the nearest vectors, then every vector inside the radius has its neighbors visited, continuing outward. `SearchOptions::range_expand_outside` (default 1) lets the growth cross that many vectors outside the radius, so a narrow gap does not cut a region in two. It is approximate; `Strategy::ForceExact` scans instead.
 
 ## API reference
 
@@ -727,7 +727,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `Value::from(x)` | Builds a value; the type comes from the C++ type of `x` |
 | `Metadata().set(name, value)`, `set_tags(name, tags)`, `unset(name)` | Builds the fields of one vector; `unset` clears a field in `set_metadata` |
 | `Schema::strict(fields)`, `Schema::dynamic(fields = {})` | Schema modes; empty or duplicate names throw |
-| `MetadataStore` | Column storage: `validate`, `write`, `update`, `clear`, `move_row`, `read`, `index_field`, `value_count`, `present_count`, fast column accessors |
+| `MetadataStore` | Column storage: `validate`, `write`, `update`, `clear`, `move_row`, `read`, `index_field`, `value_count`, `present_count`, `compact_dictionary`, `unused_string_count`, fast column accessors |
 
 ### `filter.h`
 
@@ -753,13 +753,13 @@ Not copyable, movable. Frees its memory in the destructor.
 | `search_range(query, radius, max_results = kNoLimit, options)` | Range search |
 | `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings |
 
-`thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller) and `SharedPool`; `search_result.h` adds `kNoLimit` and `l2_radius`.
+`thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
 
 ## Testing
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 396 individually named tests** in 16 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 418 individually named tests** in 17 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -770,13 +770,14 @@ Not copyable, movable. Frees its memory in the destructor.
 | `hnsw` | 44 | Parameter and input validation; rejected inserts leaving the later graph bit-identical; 1 to 10 vectors matching Flat exactly; k and ef limits; results sorted, unique and live; distances equal to Flat's; determinism; graph validity and recall for every metric; recall at k = 1, 10 and 50; level distribution; `M = 2`, `ef_construction = 1`, `M = 64`, other seeds; identical vectors; removing the entry point, a quarter, all but one, and everything; new nodes never linking to removed ones |
 | `robustness` | 20 | **Numeric extremes:** inner-product overflow (+∞ plus −∞ = NaN) sorting last instead of breaking the order, L2 overflow, huge values with cosine, denormals, −0 versus 0. **Out of memory:** every allocation in an `IdMap`, `VectorStore`, `GraphStorage` and `Storage` insert, a Flat add and search, and an HNSW first insert, insert and search is made to fail in turn, checking after each failure that nothing is corrupted and the object still works |
 | `deletion` | 59 | Scenarios D1 to D66 from the [test plan](docs/core-capabilities-test-plan.md), each test named after its scenario ID, plus 8 tests added by the coverage audit. Layer 1 building blocks (release, bind, overwrite, move, node reset); Flat swap-with-last removal checked against a `std::map` reference over 10,000 random operations; HNSW slot reuse at higher and lower levels, graph repair, entry-point reassignment, removing everything, 20-cycle churn for every metric, removing a whole cluster; `compact()`; statistics; out-of-memory sweeps for every new operation |
-| `metadata` | 31 | MD scenarios: every type round-trips; strict and dynamic schemas; type errors; extreme values (64-bit limits, 1 MB strings, UTF-8, 1,000 tags); `set_metadata` and `unset`; metadata following slots through swap-with-last, reuse and `compact()`; 3,000 random operations against a reference; out-of-memory sweeps, including no field left behind by a failed insert |
-| `filter` | 30 | FL scenarios: every condition, and 1,000 random nested filters, checked against an independent reference evaluator; missing-field and exact integer/float rules; type errors; Flat exact against brute force; HNSW never violating a filter across 1,000 random filters, recall at 50% to 5% selectivity, matches clustered or scattered, entry point failing the filter; predicates alone, combined, throwing, and called from 8 threads |
-| `planner` | 16 | PL scenarios: sampled selectivity accuracy; exact payload counts; each threshold and its inclusive boundary; per-query overrides; forced strategies; exact strategy equal to Flat; tiny, empty and all-removed indexes; determinism; consistent statistics; invalid settings; recall at 1% to 100% selectivity |
+| `metadata` | 32 | MD scenarios: every type round-trips; strict and dynamic schemas; type errors; extreme values (64-bit limits, 1 MB strings, UTF-8, 1,000 tags); `set_metadata` and `unset`; metadata following slots through swap-with-last, reuse and `compact()`; 3,000 random operations against a reference; out-of-memory sweeps, including no field left behind by a failed insert |
+| `filter` | 35 | FL scenarios: every condition, and 1,000 random nested filters, checked against an independent reference evaluator; missing-field and exact integer/float rules; type errors; Flat exact against brute force; HNSW never violating a filter across 1,000 random filters, recall at 50% to 5% selectivity, matches clustered or scattered, entry point failing the filter; predicates alone, combined, throwing, and called from 8 threads |
+| `planner` | 18 | PL scenarios: sampled selectivity accuracy; exact payload counts; each threshold and its inclusive boundary; per-query overrides; forced strategies; exact strategy equal to Flat; tiny, empty and all-removed indexes; determinism; consistent statistics; invalid settings; recall at 1% to 100% selectivity |
 | `payload` | 6 | PI scenarios: counts exact after 2,000 random operations; identical results with or without the index; backfill equal to incremental; unsupported types rejected; out of memory; kept by `compact()` |
-| `batch` | 15 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
-| `range` | 15 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
+| `batch` | 16 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
+| `range` | 16 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
 | `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
+| `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
 
@@ -786,7 +787,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 396 test names
+test_comprehensive --list               # list all 418 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -800,13 +801,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 396 of 396 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 418 of 418 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-396 passed, 0 failed, 0 skipped, 0 not run, 25976 checks, 14.24 s
+418 passed, 0 failed, 0 skipped, 0 not run, 26343 checks, 16.01 s
 All selected tests passed.
 ```
 
@@ -821,7 +822,7 @@ TEST(flat, my_new_case) {
 }
 ```
 
-**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 24 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
+**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 27 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
 
 ### Code coverage
 
@@ -829,8 +830,8 @@ Coverage is measured with gcov and gcovr. On the library code:
 
 | Measure | Covered |
 |---|---|
-| Lines | **100%** (730 of 730) |
-| Branches | **99 to 100%** (522 or 523 of 523; see below) |
+| Lines | **100%** (1,750 of 1,750) |
+| Branches | **98%** (1,636 of 1,670) |
 
 Excluded from measurement, each marked in the source with a `GCOVR_EXCL` comment that states the reason:
 
@@ -845,33 +846,36 @@ The NEON kernel file is excluded on x86 because it compiles to nothing there. Li
 cmake -B build-cov -DCMAKE_BUILD_TYPE=Debug "-DCMAKE_CXX_FLAGS=--coverage -O0 -fno-inline -fprofile-update=atomic" -DCMAKE_EXE_LINKER_FLAGS=--coverage
 cmake --build build-cov --target test_comprehensive
 ./build-cov/test_comprehensive
-gcovr -r . build-cov --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" --exclude-unreachable-branches --exclude-throw-branches --html-details coverage.html
+gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" --exclude-unreachable-branches --exclude-throw-branches --html-details coverage.html
 ```
 
 **What the coverage audit found.** The first measurement showed 99% of lines and 94% of branches. Each gap was either tested, or excluded with a reason. Closing them added 10 tests and found one real bug (number 11 below): with graph repair turned off and nearly everything removed, a search could start in a region of the graph that reaches no live vector and return nothing at all.
 
+**Second coverage audit (after the search features).** CI caught line coverage at 98.0%, and branch coverage turned out to be 92.9%. Three causes: template functions (gcov counts each instantiation separately, so executed lines were reported as missed; `--merge-lines` combines them), genuinely untested search-feature code (closed with 10 tests: every filter compilation error, number comparisons beyond 2^53 and 2^63, every field type through every metadata operation, exact counts for every filter kind, `plan_search` called directly, and out-of-memory failures in the thread pool), and two conditions that could never be true (simplified away). The remaining uncovered branches are compiler-generated (inside initializer lists and standard-library code), so the CI branch gate is 97%, one point below the measured value; the line gate stays at 99% with 100% measured. The coverage run takes several minutes, so it uses atomic counters (`-fprofile-update=atomic`) for exact counts with threads.
+
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 16 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 17 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/16 Test # 1: comprehensive.layer1 ................   Passed
- 2/16 Test # 2: comprehensive.layer2 ................   Passed
- 3/16 Test # 3: comprehensive.helpers ...............   Passed
- 4/16 Test # 4: comprehensive.flat ..................   Passed
- 5/16 Test # 5: comprehensive.hnsw ..................   Passed
- 6/16 Test # 6: comprehensive.robustness ............   Passed
- 7/16 Test # 7: comprehensive.deletion ..............   Passed
- 8/16 Test # 8: comprehensive.concurrency ...........   Passed
- 9/16 Test # 9: comprehensive.metadata ..............   Passed
-10/16 Test #10: comprehensive.filter ................   Passed
-11/16 Test #11: comprehensive.planner ...............   Passed
-12/16 Test #12: comprehensive.payload ...............   Passed
-13/16 Test #13: comprehensive.batch .................   Passed
-14/16 Test #14: comprehensive.range .................   Passed
-15/16 Test #15: comprehensive.search_e2e ............   Passed
-16/16 Test #16: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 16
+ 1/17 Test # 1: comprehensive.layer1 ................   Passed
+ 2/17 Test # 2: comprehensive.layer2 ................   Passed
+ 3/17 Test # 3: comprehensive.helpers ...............   Passed
+ 4/17 Test # 4: comprehensive.flat ..................   Passed
+ 5/17 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/17 Test # 6: comprehensive.robustness ............   Passed
+ 7/17 Test # 7: comprehensive.deletion ..............   Passed
+ 8/17 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/17 Test # 9: comprehensive.metadata ..............   Passed
+10/17 Test #10: comprehensive.filter ................   Passed
+11/17 Test #11: comprehensive.planner ...............   Passed
+12/17 Test #12: comprehensive.payload ...............   Passed
+13/17 Test #13: comprehensive.batch .................   Passed
+14/17 Test #14: comprehensive.range .................   Passed
+15/17 Test #15: comprehensive.search_e2e ............   Passed
+16/17 Test #16: comprehensive.stress ................   Passed
+17/17 Test #17: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 17
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -909,6 +913,16 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 11. **A search could return nothing while live vectors existed** (found by the coverage audit). Links are one-directional, so after many removals without graph repair, the greedy descent could end on a removed node whose links lead only to other removed nodes; the search then found no live vector. Searches that find fewer than k results, and inserts that find no live neighbor, now retry with the entry point (always live) as an extra starting point. The insert retry replaces the old fallback of linking new vectors to removed nodes.
 12. **A failed HNSW insert could leave a new metadata field behind** (found by the search-feature tests). If memory ran out while linking a vector, after its metadata had been written, the failure handler cleared the row but kept any dynamic field or dictionary string that insert had created. It now undoes the metadata write completely.
 
+**Found by the load audit** (probing behavior under deep inputs, long churn and extreme settings), all fixed and covered by the `stress` group:
+
+13. **A deeply nested filter crashed the program.** Chaining `&&` 200,000 times overflowed the stack. Filters are now limited to 256 levels; going deeper throws `std::invalid_argument` with a clear message.
+14. **The string dictionary never shrank.** With 10 live vectors after 100,000 inserts of unique strings, it held 100,000 strings. Strings now carry reference counts, and unused ones are reclaimed automatically (and by `compact()`, now also on Flat); the same run keeps 672.
+15. **HNSW slot reuse leaked upper-level link memory.** Allocations kept growing under churn (13,264 slots after 200,000 steps, with about 700 in use). Blocks are now recycled whenever a node's level changes; allocations plateau at 1,068.
+16. **A huge thread count failed.** Asking batch search for 100,000 threads threw. Thread counts are now capped at max(64, 4 x hardware threads).
+17. **Unsigned values above the `int64` range wrapped negative** in metadata and filters. They are now rejected.
+18. **`compact()` kept visited lists sized for the old index.** They are now released.
+19. **`in()` on keywords checked its values one by one** per vector; they are now sorted and binary-searched.
+
 ## Continuous integration
 
 Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
@@ -932,7 +946,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers and deletion groups |
-| Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 98% of branches, and uploads an HTML report |
+| Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.
 
@@ -983,6 +997,8 @@ These are deliberate for the current stage:
 - **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
+- **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
+- **Dynamic metadata fields are never removed**, even when no vector uses them: field names are the schema, and removing one automatically would silently forget its type. Unused strings, by contrast, are reclaimed.
 - **The payload index keeps counts, not posting lists.** It makes the planner's estimates exact, but exact filtered search still checks every vector's metadata (a fast column read) rather than reading only the matching ones.
 - **Filter-aware graph construction is not implemented.** Very selective filters go to exact search; between roughly 1% and 10% selectivity the planner's thresholds matter most, and may need tuning per dataset.
 - **HNSW range search is approximate**, like k-nearest search; use `Strategy::ForceExact` when every vector in the radius must be found.

@@ -483,12 +483,14 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
             const std::size_t seeds_ef = std::min<std::size_t>(storage_.size(), 64);
             Candidate current{distance_to(q.data(), entry_), entry_};
             for (int l = max_level_; l > 0; --l) current = greedy_closest(q.data(), current, l, kEmpty);
+            //    The entry point (always live) is always a starting point too: links
+            //    are one-directional, so after many removals the descent can end in
+            //    a region that reaches only some of the live vectors.
             auto visited = visited_pool_.acquire(storage_.size());
+            std::vector<Candidate> starts{current};
+            if (current.id != entry_) starts.push_back({distance_to(q.data(), entry_), entry_});
             std::vector<Candidate> seeds =
-                search_level(q.data(), {current}, seeds_ef, 0, *visited, kEmpty, live_only(), &stats);
-            if (seeds.empty())
-                seeds = search_level(q.data(), {current, {distance_to(q.data(), entry_), entry_}}, seeds_ef, 0,
-                                     *visited, kEmpty, live_only(), &stats);
+                search_level(q.data(), starts, seeds_ef, 0, *visited, kEmpty, live_only(), &stats);
 
             // 2. Grow the region: from every vector inside the radius, visit its
             //    neighbors; vectors outside may be crossed for up to
@@ -502,7 +504,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
                 if (hops <= options.range_expand_outside) queue.push_back({n, hops});
             };
             for (const Candidate& s : seeds)
-                if (visited->visit(s.id)) consider(s.id, s.distance, 0);
+                if (visited->visit(s.id)) consider(s.id, s.distance, 0);  // GCOVR_EXCL_BR_LINE: seeds are unique
             const GraphStorage& graph = storage_.graph();
             for (std::size_t head = 0; head < queue.size(); ++head) {
                 const auto [node, hops] = queue[head];
@@ -543,6 +545,7 @@ CompactStats HnswIndex::compact() {
     max_level_ = fresh.max_level_;
     live_ = fresh.live_;
     free_slots_ = std::move(fresh.free_slots_);
+    visited_pool_.clear();  // pooled lists were sized for the old, larger index
     return {live_, reclaimed};
 }
 

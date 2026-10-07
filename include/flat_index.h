@@ -93,8 +93,12 @@ public:
                                            std::size_t max_results = kNoLimit,
                                            const SearchOptions& options = {}) const;
 
-    /// Does nothing (swap-with-last never leaves holes) and reports that.
-    CompactStats compact() { return {live_, 0}; }
+    /// Swap-with-last never leaves holes in the vectors, so this only reclaims
+    /// metadata strings no vector uses any more. Reports 0 vectors reclaimed.
+    CompactStats compact() {
+        metadata_.compact_dictionary();
+        return {live_, 0};
+    }
 
     std::size_t size() const { return live_; }
     std::size_t deleted_count() const { return 0; }

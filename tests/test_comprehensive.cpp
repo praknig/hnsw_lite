@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -5437,6 +5437,429 @@ TEST(search_e2e, ix06_large_scale_random_filters) {
 }
 
 // ===========================================================================
+// Added by the second coverage audit (beyond the test plan)
+// ===========================================================================
+
+TEST(filter, fl60_compile_errors_for_every_type) {
+    auto f = small_meta_flat(10);
+    const std::vector<float> q{0};
+    for (const Filter& bad : {Filter::eq("tags", "a"), Filter::in("in_stock", {"yes"}), Filter::in("year", {"x"}),
+                              Filter::in("category", {1, 2}), Filter::has_all_tags("category", {"a"}),
+                              Filter::between("year", "a", 3), Filter::between("year", 1, "b"), Filter::lt("in_stock", true),
+                              Filter::ne("category", 3), Filter::exists("unknown_field"), Filter::in("price", {true})})
+        CHECK_THROWS_AS(std::invalid_argument, f->search(q, 1, with_filter(bad)));
+}
+
+TEST(filter, fl61_constant_folding) {
+    auto f = small_meta_flat(50, false);  // dynamic: unknown fields match nothing
+    const Filter unknown = Filter::eq("missing", 1), news = Filter::eq("category", "news");
+    CHECK(matching_ids(*f, !Filter::all()).empty());
+    CHECK(matching_ids(*f, !!Filter::all()).size() == 50);
+    CHECK(matching_ids(*f, !unknown).size() == 50);
+    CHECK(matching_ids(*f, unknown && news).empty() && matching_ids(*f, news && unknown).empty());
+    CHECK(matching_ids(*f, unknown || news) == reference_ids(50, news));
+    CHECK(matching_ids(*f, news || unknown) == reference_ids(50, news));
+    CHECK(matching_ids(*f, unknown || unknown).empty());
+    CHECK(matching_ids(*f, !(unknown || unknown)).size() == 50);
+}
+
+TEST(filter, fl62_number_comparison_edges) {
+    FlatIndex f(1, Metric::L2);
+    const std::int64_t lo = std::numeric_limits<std::int64_t>::min();
+    f.add(1, std::vector<float>{0}, Metadata().set("n", std::int64_t(5)));
+    f.add(2, std::vector<float>{1}, Metadata().set("n", std::int64_t(-5)));
+    f.add(3, std::vector<float>{2}, Metadata().set("n", lo));
+    f.add(4, std::vector<float>{3}, Metadata().set("x", -2.5));
+    using V = std::vector<std::uint64_t>;
+    CHECK(matching_ids(f, Filter::lt("n", 9.3e18)) == V({1, 2, 3}));       // beyond 2^63: every int is below
+    CHECK(matching_ids(f, Filter::gt("n", -9.3e18)) == V({1, 2, 3}));      // beyond -2^63: every int is above
+    CHECK(matching_ids(f, Filter::lt("n", 5.5)) == V({1, 2, 3}));          // positive fraction
+    CHECK(matching_ids(f, Filter::gt("n", 4.5)) == V({1}));
+    CHECK(matching_ids(f, Filter::gt("n", -5.5)) == V({1, 2}));            // negative fraction
+    CHECK(matching_ids(f, Filter::lt("n", -4.5)) == V({2, 3}));
+    CHECK(matching_ids(f, Filter::eq("n", 5.0)) == V({1}));                // equal, no fraction
+    CHECK(matching_ids(f, Filter::eq("n", -9223372036854775808.0)) == V({3}));
+    CHECK(matching_ids(f, Filter::gt("x", -3)) == V({4}) && matching_ids(f, Filter::lt("x", -2)) == V({4}));
+    CHECK(matching_ids(f, Filter::in("n", {5.0, 7.5})) == V({1}));         // floats against an int field
+    CHECK(matching_ids(f, Filter::in("x", {-3, -2})).empty());             // ints against a float field
+    CHECK(matching_ids(f, Filter::between("x", -3, -2.0)) == V({4}));     // mixed bounds
+    CHECK(matching_ids(f, Filter::between("n", 6, 5.5)).empty());          // low above high (mixed types)
+}
+
+TEST(filter, fl63_membership_and_tag_variants) {
+    auto f = small_meta_flat(60);
+    CHECK(matching_ids(*f, Filter::in("in_stock", {true})) == reference_ids(60, Filter::eq("in_stock", true)));
+    CHECK(matching_ids(*f, Filter::in("in_stock", {false})) == reference_ids(60, Filter::eq("in_stock", false)));
+    CHECK(matching_ids(*f, Filter::in("in_stock", {true, false})) == reference_ids(60, Filter::exists("in_stock")));
+    CHECK(matching_ids(*f, Filter::in("category", {"news", "news", "nope"})) == reference_ids(60, Filter::eq("category", "news")));
+    CHECK(matching_ids(*f, Filter::in("category", {"nope"})).empty());
+    CHECK(matching_ids(*f, Filter::has_all_tags("tags", {})) == reference_ids(60, Filter::exists("tags")));
+    CHECK(matching_ids(*f, Filter::has_all_tags("tags", {"a", "zz"})).empty());
+    CHECK(matching_ids(*f, Filter::has_any_tag("tags", {"zz", "yy"})).empty());
+    CHECK(matching_ids(*f, Filter::has_any_tag("tags", {"a", "a"})) == reference_ids(60, Filter::has_tag("tags", "a")));
+}
+
+TEST(filter, fl64_options_variants) {
+    // Filter::all() given explicitly, planner settings on Flat, statistics from range search.
+    const MetaFixture& fx = meta_fixture();
+    SearchOptions all = with_filter(Filter::all());
+    all.planner = PlannerParams{};
+    CHECK(same_results(fx.hnsw->search(fx.queries[0], 10, 64, all), fx.hnsw->search(fx.queries[0], 10, 64)));
+    CHECK(same_results(fx.flat->search(fx.queries[0], 10, all), fx.flat->search(fx.queries[0], 10)));
+    CHECK(fx.hnsw->search_batch(flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 2)), 5, 64, 2, all).size() == 2);
+    SearchStats hs, fs;
+    SearchOptions o;
+    o.stats = &hs;
+    o.strategy = Strategy::ForceGraph;
+    fx.hnsw->search_range(fx.queries[0], 2.0f, kNoLimit, o);
+    CHECK(hs.strategy == Strategy::ForceGraph && hs.reason == PlanReason::Forced);
+    o.stats = &fs;
+    fx.flat->search_range(fx.queries[0], 2.0f, kNoLimit, o);
+    CHECK(fs.reason == PlanReason::FlatIndex && fs.distance_computations == 3000);
+    SearchOptions exact = with_filter(Filter::lt("bucket", 10), Strategy::ForceExact);
+    const auto r = fx.hnsw->search_range(fx.queries[0], 4.0f, kNoLimit, exact);
+    for (const auto& x : r) CHECK(x.id % 100 < 10);
+    CHECK(!fx.flat->set_metadata(999999, Metadata().set("year", 1)));
+}
+
+TEST(planner, pl17_exact_counts_for_every_filter_kind) {
+    auto data = clustered(600, 8, 4, 390);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    for (const char* field : {"category", "tags", "in_stock"}) h.create_payload_index(field);
+    auto count = [&](const Filter& flt) {
+        SearchStats st;
+        SearchOptions o = with_filter(flt);
+        o.stats = &st;
+        h.search(data[0], 5, 64, o);
+        return std::pair<bool, std::size_t>{st.exact_count && st.estimated_matches == reference_ids(600, flt).size(), st.exact_count};
+    };
+    for (const Filter& flt : {Filter::eq("category", "tech"), Filter::in("category", {"tech", "food"}),
+                              Filter::eq("in_stock", true), Filter::eq("in_stock", false), Filter::ne("in_stock", true),
+                              Filter::has_tag("tags", "c"), Filter::exists("year"), Filter::between("year", 2010, 2005)})
+        CHECK(count(flt).first);
+    HnswIndex plain(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));  // no payload index
+    for (std::size_t i = 0; i < data.size(); ++i) plain.add(i, data[i], meta_for(i));
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::in("category", {"tech"}));
+    o.stats = &st;
+    plain.search(data[0], 5, 64, o);
+    CHECK(!st.exact_count && std::fabs(st.selectivity - 0.2) < 0.08);  // no payload index: sampled
+    CHECK(h.metadata().value_count(*h.metadata().find_field("category"), 999999) == 0);  // unknown value ID
+}
+
+TEST(planner, pl18_plan_search_directly) {
+    IdMap ids;
+    for (std::uint64_t i = 0; i < 1000; ++i) ids.add(i);
+    for (NodeId i = 0; i < 1000; ++i)
+        if (i % 50 != 0) ids.mark_deleted(i);  // 20 live slots out of 1,000
+    const Eligibility everything{&ids};
+    PlanDecision d = plan_search(1000, 0, everything, std::nullopt, 64, Strategy::Auto, PlannerParams{});
+    CHECK(d.strategy == Strategy::ForceExact && d.estimated_matches == 0);  // no live vectors
+    PlannerParams sparse{0, 0.0, 300, 32.0};  // sample size 300 > live: counted exactly
+    d = plan_search(1000, 20, everything, std::nullopt, 64, Strategy::Auto, sparse);
+    CHECK(d.exact_count && d.estimated_matches == 20);
+    PlannerParams tiny_sample{0, 0.0, 4, 32.0};  // sampling a mostly removed index
+    d = plan_search(1000, 20, everything, std::nullopt, 64, Strategy::Auto, tiny_sample);
+    CHECK(!d.exact_count && d.selectivity == 1.0 && d.strategy == Strategy::ForceGraph);
+    d = plan_search(1000, 20, everything, std::size_t(7), 64, Strategy::ForceGraph, PlannerParams{});
+    CHECK(d.reason == PlanReason::Forced && d.exact_count && d.estimated_matches == 7);
+}
+
+TEST(metadata, md60_every_type_through_every_operation) {
+    MetadataStore m(Schema::dynamic());
+    const Metadata full = Metadata().set("i", 7).set("f", 2.5).set("b", true).set("k", "key").set_tags("t", {"x", "y"});
+    m.write(0, full);
+    m.write(1, Metadata().set("i", 8).set("f", 3).set("b", false).set("k", "other").set_tags("t", {"y"}));
+    for (const char* field : {"b", "k", "t"}) m.index_field(field);
+    CHECK(m.read(0) == full);
+    m.update(1, Metadata().unset("i").unset("never_existed").set("k", "key"));
+    CHECK(!m.read(1).get("i") && m.read(1).get("k")->s == "key" && m.read(1).get("f")->f == 3.0);
+    m.write(5, full);
+    m.move_row(5, 2);  // every type moves
+    CHECK(m.read(2) == full && m.read(5).empty());
+    m.clear(0);
+    m.clear(1);
+    CHECK(m.unused_string_count() == 1);  // "other"
+    CHECK(m.compact_dictionary() && !m.compact_dictionary());
+    CHECK(m.read(2) == full && *m.value_count(*m.find_field("k"), *m.find_string("key")) == 1);
+    CHECK(*m.value_count(*m.find_field("b"), 1) == 1 && *m.value_count(*m.find_field("t"), *m.find_string("y")) == 1);
+    CHECK(m.current_schema().mode() == SchemaMode::Dynamic && m.current_schema().fields().size() == 5);
+    MetadataStore strict(Schema::strict({{"a", FieldType::Int}}));
+    CHECK(strict.current_schema().mode() == SchemaMode::Strict);
+    CHECK(!(Value::of_int(1) == Value::of_float(1.0)) && Value::of_tags({"a", "b"}) == Value::of_tags({"b", "a", "a"}));
+    CHECK_THROWS_AS(std::invalid_argument, m.validate(Metadata().set("", 1)));
+}
+
+TEST(batch, bt16_thread_pool_failures) {
+    ThreadPool pool(3);
+    pool.parallel_for(0, [](std::size_t) { CHECK(false); });  // nothing to do
+    CHECK_THROWS_AS(std::runtime_error, pool.parallel_for(50, [](std::size_t) { throw std::runtime_error("every task fails"); }));
+    if constexpr (!HNSW_ALLOC_HOOK) return;
+    // Running out of memory while starting threads or queuing tasks: clean failure, pool still usable.
+    CHECK(sweep_allocation_failures([] { ThreadPool p(4); }, [] {}) > 0);
+    std::atomic<std::size_t> sum{0};
+    CHECK(sweep_allocation_failures([&] { pool.parallel_for(8, [&](std::size_t i) { sum += i; }); }, [] {}) > 0);
+    sum = 0;
+    pool.parallel_for(100, [&](std::size_t i) { sum += i; });
+    CHECK(sum.load() == 4950);
+}
+
+TEST(range, rg16_range_search_next_to_removed_nodes) {
+    // Sparse, mostly removed graphs (repair off, M 2-4): later inserts can prune
+    // the only links to an earlier vector, making it unreachable for any search,
+    // as the M = 2 tests measure. What range search must guarantee is that it
+    // finds every live vector reachable from the entry point, which it does by
+    // always starting from the entry point as well as from the greedy descent.
+    bool complete = true;
+    for (unsigned seed = 1; seed <= 150; ++seed) {
+        std::mt19937 rng(seed);
+        HnswParams p;
+        p.M = 2 + seed % 3;
+        p.ef_construction = 1 + seed % 4;
+        p.repair_on_remove = false;
+        p.seed = seed;
+        HnswIndex h(2, Metric::L2, p);
+        const int n = 20 + int(seed % 30);
+        for (int i = 0; i < n; ++i) h.add(std::uint64_t(i), std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        const std::uint64_t entry = h.storage().ids().external(h.entry_point());
+        for (int i = 0; i < n; ++i)
+            if (std::uint64_t(i) != entry) h.remove(std::uint64_t(i));
+        for (std::uint64_t i = 0; i < 5; ++i) h.add(1000 + i, std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        const std::vector<float> q{portable_uniform(rng), portable_uniform(rng)};
+
+        // Live vectors reachable from the entry point on level 0 (through removed ones too).
+        const Storage& st = h.storage();
+        std::vector<bool> seen(st.size(), false);
+        std::vector<NodeId> stack{h.entry_point()};
+        seen[h.entry_point()] = true;
+        while (!stack.empty()) {
+            const NodeId a = stack.back();
+            stack.pop_back();
+            for (NodeId b : st.graph().links(a, 0)) {
+                if (b == kEmpty) break;
+                if (!seen[b]) {
+                    seen[b] = true;
+                    stack.push_back(b);
+                }
+            }
+        }
+        std::set<std::uint64_t> found;
+        for (const auto& r : h.search_range(q, kInf)) found.insert(r.id);
+        for (NodeId n2 = 0; n2 < st.size(); ++n2)
+            if (seen[n2] && !st.ids().is_deleted(n2)) complete = complete && found.count(st.ids().external(n2)) == 1;
+        for (std::uint64_t id : found) complete = complete && h.contains(id);
+    }
+    CHECK(complete);
+}
+
+// ===========================================================================
+// Stress: limits, memory growth under long churn, and fixes from the load audit
+// ===========================================================================
+
+TEST(stress, st01_deep_filter_rejected_not_crashing) {
+    // Chaining && in a loop used to overflow the stack (found by the load audit).
+    Filter flt = Filter::eq("n", 1);
+    bool threw = false;
+    try {
+        for (int i = 0; i < 200000; ++i) flt = flt && Filter::eq("n", 1);
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    CHECK(threw && flt.root().depth == Filter::kMaxDepth);
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("n", 1));
+    CHECK(f.search(std::vector<float>{0}, 1, with_filter(flt)).size() == 1);  // the deepest allowed filter works
+    CHECK_THROWS_AS(std::invalid_argument, !flt);  // one level too deep
+}
+
+TEST(stress, st02_wide_balanced_filter) {
+    // 4,096 conditions as a balanced tree (depth 13) evaluate correctly.
+    std::vector<Filter> level;
+    for (int i = 0; i < 4096; ++i) level.push_back(Filter::eq("n", i));
+    while (level.size() > 1) {
+        std::vector<Filter> next;
+        for (std::size_t i = 0; i < level.size(); i += 2) next.push_back(level[i] || level[i + 1]);
+        level.swap(next);
+    }
+    FlatIndex f(1, Metric::L2);
+    for (std::int64_t i = 0; i < 5000; ++i) f.add(std::uint64_t(i), std::vector<float>{float(i)}, Metadata().set("n", i));
+    CHECK(f.search(std::vector<float>{0}, kHuge, with_filter(level[0])).size() == 4096);
+}
+
+TEST(stress, st03_dictionary_bounded_under_churn) {
+    // Unique strings with few live vectors used to grow the dictionary forever.
+    for (int which = 0; which < 2; ++which) {
+        FlatIndex f(1, Metric::L2);
+        HnswIndex h(1, Metric::L2);
+        std::size_t peak = 0;
+        for (std::uint64_t i = 0; i < 100000; ++i) {
+            const Metadata md = Metadata().set("session", "s" + std::to_string(i)).set_tags("t", {"u" + std::to_string(i)});
+            which == 0 ? f.add(i, std::vector<float>{float(i % 100)}, md) : h.add(i, std::vector<float>{float(i % 100)}, md);
+            if (i >= 10) which == 0 ? f.remove(i - 10) : h.remove(i - 10);
+            peak = std::max(peak, (which == 0 ? f.metadata() : h.metadata()).dictionary_size());
+            if (which == 1 && i == 20000) break;  // HNSW is slower; 20,000 steps suffice
+        }
+        CHECK(peak <= 4200);  // 2 strings per live vector + at most ~2,048 unused before reclaiming
+        const MetadataStore& m = which == 0 ? f.metadata() : h.metadata();
+        const std::uint64_t last = which == 0 ? 99999 : 20000;
+        const auto md = which == 0 ? f.get_metadata(last) : h.get_metadata(last);
+        CHECK(md && md->get("session")->s == "s" + std::to_string(last));  // still correct after renumbering
+        CHECK(m.find_string("s0") == std::nullopt);                           // long-gone strings reclaimed
+    }
+}
+
+TEST(stress, st04_dictionary_compaction_keeps_filters_and_counts) {
+    FlatIndex f(1, Metric::L2, Schema::strict(search_fields()));
+    f.create_payload_index("category");
+    f.create_payload_index("tags");
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        f.add(i, std::vector<float>{float(i)}, Metadata().set("category", "c" + std::to_string(i)).set_tags("tags", {"t" + std::to_string(i % 7)}));
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (i % 10 != 0) f.remove(i);  // 300 left; 2,700 category strings unused
+    CHECK(f.metadata().unused_string_count() == 2700);
+    f.compact();  // explicit compaction
+    const MetadataStore& m = f.metadata();
+    CHECK(m.unused_string_count() == 0 && m.dictionary_size() == 300 + 7);
+    CHECK(matching_ids(f, Filter::eq("category", "c1230")) == std::vector<std::uint64_t>{1230});
+    CHECK(matching_ids(f, Filter::eq("category", "c1231")).empty());
+    CHECK(m.value_count(*m.find_field("category"), *m.find_string("c1230")) == 1);
+    std::size_t t3 = 0;
+    for (std::uint64_t i = 0; i < 3000; i += 10) t3 += i % 7 == 3;
+    CHECK(m.value_count(*m.find_field("tags"), *m.find_string("t3")) == t3);
+    CHECK(matching_ids(f, Filter::has_tag("tags", "t3")).size() == t3);
+}
+
+TEST(stress, st05_thread_count_is_capped) {
+    const Fixture& fx = fixture(Metric::L2);
+    const auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 4));
+    const auto h = fx.hnsw->search_batch(buffer, 5, 64, 100000);  // used to throw: too many threads
+    const auto f = fx.flat->search_batch(buffer, 5, 100000);
+    for (std::size_t i = 0; i < 4; ++i)
+        CHECK(same_results(h[i], fx.hnsw->search(fx.queries[i], 5, 64)) && same_results(f[i], fx.flat->search(fx.queries[i], 5)));
+    CHECK(effective_threads(100000) <= std::max<std::size_t>(64, 4 * std::max(1u, std::thread::hardware_concurrency())));
+    CHECK(effective_threads(0) >= 1 && effective_threads(3) == 3);
+}
+
+TEST(stress, st06_upper_blocks_recycled_under_churn) {
+    // Reusing a slot at a higher level used to abandon its old link block.
+    auto data = clustered(500, 4, 4, 380);
+    auto pool = clustered(30000, 4, 4, 381);
+    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5});  // M = 4: levels vary a lot
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    std::vector<std::uint64_t> live(500);
+    std::iota(live.begin(), live.end(), 0);
+    std::mt19937 rng(382);
+    std::size_t next = 0, after_warmup = 0;
+    for (int step = 0; step < 30000; ++step) {
+        const std::size_t pos = rng() % live.size();
+        h.remove(live[pos]);
+        h.add(100000 + next, pool[next]);
+        live[pos] = 100000 + next++;
+        if (step == 10000) after_warmup = h.storage().graph().upper_slots_allocated();
+    }
+    const std::size_t final_slots = h.storage().graph().upper_slots_allocated();
+    CHECK(final_slots <= after_warmup + after_warmup / 5);  // essentially flat, not growing with churn
+    CHECK(h.storage().graph().recycled_upper_blocks() > 0);
+    check_graph(h, 0.95);
+}
+
+TEST(stress, st07_compact_releases_visited_lists) {
+    auto data = clustered(2000, 8, 4, 383);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    h.search(data[0], 5);
+    CHECK(h.pooled_visited_lists() >= 1);
+    for (std::uint64_t i = 0; i < 2000; i += 2) h.remove(i);
+    h.compact();
+    CHECK(h.pooled_visited_lists() == 0);
+    CHECK(h.search(data[1], 5)[0].id == 1);  // searches work and create a right-sized list
+    CHECK(h.pooled_visited_lists() == 1);
+}
+
+TEST(stress, st08_unsigned_values_beyond_int64_rejected) {
+    const std::uint64_t too_big = std::uint64_t(1) << 63;
+    CHECK_THROWS_AS(std::invalid_argument, Metadata().set("n", too_big));
+    CHECK_THROWS_AS(std::invalid_argument, Filter::eq("n", too_big));
+    CHECK_NOTHROW(Metadata().set("n", too_big - 1));
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("n", too_big - 1));
+    CHECK(f.get_metadata(1)->get("n")->i == std::numeric_limits<std::int64_t>::max());
+}
+
+TEST(stress, st09_large_in_list) {
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 20000; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("k", "v" + std::to_string(i)));
+    std::vector<std::string> wanted;
+    for (int i = 0; i < 10000; ++i) wanted.push_back("v" + std::to_string(i * 2));
+    const auto ids = matching_ids(f, Filter::in("k", wanted));
+    bool ok = ids.size() == 10000;
+    for (std::size_t i = 0; ok && i < ids.size(); ++i) ok = ids[i] == i * 2;
+    CHECK(ok);
+}
+
+TEST(stress, st10_long_churn_memory_bounded) {
+    // 60,000 mixed operations on ~1,000 live vectors with metadata: slots,
+    // dictionary and link blocks all stay bounded, and results stay correct.
+    auto pool = clustered(40000, 8, 8, 384);
+    auto queries = clustered(10, 8, 8, 385);
+    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3});
+    FlatIndex f(8, Metric::L2);
+    std::vector<std::uint64_t> live;
+    std::mt19937 rng(386);
+    std::size_t next = 0, peak_live = 0, max_dictionary = 0;
+    for (int step = 0; step < 60000 && next < pool.size(); ++step) {
+        if (live.size() < 1000 || rng() % 2 == 0) {
+            const Metadata md = Metadata().set("user", "u" + std::to_string(next)).set("group", std::int64_t(next % 5));
+            h.add(next, pool[next], md);
+            f.add(next, pool[next], md);
+            live.push_back(next++);
+        } else {
+            const std::size_t pos = rng() % live.size();
+            h.remove(live[pos]);
+            f.remove(live[pos]);
+            live[pos] = live.back();
+            live.pop_back();
+        }
+        peak_live = std::max(peak_live, live.size());
+        max_dictionary = std::max(max_dictionary, h.metadata().dictionary_size());
+    }
+    CHECK(h.capacity() <= peak_live && f.capacity() == live.size());
+    CHECK(max_dictionary <= peak_live + 2100);
+    const SearchOptions o = with_filter(Filter::eq("group", 2));
+    CHECK(filtered_recall(h, f, queries, 10, 64, o) >= 0.90);
+    check_graph(h, 0.99);
+}
+
+TEST(stress, st11_oom_during_dictionary_compaction) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("k", "s" + std::to_string(i)));
+    for (std::uint64_t i = 0; i < 2900; ++i) f.remove(i);  // 2,900 unused strings: the next write compacts
+    const std::size_t before = f.metadata().dictionary_size();
+    const long points = sweep_allocation_failures([&] { f.add(5000, std::vector<float>{0}, Metadata().set("k", "fresh")); }, [&] {
+        CHECK(!f.contains(5000) && f.metadata().dictionary_size() <= before && f.size() == 100);
+        CHECK(matching_ids(f, Filter::eq("k", "s2950")) == std::vector<std::uint64_t>{2950});
+    });
+    CHECK(points > 0);
+    CHECK(f.metadata().unused_string_count() == 0 && f.metadata().dictionary_size() == 101);
+    CHECK(matching_ids(f, Filter::eq("k", "fresh")) == std::vector<std::uint64_t>{5000});
+}
+
+TEST(stress, st12_oom_upper_block_recycling) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    GraphStorage g(4);
+    std::vector<NodeId> nodes;
+    for (int i = 0; i < 6; ++i) nodes.push_back(g.add_node(i % 3));
+    CHECK(sweep_allocation_failures([&] { g.reset_node(nodes[1], 5); },
+                                    [&] { CHECK(g.level(nodes[1]) == 1 && g.recycled_upper_blocks() == 0); }) > 0);
+    CHECK(g.level(nodes[1]) == 5 && g.recycled_upper_blocks() == 1);  // its old 1-level block is recycled
+    g.reset_node(nodes[0], 1);  // takes the recycled block: no new arena slots
+    const std::size_t slots = g.upper_slots_allocated();
+    CHECK(g.recycled_upper_blocks() == 0 && g.upper_slots_allocated() == slots);
+}
+
+// ===========================================================================
 // End to end
 // ===========================================================================
 
@@ -5575,7 +5998,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

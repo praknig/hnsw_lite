@@ -163,6 +163,7 @@ int CompiledFilter::build(const Filter::Node& n) {
                     if (auto id = store_->find_string(v.s))
                         if (std::find(c.ids.begin(), c.ids.end(), *id) == c.ids.end()) c.ids.push_back(*id);
                 }
+                std::sort(c.ids.begin(), c.ids.end());  // binary search per vector
                 c.kind = c.ids.empty() ? K::False : K::KeyIn;
                 return add(std::move(c));
             }
@@ -206,9 +207,11 @@ int CompiledFilter::build(const Filter::Node& n) {
             return add(std::move(c));
         }
 
+        // GCOVR_EXCL_START: unreachable, every node kind is handled above
         default:
             c.kind = K::True;
             return add(c);
+            // GCOVR_EXCL_STOP
     }
 }
 
@@ -248,10 +251,7 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
             const bool equal = s.keyword_at(c.field, slot) == c.id;
             return c.op == CompareOp::Eq ? equal : !equal;
         }
-        case K::KeyIn: {
-            const std::uint32_t id = s.keyword_at(c.field, slot);
-            return std::find(c.ids.begin(), c.ids.end(), id) != c.ids.end();
-        }
+        case K::KeyIn: return std::binary_search(c.ids.begin(), c.ids.end(), s.keyword_at(c.field, slot));
         case K::Bool: {
             const bool equal = s.bool_at(c.field, slot) == c.b;
             return c.op == CompareOp::Eq ? equal : !equal;
@@ -269,7 +269,7 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
                 if (std::find(tags.begin(), tags.end(), id) == tags.end()) return false;
             return true;
         }
-        default: return false;
+        default: return false;  // GCOVR_EXCL_LINE: unreachable, every kind is handled above
     }
 }
 

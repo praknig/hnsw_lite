@@ -4,6 +4,7 @@
  *        planner's interface.
  */
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -37,6 +38,8 @@ enum class CompareOp { Eq, Ne, Lt, Le, Gt, Ge };
  *  - between(lo, hi) is inclusive; lo > hi matches nothing; an empty `in` list
  *    matches nothing.
  *
+ * Filters may be nested at most kMaxDepth (256) levels deep.
+ *
  * A Filter is a cheap, shareable value. It is checked against an index's
  * schema each time it is used. NaN values throw std::invalid_argument here.
  */
@@ -52,7 +55,14 @@ public:
         std::vector<Value> values;
         std::vector<std::string> tags;
         std::vector<std::shared_ptr<const Node>> children;
+        int depth = 1;  // levels in this subtree
     };
+
+    /// Deepest filter allowed. Filters are evaluated recursively, so an
+    /// unlimited depth (for example, chaining && in a loop 100,000 times) would
+    /// overflow the stack. Combine many conditions with in() or has_any_tag(),
+    /// or as a balanced tree, instead.
+    static constexpr int kMaxDepth = 256;
 
     /// Matches every live vector (the same as no filter).
     Filter() : node_(std::make_shared<Node>()) {}
@@ -107,6 +117,7 @@ public:
     friend Filter operator!(const Filter& x) {
         auto n = std::make_shared<Node>();
         n->kind = Node::Kind::Not;
+        n->depth = checked_depth(1 + x.node_->depth);
         n->children.push_back(x.node_);
         return Filter(std::move(n));
     }
@@ -118,6 +129,11 @@ public:
 private:
     explicit Filter(std::shared_ptr<const Node> n) : node_(std::move(n)) {}
 
+    static int checked_depth(int depth) {
+        if (depth > kMaxDepth)
+            throw std::invalid_argument("filter is nested more than " + std::to_string(kMaxDepth) + " levels deep");
+        return depth;
+    }
     static Value checked(Value v) {
         if (v.type == FieldType::Float && std::isnan(v.f)) throw std::invalid_argument("filter value is NaN");
         return v;
@@ -140,6 +156,7 @@ private:
     static Filter combine(Node::Kind kind, const Filter& x, const Filter& y) {
         auto n = std::make_shared<Node>();
         n->kind = kind;
+        n->depth = checked_depth(1 + std::max(x.node_->depth, y.node_->depth));
         n->children = {x.node_, y.node_};
         return Filter(std::move(n));
     }

@@ -57,7 +57,7 @@ add_executable(test_comprehensive tests/test_comprehensive.cpp)
 target_link_libraries(test_comprehensive PRIVATE hnsw_lite Threads::Threads)
 hnsw_lite_setup(test_comprehensive)
 foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-        metadata filter planner payload batch range search_e2e e2e)
+        metadata filter planner payload batch range search_e2e stress e2e)
   add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
 endforeach()
 

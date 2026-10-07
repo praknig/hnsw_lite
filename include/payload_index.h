@@ -35,6 +35,9 @@ namespace vecdb {
         /// One more vector holds `id`. `id` must be below the ensured size.
         void add(std::uint32_t id) noexcept { ++counts_[id]; }
 
+        /// Sets the count of `id` directly (used when renumbering the dictionary).
+        void set(std::uint32_t id, std::size_t n) noexcept { counts_[id] = n; }
+
         /// One vector fewer holds `id`.
         void remove(std::uint32_t id) noexcept { --counts_[id]; }
 

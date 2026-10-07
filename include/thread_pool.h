@@ -17,6 +17,15 @@
 
 namespace vecdb {
 
+/// The thread count a pool actually uses: 0 means one per hardware thread, and
+/// requests are capped at max(64, 4 x hardware threads), since more threads
+/// than that only add overhead and can exhaust the operating system's limits.
+inline std::size_t effective_threads(std::size_t requested) {
+    const std::size_t hw = std::max(1u, std::thread::hardware_concurrency());
+    if (requested == 0) return hw;
+    return std::min(requested, std::max<std::size_t>(64, 4 * hw));
+}
+
 /**
  * @brief Fixed set of worker threads that run tasks from a shared queue.
  *
@@ -30,9 +39,9 @@ namespace vecdb {
  */
 class ThreadPool {
 public:
-    /// Starts `threads` workers (0 = one per hardware thread, at least 1).
+    /// Starts `threads` workers (0 = one per hardware thread; capped, see effective_threads).
     explicit ThreadPool(std::size_t threads = 0) {
-        if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+        threads = effective_threads(threads);
         workers_.reserve(threads);
         try {
             for (std::size_t i = 0; i < threads; ++i) workers_.emplace_back([this] { work(); });
@@ -147,7 +156,7 @@ private:
 class SharedPool {
 public:
     std::shared_ptr<ThreadPool> get(std::size_t threads) {
-        if (threads == 0) threads = std::max(1u, std::thread::hardware_concurrency());
+        threads = effective_threads(threads);
         std::lock_guard<std::mutex> lock(mutex_);
         if (!pool_ || pool_->size() != threads) pool_ = std::make_shared<ThreadPool>(threads);
         return pool_;

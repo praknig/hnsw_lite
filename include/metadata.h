@@ -40,7 +40,8 @@ inline const char* field_type_name(FieldType t) {
  * @brief One metadata value: an integer, float, boolean, keyword (string) or tag set.
  *
  * Built with Value::from(x), which picks the type from the C++ type of `x`:
- * bool -> Bool, any other integer -> Int, floating point -> Float,
+ * bool -> Bool, any other integer -> Int (unsigned values above the int64
+ * range throw std::invalid_argument), floating point -> Float,
  * std::vector<std::string> -> Tags, anything convertible to a string -> Keyword.
  */
 struct Value {
@@ -63,7 +64,12 @@ struct Value {
         using D = std::decay_t<T>;
         if constexpr (std::is_same_v<D, Value>) return std::forward<T>(v);
         else if constexpr (std::is_same_v<D, bool>) return of_bool(v);
-        else if constexpr (std::is_integral_v<D>) return of_int(static_cast<std::int64_t>(v));
+        else if constexpr (std::is_integral_v<D>) {
+            if constexpr (std::is_unsigned_v<D> && sizeof(D) >= sizeof(std::int64_t))
+                if (v > static_cast<D>(std::numeric_limits<std::int64_t>::max()))
+                    throw std::invalid_argument("integer value is above the int64 range");
+            return of_int(static_cast<std::int64_t>(v));
+        }
         else if constexpr (std::is_floating_point_v<D>) return of_float(static_cast<double>(v));
         else if constexpr (std::is_same_v<D, std::vector<std::string>>) return of_tags(std::forward<T>(v));
         else return of_keyword(std::string(std::string_view(v)));
@@ -272,13 +278,72 @@ public:
 
     /// Clears every field of `slot`. Never throws.
     void clear(NodeId slot) noexcept {
-        for (Column& c : cols_) c.clear_row(slot);
+        for (Column& c : cols_) clear_row_counted(c, slot);
     }
 
     /// Moves row `from` into row `to` (swap-with-last removal; `to` < `from`)
     /// and clears `from`. Never throws.
     void move_row(NodeId from, NodeId to) noexcept {
-        for (Column& c : cols_) c.move_row(from, to);
+        for (Column& c : cols_) {
+            clear_row_counted(c, to);
+            if (from >= c.rows() || !c.present[from]) continue;
+            if (to < c.rows()) c.move_row(from, to);  // GCOVR_EXCL_BR_LINE: always true when to < from
+            else clear_row_counted(c, from);          // GCOVR_EXCL_LINE: defensive, unreachable when to < from
+        }
+    }
+
+    /// Strings in the dictionary that no vector uses any more.
+    std::size_t unused_string_count() const { return dead_strings_; }
+
+    /// Removes strings no vector uses and renumbers the rest, updating every
+    /// keyword and tag column and payload-index count. Returns false if there was
+    /// nothing to remove. All-or-nothing: the new dictionary is built before
+    /// anything changes. Runs automatically during writes once more than half of
+    /// the dictionary (and at least 1,024 strings) is unused, so a field with
+    /// unique values (session IDs, for example) cannot grow memory forever.
+    bool compact_dictionary() {
+        if (dead_strings_ == 0) return false;
+        constexpr std::uint32_t kNone = std::numeric_limits<std::uint32_t>::max();
+        // Phase 1: build the new dictionary and counts (may throw; nothing changed yet).
+        const std::size_t keep = strings_.size() - dead_strings_;
+        std::vector<std::uint32_t> remap(strings_.size(), kNone);
+        std::vector<std::string> strings;
+        std::vector<std::uint32_t> refs;
+        strings.reserve(keep);
+        refs.reserve(keep);
+        for (std::uint32_t id = 0; id < strings_.size(); ++id) {
+            if (refs_[id] == 0) continue;
+            remap[id] = static_cast<std::uint32_t>(strings.size());
+            strings.push_back(strings_[id]);
+            refs.push_back(refs_[id]);
+        }
+        std::unordered_map<std::string, std::uint32_t> ids;
+        ids.reserve(keep);
+        for (std::uint32_t id = 0; id < strings.size(); ++id) ids.emplace(strings[id], id);
+        std::vector<ValueCounts> counts(cols_.size());
+        for (std::size_t f = 0; f < cols_.size(); ++f) {
+            const Column& c = cols_[f];
+            if (!c.indexed || (c.type != FieldType::Keyword && c.type != FieldType::Tags)) continue;
+            counts[f].reset(keep);
+            for (std::uint32_t id = 0; id < remap.size(); ++id)
+                if (remap[id] != kNone) counts[f].set(remap[id], c.counts.count(id));
+        }
+        // Phase 2: commit. Renumbering in place and swapping never throw.
+        for (std::size_t f = 0; f < cols_.size(); ++f) {
+            Column& c = cols_[f];
+            for (NodeId s = 0; s < c.rows(); ++s) {
+                if (!c.present[s]) continue;
+                if (c.type == FieldType::Keyword) c.keywords[s] = remap[c.keywords[s]];
+                if (c.type == FieldType::Tags)
+                    for (std::uint32_t& id : c.tags[s]) id = remap[id];
+            }
+            if (c.indexed && (c.type == FieldType::Keyword || c.type == FieldType::Tags)) c.counts = std::move(counts[f]);
+        }
+        strings_.swap(strings);
+        refs_.swap(refs);
+        string_ids_.swap(ids);
+        dead_strings_ = 0;
+        return true;
     }
 
     /// The metadata of `slot` (only fields that have a value).
@@ -301,7 +366,7 @@ public:
             }
         }
         return md;
-    }
+    }  // GCOVR_EXCL_LINE: gcov counts this brace separately (return value optimization)
 
     // ---- Fast accessors used by compiled filters -----------------------------
 
@@ -338,7 +403,7 @@ public:
         for (std::size_t f = 0; f < cols_.size(); ++f)
             if (cols_[f].indexed) out.push_back(specs_[f].name);
         return out;
-    }
+    }  // GCOVR_EXCL_LINE: gcov counts this brace separately (return value optimization)
     /// Live vectors holding value `id` in indexed field `f`, or nothing if not indexed.
     std::optional<std::size_t> value_count(std::size_t f, std::uint32_t id) const {
         if (!cols_[f].indexed) return std::nullopt;
@@ -381,13 +446,13 @@ private:
         void count_row(NodeId s, bool add) noexcept {
             if (!indexed || s >= rows() || !present[s]) return;
             auto apply_one = [&](std::uint32_t id) { add ? counts.add(id) : counts.remove(id); };
-            switch (type) {
+            switch (type) {  // GCOVR_EXCL_BR_LINE: numeric columns are never indexed
                 case FieldType::Bool: apply_one(bools[s]); break;
                 case FieldType::Keyword: apply_one(keywords[s]); break;
                 case FieldType::Tags:
                     for (std::uint32_t id : tags[s]) apply_one(id);
                     break;
-                default: break;
+                default: break;  // GCOVR_EXCL_LINE: numeric columns are never indexed
             }
         }
 
@@ -399,13 +464,9 @@ private:
             if (type == FieldType::Tags) tags[s].clear();
         }
 
+        /// Moves row `from`'s value into row `to`. The caller has checked that
+        /// `from` has a value, `to` exists and `to` is clear.
         void move_row(NodeId from, NodeId to) noexcept {
-            clear_row(to);
-            if (from >= rows() || !present[from]) return;
-            if (to >= rows()) {  // cannot happen when to < from; drop the value safely
-                clear_row(from);
-                return;
-            }
             // The value moves between two rows: counts and present_count stay the same.
             present[to] = 1;
             present[from] = 0;
@@ -433,6 +494,24 @@ private:
         std::vector<std::uint32_t> tags;
     };
 
+    /// One more row uses each of row `s`'s strings in column `c`.
+    void ref_row(const Column& c, NodeId s) noexcept {
+        auto inc = [&](std::uint32_t id) { if (refs_[id]++ == 0) --dead_strings_; };
+        if (c.type == FieldType::Keyword) inc(c.keywords[s]);
+        if (c.type == FieldType::Tags)
+            for (std::uint32_t id : c.tags[s]) inc(id);
+    }
+
+    /// Clears row `s` of column `c`, releasing its strings. Never throws.
+    void clear_row_counted(Column& c, NodeId s) noexcept {
+        if (s >= c.rows() || !c.present[s]) return;
+        auto dec = [&](std::uint32_t id) { if (--refs_[id] == 0) ++dead_strings_; };
+        if (c.type == FieldType::Keyword) dec(c.keywords[s]);
+        if (c.type == FieldType::Tags)
+            for (std::uint32_t id : c.tags[s]) dec(id);
+        c.clear_row(s);
+    }
+
     static bool compatible(FieldType field, FieldType value) {
         return field == value || (field == FieldType::Float && value == FieldType::Int);
     }
@@ -452,11 +531,18 @@ private:
         const auto id = static_cast<std::uint32_t>(strings_.size());
         strings_.push_back(s);
         try {
-            string_ids_.emplace(s, id);
+            refs_.push_back(0);
+            try {
+                string_ids_.emplace(s, id);
+            } catch (...) {
+                refs_.pop_back();
+                throw;
+            }
         } catch (...) {
             strings_.pop_back();
             throw;
         }
+        ++dead_strings_;  // unused until the commit references it
         return id;
     }
 
@@ -468,13 +554,18 @@ private:
             cols_.pop_back();
         }
         while (strings_.size() > undo.strings) {
+            if (refs_.back() == 0) --dead_strings_;
             string_ids_.erase(strings_.back());
             strings_.pop_back();
+            refs_.pop_back();
         }
     }
 
     WriteUndo apply(NodeId slot, const Metadata& md, bool replace) {
         validate(md);
+        // Reclaim unused strings once they are the majority (amortized: at most
+        // one compaction per 1,024 strings that became unused).
+        if (dead_strings_ >= 1024 && dead_strings_ * 2 > strings_.size()) compact_dictionary();
         const WriteUndo undo{specs_.size(), strings_.size()};
         std::vector<Pending> pending;
 
@@ -525,7 +616,7 @@ private:
         if (replace) clear(slot);
         for (Pending& p : pending) {
             Column& c = cols_[p.field];
-            c.clear_row(slot);
+            clear_row_counted(c, slot);
             if (p.clear) continue;
             switch (c.type) {
                 case FieldType::Int: c.ints[slot] = p.i; break;
@@ -537,6 +628,7 @@ private:
             c.present[slot] = 1;
             ++c.present_count;
             c.count_row(slot, true);
+            ref_row(c, slot);
         }
         return undo;
     }
@@ -547,6 +639,8 @@ private:
     std::unordered_map<std::string, std::size_t> by_name_;
     std::vector<std::string> strings_;
     std::unordered_map<std::string, std::uint32_t> string_ids_;
+    std::vector<std::uint32_t> refs_;  // rows using each string
+    std::size_t dead_strings_ = 0;     // strings with no rows (reclaimed by compact_dictionary)
 };
 
 }  // namespace vecdb
