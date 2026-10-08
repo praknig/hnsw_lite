@@ -57,6 +57,34 @@ bool FlatIndex::remove(std::uint64_t id) {
     return true;
 }
 
+bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) { return replace(id, vector, nullptr); }
+
+bool FlatIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    return replace(id, vector, &metadata);
+}
+
+bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    if (replace(id, vector, nullptr)) return false;
+    add(id, vector);
+    return true;
+}
+
+bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    if (replace(id, vector, &metadata)) return false;
+    add(id, vector, metadata);
+    return true;
+}
+
+bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+    scratch_.prepare(vector, metric_);  // validates; may throw before any change
+    if (metadata) metadata_.validate(*metadata);
+    const auto node = ids_.find(id);
+    if (!node) return false;
+    if (metadata) metadata_.write(*node, *metadata);  // all-or-nothing
+    vectors_.overwrite(*node, scratch_.values());     // cannot fail: already validated
+    return true;
+}
+
 bool FlatIndex::contains(std::uint64_t id) const { return ids_.find(id).has_value(); }
 
 bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
