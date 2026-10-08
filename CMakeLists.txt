@@ -5,7 +5,19 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Tests, benchmarks and examples are built only when hnsw-lite is the main
+# project, not when another project includes it with add_subdirectory or FetchContent.
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+  set(HNSW_LITE_IS_MAIN_PROJECT ON)
+else()
+  set(HNSW_LITE_IS_MAIN_PROJECT OFF)
+endif()
+option(HNSW_LITE_BUILD_TESTS "Build the test suite" ${HNSW_LITE_IS_MAIN_PROJECT})
+option(HNSW_LITE_BUILD_BENCHMARKS "Build the benchmarks" ${HNSW_LITE_IS_MAIN_PROJECT})
+option(HNSW_LITE_BUILD_EXAMPLES "Build the example programs" ${HNSW_LITE_IS_MAIN_PROJECT})
 option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux/macOS)" OFF)
+
+find_package(Threads REQUIRED)  # batch search runs on a thread pool
 
 # ---------------------------------------------------------------------------
 # Library: Layer 1 headers, Layer 2 kernels, Layer 3 indexes
@@ -16,6 +28,8 @@ add_library(hnsw_lite STATIC
         src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp      # Layer 3
         ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
+target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
+add_library(hnsw_lite::hnsw_lite ALIAS hnsw_lite)
 
 # Each SIMD file gets only its own CPU flags; dispatch.cpp checks the CPU at runtime.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
@@ -47,22 +61,33 @@ endfunction()
 hnsw_lite_setup(hnsw_lite)
 
 # ---------------------------------------------------------------------------
-# Tests and benchmarks
+# Tests, benchmarks and examples
 # ---------------------------------------------------------------------------
-enable_testing()
-# One test program containing every test. Each group is registered as its own
-# CTest entry (its own process), e.g. "ctest -R comprehensive.hnsw".
-find_package(Threads REQUIRED)
-add_executable(test_comprehensive tests/test_comprehensive.cpp)
-target_link_libraries(test_comprehensive PRIVATE hnsw_lite Threads::Threads)
-hnsw_lite_setup(test_comprehensive)
-foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-        metadata filter planner payload batch range search_e2e stress e2e)
-  add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
-endforeach()
+if(HNSW_LITE_BUILD_TESTS)
+  enable_testing()
+  # One test program containing every test. Each group is registered as its own
+  # CTest entry (its own process), e.g. "ctest -R comprehensive.hnsw".
+  add_executable(test_comprehensive tests/test_comprehensive.cpp)
+  target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
+  hnsw_lite_setup(test_comprehensive)
+  foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
+          metadata filter planner payload batch range search_e2e stress e2e)
+    add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
+  endforeach()
+endif()
 
-foreach(name bench_distance bench_search)
-  add_executable(${name} bench/${name}.cpp)
-  target_link_libraries(${name} PRIVATE hnsw_lite)
-  hnsw_lite_setup(${name})
-endforeach()
+if(HNSW_LITE_BUILD_BENCHMARKS)
+  foreach(name bench_distance bench_search)
+    add_executable(${name} bench/${name}.cpp)
+    target_link_libraries(${name} PRIVATE hnsw_lite)
+    hnsw_lite_setup(${name})
+  endforeach()
+endif()
+
+if(HNSW_LITE_BUILD_EXAMPLES)
+  foreach(name example_basics example_filters example_batch_range)
+    add_executable(${name} examples/${name}.cpp)
+    target_link_libraries(${name} PRIVATE hnsw_lite)
+    hnsw_lite_setup(${name})
+  endforeach()
+endif()
