@@ -55,6 +55,24 @@ public:
     /// Deletes `id` for real (swap-with-last). Returns false if it is not stored.
     bool remove(std::uint64_t id);
 
+    /// Replaces the vector stored under `id` in place, keeping its metadata.
+    /// Returns false if `id` is not stored. Throws std::invalid_argument on a
+    /// wrong dimension, NaN or infinity (checked first, even for an unknown ID).
+    /// All-or-nothing.
+    bool update(std::uint64_t id, std::span<const float> vector);
+
+    /// Replaces the vector and its whole metadata (fields not given are cleared;
+    /// to change some fields only, use set_metadata()). All-or-nothing.
+    bool update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
+
+    /// Adds `id` if it is not stored, otherwise replaces its vector (keeping its
+    /// metadata). Returns true if it was added, false if it was replaced.
+    bool upsert(std::uint64_t id, std::span<const float> vector);
+
+    /// Adds `id` with this metadata, or replaces its vector and whole metadata.
+    /// Returns true if it was added, false if it was replaced.
+    bool upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
+
     /// True if `id` is stored.
     bool contains(std::uint64_t id) const;
 
@@ -108,6 +126,9 @@ public:
     const MetadataStore& metadata() const { return metadata_; }
 
 private:
+    /// update() and upsert(): `metadata` null keeps the old metadata.
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);
+
     /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;
 

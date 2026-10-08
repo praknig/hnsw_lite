@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -5654,6 +5654,499 @@ TEST(range, rg16_range_search_next_to_removed_nodes) {
 }
 
 // ===========================================================================
+// Updating vectors (U1-U20 from the test plan, U21-U27 beyond it)
+// ===========================================================================
+
+namespace {
+
+/// True if a search for `v` finds `id` stored exactly there (L2 and cosine).
+bool found_at(const FlatIndex& f, std::uint64_t id, const std::vector<float>& v) {
+    for (const auto& r : f.search(v, 5))
+        if (r.id == id && r.distance <= 1e-5f) return true;
+    return false;
+}
+bool found_at(const HnswIndex& h, std::uint64_t id, const std::vector<float>& v) {
+    for (const auto& r : h.search(v, 5, 128))
+        if (r.id == id && r.distance <= 1e-5f) return true;
+    return false;
+}
+
+/// HNSW's exact search equals Flat's for every query: both store the same vectors.
+bool same_contents(const HnswIndex& h, const FlatIndex& f, const Vectors& queries, std::size_t k = 10) {
+    SearchOptions exact;
+    exact.strategy = Strategy::ForceExact;
+    for (const auto& q : queries)
+        if (!same_results(tie_sorted(h.search(q, k, 64, exact)), tie_sorted(f.search(q, k)))) return false;
+    return true;
+}
+
+}  // namespace
+
+TEST(update, u01_flat_update_moves_the_vector) {
+    auto data = clustered(300, 8, 4, 400);
+    auto moved = clustered(20, 8, 4, 401);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    auto expected = data;
+    for (std::size_t i = 0; i < 20; ++i) {
+        CHECK(f.update(i * 7, moved[i]));
+        expected[i * 7] = moved[i];
+    }
+    bool ok = f.size() == 300;
+    for (std::size_t i = 0; i < 20; ++i) {
+        ok = ok && found_at(f, i * 7, moved[i]);
+        for (const auto& r : f.search(data[i * 7], 300)) ok = ok && !(r.id == i * 7 && r.distance <= 1e-5f);  // old position gone
+    }
+    CHECK(ok);
+    for (std::size_t i = 0; i < 10; ++i)
+        CHECK(same_results(tie_sorted(f.search(moved[i], 10)),
+                           tie_sorted(reference_search(expected, std::vector<bool>(300), moved[i], Metric::L2, 10, 0))));
+}
+
+TEST(update, u02_flat_update_unknown_or_removed) {
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) f.add(i, std::vector<float>{float(i), 0});
+    f.remove(3);
+    const Results before = f.search(std::vector<float>{2.5f, 0}, 10);
+    CHECK(!f.update(3, std::vector<float>{9, 9}));
+    CHECK(!f.update(99, std::vector<float>{9, 9}));
+    CHECK(same_results(f.search(std::vector<float>{2.5f, 0}, 10), before) && f.size() == 9 && !f.contains(3));
+    CHECK_THROWS_AS(std::invalid_argument, f.update(99, std::vector<float>{kNaN, 0}));  // input checked first
+}
+
+TEST(update, u03_flat_invalid_input_keeps_old_vector) {
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{1, 2});
+    CHECK_THROWS_AS(std::invalid_argument, f.update(1, std::vector<float>{kNaN, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, f.update(1, std::vector<float>{kInf, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, f.update(1, std::vector<float>{1, 2, 3}));
+    CHECK(found_at(f, 1, {1, 2}) && f.size() == 1);
+}
+
+TEST(update, u04_flat_update_to_same_vector) {
+    auto data = random_vectors(100, 8, 402);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
+    const Results before = f.search(data[5], 20);
+    for (std::size_t i = 0; i < data.size(); i += 3) CHECK(f.update(i, data[i]));
+    CHECK(same_results(f.search(data[5], 20), before));
+}
+
+TEST(update, u05_flat_update_normalizes_for_cosine) {
+    FlatIndex f(3, Metric::Cosine), fresh(3, Metric::Cosine);
+    f.add(1, std::vector<float>{1, 0, 0});
+    f.update(1, std::vector<float>{0, 30, 40});  // length 50
+    fresh.add(1, std::vector<float>{0, 0.6f, 0.8f});
+    const std::vector<float> q{0.2f, 0.5f, 0.1f};
+    CHECK(found_at(f, 1, {0, 3, 4}));
+    CHECK(std::fabs(f.search(q, 1)[0].distance - fresh.search(q, 1)[0].distance) < 1e-6f);
+}
+
+TEST(update, u06_flat_upsert) {
+    FlatIndex f(2, Metric::L2);
+    CHECK(f.upsert(1, std::vector<float>{0, 0}) && f.size() == 1);    // new: added
+    CHECK(!f.upsert(1, std::vector<float>{5, 5}) && f.size() == 1);   // existing: replaced
+    CHECK(found_at(f, 1, {5, 5}) && !found_at(f, 1, {0, 0}));
+    CHECK(f.upsert(2, std::vector<float>{1, 1}) && f.size() == 2);
+}
+
+TEST(update, u07_hnsw_update_moves_the_vector) {
+    auto data = clustered(2000, 16, 10, 403);
+    auto moved = clustered(50, 16, 10, 404);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::size_t i = 0; i < 50; ++i) {
+        CHECK(h.update(i * 31, moved[i]));
+        f.update(i * 31, moved[i]);
+    }
+    bool ok = h.size() == 2000;
+    for (std::size_t i = 0; i < 50; ++i) {
+        ok = ok && found_at(h, i * 31, moved[i]);
+        for (const auto& r : h.search(data[i * 31], 50, 128)) ok = ok && !(r.id == i * 31 && r.distance <= 1e-5f);
+    }
+    CHECK(ok);
+    CHECK(recall(h, f, moved, 10, 64) >= 0.95);
+    check_graph(h, 0.99);
+}
+
+TEST(update, u08_hnsw_update_capacity_bounded) {
+    auto data = clustered(500, 8, 4, 405);
+    auto moved = clustered(10, 8, 4, 406);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    CHECK(h.update(7, moved[0]));
+    CHECK(h.size() == 500 && h.capacity() == 501 && h.deleted_count() == 1);  // one extra slot...
+    for (std::size_t i = 1; i < 10; ++i) CHECK(h.update(i * 11, moved[i]));
+    CHECK(h.size() == 500 && h.capacity() == 501 && h.deleted_count() == 1);  // ...reused by every later update
+    h.add(9999, moved[0]);
+    CHECK(h.capacity() == 501 && h.deleted_count() == 0);  // and by inserts
+}
+
+TEST(update, u09_hnsw_update_unknown_or_removed) {
+    auto data = clustered(300, 8, 4, 407);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    h.remove(5);
+    const Results before = h.search(data[0], 10);
+    const std::size_t cap = h.capacity(), del = h.deleted_count();
+    const NodeId entry = h.entry_point();
+    CHECK(!h.update(5, data[1]) && !h.update(12345, data[1]));
+    CHECK(same_results(h.search(data[0], 10), before) && h.capacity() == cap && h.deleted_count() == del);
+    CHECK(h.entry_point() == entry && h.size() == 299);
+}
+
+TEST(update, u10_hnsw_invalid_input_keeps_old_vector) {
+    auto data = clustered(300, 8, 4, 408);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const NodeId entry = h.entry_point();
+    const int top = h.max_level();
+    const std::size_t cap = h.capacity();
+    std::vector<float> nan = data[3], short_vec(7, 0.0f);
+    nan[2] = kNaN;
+    CHECK_THROWS_AS(std::invalid_argument, h.update(3, nan));
+    CHECK_THROWS_AS(std::invalid_argument, h.update(3, short_vec));
+    CHECK(found_at(h, 3, data[3]) && h.entry_point() == entry && h.max_level() == top && h.capacity() == cap);
+}
+
+TEST(update, u11_update_the_entry_point) {
+    auto data = clustered(800, 8, 4, 409);
+    auto far = clustered(30, 8, 4, 410);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    bool ok = true;
+    for (std::size_t round = 0; round < 30; ++round) {
+        const std::uint64_t entry_id = h.storage().ids().external(h.entry_point());
+        CHECK(h.update(entry_id, far[round]));
+        const NodeId e = h.entry_point();
+        ok = ok && e != kEmpty && !h.storage().ids().is_deleted(e) && h.storage().graph().level(e) == h.max_level();
+        ok = ok && found_at(h, entry_id, far[round]);
+    }
+    CHECK(ok);
+    check_graph(h, 0.99);
+}
+
+TEST(update, u12_update_every_vector) {
+    auto data = clustered(2000, 16, 10, 411);
+    auto moved = clustered(2000, 16, 10, 412);
+    auto queries = clustered(40, 16, 10, 413);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::size_t i = 0; i < 2000; ++i) {
+        h.update(i, moved[i]);
+        f.update(i, moved[i]);
+    }
+    CHECK(h.size() == 2000 && h.capacity() <= 2001);
+    CHECK(recall(h, f, queries, 10, 64) >= 0.95);
+    CHECK(same_contents(h, f, queries));
+    check_graph(h, 0.99);
+}
+
+TEST(update, u13_same_id_updated_1000_times) {
+    auto data = clustered(400, 8, 4, 414);
+    auto pool = clustered(1000, 8, 4, 415);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    std::size_t slots_after_100 = 0;
+    for (std::size_t i = 0; i < 1000; ++i) {
+        h.update(42, pool[i]);
+        if (i == 100) slots_after_100 = h.storage().graph().upper_slots_allocated();
+    }
+    CHECK(h.size() == 400 && h.capacity() <= 401 && h.deleted_count() <= 1);
+    CHECK(h.storage().graph().upper_slots_allocated() <= slots_after_100 + 64);  // link memory stable
+    CHECK(found_at(h, 42, pool[999]));
+    check_graph(h, 0.99);
+}
+
+TEST(update, u14_small_and_large_moves) {
+    auto data = clustered(1500, 16, 10, 416);
+    auto far = clustered(300, 16, 10, 417);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    std::mt19937 rng(418);
+    std::normal_distribution<float> noise(0.0f, 0.01f);
+    Vectors queries;
+    for (std::size_t i = 0; i < 300; ++i) {
+        auto nudged = data[i];
+        for (float& x : nudged) x += noise(rng);  // small move
+        h.update(i, nudged);
+        f.update(i, nudged);
+        h.update(1000 + i, far[i]);  // large move
+        f.update(1000 + i, far[i]);
+        if (i % 15 == 0) {
+            queries.push_back(nudged);
+            queries.push_back(far[i]);
+        }
+    }
+    bool found = true;
+    for (std::size_t i = 0; i < 300; i += 7) found = found && found_at(h, 1000 + i, far[i]);
+    CHECK(found);
+    CHECK(recall(h, f, queries, 10, 64) >= 0.90);
+}
+
+TEST(update, u15_update_to_a_copy_of_another_vector) {
+    auto data = clustered(300, 8, 4, 419);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    h.update(10, data[200]);
+    f.update(10, data[200]);
+    std::set<std::uint64_t> at_zero_h, at_zero_f;
+    for (const auto& r : h.search(data[200], 5, 128)) if (r.distance <= 1e-6f) at_zero_h.insert(r.id);
+    for (const auto& r : f.search(data[200], 5)) if (r.distance <= 1e-6f) at_zero_f.insert(r.id);
+    CHECK(at_zero_h == std::set<std::uint64_t>({10, 200}) && at_zero_f == at_zero_h);
+}
+
+TEST(update, u16_index_with_one_vector) {
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{0, 0});
+    CHECK(h.update(1, std::vector<float>{5, 5}));
+    CHECK(h.size() == 1 && h.entry_point() != kEmpty && found_at(h, 1, {5, 5}));
+    CHECK(h.update(1, std::vector<float>{-3, 1}) && found_at(h, 1, {-3, 1}));
+    for (std::uint64_t i = 2; i < 50; ++i) h.add(i, std::vector<float>{float(i), float(i % 7)});
+    CHECK(found_at(h, 1, {-3, 1}) && h.size() == 49);
+    check_graph(h, 1.0);
+}
+
+TEST(update, u17_hnsw_upsert_matches_flat) {
+    auto pool = clustered(3000, 8, 6, 420);
+    auto queries = clustered(20, 8, 6, 421);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    std::mt19937 rng(422);
+    bool same_returns = true;
+    for (std::size_t i = 0; i < 3000; ++i) {
+        const std::uint64_t id = rng() % 800;  // many repeats: about 3 upserts per ID
+        same_returns = same_returns && h.upsert(id, pool[i]) == f.upsert(id, pool[i]);
+    }
+    CHECK(same_returns && h.size() == f.size());
+    CHECK(same_contents(h, f, queries));
+    CHECK(recall(h, f, queries, 10, 64) >= 0.95);
+}
+
+TEST(update, u18_every_metric) {
+    auto data = clustered(600, 12, 6, 423);
+    auto moved = clustered(150, 12, 6, 424);
+    for (Metric m : kMetrics) {
+        HnswIndex h(12, m);
+        FlatIndex f(12, m);
+        fill(h, f, data);
+        for (std::size_t i = 0; i < 150; ++i) {
+            h.update(i * 4, moved[i]);
+            f.update(i * 4, moved[i]);
+        }
+        CHECK(same_contents(h, f, moved));
+        CHECK(recall(h, f, moved, 10, 64) >= (m == Metric::InnerProduct ? 0.80 : 0.95));
+    }
+}
+
+TEST(update, u19_reproducible) {
+    auto data = clustered(700, 8, 4, 425);
+    auto moved = clustered(300, 8, 4, 426);
+    HnswIndex a(8, Metric::Cosine), b(8, Metric::Cosine);
+    for (HnswIndex* h : {&a, &b}) {
+        for (std::size_t i = 0; i < data.size(); ++i) h->add(i, data[i]);
+        for (std::size_t i = 0; i < 300; ++i) {
+            h->update(i * 2, moved[i]);
+            if (i % 5 == 0) h->remove(i * 2 + 1);
+            if (i % 7 == 0) h->upsert(5000 + i, moved[i]);
+        }
+    }
+    bool same = a.capacity() == b.capacity() && a.entry_point() == b.entry_point();
+    for (std::size_t i = 0; i < 30; ++i) same = same && same_results(a.search(moved[i], 10), b.search(moved[i], 10));
+    CHECK(same);
+}
+
+TEST(update, u20_oom_old_vector_survives) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 8, 4, 427);
+    auto moved = clustered(2, 8, 4, 428);
+    for (int with_free_slot = 0; with_free_slot < 2; ++with_free_slot) {
+        HnswIndex h(8, Metric::L2);
+        for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], Metadata().set("tag", "v" + std::to_string(i)));
+        if (with_free_slot) h.remove(299);  // the update then reuses a free slot instead of appending
+        const long points = sweep_allocation_failures([&] { h.update(5, moved[0]); }, [&] {
+            CHECK(h.contains(5) && found_at(h, 5, data[5]) && !found_at(h, 5, moved[0]));
+            CHECK(h.get_metadata(5)->get("tag")->s == "v5" && h.size() == (with_free_slot ? 299u : 300u));
+            check_graph(h, 0.99);
+        });
+        CHECK(points > 0);
+        CHECK(found_at(h, 5, moved[0]) && h.get_metadata(5)->get("tag")->s == "v5");
+    }
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i], Metadata().set("tag", "v" + std::to_string(i)));
+    const Metadata replacement = Metadata().set("tag", "brand_new").set("extra", 1);
+    const long points = sweep_allocation_failures([&] { f.update(5, moved[1], replacement); }, [&] {
+        CHECK(found_at(f, 5, data[5]) && *f.get_metadata(5) == Metadata().set("tag", "v5"));
+        CHECK(!f.metadata().find_field("extra").has_value());
+    });
+    CHECK(points > 0);
+    CHECK(found_at(f, 5, moved[1]) && *f.get_metadata(5) == replacement);
+}
+
+TEST(update, u21_update_keeps_metadata) {
+    auto data = clustered(400, 8, 4, 429);
+    auto moved = clustered(40, 8, 4, 430);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    FlatIndex f(8, Metric::L2, Schema::strict(search_fields()));
+    h.create_payload_index("category");
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const std::size_t news = *h.metadata().value_count(0, *h.metadata().find_string("news"));
+    for (std::size_t i = 0; i < 40; ++i) {
+        h.update(i * 10, moved[i]);
+        f.update(i * 10, moved[i]);
+    }
+    bool kept = true;
+    for (std::size_t i = 0; i < 40; ++i) kept = kept && *h.get_metadata(i * 10) == meta_for(i * 10) && *f.get_metadata(i * 10) == meta_for(i * 10);
+    CHECK(kept && *h.metadata().value_count(0, *h.metadata().find_string("news")) == news);
+    const SearchOptions o = with_filter(Filter::eq("category", "news"));  // ids divisible by 5: every updated one
+    for (std::size_t i = 0; i < 40; i += 4) {
+        const auto r = h.search(moved[i], 1, 64, o);
+        CHECK(r.size() == 1 && r[0].id == i * 10 && r[0].distance <= 1e-5f);
+    }
+}
+
+TEST(update, u22_update_with_metadata_replaces_all_fields) {
+    for (int which = 0; which < 2; ++which) {
+        HnswIndex h(2, Metric::L2);
+        FlatIndex f(2, Metric::L2);
+        const Metadata old_md = Metadata().set("a", 1).set("b", "x").set_tags("t", {"p", "q"});
+        const Metadata new_md = Metadata().set("b", "y");
+        which ? h.add(1, std::vector<float>{0, 0}, old_md) : f.add(1, std::vector<float>{0, 0}, old_md);
+        which ? h.add(2, std::vector<float>{9, 9}) : f.add(2, std::vector<float>{9, 9});
+        CHECK(which ? h.update(1, std::vector<float>{3, 3}, new_md) : f.update(1, std::vector<float>{3, 3}, new_md));
+        const auto md = which ? h.get_metadata(1) : f.get_metadata(1);
+        CHECK(*md == new_md);  // a and t cleared
+        CHECK(which ? found_at(h, 1, {3, 3}) : found_at(f, 1, {3, 3}));
+        const MetadataStore& m = which ? h.metadata() : f.metadata();
+        CHECK(m.unused_string_count() == 3);  // "x", "p" and "q" no longer used
+    }
+}
+
+TEST(update, u23_upsert_with_and_without_metadata) {
+    for (int which = 0; which < 2; ++which) {
+        HnswIndex h(2, Metric::L2);
+        FlatIndex f(2, Metric::L2);
+        auto upsert = [&](std::uint64_t id, std::vector<float> v, const Metadata* md) {
+            if (which) return md ? h.upsert(id, v, *md) : h.upsert(id, v);
+            return md ? f.upsert(id, v, *md) : f.upsert(id, v);
+        };
+        auto meta = [&](std::uint64_t id) { return which ? h.get_metadata(id) : f.get_metadata(id); };
+        const Metadata first = Metadata().set("n", 1), second = Metadata().set("m", 2);
+        CHECK(upsert(1, {0, 0}, &first) && *meta(1) == first);     // added with metadata
+        CHECK(!upsert(1, {1, 1}, nullptr) && *meta(1) == first);   // replaced, metadata kept
+        CHECK(!upsert(1, {2, 2}, &second) && *meta(1) == second);  // replaced with new metadata
+        CHECK(upsert(2, {5, 5}, nullptr) && meta(2)->empty());     // added without metadata
+    }
+}
+
+TEST(update, u24_invalid_metadata_changes_nothing) {
+    auto data = clustered(200, 8, 4, 431);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    FlatIndex f(8, Metric::L2, Schema::strict(search_fields()));
+    fill(h, f, data);
+    for (const Metadata& bad : {Metadata().set("unknown", 1), Metadata().set("year", "text"), Metadata().set("price", double(kNaN))}) {
+        CHECK_THROWS_AS(std::invalid_argument, h.update(3, data[100], bad));
+        CHECK_THROWS_AS(std::invalid_argument, f.update(3, data[100], bad));
+        CHECK_THROWS_AS(std::invalid_argument, h.upsert(3, data[100], bad));
+    }
+    CHECK(found_at(h, 3, data[3]) && found_at(f, 3, data[3]) && h.capacity() == 200);
+}
+
+TEST(update, u25_unmapped_slot_primitives) {
+    IdMap m;
+    m.add(10);  // slot 0
+    m.add(11);  // slot 1
+    const NodeId s = m.add_unmapped(10);  // a second slot holding ID 10
+    CHECK(s == 2 && *m.find(10) == 0 && m.external(2) == 10 && !m.is_deleted(2));
+    m.repoint(10, 2);
+    m.retire(0);
+    CHECK(*m.find(10) == 2 && m.is_free(0) && !m.is_free(2));
+    CHECK_THROWS_AS(std::logic_error, m.occupy_unmapped(1, 99));  // slot 1 is live
+    m.occupy_unmapped(0, 11);  // slot 0 now holds ID 11 too, unfindable
+    CHECK(*m.find(11) == 1 && !m.is_free(0));
+    m.retire(0);
+    CHECK(m.is_free(0));
+
+    Storage st(2);
+    st.insert(1, std::vector<float>{0, 0}, 0);
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_unmapped(1, std::vector<float>{0}, 0));
+    CHECK_THROWS_AS(std::invalid_argument, st.insert_unmapped(1, std::vector<float>{0, 0}, 256));
+    CHECK_THROWS_AS(std::logic_error, st.insert_into_unmapped(0, 1, std::vector<float>{0, 0}, 0));  // live slot
+    CHECK(st.size() == 1);
+    const NodeId n = st.insert_unmapped(1, std::vector<float>{4, 4}, 2);
+    CHECK(n == 1 && *st.ids().find(1) == 0 && st.graph().level(1) == 2 && st.vectors().get(1)[0] == 4.0f);
+}
+
+TEST(update, u26_update_without_graph_repair) {
+    auto data = clustered(1500, 16, 8, 432);
+    auto moved = clustered(500, 16, 8, 433);
+    HnswParams p;
+    p.repair_on_remove = false;
+    HnswIndex h(16, Metric::L2, p);
+    FlatIndex f(16, Metric::L2);
+    fill(h, f, data);
+    for (std::size_t i = 0; i < 500; ++i) {
+        h.update(i * 3, moved[i]);
+        f.update(i * 3, moved[i]);
+    }
+    CHECK(same_contents(h, f, moved));
+    CHECK(recall(h, f, moved, 10, 64) >= 0.90);
+    check_graph(h, 0.98, 0.10);
+}
+
+TEST(update, u27_mixed_operations_against_reference) {
+    // 5,000 random adds, removes, updates, upserts and metadata changes on both
+    // indexes, checked against each other and a reference map throughout.
+    auto pool = clustered(6000, 8, 8, 434);
+    auto queries = clustered(15, 8, 8, 435);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    std::map<std::uint64_t, std::int64_t> ref;  // id -> "v" field
+    std::mt19937 rng(436);
+    std::size_t next = 0, peak = 0;
+    bool ok = true;
+    for (int step = 0; step < 5000 && next < pool.size(); ++step) {
+        const unsigned op = static_cast<unsigned>(rng() % 6);
+        const std::uint64_t id = rng() % 1200;
+        const auto& v = pool[next++];
+        if (op == 0) {
+            if (!ref.count(id)) {
+                h.add(id, v, Metadata().set("v", std::int64_t(step)));
+                f.add(id, v, Metadata().set("v", std::int64_t(step)));
+                ref[id] = step;
+            }
+        } else if (op == 1) {
+            ok = ok && h.remove(id) == f.remove(id);
+            ref.erase(id);
+        } else if (op == 2 || op == 3) {
+            ok = ok && h.update(id, v) == f.update(id, v);  // metadata kept
+        } else if (op == 4) {
+            const bool added = h.upsert(id, v, Metadata().set("v", std::int64_t(step)));
+            ok = ok && added == f.upsert(id, v, Metadata().set("v", std::int64_t(step))) && added == !ref.count(id);
+            ref[id] = step;
+        } else if (ref.count(id)) {
+            h.set_metadata(id, Metadata().set("v", std::int64_t(-step)));
+            f.set_metadata(id, Metadata().set("v", std::int64_t(-step)));
+            ref[id] = -step;
+        }
+        peak = std::max(peak, ref.size());
+        if (step % 500 == 0) ok = ok && same_contents(h, f, queries);
+    }
+    for (const auto& [id, val] : ref) ok = ok && h.get_metadata(id)->get("v")->i == val && f.get_metadata(id)->get("v")->i == val;
+    CHECK(ok && h.size() == ref.size() && f.size() == ref.size());
+    CHECK(h.capacity() <= peak + 1);
+    CHECK(recall(h, f, queries, 10, 64) >= 0.90);
+    check_graph(h, 0.99);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -5998,7 +6491,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

@@ -1,4 +1,4 @@
-// The basics: create an index, add vectors, search, remove, compact.
+// The basics: create an index, add vectors, search, update, remove, compact.
 #include <cstdio>
 #include <vector>
 
@@ -18,6 +18,10 @@ int main() {
     const std::vector<float> query{1.0f, 0.15f, 0.05f, 0.0f};
     for (const vecdb::SearchResult& r : index.search(query, 2))
         std::printf("id %llu  distance %.4f\n", (unsigned long long)r.id, r.distance);
+
+    // Replace a vector: an update never loses the old one, even if it fails.
+    index.update(101, std::vector<float>{0.0f, 0.0f, 1.0f, 0.0f});
+    std::printf("after moving 101, the closest is %llu\n", (unsigned long long)index.search(query, 1)[0].id);
 
     // Remove a vector; its ID can be used again right away.
     index.remove(100);

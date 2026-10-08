@@ -61,16 +61,16 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### What a successful run looks like
 
-CTest runs the tests as 17 groups:
+CTest runs the tests as 18 groups:
 
 ```
-100% tests passed, 0 tests failed out of 17
+100% tests passed, 0 tests failed out of 18
 ```
 
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 418 tests
+./build/test_comprehensive                   # all 445 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```
@@ -80,7 +80,7 @@ The same tests can be run directly, which shows each test by name. See [Testing]
 Three small programs in [examples/](../examples) show the main features. They are built along with the project:
 
 ```bash
-./build/example_basics        # add, search, remove, compact
+./build/example_basics        # add, search, update, remove, compact
 ./build/example_filters       # metadata, filters, predicates, set_metadata
 ./build/example_batch_range   # batch search and range search
 ```
@@ -111,8 +111,8 @@ set(CMAKE_CXX_STANDARD 20)
 
 include(FetchContent)
 FetchContent_Declare(hnsw_lite
-    GIT_REPOSITORY https://github.com/praknig/hnsw_lite.git
-    GIT_TAG master)   # or a release tag, to pin a version
+        GIT_REPOSITORY https://github.com/praknig/hnsw_lite.git
+        GIT_TAG master)   # or a release tag, to pin a version
 FetchContent_MakeAvailable(hnsw_lite)
 
 add_executable(my_app main.cpp)

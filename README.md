@@ -7,14 +7,14 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 418 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 445 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
 - **Two indexes:** `FlatIndex` (exact, brute force) and `HnswIndex` (approximate, about 14x faster at 99.8% recall on 50,000 vectors).
 - **Three distance metrics:** squared Euclidean (L2), inner product and cosine.
 - **SIMD speed on any CPU:** AVX2, AVX-512 or ARM NEON versions are chosen automatically at runtime.
-- **Real deletion:** removed IDs can be reused immediately, and `compact()` rebuilds a heavily changed index.
+- **Updates and real deletion:** `update` and `upsert` replace a vector without ever losing the old one on failure; removed IDs can be reused immediately, and `compact()` rebuilds a heavily changed index.
 - **Metadata and filtered search:** integer, float, boolean, keyword and tag fields; filters like `Filter::eq("topic", "tech") && Filter::ge("year", 2020)`; a query planner that picks the fastest strategy.
 - **Batch search** on a thread pool and **range search** (everything within a radius).
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
@@ -115,11 +115,13 @@ std::vector<float> center{5.0f, 0.0f};
 auto nearby = index.search_range(center, l2_radius(2.5f));
 ```
 
-### Remove and compact
+### Update, remove and compact
 
 ```cpp
-index.remove(100);   // the ID can be added again immediately
-index.compact();     // after many removals: rebuild without them
+index.update(101, new_vector);   // replace a vector (metadata is kept)
+index.upsert(200, new_vector);   // add it if new, replace it otherwise
+index.remove(100);               // the ID can be added again immediately
+index.compact();                 // after many changes: rebuild for the best quality
 ```
 
 Complete, runnable versions of these are in [examples/](examples): `example_basics`, `example_filters` and `example_batch_range`. They are built with the project; run them from the `build` folder.
@@ -138,7 +140,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 ## Things to know
 
 - **Distances are "smaller is closer"** for every metric: L2 returns the *squared* distance, inner product returns the *negative* dot product, and cosine returns 1 minus the cosine similarity.
-- **Thread safety:** any number of searches may run at once, but changes (`add`, `remove`, `set_metadata`, `compact`) must not overlap with anything else. Protect writes with your own lock for now.
+- **Thread safety:** any number of searches may run at once, but changes (`add`, `update`, `remove`, `set_metadata`, `compact`) must not overlap with anything else. Protect writes with your own lock for now.
 - **Errors:** invalid input (wrong dimension, NaN, a duplicate ID, a metadata type mismatch) throws `std::invalid_argument` and leaves the index unchanged.
 - **Memory only:** saving and loading indexes is not implemented yet.
 
@@ -151,12 +153,12 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 418 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 445 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 
 ## Project status
 
-Done: Flat and HNSW indexes, SIMD kernels, real deletion, metadata, filtered search, batch search and range search. Next: updating vectors in place, saving and loading, and safe concurrent inserts. See the [roadmap](docs/project-notes.md#roadmap).
+Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search and range search. Next: saving and loading, and safe concurrent inserts. See the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

@@ -230,7 +230,10 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
     }
 }
 
-void HnswIndex::link_new_node(NodeId node, int level) {
+void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore) {
+    // `ignore` (the old version of an updated vector) is traversed but never
+    // chosen as a neighbor, since it is about to be removed.
+    const Eligibility eligible{&storage_.ids(), nullptr, nullptr, ignore};
     // 4. Greedy descent through the levels above the new node's level.
     const float* query = scratch_.data();
     Candidate current{distance_to(query, entry_), entry_};
@@ -243,16 +246,16 @@ void HnswIndex::link_new_node(NodeId node, int level) {
         // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
         // so new nodes do not waste link slots on them.
         std::vector<Candidate> found =
-            search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
+            search_level(query, entries, params_.ef_construction, l, *visited, node, eligible);
         if (found.empty()) {
             // Every node reachable from here is removed (possible after many
             // removals without repair). Search again from the entry point too,
             // which is always live, so the new node links to live nodes.
             entries.push_back({distance_to(query, entry_), entry_});
-            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, eligible);
         }
         connect(node, select_neighbors(found, params_.M), l);
-        if (!found.empty()) entries = std::move(found);  // GCOVR_EXCL_BR_LINE: defensive, never empty here
+        if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
     }
 
     // 6. A node higher than all others becomes the new entry point.
@@ -325,6 +328,78 @@ bool HnswIndex::remove(std::uint64_t id) {
     --live_;
     free_slots_.push_back(*node);
     if (*node == entry_) choose_new_entry();
+    return true;
+}
+
+bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) { return replace(id, vector, nullptr); }
+
+bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    return replace(id, vector, &metadata);
+}
+
+bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    if (replace(id, vector, nullptr)) return false;
+    add(id, vector);
+    return true;
+}
+
+bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    if (replace(id, vector, &metadata)) return false;
+    add(id, vector, metadata);
+    return true;
+}
+
+bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+    // 1. Validate everything before changing anything.
+    scratch_.prepare(vector, metric_);
+    if (metadata) metadata_.validate(*metadata);
+    IdMap& ids = storage_.ids();
+    const auto found = ids.find(id);
+    if (!found) return false;
+    const NodeId old = *found;
+    reserve_one_more(free_slots_);  // room for the old slot (or an abandoned new one)
+
+    // 2. Build the new version in another slot. The old one stays live and
+    //    findable throughout, so any failure below leaves it untouched.
+    const Metadata md = metadata ? *metadata : metadata_.read(old);
+    const bool reuse = !free_slots_.empty();
+    const NodeId slot = reuse ? free_slots_.back() : static_cast<NodeId>(storage_.size());
+    const auto undo = metadata_.write(slot, md);
+    const int level = random_level();
+    try {
+        if (reuse) storage_.insert_into_unmapped(slot, id, scratch_.values(), level);
+        else storage_.insert_unmapped(id, scratch_.values(), level);
+    } catch (...) {
+        metadata_.undo_write(slot, undo);
+        throw;
+    }
+
+    // 3. Link the new version (never to the old one), then repair the graph
+    //    around the old one while it is still live, as remove() does.
+    const NodeId saved_entry = entry_;
+    const int saved_max_level = max_level_;
+    try {
+        link_new_node(slot, level, old);
+        if (params_.repair_on_remove) repair_neighbors(old);
+    } catch (...) {
+        // Abandon the new version like a failed insert. Links made so far are
+        // valid; the repair only re-chose neighbors' links.
+        ids.retire(slot);
+        metadata_.undo_write(slot, undo);
+        entry_ = saved_entry;
+        max_level_ = saved_max_level;
+        if (!reuse) free_slots_.push_back(slot);  // cannot throw: reserved in step 1
+        throw;
+    }
+
+    // 4. Commit: the ID now finds the new version; the old slot is freed.
+    //    Nothing below can throw.
+    ids.repoint(id, slot);
+    ids.retire(old);
+    metadata_.clear(old);
+    if (reuse) free_slots_.pop_back();
+    free_slots_.push_back(old);
+    if (old == entry_) choose_new_entry();
     return true;
 }
 

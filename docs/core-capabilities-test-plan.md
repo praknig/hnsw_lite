@@ -96,7 +96,7 @@ Status: **section 1 (real deletion, D1 to D66) is implemented** in the `deletion
 | U5 | Flat update with cosine: the new vector is normalized | P |
 | U6 | Flat upsert: a new ID is added, an existing ID is replaced; sizes correct | P |
 | U7 | HNSW update: the new position is found, the old position never returned | P |
-| U8 | HNSW update reuses the same slot: the stored count is unchanged | P |
+| U8 | HNSW update keeps the stored count, and grows capacity by at most one slot, which later updates reuse (changed from "reuses the same slot": see the plan's "As built" note) | P |
 | U9 | HNSW update of an unknown or removed ID returns `false`; nothing changes | N |
 | U10 | HNSW update with invalid input: the old vector is intact, entry point and top level unchanged | N |
 | U11 | Updating the entry point's vector: the entry point stays valid and live | E |
@@ -109,6 +109,8 @@ Status: **section 1 (real deletion, D1 to D66) is implemented** in the `deletion
 | U18 | All three metrics | P |
 | U19 | The same operations and seed give identical results | P |
 | U20 | **Out-of-memory sweep of update: the old vector survives every failure** | M |
+
+Added during implementation (metadata did not exist when this plan was written): U21 update keeps metadata, U22 update with metadata replaces every field, U23 upsert with and without metadata, U24 invalid metadata changes nothing, U25 the new ID-map and storage operations, U26 updates without graph repair, U27 5,000 mixed operations against a reference.
 
 ---
 

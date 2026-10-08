@@ -284,9 +284,10 @@ struct Eligibility {
     const IdMap* ids = nullptr;
     const CompiledFilter* filter = nullptr;
     const std::function<bool(std::uint64_t)>* predicate = nullptr;
+    NodeId exclude = kEmpty;  // a node to leave out (the old version during an update)
 
     bool operator()(NodeId n) const {
-        if (ids->is_deleted(n)) return false;
+        if (n == exclude || ids->is_deleted(n)) return false;
         if (filter && !filter->matches(n)) return false;
         if (predicate && !(*predicate)(ids->external(n))) return false;
         return true;

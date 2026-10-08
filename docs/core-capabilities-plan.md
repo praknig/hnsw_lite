@@ -93,6 +93,8 @@ Validate and prepare the new vector, then overwrite the row in place. All-or-not
 
 **Safety:** an update must never lose the old vector. All risky work (validation, finding the new neighbors, reserving memory) happens before the old node is touched, so a failure leaves the old vector intact.
 
+**As built:** remove-then-re-insert cannot meet the safety rule (running out of memory during the re-insert would lose the vector), so the implementation reverses the order: the new version is built and linked in another slot while the old one stays live, and only then does the ID switch over. See [Updating vectors](architecture.md#updating-vectors). The cost is at most one extra slot, reused by later updates.
+
 ---
 
 ## 3. Saving and loading

@@ -88,7 +88,7 @@ hnsw-lite/
 │   ├── core-capabilities-plan.md       # Plan: deletion, update, persistence, concurrency
 │   └── core-capabilities-test-plan.md  # Test scenarios for that plan
 ├── examples/                   # Small, complete programs
-│   ├── example_basics.cpp      # Add, search, remove, compact
+│   ├── example_basics.cpp      # Add, search, update, remove, compact
 │   ├── example_filters.cpp     # Metadata, filters, predicates
 │   └── example_batch_range.cpp # Batch and range search
 ├── include/                    # Public headers (namespace vecdb)
@@ -120,7 +120,7 @@ hnsw-lite/
 │   ├── hnsw_index.cpp          # HnswIndex implementation
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 418 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 445 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -307,6 +307,19 @@ Cost: one distance per stored vector. Exact, with equal distances ordered by ins
 One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an already-kept neighbor is skipped. Identical vectors are all at distance 0 from each other, a tie, so the plain rule keeps every copy, and lists near a cluster of duplicates fill up with copies of one point. In testing with 200 identical vectors among 200 random ones, this cut links to the rest of the graph and made 44 of the random vectors unreachable; with the copy check, every random vector stays reachable. The check uses `memcmp`, which stops at the first differing byte, so it costs almost nothing, and on data without duplicates the graph is unchanged.
 
 **Threading.** One writer at a time, with no searches running. Several searches may run at once when no writer is active; each borrows its own `VisitedList` from a mutex-protected pool, and returns it automatically through an RAII handle.
+
+### Updating vectors
+
+`FlatIndex::update` validates the new vector, then overwrites the row in place: nothing can fail after validation.
+
+`HnswIndex::update` must never lose the old vector, even if memory runs out. Removing the old version and re-inserting cannot promise that (a failure during the re-insert would leave neither), so the order is reversed:
+
+1. **Build the new version in another slot** (a free slot, or a new one at the end). The slot holds the user ID but is not yet findable (`IdMap::add_unmapped`, `occupy_unmapped`), and its metadata is written there.
+2. **Link it** like any insert, except that the old version is never chosen as a neighbor (`Eligibility::exclude`), since it is about to go.
+3. **Repair the graph around the old version** (if `repair_on_remove`), while it is still live, exactly as `remove()` does.
+4. **Commit**, with nothing that can fail: the ID is pointed at the new slot (`repoint`), the old slot is retired and its metadata cleared, it joins the free list, and a new entry point is chosen if the old version was the entry point.
+
+A failure in steps 1 to 3 abandons the new version like a failed insert, restoring the entry point; the old vector is untouched. The price is one extra slot during the switch: the first update grows capacity by one, and that slot is then reused by every later update or insert, so capacity never exceeds the peak number of live vectors plus one.
 
 ## Search features design
 

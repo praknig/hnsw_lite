@@ -97,6 +97,33 @@ public:
     }
 
     /// Removes the last slot, which must already be released or moved. Never throws.
+    /// Appends a live slot holding `external` without making it findable:
+    /// find(external) keeps returning the slot it returned before. update()
+    /// builds the new version of a vector this way, then switches with repoint().
+    /// All-or-nothing.
+    NodeId add_unmapped(std::uint64_t external) {
+        reserve_one_more(to_external_);  // may throw; nothing changed yet
+        reserve_one_more(deleted_);
+        to_external_.push_back(external);  // cannot throw: capacity reserved
+        deleted_.push_back(0);
+        return static_cast<NodeId>(to_external_.size() - 1);
+    }
+
+    /// Makes free slot `slot` live and holding `external`, without making it
+    /// findable. Throws std::logic_error if the slot is not free.
+    void occupy_unmapped(NodeId slot, std::uint64_t external) {
+        if (!is_free(slot)) throw std::logic_error("slot is not free");
+        to_external_[slot] = external;
+        deleted_[slot] = 0;
+    }
+
+    /// Makes `find(external)` return `slot`. `external` must be stored. Never throws.
+    void repoint(std::uint64_t external, NodeId slot) noexcept { to_internal_.find(external)->second = slot; }
+
+    /// Frees a live slot that find() does not point to: the old version of an
+    /// updated vector, or a new version being abandoned. Never throws.
+    void retire(NodeId slot) noexcept { deleted_[slot] = 1; }
+
     void pop_back_slot() noexcept {
         to_external_.pop_back();
         deleted_.pop_back();

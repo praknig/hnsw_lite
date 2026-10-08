@@ -10,6 +10,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Creating an index](#creating-an-index)
 - [Adding vectors](#adding-vectors)
 - [Searching](#searching)
+- [Updating vectors](#updating-vectors)
 - [Removing vectors and compacting](#removing-vectors-and-compacting)
 - [Metadata](#metadata)
 - [Filtered search](#filtered-search)
@@ -25,8 +26,8 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - **Your IDs:** each vector is stored under a 64-bit integer you choose, and searches return those IDs. Use them to find the matching document, image or row in your own data.
 - **Nearest neighbors:** a search returns the `k` stored vectors closest to a query vector, closest first.
 - **Two indexes:**
-    - `FlatIndex` compares the query with every stored vector. Results are **exact**, but the time grows in proportion to the number of vectors.
-    - `HnswIndex` builds a multi-level graph and walks it towards the query. It is **approximate** (it can occasionally miss a true neighbor) but far faster on large collections. How often it finds the true neighbors is called **recall**.
+  - `FlatIndex` compares the query with every stored vector. Results are **exact**, but the time grows in proportion to the number of vectors.
+  - `HnswIndex` builds a multi-level graph and walks it towards the query. It is **approximate** (it can occasionally miss a true neighbor) but far faster on large collections. How often it finds the true neighbors is called **recall**.
 
 ## Creating an index
 
@@ -86,6 +87,18 @@ for (const SearchResult& r : results) use(r.id, r.distance);
 - With equal distances, results are ordered by an internal position, so the order of ties is stable but not by ID.
 
 Useful queries about the index: `size()` (vectors stored), `contains(id)`, `dim()`, `metric()`.
+
+## Updating vectors
+
+```cpp
+bool found = index.update(42, new_embedding);   // false if 42 is not stored
+bool added = index.upsert(42, new_embedding);   // adds 42 if new, replaces it otherwise; true if added
+```
+
+- `update` and `upsert` keep the vector's metadata. To replace the vector and its metadata together, in one step, pass the metadata too: `index.update(42, new_embedding, Metadata().set("year", 2025))`. Fields not given are then cleared; to change only some fields, use `set_metadata`.
+- The new vector is checked first: a wrong dimension, NaN or infinity throws `std::invalid_argument`, even for an unknown ID.
+- **An update never loses the old vector.** `HnswIndex` builds and links the new version in another slot while the old one stays searchable, and only then switches the ID over. If anything fails, including running out of memory, the old vector is exactly as it was. The switch uses at most one extra slot, which later updates and inserts reuse.
+- `FlatIndex` simply overwrites the vector in place.
 
 ## Removing vectors and compacting
 
@@ -242,7 +255,7 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 ## Threads
 
 - **Searches** (all kinds) may run from any number of threads at the same time.
-- **Changes** (`add`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) must not run at the same time as anything else, including searches. If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
+- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) must not run at the same time as anything else, including searches. If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
 
 ## Errors and guarantees
 

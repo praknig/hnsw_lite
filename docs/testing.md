@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 418 individually named tests** in 17 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 445 individually named tests** in 18 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -24,6 +24,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `batch` | 16 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
 | `range` | 16 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
 | `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
+| `update` | 27 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, and 5,000 mixed operations against a reference |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -34,7 +35,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 418 test names
+test_comprehensive --list               # list all 445 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -48,13 +49,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 418 of 418 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 445 of 445 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-418 passed, 0 failed, 0 skipped, 0 not run, 26343 checks, 16.01 s
+445 passed, 0 failed, 0 skipped, 0 not run, 28591 checks, 16.62 s
 All selected tests passed.
 ```
 
@@ -69,7 +70,7 @@ TEST(flat, my_new_case) {
 }
 ```
 
-**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 27 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
+**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 28 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
 
 ### Code coverage
 
@@ -102,27 +103,28 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 17 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 18 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/17 Test # 1: comprehensive.layer1 ................   Passed
- 2/17 Test # 2: comprehensive.layer2 ................   Passed
- 3/17 Test # 3: comprehensive.helpers ...............   Passed
- 4/17 Test # 4: comprehensive.flat ..................   Passed
- 5/17 Test # 5: comprehensive.hnsw ..................   Passed
- 6/17 Test # 6: comprehensive.robustness ............   Passed
- 7/17 Test # 7: comprehensive.deletion ..............   Passed
- 8/17 Test # 8: comprehensive.concurrency ...........   Passed
- 9/17 Test # 9: comprehensive.metadata ..............   Passed
-10/17 Test #10: comprehensive.filter ................   Passed
-11/17 Test #11: comprehensive.planner ...............   Passed
-12/17 Test #12: comprehensive.payload ...............   Passed
-13/17 Test #13: comprehensive.batch .................   Passed
-14/17 Test #14: comprehensive.range .................   Passed
-15/17 Test #15: comprehensive.search_e2e ............   Passed
-16/17 Test #16: comprehensive.stress ................   Passed
-17/17 Test #17: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 17
+ 1/18 Test # 1: comprehensive.layer1 ................   Passed
+ 2/18 Test # 2: comprehensive.layer2 ................   Passed
+ 3/18 Test # 3: comprehensive.helpers ...............   Passed
+ 4/18 Test # 4: comprehensive.flat ..................   Passed
+ 5/18 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/18 Test # 6: comprehensive.robustness ............   Passed
+ 7/18 Test # 7: comprehensive.deletion ..............   Passed
+ 8/18 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/18 Test # 9: comprehensive.metadata ..............   Passed
+10/18 Test #10: comprehensive.filter ................   Passed
+11/18 Test #11: comprehensive.planner ...............   Passed
+12/18 Test #12: comprehensive.payload ...............   Passed
+13/18 Test #13: comprehensive.batch .................   Passed
+14/18 Test #14: comprehensive.range .................   Passed
+15/18 Test #15: comprehensive.search_e2e ............   Passed
+16/18 Test #16: comprehensive.update ................   Passed
+17/18 Test #17: comprehensive.stress ................   Passed
+18/18 Test #18: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 18
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
