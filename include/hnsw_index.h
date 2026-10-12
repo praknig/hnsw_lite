@@ -108,6 +108,29 @@ public:
     /// stored and the graph stays valid.
     bool remove(std::uint64_t id);
 
+    /// Replaces the vector stored under `id`, keeping its metadata. Returns
+    /// false if `id` is not stored. Throws std::invalid_argument on a wrong
+    /// dimension, NaN or infinity (checked first, even for an unknown ID).
+    ///
+    /// The new version is built and linked in another slot while the old one
+    /// stays live and findable; only then does the ID switch over and the old
+    /// slot join the free list. A failure, including running out of memory,
+    /// leaves the old vector exactly as it was. Capacity grows by at most one
+    /// slot, which later inserts and updates reuse.
+    bool update(std::uint64_t id, std::span<const float> vector);
+
+    /// Replaces the vector and its whole metadata (fields not given are cleared;
+    /// to change some fields only, use set_metadata()). Same guarantees.
+    bool update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
+
+    /// Adds `id` if it is not stored, otherwise replaces its vector (keeping its
+    /// metadata). Returns true if it was added, false if it was replaced.
+    bool upsert(std::uint64_t id, std::span<const float> vector);
+
+    /// Adds `id` with this metadata, or replaces its vector and whole metadata.
+    /// Returns true if it was added, false if it was replaced.
+    bool upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
+
     /// True if `id` is stored.
     bool contains(std::uint64_t id) const;
 
@@ -235,7 +258,10 @@ private:
 
     /// Steps 4 to 6 of add(): finds neighbors on every level, links the new node
     /// both ways, and makes it the entry point if it is the highest node.
-    void link_new_node(NodeId node, int level);
+    void link_new_node(NodeId node, int level, NodeId ignore = kEmpty);
+
+    /// update() and upsert(): `metadata` null keeps the old metadata.
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.

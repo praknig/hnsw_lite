@@ -60,6 +60,8 @@ Not copyable, movable. Frees its memory in the destructor.
 | `release(external)` | Real deletion: frees the user ID and marks its slot free; returns the slot |
 | `is_free(slot)`, `bind(slot, external)` | Checks a slot is free; gives a free slot a new user ID (slot reuse) |
 | `move_slot(from, to)`, `pop_back_slot()` | Used by Flat's swap-with-last removal |
+| `add_unmapped(external)`, `occupy_unmapped(slot, external)` | A live slot holding a user ID without being findable (the new version during an update) |
+| `repoint(external, slot)`, `retire(slot)` | Switches a user ID to another slot; frees a slot `find()` no longer points to |
 | `size()` | Number of registered IDs |
 
 ## `GraphStorage`
@@ -83,6 +85,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `Storage(dim, M = 16)` | Creates all Layer 1 parts |
 | `insert(external, vector, level)` | Validates the dimension and level (0 to 255), then adds the vector to `IdMap`, `VectorStore` and `GraphStorage`; returns its `NodeId`. On error nothing is added |
 | `insert_into(slot, external, vector, level)` | Puts a vector into a free slot instead of appending; all-or-nothing |
+| `insert_unmapped(...)`, `insert_into_unmapped(slot, ...)` | The same, without making the user ID findable (used by update); all-or-nothing |
 | `vectors()`, `graph()`, `ids()` | Access to the parts |
 | `size()` | Number of stored vectors |
 
@@ -140,6 +143,8 @@ Not copyable, movable. Frees its memory in the destructor.
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
+| `update(id, vector)`, `update(id, vector, metadata)` | Replaces the vector in place (and, with metadata, the whole metadata); `false` for an unknown ID; all-or-nothing |
+| `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
 | `compact()`, `deleted_count()`, `capacity()` | No-op (never any holes), 0, equal to `size()` |
 | `contains(id)` | Stored and not removed |
 | `search(query, k)` | Up to k exact closest live vectors, closest first; k above `size()` returns all |
@@ -153,6 +158,8 @@ Not copyable, movable. Frees its memory in the destructor.
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
 | `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
+| `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |
+| `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
 | `compact()` | Rebuilds a dense index from the live vectors; the old index stays intact if memory runs out |
 | `deleted_count()`, `capacity()` | Slots waiting to be reused; all slots |
 | `contains(id)` | Stored and not removed |

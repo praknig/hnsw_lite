@@ -38,7 +38,7 @@ These are deliberate for the current stage:
 - [x] Search benchmark on synthetic data (recall@10 vs. queries per second)
 - [x] Continuous integration: Linux (GCC, Clang, sanitizers), Windows (MSVC, MinGW) and macOS on ARM
 - [x] Real deletion: reusable IDs, slot reuse, graph repair, `compact()`
-- [ ] Updating vectors: `update` and `upsert`
+- [x] Updating vectors: `update` and `upsert`
 - [ ] Saving and loading indexes
 - [ ] Concurrent inserts, including parallel HNSW construction (`add_batch`)
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search

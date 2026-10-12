@@ -64,6 +64,40 @@ public:
         return slot;
     }
 
+    /// Like insert(), but the slot holds `external` without being findable
+    /// (see IdMap::add_unmapped). All-or-nothing.
+    NodeId insert_unmapped(std::uint64_t external, std::span<const float> v, int level) {
+        if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
+        if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");
+        const NodeId id = ids_.add_unmapped(external);
+        try {
+            vectors_.add(v);
+        } catch (...) {
+            ids_.pop_back_slot();
+            throw;
+        }
+        try {
+            graph_.add_node(level);
+        } catch (...) {
+            vectors_.undo_last_add();
+            ids_.pop_back_slot();
+            throw;
+        }
+        return id;
+    }
+
+    /// Like insert_into(), but the slot holds `external` without being findable.
+    /// All-or-nothing.
+    NodeId insert_into_unmapped(NodeId slot, std::uint64_t external, std::span<const float> v, int level) {
+        if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
+        if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");
+        if (!ids_.is_free(slot)) throw std::logic_error("slot is not free");
+        graph_.reset_node(slot, level);           // all-or-nothing
+        ids_.occupy_unmapped(slot, external);     // cannot fail: checked above
+        vectors_.overwrite(slot, v);              // cannot fail: dimension and slot checked
+        return slot;
+    }
+
     const VectorStore& vectors() const { return vectors_; }
     GraphStorage& graph() { return graph_; }
     const GraphStorage& graph() const { return graph_; }
