@@ -3,6 +3,9 @@
  * @brief Result types and the top-k heap shared by FlatIndex and HnswIndex.
  */
 #pragma once
+#include <string>
+#include <stdexcept>
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -55,6 +58,49 @@ struct Candidate {
     /// Reverse order, used to build min-heaps.
     friend bool operator>(const Candidate& a, const Candidate& b) { return b < a; }
 };
+
+/**
+ * @brief Counts searches in progress, so an index can refuse to change during
+ *        one: from a predicate (which may search, but not change, the index) or
+ *        from another thread (not allowed). Detection from another thread is
+ *        best effort, since the two may simply not overlap in time.
+ */
+class SearchCounter {
+public:
+    /// Marks a search as running until destroyed.
+    class Scope {
+    public:
+        explicit Scope(const SearchCounter& c) noexcept : c_(c) { c_.count_.fetch_add(1, std::memory_order_acq_rel); }
+        ~Scope() { c_.count_.fetch_sub(1, std::memory_order_acq_rel); }
+        Scope(const Scope&) = delete;
+        Scope& operator=(const Scope&) = delete;
+
+    private:
+        const SearchCounter& c_;
+    };
+
+    Scope enter() const noexcept { return Scope(*this); }
+
+    /// Throws std::logic_error if a search is running.
+    void check_no_search(const char* operation) const {
+        if (count_.load(std::memory_order_acquire) != 0)
+            throw std::logic_error(std::string(operation) +
+                                   " called while a search is running (from a predicate or another thread); "
+                                   "change the index only when no search is in progress");
+    }
+
+private:
+    mutable std::atomic<int> count_{0};
+};
+
+/// A distance as an index reports it: cosine distances are clamped at 0
+/// (rounding can make 1 - dot slightly negative for nearly identical
+/// directions, which is meaningless), then NaN is mapped as ordered_distance()
+/// does. The raw kernels from get_distance() are left unchanged.
+inline float index_distance(float raw, bool cosine) {
+    if (cosine && raw < 0.0f) raw = 0.0f;
+    return ordered_distance(raw);
+}
 
 /// "No limit" for the number of results of a range search.
 inline constexpr std::size_t kNoLimit = std::numeric_limits<std::size_t>::max();

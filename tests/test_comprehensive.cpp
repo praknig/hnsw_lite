@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -6240,6 +6240,309 @@ TEST(update, u32_updated_vector_never_left_without_links) {
 }
 
 // ===========================================================================
+// Hardening (H1-H14, for edge cases E1-E13 of the hardening and performance plan)
+// ===========================================================================
+
+TEST(hardening, h01_levels_identical_on_every_platform) {
+    // E1: random levels come from the generator's raw bits, so every compiler and
+    // standard library must produce exactly these (checked on every CI platform).
+    const std::vector<int> m16 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+    const std::vector<int> m4 = {1, 2, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 3, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
+    HnswIndex a(2, Metric::L2);
+    HnswParams p;
+    p.M = 4;
+    p.seed = 7;
+    HnswIndex b(2, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 64; ++i) {
+        a.add(i, std::vector<float>{float(i), float(i % 7)});
+        b.add(i, std::vector<float>{float(i), float(i % 7)});
+    }
+    bool same = true;
+    for (NodeId n = 0; n < 64; ++n)
+        same = same && a.storage().graph().level(n) == m16[n] && b.storage().graph().level(n) == m4[n];
+    CHECK(same);
+}
+
+TEST(hardening, h02_nested_batch_from_a_predicate) {
+    // E2: a predicate running a batch on the same index, inside a batch, used to
+    // deadlock the pool. Nested batches now run inline.
+    auto data = clustered(400, 8, 4, 450);
+    auto queries = clustered(16, 8, 4, 451);
+    const auto buffer = flatten(queries);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    const auto expected_h = h.search_batch(buffer, 5, 64, 4);
+    const auto expected_f = f.search_batch(buffer, 5, 4);
+    std::atomic<int> nested{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        nested += int(h.search_batch(std::span<const float>(buffer.data(), 16), 2, 16, 4).size());
+        nested += int(f.search_batch(std::span<const float>(buffer.data(), 16), 2, 4).size());
+        return true;
+    };
+    const auto got_h = h.search_batch(buffer, 5, 64, 4, o);
+    const auto got_f = f.search_batch(buffer, 5, 4, o);
+    bool same = true;
+    for (std::size_t i = 0; i < queries.size(); ++i) same = same && same_results(got_h[i], expected_h[i]) && same_results(got_f[i], expected_f[i]);
+    CHECK(same && nested.load() > 0);
+}
+
+TEST(hardening, h03_changes_during_a_search_are_refused) {
+    // E2: a predicate may search the index but not change it; a change is refused
+    // with std::logic_error and the index is left unchanged.
+    auto data = clustered(300, 8, 4, 452);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    const Results before_h = h.search(data[0], 10), before_f = f.search(data[0], 10);
+    const std::vector<std::function<void()>> hnsw_changes = {
+        [&] { h.add(9999, data[1]); }, [&] { h.remove(5); }, [&] { h.update(5, data[1]); }, [&] { h.upsert(9999, data[1]); },
+        [&] { h.set_metadata(5, Metadata().set("a", 1)); }, [&] { h.create_payload_index("a"); },
+        [&] { h.set_planner_params(PlannerParams{}); }, [&] { h.compact(); }};
+    const std::vector<std::function<void()>> flat_changes = {
+        [&] { f.add(9999, data[1]); }, [&] { f.remove(5); }, [&] { f.update(5, data[1]); }, [&] { f.upsert(9999, data[1]); },
+        [&] { f.set_metadata(5, Metadata().set("a", 1)); }, [&] { f.create_payload_index("a"); }, [&] { f.compact(); }};
+    for (const auto& change : hnsw_changes) {
+        SearchOptions o;
+        o.predicate = [&](std::uint64_t) { change(); return true; };
+        CHECK_THROWS_AS(std::logic_error, h.search(data[0], 10, 64, o));
+        CHECK_THROWS_AS(std::logic_error, h.search_range(data[0], 1.0f, kNoLimit, o));
+    }
+    for (const auto& change : flat_changes) {
+        SearchOptions o;
+        o.predicate = [&](std::uint64_t) { change(); return true; };
+        CHECK_THROWS_AS(std::logic_error, f.search(data[0], 10, o));
+        CHECK_THROWS_AS(std::logic_error, f.search_batch(flatten(Vectors(data.begin(), data.begin() + 2)), 3, 2, o));
+    }
+    CHECK(same_results(h.search(data[0], 10), before_h) && same_results(f.search(data[0], 10), before_f));
+    CHECK(h.size() == 300 && f.size() == 300 && !h.contains(9999) && !f.contains(9999));
+    h.add(9999, data[1]);  // after the searches, changes work again
+    f.add(9999, data[1]);
+    CHECK(h.contains(9999) && f.contains(9999));
+}
+
+TEST(hardening, h04_cosine_distance_never_negative) {
+    // E3: rounding used to give a vector a slightly negative distance to itself.
+    std::mt19937 rng(453);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    bool non_negative = true;
+    int found_with_tolerance = 0;
+    for (int t = 0; t < 2000; ++t) {
+        std::vector<float> v(37);
+        for (float& x : v) x = g(rng);
+        FlatIndex f(37, Metric::Cosine);
+        f.add(1, v);
+        const float d = f.search(v, 1)[0].distance;
+        non_negative = non_negative && d >= 0.0f;
+        found_with_tolerance += int(f.search_range(v, 1e-6f).size());
+    }
+    CHECK(non_negative);
+    CHECK(found_with_tolerance == 2000);  // a small radius always finds exact copies
+    // HNSW too, through search, range search and graph construction.
+    Vectors data;
+    for (int i = 0; i < 400; ++i) {
+        std::vector<float> v(37);
+        for (float& x : v) x = g(rng);
+        data.push_back(v);
+    }
+    HnswIndex h(37, Metric::Cosine);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    bool hnsw_ok = true;
+    for (std::size_t i = 0; i < data.size(); i += 4) {
+        for (const auto& r : h.search(data[i], 10)) hnsw_ok = hnsw_ok && r.distance >= 0.0f;
+        const auto near = h.search_range(data[i], 1e-6f);
+        hnsw_ok = hnsw_ok && !near.empty() && near[0].id == i;
+    }
+    CHECK(hnsw_ok);
+}
+
+TEST(hardening, h05_hnsw_m_has_an_upper_bound) {
+    // E4: a huge M used to attempt a huge allocation.
+    HnswParams p;
+    p.M = 2049;
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(4, Metric::L2, p));
+    p.M = 2000000;
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(4, Metric::L2, p));
+    p.M = 2048;
+    HnswIndex h(4, Metric::L2, p);
+    h.add(1, std::vector<float>{1, 2, 3, 4});
+    CHECK(h.search(std::vector<float>{1, 2, 3, 4}, 1)[0].id == 1);
+}
+
+TEST(hardening, h06_extreme_ids) {
+    // E5: IDs 0 and 2^64-1 through every operation.
+    const std::uint64_t hi = std::numeric_limits<std::uint64_t>::max();
+    auto data = clustered(50, 4, 2, 454);
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    for (std::size_t i = 0; i < 47; ++i) {
+        h.add(1000 + i, data[i]);
+        f.add(1000 + i, data[i]);
+    }
+    for (std::uint64_t id : {std::uint64_t(0), hi, hi - 1}) {
+        h.add(id, data[47 + (id % 3)], Metadata().set("edge", true));
+        f.add(id, data[47 + (id % 3)], Metadata().set("edge", true));
+    }
+    CHECK(h.update(hi, data[0]) && f.update(hi, data[0]));
+    const SearchOptions o = with_filter(Filter::eq("edge", true));
+    std::set<std::uint64_t> edge_h, edge_f;
+    for (const auto& r : h.search(data[0], 10, 64, o)) edge_h.insert(r.id);
+    for (const auto& r : f.search(data[0], 10, o)) edge_f.insert(r.id);
+    CHECK(edge_h == std::set<std::uint64_t>({0, hi - 1, hi}) && edge_f == edge_h);
+    CHECK(h.search_batch(data[0], 1)[0][0].distance == 0.0f);
+    CHECK(h.remove(0) && h.remove(hi) && f.remove(hi) && !h.contains(hi) && !f.contains(hi));
+    h.add(hi, data[5]);
+    CHECK(h.contains(hi) && *h.get_metadata(hi) == Metadata());
+}
+
+TEST(hardening, h07_vector_from_the_index_itself) {
+    // E6: adding or updating with a vector that points into the index's own storage.
+    auto data = clustered(200, 8, 4, 455);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    const Storage& st = h.storage();
+    const NodeId s10 = *st.ids().find(10), s20 = *st.ids().find(20);
+    CHECK(h.update(10, st.vectors().get(s20)));          // copy vector 20 onto 10
+    CHECK(h.update(20, st.vectors().get(s20)));          // a vector onto itself
+    h.add(500, st.vectors().get(*st.ids().find(30)));    // add a copy of vector 30
+    std::set<std::uint64_t> at_20;
+    for (const auto& r : h.search(data[20], 5, 128)) if (r.distance == 0.0f) at_20.insert(r.id);
+    CHECK(at_20 == std::set<std::uint64_t>({10, 20}));
+    CHECK(h.search(data[30], 2, 128)[1].distance == 0.0f && s10 != s20);
+}
+
+TEST(hardening, h08_dimension_zero_rejected) {
+    // E7.
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(0, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(0, Metric::Cosine));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(0, Metric::L2, HnswParams{}, Schema::strict({})));
+}
+
+TEST(hardening, h09_thousands_of_dynamic_fields) {
+    // E8: 2,000 fields created dynamically; every vector sets 3 of them.
+    FlatIndex f(1, Metric::L2);
+    std::mt19937 rng(456);
+    std::map<std::uint64_t, Metadata> ref;
+    std::set<std::string> used;
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        Metadata md;
+        for (int j = 0; j < 3; ++j) {
+            const std::string name = "f" + std::to_string(rng() % 2000);
+            md.set(name, std::int64_t(i));
+            used.insert(name);
+        }
+        f.add(i, std::vector<float>{float(i)}, md);
+        ref[i] = md;
+    }
+    CHECK(f.metadata().field_count() == used.size() && used.size() > 1900);
+    bool ok = true;
+    for (std::uint64_t i = 0; i < 3000; i += 97) ok = ok && *f.get_metadata(i) == ref[i];
+    std::vector<std::uint64_t> expected;
+    for (const auto& [id, md] : ref) if (md.get("f777")) expected.push_back(id);
+    CHECK(ok && matching_ids(f, Filter::exists("f777")) == expected);
+}
+
+TEST(hardening, h10_thousands_of_tags_in_a_filter) {
+    // E9: has_any_tag and has_all_tags with 5,000 tags (now sorted and binary-searched).
+    FlatIndex f(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 20000; ++i)
+        f.add(i, std::vector<float>{float(i)}, Metadata().set_tags("t", {"t" + std::to_string(i % 7000), "x" + std::to_string(i % 3)}));
+    std::vector<std::string> many;
+    for (int i = 4999; i >= 0; --i) many.push_back("t" + std::to_string(i));  // unsorted on purpose
+    many.push_back("t0");                                                       // and a repeat
+    std::vector<std::uint64_t> any_expected, all_expected;
+    for (std::uint64_t i = 0; i < 20000; ++i) {
+        if (i % 7000 < 5000) any_expected.push_back(i);
+        if (i % 7000 == 12 && i % 3 == 1) all_expected.push_back(i);
+    }
+    CHECK(matching_ids(f, Filter::has_any_tag("t", many)) == any_expected);
+    CHECK(matching_ids(f, Filter::has_all_tags("t", {"x1", "t12"})) == all_expected);
+    CHECK(matching_ids(f, Filter::has_all_tags("t", {"x1", "t12", "x2"})).empty());  // more tags than any vector has
+}
+
+TEST(hardening, h11_throwing_predicate_in_a_threaded_batch) {
+    // E10: the exception reaches the caller; both indexes stay usable.
+    auto data = clustered(500, 8, 4, 457);
+    const auto buffer = flatten(clustered(32, 8, 4, 458));
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    SearchOptions o;
+    o.predicate = [](std::uint64_t id) -> bool {
+        if (id == 123) throw std::runtime_error("lookup failed");
+        return true;
+    };
+    o.strategy = Strategy::ForceExact;
+    CHECK_THROWS_AS(std::runtime_error, h.search_batch(buffer, 5, 64, 8, o));
+    CHECK_THROWS_AS(std::runtime_error, f.search_batch(buffer, 5, 8, o));
+    CHECK(h.search_batch(buffer, 5, 64, 8).size() == 32 && f.search_batch(buffer, 5, 8).size() == 32);
+    h.add(9999, data[0]);  // and changes are accepted again
+    CHECK(h.contains(9999));
+}
+
+TEST(hardening, h12_subnormal_values) {
+    // E12: very small (subnormal) floats give correct, finite results.
+    const float tiny = std::numeric_limits<float>::denorm_min();
+    std::mt19937 rng(459);
+    Vectors data;
+    for (int i = 0; i < 300; ++i) {
+        std::vector<float> v(8);
+        for (float& x : v) x = float(rng() % 1000) * tiny;  // every value subnormal or zero
+        data.push_back(v);
+    }
+    for (Metric m : kMetrics) {
+        HnswIndex h(8, m);
+        FlatIndex f(8, m);
+        fill(h, f, data);
+        bool finite = true;
+        for (const auto& r : f.search(data[0], 10)) finite = finite && std::isfinite(r.distance);
+        CHECK(finite && same_contents(h, f, Vectors(data.begin(), data.begin() + 10)));
+    }
+}
+
+TEST(hardening, h13_deep_filter_on_pool_threads) {
+    // E13: the deepest allowed filter, evaluated on pool threads (1 MB stacks on Windows).
+    Filter deep = Filter::eq("n", 1);
+    for (int i = 1; i < Filter::kMaxDepth; ++i) deep = deep && Filter::eq("n", 1);
+    REQUIRE(deep.root().depth == Filter::kMaxDepth);
+    auto data = clustered(300, 8, 4, 460);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], Metadata().set("n", std::int64_t(i % 2)));
+        f.add(i, data[i], Metadata().set("n", std::int64_t(i % 2)));
+    }
+    const auto buffer = flatten(Vectors(data.begin(), data.begin() + 32));
+    for (Strategy s : {Strategy::ForceExact, Strategy::ForceGraph}) {
+        const auto hb = h.search_batch(buffer, 5, 64, 8, with_filter(deep, s));
+        bool odd = true;
+        for (const auto& results : hb)
+            for (const auto& r : results) odd = odd && r.id % 2 == 1;
+        CHECK(odd);
+    }
+    const auto fb = f.search_batch(buffer, 5, 8, with_filter(deep));
+    for (std::size_t i = 0; i < fb.size(); ++i) CHECK(fb[i].size() == 5);
+}
+
+TEST(hardening, h14_search_counter_is_released_on_every_path) {
+    // The change detection must never block a later change: searches that
+    // return normally, throw, or return early all release it.
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    CHECK(h.search(std::vector<float>{1, 2, 3, 4}, 5).empty());                    // empty index
+    CHECK_THROWS_AS(std::invalid_argument, h.search(std::vector<float>{1, 2}, 5));  // invalid query
+    CHECK_THROWS_AS(std::invalid_argument, f.search_range(std::vector<float>{1, 2, 3, 4}, kNaN));
+    CHECK_THROWS_AS(std::invalid_argument, f.search_batch(std::vector<float>{1, 2, 3}, 5));
+    CHECK_NOTHROW(h.add(1, std::vector<float>{1, 2, 3, 4}));
+    CHECK_NOTHROW(f.add(1, std::vector<float>{1, 2, 3, 4}));
+    CHECK(h.search_batch(std::vector<float>{1, 2, 3, 4}, 1, 64, 4).size() == 1);
+    CHECK_NOTHROW(h.remove(1));
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -6584,7 +6887,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

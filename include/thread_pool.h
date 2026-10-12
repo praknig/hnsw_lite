@@ -26,6 +26,14 @@ inline std::size_t effective_threads(std::size_t requested) {
     return std::min(requested, std::max<std::size_t>(64, 4 * hw));
 }
 
+/// True on a thread that is running a pool task. parallel_for() called there
+/// (for example, by a predicate that runs a batch search) runs inline instead
+/// of waiting for pool threads, which could all be busy waiting too.
+inline bool& in_pool_task() noexcept {
+    thread_local bool flag = false;
+    return flag;
+}
+
 /**
  * @brief Fixed set of worker threads that run tasks from a shared queue.
  *
@@ -33,7 +41,8 @@ inline std::size_t effective_threads(std::size_t requested) {
  * and waits for all of them. If any call throws, the remaining indexes are
  * skipped and the first exception is rethrown to the caller once every worker
  * has stopped; the pool stays usable. Several threads may call parallel_for at
- * the same time. Calling it from inside a task can deadlock and is not allowed.
+ * the same time. Called from inside any pool's task, it runs the calls inline,
+ * in order, on the calling thread, so nested batches can never deadlock.
  *
  * The destructor finishes queued work, then joins the workers.
  */
@@ -60,6 +69,10 @@ public:
     /// Runs fn(i) for every i in [0, count) on the pool and waits for all of them.
     void parallel_for(std::size_t count, const std::function<void(std::size_t)>& fn) {
         if (count == 0) return;
+        if (in_pool_task()) {  // nested: run inline, so it cannot wait on busy workers
+            for (std::size_t i = 0; i < count; ++i) fn(i);
+            return;
+        }
         struct Shared {
             std::atomic<std::size_t> next{0};
             std::mutex m;
@@ -118,6 +131,7 @@ private:
     }
 
     void work() {
+        in_pool_task() = true;
         for (;;) {
             std::function<void()> task;
             {

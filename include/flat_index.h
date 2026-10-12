@@ -86,7 +86,10 @@ public:
 
     /// Keeps exact value counts for a keyword, boolean or tag-set field (used by
     /// filtered searches' statistics). Throws std::invalid_argument otherwise.
-    void create_payload_index(std::string_view field) { metadata_.index_field(field); }
+    void create_payload_index(std::string_view field) {
+        searches_.check_no_search("create_payload_index");
+        metadata_.index_field(field);
+    }
 
     /// Returns up to `k` closest vectors, closest first. A `k` larger than
     /// size() returns every vector. Throws std::invalid_argument if `query` has
@@ -114,6 +117,7 @@ public:
     /// Swap-with-last never leaves holes in the vectors, so this only reclaims
     /// metadata strings no vector uses any more. Reports 0 vectors reclaimed.
     CompactStats compact() {
+        searches_.check_no_search("compact");
         metadata_.compact_dictionary();
         return {live_, 0};
     }
@@ -144,6 +148,7 @@ private:
     PreparedVector scratch_;  // reused by add(); searches use their own copy
     std::size_t live_ = 0;
     mutable SharedPool pool_;
+    SearchCounter searches_;  // refuses changes made during a search
 };
 
 }  // namespace vecdb
