@@ -44,7 +44,7 @@ HnswIndex fast(768, Metric::Cosine);    // default settings
 | `Metric::L2` | Coordinates, or any data where actual distance matters | The **squared** Euclidean distance (no square root, which is faster and ranks identically) |
 | `Metric::InnerProduct` | Embeddings trained for dot-product scoring | The **negative** dot product, so a larger dot product means a smaller distance |
 
-Every metric follows the same rule: **smaller distance means closer**. With cosine, vectors are normalized automatically when added and when searched, so you do not need to normalize them yourself.
+Every metric follows the same rule: **smaller distance means closer**. With cosine, vectors are normalized automatically when added and when searched, so you do not need to normalize them yourself. An all-zero vector has no direction: with cosine it is accepted and sits at distance 1 from everything, as in hnswlib and Faiss.
 
 Inner product is not a true distance, and HNSW recall is lower with it on vectors of very different lengths. If you can, normalize your vectors and use cosine.
 

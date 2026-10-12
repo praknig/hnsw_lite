@@ -254,6 +254,13 @@ void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore) {
             entries.push_back({distance_to(query, entry_), entry_});
             found = search_level(query, entries, params_.ef_construction, l, *visited, node, eligible);
         }
+        if (found.empty() && ignore != kEmpty) {
+            // Updating, and the old version is the only live node reachable: link
+            // through it as a last resort. After it is retired it stays
+            // traversable, bridging to the new version, which would otherwise
+            // have no links at all and could never be found.
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
+        }
         connect(node, select_neighbors(found, params_.M), l);
         if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
     }

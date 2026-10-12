@@ -110,7 +110,7 @@ Status: **section 1 (real deletion, D1 to D66) is implemented** in the `deletion
 | U19 | The same operations and seed give identical results | P |
 | U20 | **Out-of-memory sweep of update: the old vector survives every failure** | M |
 
-Added during implementation (metadata did not exist when this plan was written): U21 update keeps metadata, U22 update with metadata replaces every field, U23 upsert with and without metadata, U24 invalid metadata changes nothing, U25 the new ID-map and storage operations, U26 updates without graph repair, U27 5,000 mixed operations against a reference.
+Added during implementation (metadata did not exist when this plan was written): U21 update keeps metadata, U22 update with metadata replaces every field, U23 upsert with and without metadata, U24 invalid metadata changes nothing, U25 the new ID-map and storage operations, U26 updates without graph repair, U27 5,000 mixed operations against a reference. Then, from an edge-case review: U28 a zero vector with cosine (accepted, as by `add`), U29 `upsert` with an invalid vector for a new ID, U30 `compact()` after many updates, U31 an update's metadata copy triggering the dictionary cleanup, and U32 an updated vector is never left without links in sparse, mostly removed graphs (this one found a bug).
 
 ---
 

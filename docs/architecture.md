@@ -120,7 +120,7 @@ hnsw-lite/
 │   ├── hnsw_index.cpp          # HnswIndex implementation
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 445 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 450 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -315,7 +315,7 @@ One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an 
 `HnswIndex::update` must never lose the old vector, even if memory runs out. Removing the old version and re-inserting cannot promise that (a failure during the re-insert would leave neither), so the order is reversed:
 
 1. **Build the new version in another slot** (a free slot, or a new one at the end). The slot holds the user ID but is not yet findable (`IdMap::add_unmapped`, `occupy_unmapped`), and its metadata is written there.
-2. **Link it** like any insert, except that the old version is never chosen as a neighbor (`Eligibility::exclude`), since it is about to go.
+2. **Link it** like any insert, except that the old version is never chosen as a neighbor (`Eligibility::exclude`), since it is about to go. One exception: if the old version is the only live vector the search can reach (possible in sparse graphs after many removals without repair), the new version links through it rather than to nothing; once retired, the old version stays traversable and bridges to the new one.
 3. **Repair the graph around the old version** (if `repair_on_remove`), while it is still live, exactly as `remove()` does.
 4. **Commit**, with nothing that can fail: the ID is pointed at the new slot (`repoint`), the old slot is retired and its metadata cleared, it joins the free list, and a new entry point is chosen if the old version was the entry point.
 

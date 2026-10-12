@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 445 individually named tests** in 18 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 450 individually named tests** in 18 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -24,7 +24,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `batch` | 16 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
 | `range` | 16 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
 | `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
-| `update` | 27 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, and 5,000 mixed operations against a reference |
+| `update` | 32 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, 5,000 mixed operations against a reference, and five edge cases: a zero vector with cosine, `upsert` with an invalid vector for a new ID, `compact()` after many updates, the dictionary cleanup during an update, and an updated vector never left without links |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -35,7 +35,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 445 test names
+test_comprehensive --list               # list all 450 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -49,13 +49,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 445 of 445 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 450 of 450 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-445 passed, 0 failed, 0 skipped, 0 not run, 28591 checks, 16.62 s
+450 passed, 0 failed, 0 skipped, 0 not run, 28615 checks, 16.71 s
 All selected tests passed.
 ```
 
@@ -171,6 +171,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 17. **Unsigned values above the `int64` range wrapped negative** in metadata and filters. They are now rejected.
 18. **`compact()` kept visited lists sized for the old index.** They are now released.
 19. **`in()` on keywords checked its values one by one** per vector; they are now sorted and binary-searched.
+20. **An HNSW update could leave the new version with no links at all** (found by the update edge-case review). An update leaves the old version out of the new one's neighbors; in sparse, mostly removed graphs without repair, the old version could be the only live vector the search reached, so the new version linked to nothing and could never be found. It now links through the old version as a last resort: once retired, the old version stays traversable and bridges to the new one.
 
 ## Continuous integration
 

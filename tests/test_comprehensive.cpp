@@ -6146,6 +6146,99 @@ TEST(update, u27_mixed_operations_against_reference) {
     check_graph(h, 0.99);
 }
 
+TEST(update, u28_zero_vector_with_cosine) {
+    // A zero vector has no direction; like add(), update accepts it and it sits
+    // at cosine distance 1 from everything (as in hnswlib and Faiss).
+    HnswIndex h(3, Metric::Cosine);
+    FlatIndex f(3, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        h.add(i, std::vector<float>{1, float(i), 0});
+        f.add(i, std::vector<float>{1, float(i), 0});
+    }
+    CHECK(h.update(4, std::vector<float>{0, 0, 0}) && f.update(4, std::vector<float>{0, 0, 0}));
+    bool one = true;
+    for (const auto& r : f.search(std::vector<float>{0, 1, 0}, 20)) if (r.id == 4) one = one && std::fabs(r.distance - 1.0f) < 1e-6f;
+    CHECK(one && h.size() == 20);
+    check_graph(h, 1.0);
+}
+
+TEST(update, u29_upsert_invalid_vector_for_new_id) {
+    HnswIndex h(2, Metric::L2);
+    FlatIndex f(2, Metric::L2);
+    for (const auto& bad : {std::vector<float>{kNaN, 0}, std::vector<float>{kInf, 0}, std::vector<float>{1, 2, 3}}) {
+        CHECK_THROWS_AS(std::invalid_argument, h.upsert(5, bad));
+        CHECK_THROWS_AS(std::invalid_argument, f.upsert(5, bad));
+    }
+    CHECK(h.size() == 0 && h.capacity() == 0 && f.size() == 0 && !h.contains(5));
+}
+
+TEST(update, u30_compact_after_many_updates) {
+    auto data = clustered(500, 8, 4, 437);
+    auto pool = clustered(2000, 8, 4, 438);
+    auto queries = clustered(20, 8, 4, 439);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    fill(h, f, data);
+    std::mt19937 rng(440);
+    for (std::size_t i = 0; i < 2000; ++i) {
+        const std::uint64_t id = rng() % 500;
+        h.update(id, pool[i]);
+        f.update(id, pool[i]);
+    }
+    CHECK(h.capacity() == 501 && h.deleted_count() == 1);
+    const CompactStats st = h.compact();
+    CHECK(st.kept == 500 && st.reclaimed == 1 && h.capacity() == 500 && h.deleted_count() == 0);
+    CHECK(same_contents(h, f, queries) && recall(h, f, queries, 10, 64) >= 0.95);
+}
+
+TEST(update, u31_metadata_copy_triggers_dictionary_cleanup) {
+    // An update copies the vector's metadata into the new slot; that write may
+    // first reclaim unused strings (renumbering them). Metadata stays correct.
+    FlatIndex f(1, Metric::L2);
+    HnswIndex h(1, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        f.add(i, std::vector<float>{float(i)}, Metadata().set("k", "s" + std::to_string(i)));
+        h.add(i, std::vector<float>{float(i)}, Metadata().set("k", "s" + std::to_string(i)));
+    }
+    for (std::uint64_t i = 0; i < 2900; ++i) {
+        f.remove(i);
+        h.remove(i);
+    }
+    CHECK(h.update(2950, std::vector<float>{7}));
+    CHECK(f.update(2950, std::vector<float>{7}, Metadata().set("k", "fresh")));
+    CHECK(h.metadata().dictionary_size() == 100 && h.metadata().unused_string_count() == 0);
+    bool ok = h.get_metadata(2950)->get("k")->s == "s2950" && f.get_metadata(2950)->get("k")->s == "fresh";
+    for (std::uint64_t i = 2900; i < 3000; ++i)
+        if (i != 2950) ok = ok && h.get_metadata(i)->get("k")->s == "s" + std::to_string(i) && f.get_metadata(i)->get("k")->s == "s" + std::to_string(i);
+    CHECK(ok && matching_ids(f, Filter::eq("k", "s2999")) == std::vector<std::uint64_t>{2999});
+}
+
+TEST(update, u32_updated_vector_never_left_without_links) {
+    // Sparse, mostly removed graphs without repair (as in rg16). An update leaves
+    // the old version out of the new one's neighbors; when the old version was
+    // the only live vector the search could reach, the new version must still
+    // get links (through the old version), never none at all.
+    bool linked = true;
+    for (unsigned seed = 1; seed <= 300; ++seed) {
+        std::mt19937 rng(seed);
+        HnswParams p;
+        p.M = 2 + seed % 3;
+        p.ef_construction = 1 + seed % 4;
+        p.repair_on_remove = false;
+        p.seed = seed;
+        HnswIndex h(2, Metric::L2, p);
+        const int n = 20 + int(seed % 30);
+        for (int i = 0; i < n; ++i) h.add(std::uint64_t(i), std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+        for (int i = 0; i < n - 4; ++i) h.remove(std::uint64_t(i));
+        for (int i = n - 4; i < n; ++i) {
+            h.update(std::uint64_t(i), std::vector<float>{portable_uniform(rng), portable_uniform(rng)});
+            const NodeId slot = *h.storage().ids().find(std::uint64_t(i));
+            linked = linked && h.storage().graph().links(slot, 0)[0] != kEmpty;
+        }
+    }
+    CHECK(linked);
+}
+
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================

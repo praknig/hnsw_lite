@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 445 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 450 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -153,7 +153,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 445 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 450 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 
 ## Project status
