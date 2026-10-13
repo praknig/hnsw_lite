@@ -13,6 +13,7 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema)
     : metric_(metric), distance_(get_distance(metric)), vectors_(dim), metadata_(std::move(schema)), scratch_(dim) {}
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    searches_.check_no_search("add");
     // 1. Validate everything before changing anything.
     scratch_.prepare(vector, metric_);
     metadata_.validate(metadata);
@@ -38,6 +39,7 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 }
 
 bool FlatIndex::remove(std::uint64_t id) {
+    searches_.check_no_search("remove");
     const auto node = ids_.find(id);
     if (!node) return false;
     // Swap-with-last: move the last vector (and its metadata) into the freed slot,
@@ -76,6 +78,7 @@ bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 }
 
 bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+    searches_.check_no_search("update");
     scratch_.prepare(vector, metric_);  // validates; may throw before any change
     if (metadata) metadata_.validate(*metadata);
     const auto node = ids_.find(id);
@@ -88,6 +91,7 @@ bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const M
 bool FlatIndex::contains(std::uint64_t id) const { return ids_.find(id).has_value(); }
 
 bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
+    searches_.check_no_search("set_metadata");
     const auto node = ids_.find(id);
     if (!node) return false;
     metadata_.update(*node, metadata);
@@ -120,7 +124,7 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         for (NodeId node = 0; node < count; ++node) {
             if (eligible.filtered() && !eligible(node)) continue;
             ++matches;
-            top.push({ordered_distance(distance_(query, vectors_.get_padded(node).data(), stride)), node});
+            top.push({index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine), node});
         }
         st.nodes_visited = count;
         st.distance_computations = matches;
@@ -140,6 +144,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k,
                                             const SearchOptions& options) const {
+    const auto running = searches_.enter();
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -150,6 +155,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const float> queries, std::size_t k,
                                                                std::size_t threads,
                                                                const SearchOptions& options) const {
+    const auto running = searches_.enter();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -182,7 +188,7 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
                 for (std::size_t r = r0; r < r1; ++r) {
                     if (!ok[r - r0]) continue;
                     const auto node = static_cast<NodeId>(r);
-                    tops[q].push({ordered_distance(distance_(prepared[q].data(), vectors_.get_padded(node).data(), stride)), node});
+                    tops[q].push({index_distance(distance_(prepared[q].data(), vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine), node});
                 }
         }
         for (std::size_t q = 0; q < tops.size(); ++q)
@@ -198,6 +204,7 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
 
 std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
+    const auto running = searches_.enter();
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
@@ -212,7 +219,7 @@ std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, 
         for (NodeId node = 0; node < count; ++node) {
             if (eligible.filtered() && !eligible(node)) continue;
             ++st.distance_computations;
-            const float d = ordered_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride));
+            const float d = index_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
             if (d <= radius) hits.push_back({d, node});
         }
         st.nodes_visited = count;

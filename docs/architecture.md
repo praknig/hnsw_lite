@@ -120,7 +120,7 @@ hnsw-lite/
 │   ├── hnsw_index.cpp          # HnswIndex implementation
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 450 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 464 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall

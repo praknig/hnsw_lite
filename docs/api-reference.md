@@ -202,3 +202,12 @@ Not copyable, movable. Frees its memory in the destructor.
 | `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings |
 
 `thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
+
+## Hardening additions
+
+| Name | Header | Description |
+|---|---|---|
+| `SearchCounter` | `search_result.h` | Counts searches in progress; every index uses one to refuse changes made during a search (`std::logic_error`) |
+| `index_distance(raw, cosine)` | `search_result.h` | A distance as indexes report it: cosine clamped at 0, NaN mapped like `ordered_distance()`. `get_distance()` kernels are unchanged |
+| `in_pool_task()` | `thread_pool.h` | True on a thread running a pool task; `parallel_for()` called there runs inline, so nested batches cannot deadlock |
+| `HnswParams::M` | `hnsw_index.h` | Now limited to 2 to 2048 |

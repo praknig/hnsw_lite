@@ -25,12 +25,15 @@ namespace vecdb {
  */
 struct HnswParams {
     /// Links per node on levels 1+ (2*M on level 0). Higher: better recall,
-    /// more memory, slower inserts. Must be at least 2; 8 or more recommended.
+    /// more memory, slower inserts. Must be 2 to 2048; 8 to 48 recommended.
     std::size_t M = 16;
     /// How hard insertion searches for good neighbors. Higher: better graph,
     /// slower inserts. Must be at least 1.
     std::size_t ef_construction = 200;
-    /// Seed for random levels. Same seed + same operations = identical graph.
+    /// Seed for random levels, which are identical on every platform. Same seed
+    /// and same operations give an identical graph on the same CPU kernel; the
+    /// SIMD kernels (AVX-512, AVX2, NEON, scalar) round distances differently,
+    /// so graphs can differ slightly between machines.
     std::uint64_t seed = 42;
     /// Repair the graph around a removed vector: each of its neighbors re-chooses
     /// its links from its own links plus the removed vector's links. Keeps search
@@ -173,10 +176,14 @@ public:
 
     /// Keeps exact value counts for a keyword, boolean or tag-set field, so the
     /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
-    void create_payload_index(std::string_view field) { metadata_.index_field(field); }
+    void create_payload_index(std::string_view field) {
+        searches_.check_no_search("create_payload_index");
+        metadata_.index_field(field);
+    }
 
     /// The index's planner settings (per-query settings in SearchOptions override them).
     void set_planner_params(const PlannerParams& p) {
+        searches_.check_no_search("set_planner_params");
         validate(p);
         planner_ = p;
     }
@@ -291,6 +298,7 @@ private:
     PlannerParams planner_;
     mutable VisitedListPool visited_pool_;
     mutable SharedPool pool_;
+    SearchCounter searches_;  // refuses changes made during a search
 };
 
 }  // namespace vecdb

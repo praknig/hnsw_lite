@@ -44,7 +44,7 @@ HnswIndex fast(768, Metric::Cosine);    // default settings
 | `Metric::L2` | Coordinates, or any data where actual distance matters | The **squared** Euclidean distance (no square root, which is faster and ranks identically) |
 | `Metric::InnerProduct` | Embeddings trained for dot-product scoring | The **negative** dot product, so a larger dot product means a smaller distance |
 
-Every metric follows the same rule: **smaller distance means closer**. With cosine, vectors are normalized automatically when added and when searched, so you do not need to normalize them yourself. An all-zero vector has no direction: with cosine it is accepted and sits at distance 1 from everything, as in hnswlib and Faiss.
+Every metric follows the same rule: **smaller distance means closer**, and cosine distances are never negative. With cosine, vectors are normalized automatically when added and when searched, so you do not need to normalize them yourself. An all-zero vector has no direction: with cosine it is accepted and sits at distance 1 from everything, as in hnswlib and Faiss.
 
 Inner product is not a true distance, and HNSW recall is lower with it on vectors of very different lengths. If you can, normalize your vectors and use cosine.
 
@@ -52,14 +52,16 @@ Inner product is not a true distance, and HNSW recall is lower with it on vector
 
 ```cpp
 HnswParams params;
-params.M = 16;                  // links per node; more = better recall, more memory
+params.M = 16;                  // links per node (2 to 2048); more = better recall, more memory
 params.ef_construction = 200;   // effort spent building; more = better graph, slower inserts
-params.seed = 42;               // same seed and same operations = identical graph
+params.seed = 42;               // same seed and operations = identical graph (see below)
 params.repair_on_remove = true; // repair links around removed vectors
 HnswIndex index(768, Metric::Cosine, params);
 ```
 
-The defaults suit most data. `M` between 8 and 48 is typical; values below 8 leave parts of the graph poorly connected. See [Performance and tuning](performance.md) for measured trade-offs.
+The defaults suit most data. `M` between 8 and 48 is typical; values below 8 leave parts of the graph poorly connected, and values above 2,048 are rejected.
+
+**Reproducibility:** the same seed and the same operations give an identical graph on the same machine. Random levels are identical on every platform, but the SIMD distance code differs by CPU (AVX-512, AVX2, NEON or plain C++) and rounds distances slightly differently, so graphs built on different machines can differ a little. See [Performance and tuning](performance.md) for measured trade-offs.
 
 ## Adding vectors
 
@@ -71,6 +73,7 @@ index.add(42, embedding);   // embedding: std::vector<float>, std::array, or any
 - NaN and infinite values are rejected.
 - An ID can only be stored once at a time. Adding an ID that is already stored throws; use `remove` first to replace a vector.
 - `add` copies the vector, so your own buffer can be reused or freed afterwards.
+- Values extremely close to zero (subnormal floats, below about 1e-38) give correct results. They caused no slowdown on the CPUs tested, but some older CPUs process them many times slower; if you see that, round such values to 0.
 
 Any failure leaves the index exactly as it was. See [Errors and guarantees](#errors-and-guarantees).
 
@@ -200,6 +203,8 @@ options.predicate = [&](std::uint64_t id) { return user_can_see(id); };
 
 A predicate can be combined with a filter: both must pass, and the filter is checked first. In batch search the predicate is called from several threads at once, so it must be safe to call concurrently.
 
+A predicate may **search** the index it filters, including a batch search, but must not **change** it: a change made during a search throws `std::logic_error` and leaves the index unchanged.
+
 ### How filtered HNSW searches work
 
 A filtered HNSW search either scans the matching vectors exactly, or walks the graph while skipping vectors that fail the filter. A **query planner** chooses per query by estimating how many vectors match:
@@ -236,6 +241,7 @@ auto all2 = flat.search_batch(queries, /*k=*/10, /*threads=*/4);
 - Every query is checked before any work starts; one invalid query rejects the whole batch.
 - An optional `SearchOptions` (filter, predicate) applies to all queries. Statistics are not filled in for batches.
 - Thread counts are capped at a sensible maximum (64, or 4 per core on larger machines).
+- Each thread holds a visited list of 4 bytes per vector slot, so a batch on 64 threads over 1 million vectors uses about 256 MB extra while it runs. Use fewer threads if memory is tight.
 
 ## Range search
 
@@ -248,6 +254,7 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 ```
 
 - The radius uses the same distance values searches return. For L2 that is the **squared** distance, so convert an ordinary radius with `l2_radius(r)`. For inner product, distances are negative.
+- With cosine, rounding can give an exact copy of the query a distance of about 0.0000001 instead of 0, so use a small radius such as `1e-6f`, rather than 0, to find exact copies.
 - Without `max_results`, there is no limit: a large radius can return the whole index.
 - `FlatIndex` is exact. `HnswIndex` is approximate, like its normal search; pass `Strategy::ForceExact` in the options when every vector within the radius must be found.
 - Filters and predicates work here too.
@@ -255,13 +262,14 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 ## Threads
 
 - **Searches** (all kinds) may run from any number of threads at the same time.
-- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) must not run at the same time as anything else, including searches. If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
+- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) must not run at the same time as anything else, including searches. A change attempted while a search is running throws `std::logic_error`; this is detected reliably from a predicate, and on a best-effort basis from another thread (only if the two actually overlap). If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
 
 ## Errors and guarantees
 
 | Exception | When |
 |---|---|
 | `std::invalid_argument` | Wrong dimension; NaN or infinity in a vector, metadata float or radius; an ID already stored; unknown field (strict schema) or wrong type; invalid filter, planner or HNSW settings; an integer above the 64-bit signed range |
+| `std::logic_error` | A change (`add`, `update`, `remove`, `set_metadata`, `compact` and the like) attempted while a search is running |
 | `std::bad_alloc` | Out of memory |
 | `std::length_error` | More than about 4 billion vectors in one index |
 
