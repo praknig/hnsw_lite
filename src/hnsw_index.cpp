@@ -20,9 +20,14 @@
 namespace vecdb {
 namespace {
 
+/// Largest M allowed: 2048 means 16 KB of level-0 links per vector, far beyond
+/// any useful setting; larger values only cause huge allocations.
+constexpr std::size_t kMaxM = 2048;
+
 /// Throws if the settings cannot build a valid graph; otherwise returns them.
 const HnswParams& validated(const HnswParams& p) {
     if (p.M < 2) throw std::invalid_argument("HnswParams::M must be at least 2");
+    if (p.M > kMaxM) throw std::invalid_argument("HnswParams::M must be at most 2048");
     if (p.ef_construction < 1) throw std::invalid_argument("HnswParams::ef_construction must be >= 1");
     return p;
 }
@@ -52,7 +57,7 @@ int HnswIndex::random_level() {
 }
 
 float HnswIndex::distance_to(const float* query, NodeId node) const {
-    return ordered_distance(distance_(query, storage_.vectors().get_padded(node).data(), stride_));
+    return index_distance(distance_(query, storage_.vectors().get_padded(node).data(), stride_), metric_ == Metric::Cosine);
 }
 
 float HnswIndex::distance_between(NodeId a, NodeId b) const {
@@ -183,6 +188,7 @@ void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int l
 }
 
 void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    searches_.check_no_search("add");
     // 1. Validate everything before changing anything (or drawing a random level).
     scratch_.prepare(vector, metric_);
     metadata_.validate(metadata);
@@ -320,6 +326,7 @@ void HnswIndex::choose_new_entry() {
 }
 
 bool HnswIndex::remove(std::uint64_t id) {
+    searches_.check_no_search("remove");
     IdMap& ids = storage_.ids();
     const auto node = ids.find(id);
     if (!node) return false;
@@ -357,6 +364,7 @@ bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 }
 
 bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+    searches_.check_no_search("update");
     // 1. Validate everything before changing anything.
     scratch_.prepare(vector, metric_);
     if (metadata) metadata_.validate(*metadata);
@@ -413,6 +421,7 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
 bool HnswIndex::contains(std::uint64_t id) const { return storage_.ids().find(id).has_value(); }
 
 bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
+    searches_.check_no_search("set_metadata");
     const auto node = storage_.ids().find(id);
     if (!node) return false;
     metadata_.update(*node, metadata);
@@ -439,6 +448,7 @@ Eligibility HnswIndex::eligibility(const SearchOptions& options, std::optional<C
 
 std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t ef,
                                             const SearchOptions& options) const {
+    const auto running = searches_.enter();
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -517,6 +527,7 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
 std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const float> queries, std::size_t k,
                                                                std::size_t ef, std::size_t threads,
                                                                const SearchOptions& options) const {
+    const auto running = searches_.enter();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -538,6 +549,7 @@ std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const f
 
 std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
+    const auto running = searches_.enter();
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
@@ -610,6 +622,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
 }
 
 CompactStats HnswIndex::compact() {
+    searches_.check_no_search("compact");
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
     HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());

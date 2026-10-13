@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 450 individually named tests** in 18 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 464 individually named tests** in 19 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -25,6 +25,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `range` | 16 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
 | `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
 | `update` | 32 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, 5,000 mixed operations against a reference, and five edge cases: a zero vector with cosine, `upsert` with an invalid vector for a new ID, `compact()` after many updates, the dictionary cleanup during an update, and an updated vector never left without links |
+| `hardening` | 14 | Edge cases E1 to E13 of the [hardening and performance plan](hardening-and-performance-plan.md): random levels identical on every platform, nested batches from predicates, changes during a search refused, cosine distances never negative, the `M` limit, extreme IDs, vectors taken from the index itself, dimension 0, thousands of fields and filter tags, throwing predicates in threaded batches, subnormal values, the deepest filter on pool threads, and the change detection released on every path |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -35,7 +36,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 450 test names
+test_comprehensive --list               # list all 464 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -49,13 +50,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 450 of 450 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 464 of 464 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-450 passed, 0 failed, 0 skipped, 0 not run, 28615 checks, 16.71 s
+464 passed, 0 failed, 0 skipped, 0 not run, 28723 checks, 19.97 s
 All selected tests passed.
 ```
 
@@ -103,28 +104,29 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 18 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 19 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/18 Test # 1: comprehensive.layer1 ................   Passed
- 2/18 Test # 2: comprehensive.layer2 ................   Passed
- 3/18 Test # 3: comprehensive.helpers ...............   Passed
- 4/18 Test # 4: comprehensive.flat ..................   Passed
- 5/18 Test # 5: comprehensive.hnsw ..................   Passed
- 6/18 Test # 6: comprehensive.robustness ............   Passed
- 7/18 Test # 7: comprehensive.deletion ..............   Passed
- 8/18 Test # 8: comprehensive.concurrency ...........   Passed
- 9/18 Test # 9: comprehensive.metadata ..............   Passed
-10/18 Test #10: comprehensive.filter ................   Passed
-11/18 Test #11: comprehensive.planner ...............   Passed
-12/18 Test #12: comprehensive.payload ...............   Passed
-13/18 Test #13: comprehensive.batch .................   Passed
-14/18 Test #14: comprehensive.range .................   Passed
-15/18 Test #15: comprehensive.search_e2e ............   Passed
-16/18 Test #16: comprehensive.update ................   Passed
-17/18 Test #17: comprehensive.stress ................   Passed
-18/18 Test #18: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 18
+ 1/19 Test # 1: comprehensive.layer1 ................   Passed
+ 2/19 Test # 2: comprehensive.layer2 ................   Passed
+ 3/19 Test # 3: comprehensive.helpers ...............   Passed
+ 4/19 Test # 4: comprehensive.flat ..................   Passed
+ 5/19 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/19 Test # 6: comprehensive.robustness ............   Passed
+ 7/19 Test # 7: comprehensive.deletion ..............   Passed
+ 8/19 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/19 Test # 9: comprehensive.metadata ..............   Passed
+10/19 Test #10: comprehensive.filter ................   Passed
+11/19 Test #11: comprehensive.planner ...............   Passed
+12/19 Test #12: comprehensive.payload ...............   Passed
+13/19 Test #13: comprehensive.batch .................   Passed
+14/19 Test #14: comprehensive.range .................   Passed
+15/19 Test #15: comprehensive.search_e2e ............   Passed
+16/19 Test #16: comprehensive.update ................   Passed
+17/19 Test #17: comprehensive.hardening .............   Passed
+18/19 Test #18: comprehensive.stress ................   Passed
+19/19 Test #19: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 19
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -172,6 +174,14 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 18. **`compact()` kept visited lists sized for the old index.** They are now released.
 19. **`in()` on keywords checked its values one by one** per vector; they are now sorted and binary-searched.
 20. **An HNSW update could leave the new version with no links at all** (found by the update edge-case review). An update leaves the old version out of the new one's neighbors; in sparse, mostly removed graphs without repair, the old version could be the only live vector the search reached, so the new version linked to nothing and could never be found. It now links through the old version as a last resort: once retired, the old version stays traversable and bridges to the new one.
+
+**Found by the hardening review** (Phase 1 of the [hardening and performance plan](hardening-and-performance-plan.md)), all fixed and covered by the `hardening` group:
+
+21. **A batch search started from a predicate, inside a batch on the same index, hung forever.** The pool's threads all waited for each other. Nested batches now run inline on the calling thread.
+22. **Changing an index from inside a predicate went undetected**, with undefined results. Indexes now refuse changes during a search with `std::logic_error`.
+23. **Cosine distances could be slightly negative**, so radius-0 range search missed exact copies. Indexes now clamp cosine distances at 0.
+24. **A huge `M` attempted a huge allocation.** `M` is now limited to 2048.
+25. **Filters listing thousands of tags were slow** (136 ms over 20,000 vectors). Tags are now sorted and binary-searched (4.7 ms).
 
 ## Continuous integration
 

@@ -201,6 +201,7 @@ int CompiledFilter::build(const Filter::Node& n) {
                     unknown = true;
                 }
             }
+            std::sort(c.ids.begin(), c.ids.end());  // binary search per vector
             if (n.kind == NK::HasAnyTag) c.kind = c.ids.empty() ? K::False : K::AnyTag;
             else if (unknown || c.ids.empty()) c.kind = K::False;  // a needed tag no vector has
             else c.kind = n.kind == NK::HasTag ? K::Tag : K::AllTags;
@@ -258,13 +259,14 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
         }
         case K::Tag:
         case K::AnyTag: {
-            const auto& tags = s.tags_at(c.field, slot);
-            for (std::uint32_t id : c.ids)
-                if (std::find(tags.begin(), tags.end(), id) != tags.end()) return true;
+            // A vector has few tags; the filter may list thousands (sorted).
+            for (std::uint32_t id : s.tags_at(c.field, slot))
+                if (std::binary_search(c.ids.begin(), c.ids.end(), id)) return true;
             return false;
         }
         case K::AllTags: {
             const auto& tags = s.tags_at(c.field, slot);
+            if (c.ids.size() > tags.size()) return false;  // cannot hold them all
             for (std::uint32_t id : c.ids)
                 if (std::find(tags.begin(), tags.end(), id) == tags.end()) return false;
             return true;

@@ -45,7 +45,7 @@ These are deliberate for the current stage:
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe
 
-The core capabilities (real deletion, now done, then updating vectors, saving and loading, and concurrent inserts) are planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md).
+The core capabilities (real deletion, now done, then updating vectors, saving and loading, and concurrent inserts) are planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 
 ## Comparison with existing implementations
 
