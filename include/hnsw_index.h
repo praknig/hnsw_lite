@@ -5,6 +5,9 @@
  */
 #pragma once
 #include <cstdint>
+#include <iosfwd>
+#include <memory>
+#include <string>
 #include <random>
 #include <span>
 #include <vector>
@@ -199,6 +202,25 @@ public:
     CompactStats compact();
 
     /// Number of live vectors.
+    /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
+    /// written to "<path>.tmp" first and then renamed into place, so a failure
+    /// never damages an existing file at `path`. Searches may run during a save;
+    /// changes attempted during one throw std::logic_error. Throws
+    /// std::runtime_error if the file cannot be written.
+    void save(const std::string& path) const;
+
+    /// Saves to a stream (for example a std::ostringstream).
+    void save(std::ostream& out) const;
+
+    /// Loads an index saved by save(). Throws FormatError if the file is damaged,
+    /// truncated, from an unsupported version or of the other index kind (a
+    /// failed load never produces a partly built index), and std::runtime_error
+    /// if the file cannot be opened.
+    static std::unique_ptr<HnswIndex> load(const std::string& path);
+
+    /// Loads from a stream, which must be seekable (files and string streams are).
+    static std::unique_ptr<HnswIndex> load(std::istream& in);
+
     std::size_t size() const { return live_; }
     /// Slots of removed vectors still occupying memory (waiting to be reused).
     std::size_t deleted_count() const { return storage_.size() - live_; }

@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -40,6 +40,12 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <streambuf>
+#include <sstream>
+#include <iterator>
+#include <functional>
+#include <fstream>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <memory>
@@ -55,6 +61,7 @@
 #include "flat_index.h"
 #include "hnsw_index.h"
 #include "storage.h"
+#include "serialize.h"
 #include "thread_pool.h"
 
 using namespace vecdb;
@@ -6543,6 +6550,739 @@ TEST(hardening, h14_search_counter_is_released_on_every_path) {
 }
 
 // ===========================================================================
+// Saving and loading (P1-P42 from the test plan, P50-P56 beyond it)
+// ===========================================================================
+
+namespace {
+
+std::string save_bytes(const FlatIndex& f) {
+    std::ostringstream out(std::ios::binary);
+    f.save(out);
+    return out.str();
+}
+std::string save_bytes(const HnswIndex& h) {
+    std::ostringstream out(std::ios::binary);
+    h.save(out);
+    return out.str();
+}
+std::unique_ptr<FlatIndex> load_flat(const std::string& bytes) {
+    std::istringstream in(bytes, std::ios::binary);
+    return FlatIndex::load(in);
+}
+std::unique_ptr<HnswIndex> load_hnsw(const std::string& bytes) {
+    std::istringstream in(bytes, std::ios::binary);
+    return HnswIndex::load(in);
+}
+
+/// A unique temporary file path for one test.
+std::string temp_path(const std::string& name) {
+    return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + name + ".bin")).string();
+}
+
+std::string read_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::string& path, const std::string& bytes) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), std::streamsize(bytes.size()));
+}
+
+/// Every link of every slot, for comparing two graphs exactly.
+std::vector<std::vector<NodeId>> all_links(const HnswIndex& h) {
+    std::vector<std::vector<NodeId>> out;
+    const GraphStorage& g = h.storage().graph();
+    for (NodeId n = 0; n < h.storage().size(); ++n)
+        for (int l = 0; l <= g.level(n); ++l) {
+            auto s = g.links(n, l);
+            out.emplace_back(s.begin(), s.begin() + std::ptrdiff_t(GraphStorage::count(s)));
+        }
+    return out;
+}
+
+/// A file split into its header and sections, so tests can edit a section's
+/// payload and recompute its checksum (to test validation, not the checksum).
+struct ParsedFile {
+    std::string header;
+    std::vector<std::pair<std::uint32_t, std::string>> sections;  // (tag, payload)
+
+    static ParsedFile parse(const std::string& bytes) {
+        ParsedFile f;
+        f.header = bytes.substr(0, 24);
+        std::size_t at = 24;
+        while (at < bytes.size()) {
+            const auto t = persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(&bytes[at]));
+            const auto len = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(&bytes[at + 4]));
+            f.sections.push_back({t, bytes.substr(at + 12, std::size_t(len))});
+            at += 12 + std::size_t(len) + 4;
+        }
+        return f;
+    }
+
+    std::string& payload(const char (&name)[5]) {
+        for (auto& [t, p] : sections)
+            if (t == persist::tag(name)) return p;
+        throw std::logic_error("no such section");
+    }
+
+    std::string assemble() const {
+        std::string out = header;
+        for (const auto& [t, p] : sections) {
+            unsigned char head[12], crc[4];
+            persist::to_little_endian(t, head);
+            persist::to_little_endian(std::uint64_t(p.size()), head + 4);
+            persist::to_little_endian(persist::crc32(0, p.data(), p.size()), crc);
+            out.append(reinterpret_cast<const char*>(head), 12).append(p).append(reinterpret_cast<const char*>(crc), 4);
+        }
+        return out;
+    }
+};
+
+template <class T>
+void poke(std::string& s, std::size_t at, T value) {
+    persist::to_little_endian(value, reinterpret_cast<unsigned char*>(&s[at]));
+}
+
+/// Vectors of small whole numbers: every distance kernel sums them exactly, so
+/// the same index is built identically on every CPU and platform.
+std::vector<float> integer_vector(std::mt19937& rng, std::size_t dim) {
+    std::vector<float> v(dim);
+    for (float& x : v) x = float((rng() >> 28) & 15u);
+    return v;
+}
+
+/// The index stored in tests/data/golden_hnsw_v1.bin (format version 1).
+std::unique_ptr<HnswIndex> golden_hnsw() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 7;
+    auto h = std::make_unique<HnswIndex>(8, Metric::L2, p, Schema::dynamic({{"category", FieldType::Keyword}}));
+    h->create_payload_index("category");
+    std::mt19937 rng(2026);
+    for (std::uint64_t i = 0; i < 300; ++i)
+        h->add(i, integer_vector(rng, 8),
+               Metadata().set("category", kCategories[i % 5]).set("n", std::int64_t(i)).set_tags("t", {i % 2 ? "odd" : "even"}));
+    for (std::uint64_t i = 0; i < 300; i += 7) h->remove(i);
+    for (std::uint64_t i = 1; i < 300; i += 11)
+        if (h->contains(i)) h->update(i, integer_vector(rng, 8));
+    h->set_planner_params(PlannerParams{500, 0.02, 128, 16.0});
+    return h;
+}
+
+/// The index stored in tests/data/golden_flat_v1.bin (format version 1).
+std::unique_ptr<FlatIndex> golden_flat() {
+    auto f = std::make_unique<FlatIndex>(8, Metric::L2, Schema::strict({{"category", FieldType::Keyword}, {"n", FieldType::Int}}));
+    std::mt19937 rng(2027);
+    for (std::uint64_t i = 0; i < 100; ++i)
+        f->add(1000 + i, integer_vector(rng, 8), Metadata().set("category", kCategories[i % 5]).set("n", std::int64_t(i)));
+    for (std::uint64_t i = 0; i < 100; i += 9) f->remove(1000 + i);
+    f->update(1001, integer_vector(rng, 8));
+    return f;
+}
+
+std::string golden_path(const char* name) { return std::string(HNSW_TEST_DATA_DIR) + "/" + name; }
+
+/// A small HNSW index used by the corruption tests (small, so every byte can be tried).
+std::unique_ptr<HnswIndex> tiny_hnsw() {
+    HnswParams p;
+    p.M = 4;
+    p.ef_construction = 16;
+    auto h = std::make_unique<HnswIndex>(4, Metric::L2, p);
+    std::mt19937 rng(5);
+    for (std::uint64_t i = 0; i < 30; ++i) h->add(i, integer_vector(rng, 4), Metadata().set("k", i % 2 ? "a" : "b"));
+    h->remove(3);
+    h->remove(17);
+    return h;
+}
+
+}  // namespace
+
+TEST(persistence, p01_flat_round_trip_every_metric) {
+    auto data = random_vectors(400, 12, 500);
+    auto queries = random_vectors(15, 12, 501);
+    for (Metric m : kMetrics) {
+        FlatIndex f(12, m, Schema::strict(search_fields()));
+        for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i], meta_for(i));
+        auto g = load_flat(save_bytes(f));
+        CHECK(g->size() == f.size() && g->dim() == 12 && g->metric() == m);
+        bool same = true;
+        for (const auto& q : queries) {
+            same = same && same_results(g->search(q, 10), f.search(q, 10));
+            same = same && same_results(g->search(q, 10, with_filter(Filter::eq("category", "tech"))),
+                                        f.search(q, 10, with_filter(Filter::eq("category", "tech"))));
+        }
+        for (std::uint64_t i = 0; i < 400; i += 37) same = same && *g->get_metadata(i) == *f.get_metadata(i);
+        CHECK(same);
+    }
+}
+
+TEST(persistence, p02_hnsw_round_trip_every_metric) {
+    auto data = clustered(800, 12, 6, 502);
+    auto queries = clustered(15, 12, 6, 503);
+    for (Metric m : kMetrics) {
+        HnswIndex h(12, m);
+        for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+        auto g = load_hnsw(save_bytes(h));
+        CHECK(g->entry_point() == h.entry_point() && g->max_level() == h.max_level() && g->size() == h.size());
+        CHECK(all_links(*g) == all_links(h));
+        bool same = true;
+        for (const auto& q : queries) same = same && same_results(g->search(q, 10, 64), h.search(q, 10, 64));
+        CHECK(same);
+    }
+}
+
+TEST(persistence, p03_after_removals_updates_and_compaction) {
+    auto data = clustered(600, 8, 4, 504);
+    auto moved = clustered(100, 8, 4, 505);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 600; i += 4) h.remove(i);
+    for (std::size_t i = 0; i < 100; ++i) h.update(i * 6 + 1, moved[i]);
+    for (int stage = 0; stage < 2; ++stage) {
+        auto g = load_hnsw(save_bytes(h));
+        CHECK(g->size() == h.size() && g->capacity() == h.capacity() && g->deleted_count() == h.deleted_count());
+        CHECK(all_links(*g) == all_links(h));
+        bool same = true;
+        for (std::size_t i = 0; i < 30; ++i) same = same && same_results(g->search(data[i], 10, 64), h.search(data[i], 10, 64));
+        for (std::uint64_t i = 1; i < 600; i += 4) same = same && *g->get_metadata(i) == *h.get_metadata(i);
+        CHECK(same);
+        check_graph(*g, 0.99);
+        h.compact();  // second round: after compaction
+    }
+}
+
+TEST(persistence, p04_empty_indexes) {
+    FlatIndex f(5, Metric::Cosine);
+    HnswIndex h(5, Metric::InnerProduct);
+    auto f2 = load_flat(save_bytes(f));
+    auto h2 = load_hnsw(save_bytes(h));
+    CHECK(f2->size() == 0 && f2->dim() == 5 && f2->metric() == Metric::Cosine);
+    CHECK(h2->size() == 0 && h2->entry_point() == kEmpty && h2->max_level() == -1 && h2->metric() == Metric::InnerProduct);
+    h2->add(1, std::vector<float>{1, 2, 3, 4, 5});  // usable afterwards
+    CHECK(h2->search(std::vector<float>{1, 2, 3, 4, 5}, 1)[0].id == 1);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>(5, float(i)));
+    for (std::uint64_t i = 0; i < 20; ++i) h.remove(i);  // removed everything: still "empty"
+    auto h3 = load_hnsw(save_bytes(h));
+    CHECK(h3->size() == 0 && h3->capacity() == 20 && h3->entry_point() == kEmpty);
+}
+
+TEST(persistence, p05_single_vector) {
+    FlatIndex f(3, Metric::L2);
+    HnswIndex h(3, Metric::L2);
+    f.add(9, std::vector<float>{1, 2, 3});
+    h.add(9, std::vector<float>{1, 2, 3});
+    CHECK(load_flat(save_bytes(f))->search(std::vector<float>{0, 0, 0}, 5)[0].id == 9);
+    auto g = load_hnsw(save_bytes(h));
+    CHECK(g->search(std::vector<float>{0, 0, 0}, 5).size() == 1 && g->entry_point() == 0);
+}
+
+TEST(persistence, p06_dimensions) {
+    for (std::size_t dim : std::initializer_list<std::size_t>{1, 37, 1536}) {
+        auto data = random_vectors(60, dim, unsigned(506 + dim));
+        FlatIndex f(dim, Metric::L2);
+        HnswIndex h(dim, Metric::Cosine);
+        fill(h, f, data);
+        auto f2 = load_flat(save_bytes(f));
+        auto h2 = load_hnsw(save_bytes(h));
+        CHECK(same_results(f2->search(data[3], 10), f.search(data[3], 10)));
+        CHECK(same_results(h2->search(data[3], 10), h.search(data[3], 10)));
+    }
+}
+
+TEST(persistence, p07_extreme_ids) {
+    FlatIndex f(2, Metric::L2);
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t id : {std::uint64_t(0), kMaxId, kMaxId - 1}) {
+        f.add(id, std::vector<float>{float(id % 5), 1});
+        h.add(id, std::vector<float>{float(id % 5), 1});
+    }
+    auto f2 = load_flat(save_bytes(f));
+    auto h2 = load_hnsw(save_bytes(h));
+    for (std::uint64_t id : {std::uint64_t(0), kMaxId, kMaxId - 1}) CHECK(f2->contains(id) && h2->contains(id));
+}
+
+TEST(persistence, p08_settings_preserved) {
+    HnswParams p;
+    p.M = 12;
+    p.ef_construction = 77;
+    p.seed = 123456789;
+    p.repair_on_remove = false;
+    HnswIndex h(9, Metric::Cosine, p, Schema::strict({{"a", FieldType::Int}}));
+    h.set_planner_params(PlannerParams{1234, 0.07, 99, 8.5});
+    auto g = load_hnsw(save_bytes(h));
+    CHECK(g->dim() == 9 && g->metric() == Metric::Cosine);
+    CHECK(g->params().M == 12 && g->params().ef_construction == 77 && g->params().seed == 123456789 && !g->params().repair_on_remove);
+    const PlannerParams& pp = g->planner_params();
+    CHECK(pp.max_exact_matches == 1234 && pp.max_exact_fraction == 0.07 && pp.sample_size == 99 && pp.max_ef_multiplier == 8.5);
+    CHECK(g->metadata().mode() == SchemaMode::Strict && g->metadata().field_count() == 1);
+    CHECK_THROWS_AS(std::invalid_argument, g->add(1, std::vector<float>(9, 1.0f), Metadata().set("b", 1)));  // still strict
+}
+
+TEST(persistence, p09_continuation_builds_the_same_graph) {
+    auto data = clustered(1000, 8, 6, 507);
+    HnswIndex straight(8, Metric::L2), first(8, Metric::L2);
+    for (std::size_t i = 0; i < 1000; ++i) straight.add(i, data[i], meta_for(i));
+    for (std::size_t i = 0; i < 500; ++i) first.add(i, data[i], meta_for(i));
+    auto resumed = load_hnsw(save_bytes(first));
+    for (std::size_t i = 500; i < 1000; ++i) resumed->add(i, data[i], meta_for(i));
+    CHECK(save_bytes(*resumed) == save_bytes(straight));  // identical in every byte
+}
+
+TEST(persistence, p10_free_list_survives) {
+    auto data = clustered(200, 8, 4, 508);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
+    for (std::uint64_t i : {std::uint64_t(5), std::uint64_t(50), std::uint64_t(99)}) h.remove(i);
+    auto g = load_hnsw(save_bytes(h));
+    CHECK(g->deleted_count() == 3);
+    for (std::uint64_t i = 0; i < 3; ++i) {
+        h.add(1000 + i, data[i]);
+        g->add(1000 + i, data[i]);
+        CHECK(*g->storage().ids().find(1000 + i) == *h.storage().ids().find(1000 + i));  // same slot, same order
+    }
+    CHECK(save_bytes(*g) == save_bytes(h));
+}
+
+TEST(persistence, p11_stream_and_file_identical) {
+    auto h = golden_hnsw();
+    const std::string path = temp_path("p11");
+    h->save(path);
+    CHECK(read_file(path) == save_bytes(*h));
+    auto f = golden_flat();
+    f->save(path);
+    CHECK(read_file(path) == save_bytes(*f));
+    std::filesystem::remove(path);
+}
+
+TEST(persistence, p12_saving_is_deterministic) {
+    auto h = golden_hnsw();
+    const std::string once = save_bytes(*h);
+    CHECK(save_bytes(*h) == once);                   // twice: identical
+    CHECK(save_bytes(*load_hnsw(once)) == once);     // save, load, save: identical
+    auto f = golden_flat();
+    const std::string flat_once = save_bytes(*f);
+    CHECK(save_bytes(*load_flat(flat_once)) == flat_once);
+}
+
+TEST(persistence, p13_overwrite_leaves_no_temporary_file) {
+    const std::string path = temp_path("p13");
+    write_file(path, "an older file");
+    auto h = golden_hnsw();
+    h->save(path);
+    CHECK(read_file(path) == save_bytes(*h));
+    CHECK(!std::filesystem::exists(path + ".tmp"));
+    CHECK(HnswIndex::load(path)->size() == h->size());
+    std::filesystem::remove(path);
+}
+
+TEST(persistence, p20_truncated_at_every_byte) {
+    const std::string bytes = save_bytes(*tiny_hnsw());
+    std::size_t rejected = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len) {
+        try {
+            load_hnsw(bytes.substr(0, len));
+        } catch (const FormatError&) {
+            ++rejected;
+        }
+    }
+    CHECK(rejected == bytes.size());  // every shorter file is rejected with FormatError
+}
+
+TEST(persistence, p21_any_flipped_bit_is_detected) {
+    const std::string bytes = save_bytes(*tiny_hnsw());
+    std::size_t rejected = 0;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try {
+            load_hnsw(damaged);
+        } catch (const FormatError&) {
+            ++rejected;
+        }
+    }
+    CHECK(rejected == bytes.size());
+}
+
+TEST(persistence, p22_wrong_magic_version_or_byte_order) {
+    const std::string bytes = save_bytes(*tiny_hnsw());
+    std::string magic = bytes, version = bytes, order = bytes, reserved = bytes;
+    magic[0] = 'X';
+    poke<std::uint32_t>(version, 8, 2);
+    poke<std::uint32_t>(order, 12, 0x04030201u);
+    poke<std::uint32_t>(reserved, 20, 1);
+    for (const std::string& bad : {magic, version, order, reserved}) CHECK_THROWS_AS(FormatError, load_hnsw(bad));
+    try {
+        load_hnsw(version);
+    } catch (const FormatError& e) {
+        CHECK(std::string(e.what()).find("version 2") != std::string::npos);  // a clear message
+    }
+}
+
+TEST(persistence, p23_wrong_index_kind) {
+    CHECK_THROWS_AS(FormatError, load_hnsw(save_bytes(*golden_flat())));
+    CHECK_THROWS_AS(FormatError, load_flat(save_bytes(*golden_hnsw())));
+}
+
+TEST(persistence, p24_empty_or_header_only) {
+    CHECK_THROWS_AS(FormatError, load_hnsw(""));
+    CHECK_THROWS_AS(FormatError, load_flat(""));
+    const std::string bytes = save_bytes(*tiny_hnsw());
+    CHECK_THROWS_AS(FormatError, load_hnsw(bytes.substr(0, 24)));
+}
+
+TEST(persistence, p25_bytes_after_the_end) {
+    const std::string bytes = save_bytes(*tiny_hnsw());
+    CHECK_THROWS_AS(FormatError, load_hnsw(bytes + "x"));
+    CHECK_THROWS_AS(FormatError, load_hnsw(bytes + bytes));
+    CHECK_THROWS_AS(FormatError, load_flat(save_bytes(*golden_flat()) + std::string(1, '\0')));
+}
+
+TEST(persistence, p26_inflated_counts_rejected_before_allocating) {
+    ParsedFile f = ParsedFile::parse(save_bytes(*tiny_hnsw()));
+    std::string& node = f.payload("NODE");
+    const std::string original = node;
+    poke<std::uint64_t>(node, 0, std::uint64_t(1) << 40);  // "a trillion vectors"
+    CHECK_THROWS_AS(FormatError, load_hnsw(f.assemble()));
+    node = original;
+    std::string& stat = f.payload("STAT");
+    poke<std::uint64_t>(stat, 8, std::uint64_t(1) << 50);  // free-slot count
+    CHECK_THROWS_AS(FormatError, load_hnsw(f.assemble()));
+    ParsedFile g = ParsedFile::parse(save_bytes(*golden_flat()));
+    poke<std::uint64_t>(g.payload("NODE"), 0, std::uint64_t(1) << 45);
+    CHECK_THROWS_AS(FormatError, load_flat(g.assemble()));
+    if constexpr (HNSW_ALLOC_HOOK) {  // nothing large is even attempted: fail the first allocation over 1 GB
+        ParsedFile h = ParsedFile::parse(save_bytes(*tiny_hnsw()));
+        poke<std::uint64_t>(h.payload("NODE"), 0, std::uint64_t(1) << 40);
+        const std::string bad = h.assemble();
+        CHECK_THROWS_AS(FormatError, load_hnsw(bad));  // FormatError, not bad_alloc
+    }
+}
+
+TEST(persistence, p27_invalid_content_with_valid_checksums) {
+    const std::string good = save_bytes(*tiny_hnsw());
+    const ParsedFile base = ParsedFile::parse(good);
+    // Walk the NODE payload of slot 0 and slot 1: id (8), removed (1), level (1), vector (4 x 4), then per level: count (4) + links.
+    const std::string node = ParsedFile(base).payload("NODE");
+    const std::size_t slot0 = 8, links0 = slot0 + 8 + 1 + 1 + 16;
+    const auto count0 = persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(&node[links0]));
+    REQUIRE(count0 > 0);
+    auto with_node = [&](auto&& edit) {
+        ParsedFile f = base;
+        edit(f.payload("NODE"));
+        return f.assemble();
+    };
+    auto with_stat = [&](auto&& edit) {
+        ParsedFile f = base;
+        edit(f.payload("STAT"));
+        return f.assemble();
+    };
+    const std::vector<std::string> bad = {
+        with_node([&](std::string& p) { poke<std::uint32_t>(p, links0 + 4, 999999); }),          // link out of range
+        with_node([&](std::string& p) { poke<std::uint32_t>(p, links0 + 4, 0); }),               // self-link
+        with_node([&](std::string& p) { poke<std::uint32_t>(p, links0, 1000); }),                // list longer than capacity
+        with_node([&](std::string& p) { poke<std::uint8_t>(p, slot0 + 8, 2); }),                 // removed flag 2
+        with_node([&](std::string& p) { poke<float>(p, slot0 + 10, kNaN); }),                    // NaN in a vector
+        with_node([&](std::string& p) { poke<std::uint64_t>(p, slot0, 1); }),                    // duplicate user ID (slot 1 has ID 1)
+        with_stat([&](std::string& p) { poke<std::uint32_t>(p, 0, 999); }),                      // entry point out of range
+        with_stat([&](std::string& p) { poke<std::int32_t>(p, 4, 7); }),                         // wrong top level
+        with_stat([&](std::string& p) { poke<std::uint32_t>(p, 16, 4); }),                       // free list names a live slot
+        with_stat([&](std::string& p) { p[p.size() - 3] = 'x'; }),                               // damaged generator state
+    };
+    for (const std::string& b : bad) CHECK_THROWS_AS(FormatError, load_hnsw(b));
+    // Duplicate links in one list: make the second link equal the first.
+    if (count0 >= 2) {
+        const std::string dup = with_node([&](std::string& p) { p.replace(links0 + 8, 4, p.substr(links0 + 4, 4)); });
+        CHECK_THROWS_AS(FormatError, load_hnsw(dup));
+    }
+    CHECK(load_hnsw(good)->size() == 28);  // the unedited file still loads
+}
+
+TEST(persistence, p28_unusable_paths) {
+    auto h = golden_hnsw();
+    const std::string missing_dir = (std::filesystem::temp_directory_path() / "hnsw_lite_no_such_dir" / "x.bin").string();
+    CHECK_THROWS_AS(std::runtime_error, h->save(missing_dir));
+    CHECK_THROWS_AS(std::runtime_error, HnswIndex::load(missing_dir));
+    CHECK_THROWS_AS(std::runtime_error, FlatIndex::load(missing_dir));
+    CHECK(!std::filesystem::exists(missing_dir + ".tmp"));
+}
+
+TEST(persistence, p29_oom_load) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    const std::string bytes = save_bytes(*golden_hnsw()), flat_bytes = save_bytes(*golden_flat());
+    std::unique_ptr<HnswIndex> h;
+    CHECK(sweep_allocation_failures([&] { h = load_hnsw(bytes); }, [&] { CHECK(h == nullptr); }) > 0);
+    CHECK(h && save_bytes(*h) == bytes);
+    std::unique_ptr<FlatIndex> f;
+    CHECK(sweep_allocation_failures([&] { f = load_flat(flat_bytes); }, [&] { CHECK(f == nullptr); }) > 0);
+    CHECK(f && save_bytes(*f) == flat_bytes);
+}
+
+TEST(persistence, p30_oom_save_keeps_the_old_file) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    const std::string path = temp_path("p30");
+    auto old_index = tiny_hnsw();
+    old_index->save(path);
+    const std::string old_bytes = read_file(path);
+    auto h = golden_hnsw();
+    CHECK(sweep_allocation_failures([&] { h->save(path); }, [&] {
+        CHECK(read_file(path) == old_bytes && !std::filesystem::exists(path + ".tmp"));
+    }) > 0);
+    CHECK(read_file(path) == save_bytes(*h));
+    std::filesystem::remove(path);
+}
+
+TEST(persistence, p40_golden_files_load) {
+    auto h = HnswIndex::load(golden_path("golden_hnsw_v1.bin"));
+    auto f = FlatIndex::load(golden_path("golden_flat_v1.bin"));
+    auto h_ref = golden_hnsw();
+    auto f_ref = golden_flat();
+    CHECK(h->size() == h_ref->size() && h->capacity() == h_ref->capacity() && h->deleted_count() == h_ref->deleted_count());
+    CHECK(f->size() == f_ref->size());
+    std::mt19937 rng(99);
+    bool same = true;
+    for (int i = 0; i < 20; ++i) {
+        const auto q = integer_vector(rng, 8);
+        same = same && same_results(h->search(q, 10, 32), h_ref->search(q, 10, 32));
+        same = same && same_results(f->search(q, 10), f_ref->search(q, 10));
+        same = same && same_results(h->search(q, 5, 32, with_filter(Filter::eq("category", "news"))),
+                                    h_ref->search(q, 5, 32, with_filter(Filter::eq("category", "news"))));
+    }
+    CHECK(same);
+    CHECK(*h->get_metadata(2) == *h_ref->get_metadata(2) && *f->get_metadata(1002) == *f_ref->get_metadata(1002));
+    CHECK(h->metadata().is_indexed(*h->metadata().find_field("category")));
+}
+
+TEST(persistence, p41_identical_bytes_on_every_platform) {
+    // Built from whole numbers, which every distance kernel sums exactly, so every
+    // CI platform must reproduce the committed version 1 files byte for byte.
+    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v1.bin")));
+    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v1.bin")));
+}
+
+TEST(persistence, p42_large_round_trip) {
+    auto data = clustered(20000, 16, 20, 509);
+    HnswIndex h(16, Metric::L2, HnswParams{12, 60, 3});
+    FlatIndex f(16, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
+        f.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
+    }
+    for (std::size_t i = 0; i < 80000; ++i) f.add(100000 + i, data[i % 20000]);  // Flat: 100,000 vectors
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    auto h2 = load_hnsw(hb);
+    auto f2 = load_flat(fb);
+    CHECK(f2->size() == 100000 && h2->size() == 20000);
+    CHECK(all_links(*h2) == all_links(h));
+    bool same = true;
+    for (std::size_t i = 0; i < 20; ++i) {
+        same = same && same_results(h2->search(data[i * 97], 10), h.search(data[i * 97], 10));
+        same = same && same_results(f2->search(data[i * 97], 10), f.search(data[i * 97], 10));
+    }
+    CHECK(same && save_bytes(*h2) == hb && save_bytes(*f2) == fb);
+}
+
+TEST(persistence, p50_metadata_round_trip) {
+    for (int strict = 0; strict < 2; ++strict) {
+        const std::vector<FieldSpec> declared{{"year", FieldType::Int}};  // named: no temporary inside ?:
+        const Schema schema = strict ? Schema::strict(search_fields()) : Schema::dynamic(declared);
+        HnswIndex h(4, Metric::L2, HnswParams{}, schema);
+        for (std::uint64_t i = 0; i < 300; ++i) h.add(i, std::vector<float>{float(i), 0, 0, 1}, meta_for(i));
+        h.create_payload_index("category");  // after the adds: a dynamic schema creates the fields on first use
+        h.create_payload_index("tags");
+        for (std::uint64_t i = 0; i < 300; i += 3) h.remove(i);  // leaves unused strings? (categories stay used)
+        h.set_metadata(5, Metadata().set("category", "one-off").unset("tags"));
+        h.set_metadata(5, Metadata().set("category", "news"));  // "one-off" is now unused
+        auto g = load_hnsw(save_bytes(h));
+        CHECK(g->metadata().mode() == (strict ? SchemaMode::Strict : SchemaMode::Dynamic));
+        CHECK(g->metadata().dictionary_size() == h.metadata().dictionary_size());
+        CHECK(g->metadata().unused_string_count() == h.metadata().unused_string_count());
+        bool same = true;
+        for (std::uint64_t i = 0; i < 300; ++i) {
+            const auto a = g->get_metadata(i), b = h.get_metadata(i);
+            same = same && a.has_value() == b.has_value() && (!a || *a == *b);
+        }
+        CHECK(same);
+        const MetadataStore &m = g->metadata(), &n = h.metadata();
+        for (const char* cat : kCategories)
+            CHECK(m.value_count(*m.find_field("category"), *m.find_string(cat)) == n.value_count(*n.find_field("category"), *n.find_string(cat)));
+        SearchStats st;
+        SearchOptions o = with_filter(Filter::eq("category", "tech"));
+        o.stats = &st;
+        g->search(std::vector<float>{1, 0, 0, 1}, 5, 64, o);
+        CHECK(st.exact_count);  // the payload index works after loading
+    }
+}
+
+TEST(persistence, p51_every_search_feature_after_loading) {
+    const MetaFixture& fx = meta_fixture();
+    auto h = load_hnsw(save_bytes(*fx.hnsw));
+    auto f = load_flat(save_bytes(*fx.flat));
+    const SearchOptions o = with_filter(Filter::lt("bucket", 30) && Filter::ne("category", "food"));
+    const auto buffer = flatten(Vectors(fx.queries.begin(), fx.queries.begin() + 8));
+    bool same = true;
+    for (std::size_t i = 0; i < 8; ++i) {
+        same = same && same_results(h->search(fx.queries[i], 10, 64, o), fx.hnsw->search(fx.queries[i], 10, 64, o));
+        same = same && same_results(f->search(fx.queries[i], 10, o), fx.flat->search(fx.queries[i], 10, o));
+        same = same && same_results(h->search_range(fx.queries[i], 2.0f), fx.hnsw->search_range(fx.queries[i], 2.0f));
+    }
+    const auto hb = h->search_batch(buffer, 5, 64, 2, o), hb_ref = fx.hnsw->search_batch(buffer, 5, 64, 2, o);
+    for (std::size_t i = 0; i < 8; ++i) same = same && same_results(hb[i], hb_ref[i]);
+    CHECK(same);
+}
+
+TEST(persistence, p52_changes_continue_identically_after_loading) {
+    auto data = clustered(900, 8, 6, 510);
+    HnswIndex straight(8, Metric::L2);
+    for (std::size_t i = 0; i < 600; ++i) straight.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 600; i += 5) straight.remove(i);
+    auto resumed = load_hnsw(save_bytes(straight));
+    for (HnswIndex* h : {&straight, resumed.get()}) {  // the same changes to both
+        for (std::size_t i = 600; i < 900; ++i) h->add(i, data[i], meta_for(i));
+        for (std::uint64_t i = 1; i < 600; i += 9) h->update(i, data[(i * 7) % 900]);
+        h->upsert(5, data[3], Metadata().set("year", 1990));
+        h->remove(2);
+        h->set_metadata(4, Metadata().set("category", "sports"));
+    }
+    CHECK(save_bytes(*resumed) == save_bytes(straight));
+    resumed->compact();
+    straight.compact();
+    CHECK(save_bytes(*resumed) == save_bytes(straight));
+}
+
+TEST(persistence, p53_save_during_a_search) {
+    // Saving reads the index, so a predicate may save; changes during a save are refused.
+    auto h = golden_hnsw();
+    std::string saved;
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        if (saved.empty()) saved = save_bytes(*h);
+        return true;
+    };
+    h->search(std::vector<float>(8, 1.0f), 5, 32, o);
+    CHECK(saved == save_bytes(*h));
+}
+
+TEST(persistence, p54_unseekable_stream_rejected) {
+    struct OneWay : std::streambuf {  // a stream that cannot seek (like a pipe)
+        std::string data;
+        explicit OneWay(std::string d) : data(std::move(d)) { setg(data.data(), data.data(), data.data() + data.size()); }
+    } buffer(save_bytes(*tiny_hnsw()));
+    std::istream in(&buffer);
+    CHECK_THROWS_AS(FormatError, HnswIndex::load(in));
+}
+
+TEST(persistence, p55_other_metadata_damage) {
+    // Metadata problems behind valid checksums: a row on a removed vector, a bad string reference.
+    HnswIndex h(2, Metric::L2);
+    h.add(0, std::vector<float>{0, 0}, Metadata().set("k", "a"));
+    h.add(1, std::vector<float>{1, 1}, Metadata().set("k", "b"));
+    h.remove(0);
+    ParsedFile base = ParsedFile::parse(save_bytes(h));
+    // META: mode (1), field count (4), name (4 + 1), type (1), indexed (1), string count (4), "a" (4 + 1), "b" (4 + 1), rows (8), slot (4), id (4)
+    const std::size_t rows_at = 1 + 4 + 5 + 1 + 1 + 4 + 5 + 5, slot_at = rows_at + 8, id_at = slot_at + 4;
+    ParsedFile on_removed = base, bad_ref = base;
+    poke<std::uint32_t>(on_removed.payload("META"), slot_at, 0);  // slot 0 was removed
+    poke<std::uint32_t>(bad_ref.payload("META"), id_at, 7);       // only 2 strings exist
+    CHECK_THROWS_AS(FormatError, load_hnsw(on_removed.assemble()));
+    CHECK_THROWS_AS(FormatError, load_hnsw(bad_ref.assemble()));
+    CHECK(load_hnsw(base.assemble())->get_metadata(1)->get("k")->s == "b");
+}
+
+TEST(persistence, p57_every_validation_rule) {
+    // Each rule the loader enforces, triggered behind a valid checksum.
+    auto expect_rejected = [](const std::string& bytes) { CHECK_THROWS_AS(FormatError, load_hnsw(bytes)); };
+
+    // Settings: dimension and repair flag (CONF: dimension at 0, repair flag at 36).
+    const ParsedFile tiny = ParsedFile::parse(save_bytes(*tiny_hnsw()));
+    for (std::uint64_t dim : {std::uint64_t(0), std::uint64_t(1) << 25}) {
+        ParsedFile f = tiny;
+        poke<std::uint64_t>(f.payload("CONF"), 0, dim);
+        expect_rejected(f.assemble());
+    }
+    {
+        ParsedFile f = tiny;
+        poke<std::uint8_t>(f.payload("CONF"), 36, 2);
+        expect_rejected(f.assemble());
+    }
+    {   // A vector cut off in the middle.
+        ParsedFile f = tiny;
+        f.payload("NODE").resize(8 + 8 + 1 + 1 + 2);
+        expect_rejected(f.assemble());
+    }
+
+    // Entry point and free list (STAT: entry 0, top level 4, free count 8, free slots 16...).
+    const auto t = tiny_hnsw();
+    NodeId low = kEmpty;  // a live slot below the top level
+    for (NodeId n = 0; n < t->storage().size(); ++n)
+        if (!t->storage().ids().is_deleted(n) && t->storage().graph().level(n) < t->max_level()) low = n;
+    REQUIRE(low != kEmpty && t->deleted_count() == 2);
+    const std::vector<std::function<void(std::string&)>> stat_edits = {
+        [&](std::string& p) { poke<std::uint32_t>(p, 0, 3); },                     // entry point is a removed slot (3)
+        [&](std::string& p) { poke<std::uint32_t>(p, 0, low); },                   // entry point below the top level
+        [&](std::string& p) { poke<std::uint32_t>(p, 0, low);                      // top level that is not the highest
+                              poke<std::int32_t>(p, 4, t->storage().graph().level(low)); },
+        [&](std::string& p) { poke<std::uint32_t>(p, 16, 999); },                  // free slot out of range
+        [&](std::string& p) { poke<std::uint32_t>(p, 20, persist::from_little_endian<std::uint32_t>(
+                                  reinterpret_cast<const unsigned char*>(&p[16]))); },  // a repeated free slot
+    };
+    for (const auto& edit : stat_edits) {
+        ParsedFile f = tiny;
+        edit(f.payload("STAT"));
+        expect_rejected(f.assemble());
+    }
+    {   // An empty index must have no entry point and top level -1.
+        HnswIndex e(2, Metric::L2);
+        e.add(1, std::vector<float>{0, 0});
+        e.remove(1);
+        const ParsedFile empty = ParsedFile::parse(save_bytes(e));
+        ParsedFile a = empty, b = empty;
+        poke<std::uint32_t>(a.payload("STAT"), 0, 0);
+        poke<std::int32_t>(b.payload("STAT"), 4, 0);
+        expect_rejected(a.assemble());
+        expect_rejected(b.assemble());
+        CHECK(load_hnsw(empty.assemble())->size() == 0);
+    }
+
+    // Metadata. Fields are created in name order b (bool), f (float), t (tags):
+    //   mode 0, field count 1, fields at 5 (each: name 4+1, type 1, indexed 1), so b's type is at 10;
+    //   string count 26, "x" at 30 (length) and 34, "y" at 35 and 39;
+    //   b: rows 40 (8 bytes), slot 48, value 52;  f: rows 53, slot 61, value 65;  t: rows 73, slot 81, count 85, ids 89 and 93.
+    HnswIndex m(2, Metric::L2);
+    m.add(0, std::vector<float>{0, 0}, Metadata().set("b", true).set("f", 1.5).set_tags("t", {"x", "y"}));
+    const ParsedFile meta = ParsedFile::parse(save_bytes(m));
+    REQUIRE(load_hnsw(meta.assemble())->get_metadata(0)->get("f")->f == 1.5);
+    {   // the layout assumed below: the tag IDs are 0 and 1, at 89 and 93
+        ParsedFile copy = meta;
+        const std::string& p = copy.payload("META");
+        REQUIRE(p.size() == 97 && persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(&p[93])) == 1);
+    }
+    const std::vector<std::function<void(std::string&)>> meta_edits = {
+        [](std::string& p) { poke<std::uint8_t>(p, 10, 9); },               // unknown field type
+        [](std::string& p) { p[39] = 'x'; },                                 // a repeated dictionary string
+        [](std::string& p) { poke<std::uint64_t>(p, 40, 5); },              // more rows than vectors
+        [](std::string& p) { poke<std::uint8_t>(p, 52, 2); },               // a boolean that is neither 0 nor 1
+        [](std::string& p) { poke<double>(p, 65, double(kNaN)); },          // a NaN metadata float
+        [](std::string& p) { poke<std::uint32_t>(p, 85, 1000000); },        // a huge tag count
+        [](std::string& p) { poke<std::uint32_t>(p, 89, 9); },              // a tag that is not in the dictionary
+        [](std::string& p) { poke<std::uint32_t>(p, 93, 0); },              // a repeated tag (the first is 0)
+    };
+    for (const auto& edit : meta_edits) {
+        ParsedFile f = meta;
+        edit(f.payload("META"));
+        expect_rejected(f.assemble());
+    }
+}
+
+TEST(persistence, p56_writing_to_a_failing_stream) {
+    std::ostringstream out;
+    out.setstate(std::ios::badbit);
+    CHECK_THROWS_AS(std::runtime_error, golden_hnsw()->save(out));
+    CHECK_THROWS_AS(std::runtime_error, golden_flat()->save(out));
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -6884,10 +7624,11 @@ void print_usage() {
         "  --exclude <text>    skip tests whose \"group.name\" contains text (repeatable)\n"
         "  --list              list the selected tests without running them\n"
         "  --fail-fast         stop after the first failing test\n"
+        "  --write-golden      rewrite the saved-format golden files (format changes only)\n"
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -6914,6 +7655,13 @@ int main(int argc, char** argv) {
             list_only = true;
         } else if (arg == "--fail-fast") {
             fail_fast = true;
+        } else if (arg == "--write-golden") {
+            // Rewrites the format version 1 golden files in tests/data. Only for a
+            // deliberate format change: the files guard compatibility.
+            golden_hnsw()->save(golden_path("golden_hnsw_v1.bin"));
+            golden_flat()->save(golden_path("golden_flat_v1.bin"));
+            std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
+            return 0;
         } else if (arg == "--group" || arg == "--exclude") {
             if (i + 1 >= argc) {
                 std::printf("Missing value after %s\n\n", arg.c_str());

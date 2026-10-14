@@ -14,7 +14,7 @@ These are deliberate for the current stage:
 
 - **One writer at a time.** `add` and `remove` must not run alongside anything else. Concurrent searches are safe when no writer is active. Concurrent inserts will need per-node locks and an atomic arena.
 - **HNSW build speed.** Building is single-threaded, and every access is bounds-checked for safety. Parallel construction and unchecked accessors in the hot loops are future optimizations.
-- **No persistence.** Data lives only in memory. The arena stores raw pointers; switching to offsets will make saving to disk straightforward.
+- **Saving cannot force data onto the physical disk:** a save is atomic (temporary file, then rename), but a power cut right after `save` returns could lose that latest save. Loading is not memory-mapped, so a large index is read fully into memory.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
@@ -39,7 +39,7 @@ These are deliberate for the current stage:
 - [x] Continuous integration: Linux (GCC, Clang, sanitizers), Windows (MSVC, MinGW) and macOS on ARM
 - [x] Real deletion: reusable IDs, slot reuse, graph repair, `compact()`
 - [x] Updating vectors: `update` and `upsert`
-- [ ] Saving and loading indexes
+- [x] Saving and loading indexes
 - [ ] Concurrent inserts, including parallel HNSW construction (`add_batch`)
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

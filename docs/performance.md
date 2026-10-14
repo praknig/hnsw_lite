@@ -38,6 +38,43 @@ Build time: 0.02 s for Flat, 8.6 s for HNSW.
 
 `ef` is the speed–accuracy dial: small values are very fast but miss some neighbors; around `ef = 80` HNSW is over 13x faster than exact search while finding 99.8% of the true neighbors. The gap grows with the number of vectors, because Flat's cost grows linearly while HNSW's grows roughly logarithmically.
 
+## Baseline for performance work (Phase 0)
+
+Measured with `bench_baseline` (in [bench/](../bench)), which reports build time, index memory, and for `ef` from 16 to 256: queries per second (the median of 5 passes), p50 and p99 latency, and recall@10. hnswlib (v0.10.0 release candidate, header-only C++) was measured with identical data, settings (`M = 16`, `ef_construction = 200`, k = 10) and method.
+
+**Data:** 200,000 vectors of 128 dimensions, L2, 1,000 queries. Points come from 100 clusters in a 16-dimensional space, mapped into 128 dimensions with a little noise, because real embeddings vary along far fewer directions than their dimension. (Plain random noise in all 128 dimensions makes nearest neighbors nearly meaningless: both libraries then reach only 15% to 57% recall, so such data says nothing about either.)
+
+**Machine:** one shared virtual core (Intel Xeon, 2.1 GHz), AVX-512, GCC, Release build, single-threaded.
+
+| | hnsw-lite | hnswlib |
+|---|---|---|
+| Build | 40.2 s (4,972 vectors/s) | 40.5 s (4,937 vectors/s) |
+| Index memory | 151 MiB | 144 MiB |
+
+| `ef` | hnsw-lite queries/s | hnsw-lite recall@10 | hnswlib queries/s | hnswlib recall@10 |
+|---|---|---|---|---|
+| 16 | 37,922 | 0.953 | 32,290 | 0.955 |
+| 32 | 20,667 | 0.993 | 14,603 | 0.994 |
+| 64 | 11,309 | 1.000 | 11,457 | 1.000 |
+| 128 | 6,542 | 1.000 | 6,315 | 1.000 |
+| 256 | 3,435 | 1.000 | 3,828 | 1.000 |
+
+**Reading these numbers:** the two libraries are level. Build time and recall match, and search speed is within the machine's noise at every `ef`; hnsw-lite uses about 5% more memory.
+
+**Measurement noise:** on this shared machine, running the same program three times gave 18,759 to 24,773 queries per second (`ef = 64`, 50,000 vectors) and builds of 5.7 to 6.6 seconds: differences of up to 30%. That is far above the 5% gain an optimization must show to be kept, so **optimizations are judged on a quiet machine with dedicated cores**, with the baseline and the candidate run alternately several times and their medians compared.
+
+### Running the baseline on real data
+
+`bench_baseline --files` reads the standard `.fvecs` and `.ivecs` formats. For SIFT1M (1 million vectors of 128 dimensions, about 160 MB to download), on Windows:
+
+```powershell
+curl.exe -O ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+tar -xzf sift.tar.gz
+.\build\bench_baseline.exe --files sift\sift_base.fvecs sift\sift_query.fvecs sift\sift_groundtruth.ivecs l2 1000
+```
+
+The ground-truth file holds the exact nearest neighbors, so recall is measured without a brute-force search over a million vectors. Building the index takes several minutes on one thread.
+
 ## Tuning guide
 
 ### Flat or HNSW?

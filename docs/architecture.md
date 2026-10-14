@@ -105,6 +105,7 @@ hnsw-lite/
 │   ├── visited_list.h          # Layer 3: VisitedList, VisitedListPool
 │   ├── flat_index.h            # Layer 3: FlatIndex
 │   ├── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
+│   ├── serialize.h             # Saving: checksums, writer, untrusted-file reader, FormatError
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -118,9 +119,11 @@ hnsw-lite/
 │   ├── distance_neon.cpp       # NEON, 4 floats per instruction (ARM only)
 │   ├── flat_index.cpp          # FlatIndex implementation
 │   ├── hnsw_index.cpp          # HnswIndex implementation
+│   ├── persistence.cpp         # Saving and loading (file format version 1)
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
-│   └── test_comprehensive.cpp  # All 464 tests with a built-in runner
+│   ├── data/                   # Golden files: format version 1, for compatibility tests
+│   └── test_comprehensive.cpp  # All 499 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -320,6 +323,28 @@ One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an 
 4. **Commit**, with nothing that can fail: the ID is pointed at the new slot (`repoint`), the old slot is retired and its metadata cleared, it joins the free list, and a new entry point is chosen if the old version was the entry point.
 
 A failure in steps 1 to 3 abandons the new version like a failed insert, restoring the entry point; the old vector is untouched. The price is one extra slot during the switch: the first update grows capacity by one, and that slot is then reused by every later update or insert, so capacity never exceeds the peak number of live vectors plus one.
+
+### Saving and loading
+
+**File format (version 1).** All numbers are little-endian. A 24-byte header (the magic text `HNSWLITE`, the format version, a byte-order mark, the index kind and a reserved field) is followed by sections, each a 4-letter tag, a 64-bit length, the payload and a CRC-32 of the payload, and finally an empty `END ` section; nothing may follow it.
+
+| Section | Flat | HNSW |
+|---|---|---|
+| `CONF` | Dimension, metric | Dimension, metric, `M`, `ef_construction`, seed, graph repair, planner settings |
+| `NODE` | Each vector with its user ID | Each slot, live or removed: user ID, removed flag, level, vector, then the links on each level |
+| `STAT` | | Entry point, top level, free slots in reuse order, the random generator's state |
+| `META` | Metadata | Metadata: schema mode, fields (name, type, indexed), string dictionary, then each field's rows in slot order |
+
+**Design choices:**
+- **The graph is saved logically** (levels and link lists) and rebuilt on load, so files do not depend on memory addresses. The arena's raw pointers are never written.
+- **Removed slots are saved:** other vectors may still link through them, and inserts reuse them in a fixed order. With the free list and the random generator's state (in the C++ standard's portable text form), a loaded index continues exactly as the original would have.
+- **Derived data is recomputed, not trusted:** payload-index counts and string reference counts are rebuilt from the rows on load.
+- **Each section's length is computed by a counting pass** before it is written, so saving needs no extra copy of the data.
+- **Streams rethrow their errors** (`StreamErrorsThrow`): by default a C++ stream that runs out of memory only sets a flag and stops writing, which would produce a damaged file without an error.
+
+**Loading untrusted files.** `persist::Reader` knows the file's size before reading (hence seekable streams), and checks every read against the bytes left in the section and the file. Every count is checked against those bytes **before** allocating, so a damaged count cannot trigger a huge allocation. After the checksums, the content is validated: link targets, self-links, repeated links, list lengths, levels, removed flags, finite vector values, unique user IDs, an entry point that is live and on the top level, a free list naming exactly the removed slots, the generator state, and every metadata value. Any problem throws `FormatError`, and nothing partly built escapes.
+
+**Compatibility** is guarded by two small golden files in `tests/data/`, saved in format version 1. Their vectors are small whole numbers, which every distance kernel sums exactly, so every CI platform must rebuild them **byte for byte**; this checks the format, the determinism of saving and portability across platforms at once. `test_comprehensive --write-golden` rewrites them, for a deliberate format change only.
 
 ## Search features design
 

@@ -160,6 +160,8 @@ Every case must produce a clean format error: never a crash, never a partly buil
 | P41 | A file saved on one platform loads on another (CI: Linux saves; Windows and macOS load) | P |
 | P42 | Large index (100,000 vectors) round trip completes and matches | S |
 
+Added during implementation: P50 metadata round trip (both schema modes, payload indexes, unused strings), P51 every search feature after loading, P52 changes continuing identically after loading, P53 saving during a search, P54 unseekable streams rejected, P55 metadata damage behind valid checksums, P56 writing to a failing stream, P57 every validation rule. P41 (cross-platform) is covered by the golden files: every CI platform must rebuild them byte for byte.
+
 ---
 
 ## 4. Concurrent inserts — expanded group `concurrency`

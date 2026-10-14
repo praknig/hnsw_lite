@@ -101,6 +101,23 @@ Expected gains are estimates, based on what similar changes achieve in hnswlib a
 | O11 | **One Flat query split across threads** | Close to the core count | Small | Tie order must stay identical when merging per-thread results |
 | O12 | **Matrix-multiply kernel for Flat batches** | 2–4 times for large batches | Medium | Different summation order gives slightly different distances, breaking "batch results identical to separate searches" (decision D3) |
 
+### Found after Phase 1 (N1 to N10)
+
+A second review of the plans and limitations found these:
+
+| ID | Item | Kind | Phase |
+|---|---|---|---|
+| N1 | Skip bounds checks inside the search loop, where positions are already known valid (keep them in debug builds and the public API) | Optimization | 2 |
+| N2 | Reusable compiled filters, instead of recompiling on every search | Optimization | 7 |
+| N3 | Cached selectivity estimates for repeated filters, until the index changes | Optimization | 7 |
+| N4 | Let the user choose the distance code (for example AVX2 where AVX-512 lowers the clock speed) | Option | 2 |
+| N5 | Optional automatic `compact()` when removed slots pass a set fraction | Option | 4 |
+| N6 | Each concurrent search holds a visited list sized to the index: 64 threads at 1 million vectors use about 256 MB | Edge case | Next hardening pass |
+| N7 | Alternating thread counts in `search_batch` recreate the thread pool each time | Edge case | Next hardening pass |
+| N8 | Saving needs offsets instead of the arena's raw pointers; plan for versions, corrupted files and safe writes | Edge case | 5 |
+| N9 | Two writers at the same time are not detected (only writes during searches are) | Edge case | 3 |
+| N10 | 32-bit platforms are untested and probably unsupported: document or reject at build time | Edge case | Next hardening pass |
+
 ## Part 3: Order of work
 
 | Phase | Contents | Branch | Effort |
@@ -119,22 +136,22 @@ Each phase ends with a merged pull request, passing CI, and updated documentatio
 ## Rules for every phase
 
 - **Test plan first,** with scenario IDs, before implementation, as for every feature so far.
-- **Benchmark before and after.** Only changes with a measured gain are kept; each phase records its numbers in [Performance and tuning](performance.md).
+- **Benchmark before and after.** Only changes at least **5% faster** are kept (decided for Phase 2). Timings on a shared machine vary by up to 30% between identical runs, so gains are judged on a quiet machine with dedicated cores, running the baseline and the candidate alternately several times and comparing medians. Each phase records its numbers in [Performance and tuning](performance.md).
 - **Recall never gets worse:** recall at each `ef` stays within noise of the baseline. Changes that do not alter the search order give identical results, which the determinism tests check.
 - **No guarantee is lost:** all-or-nothing behavior under out-of-memory (sweeps for every new allocation path), ThreadSanitizer cleanliness, the coverage gate, and zero warnings under strict compiler settings.
 - **Fresh builds for verification.** Final checks use builds from scratch, never incremental ones, after a stale build misled an earlier verification.
 
 ## Decisions needed
 
-Each decision has a recommendation. D1 and D2 were applied in Phase 1; D3 to D5 are still open.
+D1 and D2 were applied in Phase 1; D3 to D5 have been decided and apply when their phases start.
 
 | ID | Question | Options | Recommendation |
 |---|---|---|---|
 | D1 | Must the same seed give the same graph on GCC, Clang and MSVC (E1)? | Portable across platforms, or same platform only | **Applied: portable levels**, checked in CI |
 | D2 | May a predicate call back into the index (E2, O3)? | Support re-entrant searches; or forbid it, documented and detected where possible | **Applied: searches allowed, changes refused** with `std::logic_error`. Phase 2's scratch space (O3) must keep searches re-entrant |
-| D3 | Must Flat batch results stay identical to separate searches (O12)? | Identical, using the matrix kernel only to find candidates that are then re-checked exactly; or allow rounding differences | **Identical**, via the re-check |
-| D4 | Pursue SQ8 (O6)? | An optional per-index setting; or not until Phase 0 shows memory or bandwidth is the bottleneck | **Wait for Phase 0** |
-| D5 | Must parallel builds be reproducible (O7)? | A reproducible single-threaded mode is enough; or parallel builds reproducible too | **Single-threaded mode is enough**; reproducible parallel builds are much harder |
+| D3 | Must Flat batch results stay identical to separate searches (O12)? | Identical, using the matrix kernel only to find candidates that are then re-checked exactly; or allow rounding differences | **Decided: the user chooses.** An exact mode (the default) gives results identical to separate searches; a fast mode uses the matrix kernel and accepts tiny rounding differences |
+| D4 | Pursue SQ8 (O6)? | An optional per-index setting; or not until Phase 0 shows memory or bandwidth is the bottleneck | **Decided: offer it as an optional per-index setting** in Phase 4; full-precision floats stay the default |
+| D5 | Must parallel builds be reproducible (O7)? | A reproducible single-threaded mode is enough; or parallel builds reproducible too | **Decided: single-threaded mode is enough.** Parallel builds may differ between runs; a single-threaded mode always gives the identical graph |
 
 ## Phase 1 results
 
@@ -160,11 +177,11 @@ Decisions applied: **D1** (levels identical on every platform; a fixed-answer te
 
 | Phase | Status |
 |---|---|
-| 0. Measure | Not started |
+| 0. Measure | **Baseline done here** on generated data (see [Performance and tuning](performance.md#baseline-for-performance-work-phase-0)); real datasets still to run on a quiet machine |
 | 1. Harden | **Done** (see Phase 1 results) |
 | 2. Quick wins | Not started |
 | 3. Concurrency stage A | Not started |
 | 4. Layout decision | Not started |
-| 5. Persistence | Not started |
+| 5. Persistence | **Done** (file format version 1; see [Architecture and design](architecture.md#saving-and-loading)) |
 | 6. Parallel build | Not started |
 | 7. Filtered and Flat speed | Not started |

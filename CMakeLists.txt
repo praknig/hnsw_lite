@@ -25,7 +25,7 @@ find_package(Threads REQUIRED)  # batch search runs on a thread pool
 file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
         src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
-        src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp      # Layer 3
+        src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
         ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
@@ -68,16 +68,17 @@ if(HNSW_LITE_BUILD_TESTS)
   # One test program containing every test. Each group is registered as its own
   # CTest entry (its own process), e.g. "ctest -R comprehensive.hnsw".
   add_executable(test_comprehensive tests/test_comprehensive.cpp)
+  target_compile_definitions(test_comprehensive PRIVATE HNSW_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
   target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
   hnsw_lite_setup(test_comprehensive)
   foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-          metadata filter planner payload batch range search_e2e update hardening stress e2e)
+          metadata filter planner payload batch range search_e2e update hardening persistence stress e2e)
     add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
   endforeach()
 endif()
 
 if(HNSW_LITE_BUILD_BENCHMARKS)
-  foreach(name bench_distance bench_search)
+  foreach(name bench_distance bench_search bench_baseline)
     add_executable(${name} bench/${name}.cpp)
     target_link_libraries(${name} PRIVATE hnsw_lite)
     hnsw_lite_setup(${name})

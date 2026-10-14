@@ -61,16 +61,16 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### What a successful run looks like
 
-CTest runs the tests as 19 groups:
+CTest runs the tests as 20 groups:
 
 ```
-100% tests passed, 0 tests failed out of 19
+100% tests passed, 0 tests failed out of 20
 ```
 
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 464 tests
+./build/test_comprehensive                   # all 499 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```
