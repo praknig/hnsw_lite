@@ -202,7 +202,7 @@ Every change is built and tested automatically by GitHub Actions ([`.github/work
 
 It does not run on pushes to a branch without a pull request; that would run everything twice once a pull request exists. To get feedback early, open a **draft pull request** as soon as the branch is created. A newer run for the same branch cancels an older one that is still running.
 
-**What it runs (8 jobs in parallel):**
+**What it runs (14 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
@@ -212,6 +212,10 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Windows / MSVC | Release | Full test suite with Microsoft's compiler, including the MSVC-specific CPU detection |
 | Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
+| Linux ARM64 / GCC (NEON) | Release | Full suite on ARM with GCC and libstdc++ (macOS covers ARM only with Apple's compiler and libc++) |
+| Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
+| Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
+| Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers and deletion groups |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
