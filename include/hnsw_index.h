@@ -5,6 +5,9 @@
  */
 #pragma once
 #include <cstdint>
+#include <iosfwd>
+#include <memory>
+#include <string>
 #include <random>
 #include <span>
 #include <vector>
@@ -19,6 +22,26 @@
 #include "visited_list.h"
 
 namespace vecdb {
+
+/**
+ * @brief SplitMix64 (Steele, Lea and Flood, 2014): a small, fast random number
+ *        generator whose entire state is one 64-bit number.
+ *
+ * Used for random levels. Its state is saved as plain bytes, so a saved index
+ * continues identically on every platform. (The text form that C++ streams
+ * write for std::mt19937_64 differs between standard libraries: a file saved
+ * with libstdc++ could not be loaded with libc++.)
+ */
+struct SplitMix64 {
+    std::uint64_t state;
+    explicit SplitMix64(std::uint64_t seed = 0) : state(seed) {}
+    std::uint64_t operator()() {
+        std::uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+};
 
 /**
  * @brief Settings that control HNSW graph quality, memory and speed.
@@ -199,6 +222,25 @@ public:
     CompactStats compact();
 
     /// Number of live vectors.
+    /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
+    /// written to "<path>.tmp" first and then renamed into place, so a failure
+    /// never damages an existing file at `path`. Searches may run during a save;
+    /// changes attempted during one throw std::logic_error. Throws
+    /// std::runtime_error if the file cannot be written.
+    void save(const std::string& path) const;
+
+    /// Saves to a stream (for example a std::ostringstream).
+    void save(std::ostream& out) const;
+
+    /// Loads an index saved by save(). Throws FormatError if the file is damaged,
+    /// truncated, from an unsupported version or of the other index kind (a
+    /// failed load never produces a partly built index), and std::runtime_error
+    /// if the file cannot be opened.
+    static std::unique_ptr<HnswIndex> load(const std::string& path);
+
+    /// Loads from a stream, which must be seekable (files and string streams are).
+    static std::unique_ptr<HnswIndex> load(std::istream& in);
+
     std::size_t size() const { return live_; }
     /// Slots of removed vectors still occupying memory (waiting to be reused).
     std::size_t deleted_count() const { return storage_.size() - live_; }
@@ -289,7 +331,7 @@ private:
     Storage storage_;
     std::size_t stride_;
     PreparedVector scratch_;  // reused by add(); search() uses its own copy
-    std::mt19937_64 rng_;
+    SplitMix64 rng_;  // random levels
     NodeId entry_ = kEmpty;
     int max_level_ = -1;
     std::size_t live_ = 0;

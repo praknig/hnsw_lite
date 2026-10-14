@@ -16,6 +16,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Filtered search](#filtered-search)
 - [Batch search](#batch-search)
 - [Range search](#range-search)
+- [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
 - [Errors and guarantees](#errors-and-guarantees)
 - [Memory](#memory)
@@ -259,10 +260,25 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 - `FlatIndex` is exact. `HnswIndex` is approximate, like its normal search; pass `Strategy::ForceExact` in the options when every vector within the radius must be found.
 - Filters and predicates work here too.
 
+## Saving and loading
+
+```cpp
+index.save("products.hnsw");                        // the whole index: vectors, graph, metadata, settings
+auto loaded = HnswIndex::load("products.hnsw");     // a std::unique_ptr<HnswIndex>
+auto flat = FlatIndex::load("exact.flat");           // the same for FlatIndex
+```
+
+- **Everything is saved:** vectors, the HNSW graph, removed slots and the order they will be reused in, metadata with its schema and payload indexes, HNSW and planner settings, and the random generator's state. A loaded index continues exactly as if the program had never stopped: adding the same vectors afterwards builds the same graph.
+- **Saving never damages an existing file.** The index is written to `<path>.tmp` and renamed over `path` only when complete, so a crash or a full disk leaves the previous file intact. (Standard C++ cannot force data onto the physical disk, so a power cut immediately after `save` returns could still lose that latest save.)
+- **Loaded files are checked thoroughly.** Each section carries a checksum, every count is checked before memory is allocated, and every link, level and value is validated. A damaged, truncated or foreign file throws `vecdb::FormatError`; a failed load never produces a half-built index.
+- **Streams work too:** `save(std::ostream&)` and `load(std::istream&)`, for example with `std::stringstream`. A stream given to `load` must be seekable (files and string streams are).
+- A save reads the index, so searches may run during it; changes attempted during a save throw `std::logic_error`, as during a search.
+- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned).
+
 ## Threads
 
 - **Searches** (all kinds) may run from any number of threads at the same time.
-- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) must not run at the same time as anything else, including searches. A change attempted while a search is running throws `std::logic_error`; this is detected reliably from a predicate, and on a best-effort basis from another thread (only if the two actually overlap). If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
+- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`; `save` counts as a search) must not run at the same time as anything else, including searches. A change attempted while a search is running throws `std::logic_error`; this is detected reliably from a predicate, and on a best-effort basis from another thread (only if the two actually overlap). If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
 
 ## Errors and guarantees
 
@@ -270,6 +286,8 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 |---|---|
 | `std::invalid_argument` | Wrong dimension; NaN or infinity in a vector, metadata float or radius; an ID already stored; unknown field (strict schema) or wrong type; invalid filter, planner or HNSW settings; an integer above the 64-bit signed range |
 | `std::logic_error` | A change (`add`, `update`, `remove`, `set_metadata`, `compact` and the like) attempted while a search is running |
+| `vecdb::FormatError` (a `std::runtime_error`) | `load` was given a damaged, truncated or unsupported file, or a file of the other index type |
+| `std::runtime_error` | `save` or `load` could not open or write a file |
 | `std::bad_alloc` | Out of memory |
 | `std::length_error` | More than about 4 billion vectors in one index |
 

@@ -141,6 +141,8 @@ A damaged or malicious file must never cause a crash or an out-of-bounds access:
 
 `save` writes to a temporary file and renames it into place at the end, so a crash during saving never destroys the previous good file.
 
+**As built:** the format also saves everything added since this plan: metadata (schema mode, fields, string dictionary, rows, payload-index flags), planner settings and the free-slot order. `load` returns a `std::unique_ptr` (indexes hold a mutex and atomics, so they cannot be moved), errors in a file throw a dedicated `FormatError`, and saving counts as a search, so changes during a save are refused. See [Saving and loading](architecture.md#saving-and-loading).
+
 ### Compatibility
 
 - Byte order is recorded in the header; files with a different byte order are rejected.

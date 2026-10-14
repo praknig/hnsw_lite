@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 464 individually named tests** in 19 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 499 individually named tests** in 20 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -26,6 +26,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `search_e2e` | 6 | IX scenarios: a 4,000-step lifecycle with filters and `compact()`; batches during churn; 8 threads; every metric with every feature; reproducibility; 20,000 vectors with random filters |
 | `update` | 32 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, 5,000 mixed operations against a reference, and five edge cases: a zero vector with cosine, `upsert` with an invalid vector for a new ID, `compact()` after many updates, the dictionary cleanup during an update, and an updated vector never left without links |
 | `hardening` | 14 | Edge cases E1 to E13 of the [hardening and performance plan](hardening-and-performance-plan.md): random levels identical on every platform, nested batches from predicates, changes during a search refused, cosine distances never negative, the `M` limit, extreme IDs, vectors taken from the index itself, dimension 0, thousands of fields and filter tags, throwing predicates in threaded batches, subnormal values, the deepest filter on pool threads, and the change detection released on every path |
+| `persistence` | 35 | Scenarios P1 to P42 from the [test plan](core-capabilities-test-plan.md), each named after its ID: round trips for every metric and index state (empty, one vector, removals, updates, compaction, extreme IDs, several dimensions), settings preserved, continuing after a load building the identical graph, deterministic bytes, safe overwriting, a file truncated at every byte and a bit flipped in every byte, wrong headers and kinds, extra bytes, inflated counts, invalid content behind valid checksums, unusable paths, out-of-memory sweeps of loading and saving, golden files reproduced byte for byte, and a 100,000-vector round trip. Plus P50 to P57: metadata, every search feature after loading, changes continuing identically, saving during a search, unseekable streams, metadata damage, failing streams and every validation rule |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -36,7 +37,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 464 test names
+test_comprehensive --list               # list all 499 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -50,13 +51,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 464 of 464 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 499 of 499 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-464 passed, 0 failed, 0 skipped, 0 not run, 28723 checks, 19.97 s
+499 passed, 0 failed, 0 skipped, 0 not run, 29720 checks, 29.48 s
 All selected tests passed.
 ```
 
@@ -71,7 +72,7 @@ TEST(flat, my_new_case) {
 }
 ```
 
-**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 28 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
+**How the out-of-memory tests work.** The test program replaces the global `operator new` and `operator delete` with versions that behave normally until told to fail the Nth allocation. Each test runs an operation with N = 0, then 1, then 2, and so on, until it completes without hitting the failure, so *every* allocation point is tried. After each failure it checks that nothing changed (or, for HNSW inserts, that the index is still consistent and searchable). AddressSanitizer and ThreadSanitizer install their own allocators, so under them these 30 tests report SKIP; define `HNSW_TEST_NO_ALLOC_HOOK` to turn the hook off manually.
 
 ### Code coverage
 
@@ -104,29 +105,30 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 19 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 20 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/19 Test # 1: comprehensive.layer1 ................   Passed
- 2/19 Test # 2: comprehensive.layer2 ................   Passed
- 3/19 Test # 3: comprehensive.helpers ...............   Passed
- 4/19 Test # 4: comprehensive.flat ..................   Passed
- 5/19 Test # 5: comprehensive.hnsw ..................   Passed
- 6/19 Test # 6: comprehensive.robustness ............   Passed
- 7/19 Test # 7: comprehensive.deletion ..............   Passed
- 8/19 Test # 8: comprehensive.concurrency ...........   Passed
- 9/19 Test # 9: comprehensive.metadata ..............   Passed
-10/19 Test #10: comprehensive.filter ................   Passed
-11/19 Test #11: comprehensive.planner ...............   Passed
-12/19 Test #12: comprehensive.payload ...............   Passed
-13/19 Test #13: comprehensive.batch .................   Passed
-14/19 Test #14: comprehensive.range .................   Passed
-15/19 Test #15: comprehensive.search_e2e ............   Passed
-16/19 Test #16: comprehensive.update ................   Passed
-17/19 Test #17: comprehensive.hardening .............   Passed
-18/19 Test #18: comprehensive.stress ................   Passed
-19/19 Test #19: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 19
+ 1/20 Test # 1: comprehensive.layer1 ................   Passed
+ 2/20 Test # 2: comprehensive.layer2 ................   Passed
+ 3/20 Test # 3: comprehensive.helpers ...............   Passed
+ 4/20 Test # 4: comprehensive.flat ..................   Passed
+ 5/20 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/20 Test # 6: comprehensive.robustness ............   Passed
+ 7/20 Test # 7: comprehensive.deletion ..............   Passed
+ 8/20 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/20 Test # 9: comprehensive.metadata ..............   Passed
+10/20 Test #10: comprehensive.filter ................   Passed
+11/20 Test #11: comprehensive.planner ...............   Passed
+12/20 Test #12: comprehensive.payload ...............   Passed
+13/20 Test #13: comprehensive.batch .................   Passed
+14/20 Test #14: comprehensive.range .................   Passed
+15/20 Test #15: comprehensive.search_e2e ............   Passed
+16/20 Test #16: comprehensive.update ................   Passed
+17/20 Test #17: comprehensive.hardening .............   Passed
+18/20 Test #18: comprehensive.persistence ...........   Passed
+19/20 Test #19: comprehensive.stress ................   Passed
+20/20 Test #20: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 20
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -183,6 +185,11 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 24. **A huge `M` attempted a huge allocation.** `M` is now limited to 2048.
 25. **Filters listing thousands of tags were slow** (136 ms over 20,000 vectors). Tags are now sorted and binary-searched (4.7 ms).
 
+**Found while building saving and loading:**
+
+26. **A save could write a damaged file without reporting an error when memory ran out.** C++ streams catch an allocation failure inside their buffer and only set an error flag; the random generator's state, written through a string stream, could be silently cut short. Saving and loading now switch every stream they use to rethrow such errors (`StreamErrorsThrow`). Found by the out-of-memory sweep of saving.
+27. **Saved HNSW indexes were not portable between standard libraries.** The random generator's state was written through C++ streams, whose text form of `std::mt19937_64` differs between libstdc++ (Linux, MinGW) and libc++ (macOS): a file saved on one could not be loaded on the other. The golden files caught it on the macOS CI job before release. Random levels now come from SplitMix64, whose whole state is one 64-bit number saved as plain bytes; the fix was verified by building and testing against libc++. The same CI run showed that libc++ reports running out of memory inside a file stream as `std::ios_base::failure` rather than `std::bad_alloc`; the save still left the old file intact, and the test now accepts either.
+
 ## Continuous integration
 
 Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
@@ -195,7 +202,7 @@ Every change is built and tested automatically by GitHub Actions ([`.github/work
 
 It does not run on pushes to a branch without a pull request; that would run everything twice once a pull request exists. To get feedback early, open a **draft pull request** as soon as the branch is created. A newer run for the same branch cancels an older one that is still running.
 
-**What it runs (8 jobs in parallel):**
+**What it runs (14 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
@@ -205,9 +212,27 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Windows / MSVC | Release | Full test suite with Microsoft's compiler, including the MSVC-specific CPU detection |
 | Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
+| Linux ARM64 / GCC (NEON) | Release | Full suite on ARM with GCC and libstdc++ (macOS covers ARM only with Apple's compiler and libc++) |
+| Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
+| Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
+| Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers and deletion groups |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.
 
 **Protecting `master`.** To make passing CI a requirement for merging: on GitHub, open **Settings → Branches → Add branch protection rule** for `master`, enable **Require status checks to pass before merging**, and select the CI jobs. Together with **Require a pull request before merging**, nothing reaches `master` without passing every platform.
+
+### Nightly run
+
+A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every night at 02:00 UTC on `master`, and on demand from the Actions tab (**Nightly**, then **Run workflow**). It runs what pull requests skip to stay fast:
+
+| Job | What it adds to the pull-request checks |
+|---|---|
+| Emulated Nehalem and Haswell, full suite | The two exhaustive file-corruption sweeps and the stress group, which pull requests skip under emulation |
+| ASan + UBSan, full suite | The same as on pull requests, but checking `master` itself every night |
+| ThreadSanitizer, full suite | Every test group, where pull requests check only the threaded groups |
+
+**The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
+
+GitHub pauses scheduled workflows on public repositories after 60 days without activity (and emails a warning first); any commit restarts them.

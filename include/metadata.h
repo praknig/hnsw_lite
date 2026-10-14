@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -180,6 +181,11 @@ private:
     std::vector<FieldSpec> fields_;
 };
 
+namespace persist {
+class Writer;
+class Reader;
+}  // namespace persist
+
 /**
  * @brief Column storage for metadata, one row per slot (NodeId).
  *
@@ -291,6 +297,13 @@ public:
             else clear_row_counted(c, from);          // GCOVR_EXCL_LINE: defensive, unreachable when to < from
         }
     }
+
+    /// Writes the schema, the dictionary and every row (see persistence.cpp).
+    void save(persist::Writer& w) const;
+
+    /// Reads what save() wrote, for `slots` slots of which `live(slot)` are live.
+    /// Throws FormatError for anything invalid.
+    static MetadataStore load(persist::Reader& r, std::size_t slots, const std::function<bool(NodeId)>& live);
 
     /// Strings in the dictionary that no vector uses any more.
     std::size_t unused_string_count() const { return dead_strings_; }

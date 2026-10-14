@@ -1,0 +1,185 @@
+# Nightly checks for hnsw-lite: the slow, exhaustive runs that pull requests
+# skip to stay fast.
+#
+# Runs every night on master, and manually from the Actions tab ("Run
+# workflow"). Every job writes a summary to the run's page and uploads its full
+# test log. If any job fails, an issue labelled "nightly-failure" is opened, or
+# commented on if one is already open.
+#
+# The time is in UTC. To change it, edit the cron line: "M H * * *" runs at
+# H:M UTC (for example "30 20 * * *" is 20:30 UTC, which is 02:00 in India).
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 02:00 UTC every day
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false  # let a running nightly finish
+
+permissions:
+  contents: read
+
+jobs:
+  # The whole suite on emulated older x86 CPUs, with nothing skipped (pull
+  # requests skip the two file-corruption sweeps and the stress group here).
+  emulated:
+    name: Emulated ${{ matrix.cpu }}, full suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu: [Nehalem, Haswell]  # no AVX (plain C++ kernels); AVX2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: |
+          set -o pipefail
+          qemu-x86_64 -cpu ${{ matrix.cpu }} ./build/test_comprehensive 2>&1 | tee test.log
+
+      - name: Summary
+        if: always()
+        run: bash .github/scripts/summarize_tests.sh test.log "Emulated ${{ matrix.cpu }}, full suite" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-log-emulated-${{ matrix.cpu }}
+          path: test.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Memory errors, leaks and undefined behavior across every test group (pull
+  # requests run this too; nightly it doubles as a check on master itself).
+  address-sanitizer:
+    name: ASan + UBSan, full suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DHNSW_LITE_SANITIZE=ON -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --parallel --target test_comprehensive
+
+      - name: Test
+        run: |
+          set -o pipefail
+          ./build/test_comprehensive 2>&1 | tee test.log
+
+      - name: Summary
+        if: always()
+        run: bash .github/scripts/summarize_tests.sh test.log "ASan + UBSan, full suite" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-log-address-sanitizer
+          path: test.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Data races across every test group (pull requests check only the threaded groups).
+  thread-sanitizer:
+    name: ThreadSanitizer, full suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Allow ThreadSanitizer on this kernel
+        # Newer kernels randomize memory addresses more than TSan supports.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: >
+          cmake -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_FLAGS=-fsanitize=thread
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+          -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --parallel --target test_comprehensive
+
+      - name: Test
+        run: |
+          set -o pipefail
+          ./build/test_comprehensive 2>&1 | tee test.log
+
+      - name: Summary
+        if: always()
+        run: bash .github/scripts/summarize_tests.sh test.log "ThreadSanitizer, full suite" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-log-thread-sanitizer
+          path: test.log
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # The overall report, plus an issue when anything failed.
+  report:
+    name: Nightly report
+    needs: [emulated, address-sanitizer, thread-sanitizer]
+    if: always()
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write  # to open or comment on the nightly-failure issue
+    steps:
+      - name: Results table
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          {
+            echo "## Nightly run, $(date -u +%Y-%m-%d)"
+            echo
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "$RESULTS" | jq -r 'to_entries[] | "| \(.key) | \(.value.result) |"'
+            echo
+            echo "Each job's summary is shown above; full logs are under Artifacts (kept 14 days)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open or update the nightly-failure issue
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "- \(.key): \(.value.result)"')
+          body=$(printf 'The nightly run on %s did not pass:\n\n%s\n\nDetails, summaries and logs: %s\n' "$(date -u +%Y-%m-%d)" "$failed" "$RUN_URL")
+          gh label create nightly-failure --color B60205 --description "The nightly run failed" --force
+          existing=$(gh issue list --label nightly-failure --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "Nightly run failed" --label nightly-failure --body "$body"
+          fi

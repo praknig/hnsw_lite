@@ -211,3 +211,15 @@ Not copyable, movable. Frees its memory in the destructor.
 | `index_distance(raw, cosine)` | `search_result.h` | A distance as indexes report it: cosine clamped at 0, NaN mapped like `ordered_distance()`. `get_distance()` kernels are unchanged |
 | `in_pool_task()` | `thread_pool.h` | True on a thread running a pool task; `parallel_for()` called there runs inline, so nested batches cannot deadlock |
 | `HnswParams::M` | `hnsw_index.h` | Now limited to 2 to 2048 |
+
+## Saving and loading
+
+| Name | Description |
+|---|---|
+| `index.save(path)` | Writes the whole index to `path` (through `<path>.tmp` and a rename, so an existing file is never damaged). Throws `std::runtime_error` if the file cannot be written |
+| `index.save(std::ostream&)` | Writes to a stream |
+| `HnswIndex::load(path)`, `FlatIndex::load(path)` | Return a `std::unique_ptr` to the loaded index. Throw `FormatError` for a damaged, truncated, unsupported or wrong-kind file, and `std::runtime_error` if the file cannot be opened |
+| `HnswIndex::load(std::istream&)`, `FlatIndex::load(std::istream&)` | The same from a seekable stream |
+| `FormatError` (`serialize.h`) | Derived from `std::runtime_error` |
+| `MetadataStore::save(w)`, `MetadataStore::load(r, slots, live)` | Used by the indexes to save and load metadata |
+| `persist::Writer`, `persist::Reader`, `persist::crc32`, `persist::StreamErrorsThrow` (`serialize.h`) | The format's building blocks; see [Architecture and design](architecture.md#saving-and-loading) |

@@ -42,6 +42,24 @@ jobs:
           - name: Windows / MSVC
             os: windows-2022
             cxx: ""  # use the default Visual Studio generator and compiler
+          # ARM with GCC and libstdc++ (macOS covers ARM only with Apple's compiler and libc++).
+          - name: Linux ARM64 / GCC (NEON)
+            os: ubuntu-24.04-arm
+            cxx: g++
+          # libc++ (macOS's standard library) on Linux: catches library differences
+          # quickly, such as the saved-file portability bug found in this way.
+          - name: Linux / Clang + libc++
+            os: ubuntu-24.04
+            cxx: clang++
+            packages: libc++-dev libc++abi-dev
+            cmake_args: '"-DCMAKE_CXX_FLAGS=-stdlib=libc++" "-DCMAKE_EXE_LINKER_FLAGS=-stdlib=libc++ -lc++abi"'
+          # The oldest compilers the README promises to support.
+          - name: Linux / GCC 11 (oldest supported)
+            os: ubuntu-22.04
+            cxx: g++-11
+          - name: Linux / Clang 14 (oldest supported)
+            os: ubuntu-22.04
+            cxx: clang++-14
     env:
       CXX: ${{ matrix.cxx }}
     steps:
@@ -53,8 +71,13 @@ jobs:
           echo "Runner: $RUNNER_OS $(uname -m)"
           if [ -n "$CXX" ]; then $CXX --version; fi
 
+      - name: Install packages
+        if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.cmake_args }}
 
       - name: Build
         run: cmake --build build --config Release --parallel
@@ -67,6 +90,38 @@ jobs:
         run: |
           ./build/bench_distance
           ./build/bench_search
+
+  # Older x86 CPUs, emulated with QEMU. GitHub's machines all support AVX2 or
+  # better, so without this the plain C++ distance code never runs in CI. The
+  # build uses runtime dispatch (no -march), so the same binary runs on both.
+  emulated-cpus:
+    name: Linux / emulated ${{ matrix.cpu }} (${{ matrix.kernel }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: Nehalem  # no AVX at all
+            kernel: plain C++ kernels
+          - cpu: Haswell  # AVX2 without AVX-512
+            kernel: AVX2 kernels
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      # Emulation is slow, so the two exhaustive file-corruption sweeps and the
+      # long-running stress group are left to the native jobs.
+      - name: Test on the emulated CPU
+        run: qemu-x86_64 -cpu ${{ matrix.cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_ --exclude stress.
 
   # The toolchain used for local development on Windows (MinGW-w64 GCC).
   windows-mingw:
