@@ -412,7 +412,8 @@ Results tie_sorted(Results r) {
     return r;
 }
 
-/// Exact reference search: every distance (same kernel), sorted, first k.
+/// Exact reference search: every distance (same kernel, reported as the indexes
+/// report it: cosine clamped at 0), sorted, first k.
 /// User IDs are `id_offset + position in data`.
 Results reference_search(const Vectors& data, const std::vector<bool>& removed,
                          const std::vector<float>& query, Metric m, std::size_t k,
@@ -425,7 +426,7 @@ Results reference_search(const Vectors& data, const std::vector<bool>& removed,
     for (NodeId i = 0; i < data.size(); ++i) {
         if (removed[i]) continue;
         row.prepare(data[i], m);
-        all.push_back({fn(q.data(), row.data(), q.stride()), i});
+        all.push_back({index_distance(fn(q.data(), row.data(), q.stride()), m == Metric::Cosine), i});  // as the index reports it
     }
     std::sort(all.begin(), all.end());
     Results out;
@@ -2666,7 +2667,7 @@ Results brute_force(const std::map<std::uint64_t, std::vector<float>>& live,
     Results all;
     for (const auto& [id, v] : live) {
         row.prepare(v, m);
-        all.push_back({id, fn(q.data(), row.data(), q.stride())});
+        all.push_back({id, index_distance(fn(q.data(), row.data(), q.stride()), m == Metric::Cosine)});  // as the index reports it
     }
     all = tie_sorted(all);
     if (all.size() > k) all.resize(k);

@@ -1,2 +1,2 @@
 # Golden files for the saved-format tests: never convert line endings.
-*.bin binary
+*.bin binary*.sh text eol=lf

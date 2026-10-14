@@ -222,3 +222,17 @@ It does not run on pushes to a branch without a pull request; that would run eve
 Each job fails on its own, so one broken platform never hides the results of the others.
 
 **Protecting `master`.** To make passing CI a requirement for merging: on GitHub, open **Settings → Branches → Add branch protection rule** for `master`, enable **Require status checks to pass before merging**, and select the CI jobs. Together with **Require a pull request before merging**, nothing reaches `master` without passing every platform.
+
+### Nightly run
+
+A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every night at 02:00 UTC on `master`, and on demand from the Actions tab (**Nightly**, then **Run workflow**). It runs what pull requests skip to stay fast:
+
+| Job | What it adds to the pull-request checks |
+|---|---|
+| Emulated Nehalem and Haswell, full suite | The two exhaustive file-corruption sweeps and the stress group, which pull requests skip under emulation |
+| ASan + UBSan, full suite | The same as on pull requests, but checking `master` itself every night |
+| ThreadSanitizer, full suite | Every test group, where pull requests check only the threaded groups |
+
+**The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
+
+GitHub pauses scheduled workflows on public repositories after 60 days without activity (and emails a warning first); any commit restarts them.
