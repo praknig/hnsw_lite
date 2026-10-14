@@ -90,7 +90,7 @@ public:
     /// Keeps exact value counts for a keyword, boolean or tag-set field (used by
     /// filtered searches' statistics). Throws std::invalid_argument otherwise.
     void create_payload_index(std::string_view field) {
-        searches_.check_no_search("create_payload_index");
+        const auto guard = lock_.write("create_payload_index");
         metadata_.index_field(field);
     }
 
@@ -120,14 +120,16 @@ public:
     /// Swap-with-last never leaves holes in the vectors, so this only reclaims
     /// metadata strings no vector uses any more. Reports 0 vectors reclaimed.
     CompactStats compact() {
-        searches_.check_no_search("compact");
+        const auto guard = lock_.write("compact");
         metadata_.compact_dictionary();
         return {live_, 0};
     }
 
     /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
-    /// written to "<path>.tmp" first and then renamed into place, so a failure
-    /// never damages an existing file at `path`. Searches may run during a save;
+    /// written to a temporary file next to it ("<path>.tmp-" and a unique
+    /// suffix) and then renamed into place, so a failure never damages an
+    /// existing file at `path`, and saves to one path at the same time each
+    /// produce a complete file (the last one wins). Searches may run during a save;
     /// changes attempted during one throw std::logic_error. Throws
     /// std::runtime_error if the file cannot be written.
     void save(const std::string& path) const;
@@ -144,16 +146,23 @@ public:
     /// Loads from a stream, which must be seekable (files and string streams are).
     static std::unique_ptr<FlatIndex> load(std::istream& in);
 
-    std::size_t size() const { return live_; }
+    std::size_t size() const {
+        const auto guard = lock_.read();
+        return live_;
+    }
     std::size_t deleted_count() const { return 0; }
-    std::size_t capacity() const { return vectors_.size(); }
+    std::size_t capacity() const {
+        const auto guard = lock_.read();
+        return vectors_.size();
+    }
     std::size_t dim() const { return vectors_.dim(); }
     Metric metric() const { return metric_; }
     const MetadataStore& metadata() const { return metadata_; }
 
 private:
     /// update() and upsert(): `metadata` null keeps the old metadata.
-    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
 
     /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;
@@ -170,7 +179,7 @@ private:
     PreparedVector scratch_;  // reused by add(); searches use their own copy
     std::size_t live_ = 0;
     mutable SharedPool pool_;
-    SearchCounter searches_;  // refuses changes made during a search
+    IndexLock lock_;  // reads share it, changes take it alone (see IndexLock)
 };
 
 }  // namespace vecdb

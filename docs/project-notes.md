@@ -12,7 +12,8 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 
 These are deliberate for the current stage:
 
-- **One writer at a time.** `add` and `remove` must not run alongside anything else. Concurrent searches are safe when no writer is active. Concurrent inserts will need per-node locks and an atomic arena.
+- **Changes run one at a time.** Indexes are thread-safe, but adds, updates and removes take the lock alone, so building is single-threaded. Parallel inserts will need per-node locks and an atomic arena (stage B).
+- **Many exact copies of the same vector weaken the graph,** especially combined with heavy removal and update churn: graph reachability drops noticeably (hnswlib shares this limitation).
 - **HNSW build speed.** Building is single-threaded, and every access is bounds-checked for safety. Parallel construction and unchecked accessors in the hot loops are future optimizations.
 - **Saving cannot force data onto the physical disk:** a save is atomic (temporary file, then rename), but a power cut right after `save` returns could lose that latest save. Loading is not memory-mapped, so a large index is read fully into memory.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
@@ -40,12 +41,13 @@ These are deliberate for the current stage:
 - [x] Real deletion: reusable IDs, slot reuse, graph repair, `compact()`
 - [x] Updating vectors: `update` and `upsert`
 - [x] Saving and loading indexes
-- [ ] Concurrent inserts, including parallel HNSW construction (`add_batch`)
+- [x] Thread-safe indexes: one lock per index (stage A)
+- [ ] Parallel inserts, including parallel HNSW construction (`add_batch`, stage B)
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe
 
-The core capabilities (real deletion, now done, then updating vectors, saving and loading, and concurrent inserts) are planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
+The core capabilities (real deletion, updating vectors, saving and loading, and thread safety, all done; parallel inserts remain) are planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 
 ## Comparison with existing implementations
 

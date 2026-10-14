@@ -18,9 +18,14 @@
  * been saved. Payload-index counts and string reference counts are recomputed
  * on load rather than trusted from the file.
  */
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 #include "flat_index.h"
 #include "hnsw_index.h"
@@ -43,11 +48,30 @@ constexpr std::uint32_t kEnd = persist::tag("END ");
 /// Largest dimension accepted from a file (16 million floats per vector).
 constexpr std::uint64_t kMaxDim = std::uint64_t(1) << 24;
 
-/// Writes to "<path>.tmp", then renames it over `path`; removes the temporary
-/// file if anything fails, so an existing file at `path` is never damaged.
+/// A temporary file name next to `path`, unique to this save, so several saves
+/// to the same path at once (from threads or processes) never write into one
+/// temporary file: "<path>.tmp-<counter>-<mix>". The counter makes names unique
+/// within this program; the mix of thread, time and a memory address separates
+/// programs.
+std::string temporary_path(const std::string& path) {
+    static std::atomic<std::uint64_t> counter{0};
+    const std::uint64_t n = counter.fetch_add(1);
+    std::uint64_t mix = std::uint64_t(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    mix ^= std::uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()) * 0x9E3779B97F4A7C15ull;
+    mix ^= std::uint64_t(reinterpret_cast<std::uintptr_t>(&counter)) << 7;
+    char suffix[48];
+    std::snprintf(suffix, sizeof suffix, ".tmp-%llx-%016llx", static_cast<unsigned long long>(n),
+                  static_cast<unsigned long long>(mix));
+    return path + suffix;
+}
+
+/// Writes to a temporary file, then renames it over `path`; removes the
+/// temporary file if anything fails, so an existing file at `path` is never
+/// damaged. Saves to the same path at the same time each write their own
+/// temporary file, and the last rename wins: the result is always one complete file.
 template <class Write>
 void save_to_file(const std::string& path, Write&& write) {
-    const std::string tmp = path + ".tmp";
+    const std::string tmp = temporary_path(path);
     try {
         {
             std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
@@ -239,7 +263,7 @@ void FlatIndex::save(const std::string& path) const {
 }
 
 void FlatIndex::save(std::ostream& out) const {
-    const auto running = searches_.enter();  // a save reads: changes are refused meanwhile
+    const auto guard = lock_.read();  // a save reads: searches continue, changes wait
     const persist::StreamErrorsThrow errors(out);
     persist::write_header(out, IndexKind::Flat);
     persist::write_section(out, kConf, [&](Writer& w) {
@@ -303,7 +327,7 @@ void HnswIndex::save(const std::string& path) const {
 }
 
 void HnswIndex::save(std::ostream& out) const {
-    const auto running = searches_.enter();  // a save reads: changes are refused meanwhile
+    const auto guard = lock_.read();  // a save reads: searches continue, changes wait
     const persist::StreamErrorsThrow errors(out);
     const IdMap& ids = storage_.ids();
     const GraphStorage& graph = storage_.graph();

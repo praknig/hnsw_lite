@@ -163,6 +163,8 @@ This is the largest and riskiest item, so it is split into two stages.
 
 A shared mutex: searches take it in shared mode, so many run at once; adds, removes, updates, saves and compaction take it exclusively. Writes still happen one at a time, but searches and writes can be mixed freely from any number of threads. Internal operations call unlocked versions of each other (for example, `update` calls the unlocked remove and add) so the lock is never taken twice.
 
+**As built:** a writer-preferring lock of its own (`IndexLock`), because glibc's `std::shared_mutex` prefers readers and could starve writers; saves take it shared, not exclusively; and two rules keep predicates that search indexes deadlock-free: no change from inside any index operation, and nested reads skip the writer queue. See [Thread safety](architecture.md#thread-safety).
+
 ### Stage B: fine-grained locking (parallel inserts)
 
 Following hnswlib:

@@ -115,7 +115,7 @@ A second review of the plans and limitations found these:
 | N6 | Each concurrent search holds a visited list sized to the index: 64 threads at 1 million vectors use about 256 MB | Edge case | Next hardening pass |
 | N7 | Alternating thread counts in `search_batch` recreate the thread pool each time | Edge case | Next hardening pass |
 | N8 | Saving needs offsets instead of the arena's raw pointers; plan for versions, corrupted files and safe writes | Edge case | 5 |
-| N9 | Two writers at the same time are not detected (only writes during searches are) | Edge case | 3 |
+| N9 | Two writers at the same time are not detected (only writes during searches are) | Edge case | **Done** in phase 3: changes are serialized by the index lock |
 | N10 | 32-bit platforms are untested and probably unsupported: document or reject at build time | Edge case | Next hardening pass |
 
 ## Part 3: Order of work
@@ -180,7 +180,7 @@ Decisions applied: **D1** (levels identical on every platform; a fixed-answer te
 | 0. Measure | **Baseline done here** on generated data (see [Performance and tuning](performance.md#baseline-for-performance-work-phase-0)); real datasets still to run on a quiet machine |
 | 1. Harden | **Done** (see Phase 1 results) |
 | 2. Quick wins | Not started |
-| 3. Concurrency stage A | Not started |
+| 3. Concurrency stage A (one lock) | **Done** (see [Thread safety](architecture.md#thread-safety)) |
 | 4. Layout decision | Not started |
 | 5. Persistence | **Done** (file format version 1; see [Architecture and design](architecture.md#saving-and-loading)) |
 | 6. Parallel build | Not started |

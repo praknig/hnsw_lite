@@ -200,17 +200,21 @@ public:
     /// Keeps exact value counts for a keyword, boolean or tag-set field, so the
     /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
     void create_payload_index(std::string_view field) {
-        searches_.check_no_search("create_payload_index");
+        const auto guard = lock_.write("create_payload_index");
         metadata_.index_field(field);
     }
 
     /// The index's planner settings (per-query settings in SearchOptions override them).
     void set_planner_params(const PlannerParams& p) {
-        searches_.check_no_search("set_planner_params");
+        const auto guard = lock_.write("set_planner_params");
         validate(p);
         planner_ = p;
     }
-    const PlannerParams& planner_params() const { return planner_; }
+    /// A copy, so it is safe to call while other threads change the settings.
+    PlannerParams planner_params() const {
+        const auto guard = lock_.read();
+        return planner_;
+    }
     const MetadataStore& metadata() const { return metadata_; }
     /// Visited lists kept for reuse by searches (released by compact()).
     std::size_t pooled_visited_lists() const { return visited_pool_.idle_count(); }
@@ -223,8 +227,10 @@ public:
 
     /// Number of live vectors.
     /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
-    /// written to "<path>.tmp" first and then renamed into place, so a failure
-    /// never damages an existing file at `path`. Searches may run during a save;
+    /// written to a temporary file next to it ("<path>.tmp-" and a unique
+    /// suffix) and then renamed into place, so a failure never damages an
+    /// existing file at `path`, and saves to one path at the same time each
+    /// produce a complete file (the last one wins). Searches may run during a save;
     /// changes attempted during one throw std::logic_error. Throws
     /// std::runtime_error if the file cannot be written.
     void save(const std::string& path) const;
@@ -241,20 +247,35 @@ public:
     /// Loads from a stream, which must be seekable (files and string streams are).
     static std::unique_ptr<HnswIndex> load(std::istream& in);
 
-    std::size_t size() const { return live_; }
+    std::size_t size() const {
+        const auto guard = lock_.read();
+        return live_;
+    }
     /// Slots of removed vectors still occupying memory (waiting to be reused).
-    std::size_t deleted_count() const { return storage_.size() - live_; }
+    std::size_t deleted_count() const {
+        const auto guard = lock_.read();
+        return storage_.size() - live_;
+    }
     /// All slots, live or removed.
-    std::size_t capacity() const { return storage_.size(); }
+    std::size_t capacity() const {
+        const auto guard = lock_.read();
+        return storage_.size();
+    }
 
     std::size_t dim() const { return storage_.vectors().dim(); }
     Metric metric() const { return metric_; }
     const HnswParams& params() const { return params_; }
 
     /// Highest level of a live node, or -1 when the index has no live vectors.
-    int max_level() const { return max_level_; }
+    int max_level() const {
+        const auto guard = lock_.read();
+        return max_level_;
+    }
     /// Node where every search starts, or kEmpty when there are no live vectors.
-    NodeId entry_point() const { return entry_; }
+    NodeId entry_point() const {
+        const auto guard = lock_.read();
+        return entry_;
+    }
     /// Read-only access to the underlying storage (used by tests to check the graph).
     const Storage& storage() const { return storage_; }
 
@@ -310,7 +331,8 @@ private:
     void link_new_node(NodeId node, int level, NodeId ignore = kEmpty);
 
     /// update() and upsert(): `metadata` null keeps the old metadata.
-    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.
@@ -340,7 +362,7 @@ private:
     PlannerParams planner_;
     mutable VisitedListPool visited_pool_;
     mutable SharedPool pool_;
-    SearchCounter searches_;  // refuses changes made during a search
+    IndexLock lock_;  // reads share it, changes take it alone (see IndexLock)
 };
 
 }  // namespace vecdb

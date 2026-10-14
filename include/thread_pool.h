@@ -12,6 +12,8 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <string>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -179,6 +181,169 @@ public:
 private:
     std::mutex mutex_;
     std::shared_ptr<ThreadPool> pool_;
+};
+
+
+/**
+ * @brief The lock inside every index: any number of reads (searches, saves,
+ *        lookups) at once, or one change at a time.
+ *
+ * **Writers are preferred:** while a change waits, new reads wait too, so a
+ * steady stream of searches can never starve a change. (std::shared_mutex is
+ * not used because with glibc it prefers readers, and a change could then wait
+ * forever.)
+ *
+ * **Nesting:** each thread records which indexes it is inside. Two rules make
+ * deadlocks impossible, even with predicates that search other indexes:
+ *  - **No change from inside any index operation.** A change requested while
+ *    the thread is inside an operation on any index (a predicate that adds, to
+ *    its own index or another) throws std::logic_error. Changes nested in reads
+ *    are what create lock cycles between threads.
+ *  - **Nested reads skip the writer queue.** A read requested from inside an
+ *    index operation waits only for a change that is actually running, never
+ *    for queued ones. A running change never waits for anything (rule 1), so the
+ *    nested read always proceeds. Top-level reads still queue behind waiting
+ *    changes, so changes cannot be starved.
+ * A read nested in an operation on the same index does not lock again at all.
+ * Batch tasks on pool threads inherit their caller's read with Hold.
+ */
+class IndexLock {
+public:
+    /// Reads the index: shared with other reads; free if this thread is already inside it.
+    class ReadGuard {
+    public:
+        explicit ReadGuard(const IndexLock& lock) : lock_(lock), nested_(lock.held()) {
+            if (nested_) return;
+            lock_.lock_shared(inside_any());
+            try {
+                lock_.push();
+            } catch (...) {
+                lock_.unlock_shared();
+                throw;
+            }
+        }
+        ~ReadGuard() {
+            if (nested_) return;
+            lock_.pop();
+            lock_.unlock_shared();
+        }
+        ReadGuard(const ReadGuard&) = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
+
+    private:
+        const IndexLock& lock_;
+        bool nested_;
+    };
+
+    /// Changes the index: exclusive. Throws std::logic_error if this thread is
+    /// inside an operation on any index.
+    class WriteGuard {
+    public:
+        WriteGuard(const IndexLock& lock, const char* operation) : lock_(lock) {
+            if (inside_any())
+                throw std::logic_error(std::string("vecdb: ") + operation +
+                                       " called from inside an index operation (for example a filter predicate); "
+                                       "change indexes only outside searches");
+            lock_.lock();
+            try {
+                lock_.push();
+                // GCOVR_EXCL_START: unreachable, a change starts only when this thread is inside no index (nothing to overflow)
+            } catch (...) {
+                lock_.unlock();
+                throw;
+            }
+            // GCOVR_EXCL_STOP
+        }
+        ~WriteGuard() {
+            lock_.pop();
+            lock_.unlock();
+        }
+        WriteGuard(const WriteGuard&) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
+
+    private:
+        const IndexLock& lock_;
+    };
+
+    /// Marks this thread as inside the index without locking, for work done on
+    /// behalf of a caller that already holds a read (batch tasks on pool threads).
+    class Hold {
+    public:
+        explicit Hold(const IndexLock& lock) : lock_(lock) { lock_.push(); }
+        ~Hold() { lock_.pop(); }
+        Hold(const Hold&) = delete;
+        Hold& operator=(const Hold&) = delete;
+
+    private:
+        const IndexLock& lock_;
+    };
+
+    ReadGuard read() const { return ReadGuard(*this); }
+    WriteGuard write(const char* operation) const { return WriteGuard(*this, operation); }
+
+    /// Whether this thread is inside an operation on this index.
+    bool held() const {
+        const Held& h = held_by_this_thread();
+        return std::find(h.items, h.items + h.count, this) != h.items + h.count;
+    }
+
+    /// Whether this thread is inside an operation on any index.
+    static bool inside_any() { return held_by_this_thread().count > 0; }
+
+    /// Maximum nesting of index operations within one thread (across all indexes).
+    static constexpr std::size_t kMaxNesting = 64;
+
+private:
+    struct Held {
+        const IndexLock* items[kMaxNesting];
+        std::size_t count = 0;
+    };
+    static Held& held_by_this_thread() {
+        thread_local Held h;
+        return h;
+    }
+    void push() const {
+        Held& h = held_by_this_thread();
+        if (h.count == kMaxNesting) throw std::logic_error("vecdb: index operations nested too deeply");
+        h.items[h.count++] = this;
+    }
+    void pop() const {  // removes the most recent entry for this lock
+        Held& h = held_by_this_thread();
+        for (std::size_t i = h.count; i-- > 0;)  // GCOVR_EXCL_BR_LINE: always found, every pop follows its push
+            if (h.items[i] == this) {
+                std::copy(h.items + i + 1, h.items + h.count, h.items + i);
+                --h.count;
+                return;
+            }
+    }
+
+    void lock_shared(bool nested) const {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return !writer_ && (nested || waiting_writers_ == 0); });
+        ++readers_;
+    }
+    void unlock_shared() const {
+        std::lock_guard<std::mutex> l(m_);
+        if (--readers_ == 0) cv_.notify_all();
+    }
+    void lock() const {
+        std::unique_lock<std::mutex> l(m_);
+        ++waiting_writers_;
+        cv_.wait(l, [&] { return !writer_ && readers_ == 0; });
+        --waiting_writers_;
+        writer_ = true;
+    }
+    void unlock() const {
+        std::lock_guard<std::mutex> l(m_);
+        writer_ = false;
+        cv_.notify_all();
+    }
+
+    mutable std::mutex m_;
+    mutable std::condition_variable cv_;
+    mutable std::size_t readers_ = 0;
+    mutable std::size_t waiting_writers_ = 0;
+    mutable bool writer_ = false;
 };
 
 }  // namespace vecdb

@@ -13,7 +13,11 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema)
     : metric_(metric), distance_(get_distance(metric)), vectors_(dim), metadata_(std::move(schema)), scratch_(dim) {}
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
-    searches_.check_no_search("add");
+    const auto guard = lock_.write("add");
+    add_unlocked(id, vector, metadata);
+}
+
+void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything.
     scratch_.prepare(vector, metric_);
     metadata_.validate(metadata);
@@ -39,7 +43,7 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 }
 
 bool FlatIndex::remove(std::uint64_t id) {
-    searches_.check_no_search("remove");
+    const auto guard = lock_.write("remove");
     const auto node = ids_.find(id);
     if (!node) return false;
     // Swap-with-last: move the last vector (and its metadata) into the freed slot,
@@ -59,26 +63,31 @@ bool FlatIndex::remove(std::uint64_t id) {
     return true;
 }
 
-bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) { return replace(id, vector, nullptr); }
+bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("update");
+    return replace(id, vector, nullptr);
+}
 
 bool FlatIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("update");
     return replace(id, vector, &metadata);
 }
 
 bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, nullptr)) return false;
-    add(id, vector);
+    add_unlocked(id, vector, {});
     return true;
 }
 
 bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, &metadata)) return false;
-    add(id, vector, metadata);
+    add_unlocked(id, vector, metadata);
     return true;
 }
 
 bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
-    searches_.check_no_search("update");
     scratch_.prepare(vector, metric_);  // validates; may throw before any change
     if (metadata) metadata_.validate(*metadata);
     const auto node = ids_.find(id);
@@ -88,10 +97,13 @@ bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     return true;
 }
 
-bool FlatIndex::contains(std::uint64_t id) const { return ids_.find(id).has_value(); }
+bool FlatIndex::contains(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    return ids_.find(id).has_value();
+}
 
 bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
-    searches_.check_no_search("set_metadata");
+    const auto guard = lock_.write("set_metadata");
     const auto node = ids_.find(id);
     if (!node) return false;
     metadata_.update(*node, metadata);
@@ -99,6 +111,7 @@ bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
 }
 
 std::optional<Metadata> FlatIndex::get_metadata(std::uint64_t id) const {
+    const auto guard = lock_.read();
     const auto node = ids_.find(id);
     if (!node) return std::nullopt;
     return metadata_.read(*node);
@@ -144,7 +157,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k,
                                             const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -155,7 +168,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const float> queries, std::size_t k,
                                                                std::size_t threads,
                                                                const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -170,6 +183,7 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
     const std::size_t chunks = (nq + kQueryChunk - 1) / kQueryChunk;
     const std::size_t count = vectors_.size(), stride = vectors_.stride();
     auto run_chunk = [&](std::size_t chunk) {
+        const IndexLock::Hold inside(lock_);  // pool threads work under the caller's read
         const std::size_t q0 = chunk * kQueryChunk, q1 = std::min(nq, q0 + kQueryChunk);
         std::vector<PreparedVector> prepared;
         prepared.reserve(q1 - q0);
@@ -204,7 +218,7 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
 
 std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");

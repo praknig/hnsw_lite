@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 499 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 519 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -148,7 +148,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 ## Things to know
 
 - **Distances are "smaller is closer"** for every metric: L2 returns the *squared* distance, inner product returns the *negative* dot product, and cosine returns 1 minus the cosine similarity.
-- **Thread safety:** any number of searches may run at once, but changes (`add`, `update`, `remove`, `set_metadata`, `compact`) must not overlap with anything else; a change attempted during a search throws `std::logic_error`. Protect writes with your own lock for now.
+- **Thread safety:** every index can be used from any number of threads with no lock of your own. Searches and saves run in parallel; changes run one at a time and wait for running searches. Changes cannot be made from inside a search (for example from a filter predicate): that throws `std::logic_error`.
 - **Errors:** invalid input (wrong dimension, NaN, a duplicate ID, a metadata type mismatch) throws `std::invalid_argument` and leaves the index unchanged.
 - **Saving:** `index.save(path)` writes everything, and `HnswIndex::load(path)` returns the index exactly as it was; a damaged file throws `vecdb::FormatError`.
 
@@ -161,13 +161,13 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 499 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 519 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | The next phases of work: open edge cases, planned optimizations, and their order |
 
 ## Project status
 
-Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, and saving and loading. Next: safe concurrent inserts. See the [roadmap](docs/project-notes.md#roadmap).
+Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, saving and loading, and thread-safe indexes. Next: parallel inserts (`add_batch`). See the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

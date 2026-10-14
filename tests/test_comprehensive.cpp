@@ -40,6 +40,8 @@
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
+#include <condition_variable>
 #include <streambuf>
 #include <sstream>
 #include <iterator>
@@ -6580,6 +6582,19 @@ std::string temp_path(const std::string& name) {
     return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + name + ".bin")).string();
 }
 
+/// Temporary files a save left next to `path` ("<path>.tmp-..."): must be none.
+std::size_t temporaries_left(const std::string& path) {
+    const std::filesystem::path p(path);
+    const std::filesystem::path dir = p.parent_path();
+    std::error_code ec;
+    if (!std::filesystem::is_directory(dir, ec)) return 0;
+    const std::string prefix = p.filename().string() + ".tmp";
+    std::size_t n = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
+        if (entry.path().filename().string().rfind(prefix, 0) == 0) ++n;
+    return n;
+}
+
 std::string read_file(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -6873,7 +6888,7 @@ TEST(persistence, p13_overwrite_leaves_no_temporary_file) {
     auto h = golden_hnsw();
     h->save(path);
     CHECK(read_file(path) == save_bytes(*h));
-    CHECK(!std::filesystem::exists(path + ".tmp"));
+    CHECK(temporaries_left(path) == 0);
     CHECK(HnswIndex::load(path)->size() == h->size());
     std::filesystem::remove(path);
 }
@@ -7005,7 +7020,7 @@ TEST(persistence, p28_unusable_paths) {
     CHECK_THROWS_AS(std::runtime_error, h->save(missing_dir));
     CHECK_THROWS_AS(std::runtime_error, HnswIndex::load(missing_dir));
     CHECK_THROWS_AS(std::runtime_error, FlatIndex::load(missing_dir));
-    CHECK(!std::filesystem::exists(missing_dir + ".tmp"));
+    CHECK(temporaries_left(missing_dir) == 0);
 }
 
 TEST(persistence, p29_oom_load) {
@@ -7045,7 +7060,7 @@ TEST(persistence, p30_oom_save_keeps_the_old_file) {
         alloc_hook::disarm();
         if (failed) {
             ++points;
-            clean = clean && read_file(path) == old_bytes && !std::filesystem::exists(path + ".tmp");
+            clean = clean && read_file(path) == old_bytes && temporaries_left(path) == 0;
         } else {
             completed = !alloc_hook::fired;  // a failure that did not surface would be a bug
             clean = clean && completed;
@@ -7304,6 +7319,782 @@ TEST(persistence, p56_writing_to_a_failing_stream) {
     CHECK_THROWS_AS(std::runtime_error, golden_hnsw()->save(out));
     CHECK_THROWS_AS(std::runtime_error, golden_flat()->save(out));
 }
+
+// ===========================================================================
+// Concurrency stage A: one lock per index (C1-C10 from the test plan, C11-C19 beyond it)
+// ===========================================================================
+
+namespace {
+
+/// Runs `fn` on its own thread. If it has not finished within `seconds`, the test
+/// program reports a deadlock and exits, so CI fails instead of hanging.
+template <class Fn>
+void with_watchdog(double seconds, const char* what, Fn&& fn) {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    std::exception_ptr error;
+    std::thread worker([&] {
+        try {
+            fn();
+        } catch (...) {
+            error = std::current_exception();
+        }
+        std::lock_guard<std::mutex> l(m);
+        done = true;
+        cv.notify_all();
+    });
+    {
+        std::unique_lock<std::mutex> l(m);
+        if (!cv.wait_for(l, std::chrono::duration<double>(seconds), [&] { return done; })) {
+            std::fprintf(stderr, "\nDEADLOCK: %s did not finish within %.0f seconds\n", what, seconds);
+            std::fflush(stderr);
+            std::_Exit(3);
+        }
+    }
+    worker.join();
+    if (error) std::rethrow_exception(error);
+}
+
+/// Problems found by worker threads; checked by the main thread afterwards.
+struct Problems {
+    std::atomic<long> unsorted{0}, duplicate{0}, not_finite{0}, unknown_id{0}, unexpected_exception{0};
+    long total() const {
+        return unsorted.load() + duplicate.load() + not_finite.load() + unknown_id.load() + unexpected_exception.load();
+    }
+};
+
+/// Checks one result list: sorted, no repeated ID, finite distances, IDs below `id_limit`.
+void check_results(const std::vector<SearchResult>& r, std::uint64_t id_limit, Problems& p) {
+    std::set<std::uint64_t> seen;
+    for (std::size_t i = 0; i < r.size(); ++i) {
+        if (i > 0 && r[i].distance < r[i - 1].distance) ++p.unsorted;
+        if (!seen.insert(r[i].id).second) ++p.duplicate;
+        if (!std::isfinite(r[i].distance)) ++p.not_finite;
+        if (r[i].id >= id_limit) ++p.unknown_id;
+    }
+}
+
+/// Starts `n` threads running fn(thread_index) and joins them.
+template <class Fn>
+void run_threads(std::size_t n, Fn&& fn) {
+    std::vector<std::thread> threads;
+    for (std::size_t t = 0; t < n; ++t) threads.emplace_back([&, t] { fn(t); });
+    for (auto& th : threads) th.join();
+}
+
+}  // namespace
+
+TEST(concurrency, c01_searches_while_one_thread_adds) {
+    auto data = clustered(1500, 8, 6, 600);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 500; ++i) h.add(i, data[i]);
+    std::atomic<std::uint64_t> added{500};
+    std::atomic<bool> stop{false};
+    Problems p;
+    std::atomic<long> searches{0};
+    with_watchdog(120, "c01", [&] {
+        std::thread writer([&] {
+            for (std::size_t i = 500; i < 1500; ++i) {
+                h.add(i, data[i]);
+                added.store(i + 1);
+            }
+            stop = true;
+        });
+        run_threads(4, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                try {
+                    const auto r = h.search(data[q++ % 1500], 10, 32);
+                    check_results(r, added.load() + 1, p);  // read the limit after searching
+                    ++searches;
+                } catch (...) {
+                    ++p.unexpected_exception;
+                }
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && searches > 0);
+    CHECK(h.size() == 1500);
+    check_graph(h, 0.99);
+}
+
+TEST(concurrency, c02_several_writers_different_ranges) {
+    auto data = clustered(1200, 8, 6, 601);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    with_watchdog(120, "c02", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (std::size_t i = t * 300; i < (t + 1) * 300; ++i) h.add(i, data[i]);
+        });
+    });
+    for (std::size_t i = 0; i < 1200; ++i) f.add(i, data[i]);
+    CHECK(h.size() == 1200);
+    bool all = true;
+    for (std::uint64_t i = 0; i < 1200; ++i) all = all && h.contains(i);
+    CHECK(all);
+    check_graph(h, 0.99);
+    CHECK(recall(h, f, Vectors(data.begin(), data.begin() + 100), 10, 64) > 0.95);
+}
+
+TEST(concurrency, c03_mixed_operations_from_many_threads) {
+    // Every ID gets its own vector (0-5999), and updates draw from a separate pool
+    // (6000-7999): many exact copies would hurt graph connectivity on their own,
+    // with or without threads.
+    auto data = clustered(8000, 8, 6, 602);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::dynamic({}));
+    Problems p;
+    std::vector<long> live(6, 0);
+    with_watchdog(180, "c03", [&] {
+        run_threads(6, [&](std::size_t t) {
+            std::mt19937 rng(unsigned(t + 1));
+            const std::uint64_t base = t * 1000;  // each thread owns IDs base .. base + 999
+            std::vector<std::uint64_t> mine;
+            std::uint64_t next = base;
+            for (int op = 0; op < 400; ++op) {
+                try {
+                    switch (rng() % 6) {
+                        case 0:
+                        case 1:
+                            if (next < base + 1000) {
+                                h.add(next, data[next], Metadata().set("t", std::int64_t(t)));
+                                mine.push_back(next++);
+                            }
+                            break;
+                        case 2:
+                            if (!mine.empty()) {
+                                const std::size_t k = rng() % mine.size();
+                                if (!h.remove(mine[k])) ++p.unexpected_exception;
+                                mine.erase(mine.begin() + std::ptrdiff_t(k));
+                            }
+                            break;
+                        case 3:
+                            if (!mine.empty() && !h.update(mine[rng() % mine.size()], data[6000 + rng() % 2000])) ++p.unexpected_exception;
+                            break;
+                        case 4:
+                            check_results(h.search(data[rng() % 8000], 10, 32), 6000, p);
+                            break;
+                        default:  // accessors
+                            if (!mine.empty() && !h.contains(mine.back())) ++p.unexpected_exception;
+                            if (!mine.empty() && !h.get_metadata(mine.back())) ++p.unexpected_exception;
+                            (void)h.size();
+                            (void)h.capacity();
+                            break;
+                    }
+                } catch (...) {
+                    ++p.unexpected_exception;
+                }
+            }
+            live[t] = long(mine.size());
+        });
+    });
+    CHECK(p.total() == 0);
+    CHECK(long(h.size()) == std::accumulate(live.begin(), live.end(), 0L));
+    check_graph(h, 0.98);
+}
+
+TEST(concurrency, c04_same_id_added_by_two_threads) {
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    std::atomic<long> wrong_outcome{0};
+    with_watchdog(120, "c04", [&] {
+        for (std::uint64_t id = 0; id < 150; ++id) {
+            std::atomic<int> successes{0}, rejections{0};
+            run_threads(4, [&](std::size_t t) {
+                try {
+                    if (t % 2) h.add(id, std::vector<float>{float(id), float(t), 0, 1});
+                    else f.add(id, std::vector<float>{float(id), float(t), 0, 1});
+                    ++successes;
+                } catch (const std::invalid_argument&) {
+                    ++rejections;
+                }
+            });
+            if (successes != 2 || rejections != 2) ++wrong_outcome;  // one winner per index
+        }
+    });
+    CHECK(wrong_outcome == 0 && h.size() == 150 && f.size() == 150);
+}
+
+TEST(concurrency, c05_same_id_removed_by_two_threads) {
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    for (std::uint64_t id = 0; id < 150; ++id) {
+        h.add(id, std::vector<float>{float(id), 1, 0, 1});
+        f.add(id, std::vector<float>{float(id), 1, 0, 1});
+    }
+    std::atomic<long> wrong_outcome{0};
+    with_watchdog(120, "c05", [&] {
+        for (std::uint64_t id = 0; id < 150; ++id) {
+            std::atomic<int> h_true{0}, f_true{0};
+            run_threads(4, [&](std::size_t t) {
+                if (t % 2 ? h.remove(id) : f.remove(id)) ++(t % 2 ? h_true : f_true);
+            });
+            if (h_true != 1 || f_true != 1) ++wrong_outcome;
+        }
+    });
+    CHECK(wrong_outcome == 0 && h.size() == 0 && f.size() == 0);
+}
+
+TEST(concurrency, c06_update_during_searches) {
+    auto data = clustered(800, 8, 6, 603);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 400; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "c06", [&] {
+        std::thread writer([&] {
+            for (int round = 0; round < 3; ++round)
+                for (std::size_t i = 0; i < 400; i += 2) h.update(i, data[400 + (i + std::size_t(round) * 7) % 400]);
+            stop = true;
+        });
+        run_threads(4, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                try {
+                    check_results(h.search(data[q++ % 800], 10, 32), 400, p);  // never the same ID twice
+                } catch (...) {
+                    ++p.unexpected_exception;
+                }
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && h.size() == 400 && h.capacity() <= 401);
+    check_graph(h, 0.99);
+}
+
+TEST(concurrency, c07_save_during_searches_and_changes) {
+    auto data = clustered(1200, 8, 6, 604);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 400; ++i) h.add(i, data[i], meta_for(i));
+    std::atomic<bool> stop{false};
+    std::vector<std::string> snapshots;
+    Problems p;
+    with_watchdog(180, "c07", [&] {
+        std::thread writer([&] {
+            for (std::size_t i = 400; i < 1200; ++i) {
+                h.add(i, data[i], meta_for(i));
+                if (i % 5 == 0) h.remove(i - 300);
+            }
+            stop = true;
+        });
+        std::thread saver([&] {
+            while (!stop) snapshots.push_back(save_bytes(h));
+        });
+        run_threads(2, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) check_results(h.search(data[q++ % 1200], 10, 32), 1200, p);
+        });
+        writer.join();
+        saver.join();
+    });
+    CHECK(p.total() == 0 && !snapshots.empty());
+    bool consistent = true;
+    for (std::size_t i = 0; i < snapshots.size(); i += std::max<std::size_t>(1, snapshots.size() / 8)) {
+        auto g = load_hnsw(snapshots[i]);  // every snapshot is a complete, valid index
+        consistent = consistent && g->size() >= 400 && g->size() <= 1200 && save_bytes(*g) == snapshots[i];
+        check_graph(*g, 0.98);
+    }
+    CHECK(consistent);
+}
+
+TEST(concurrency, c08_compact_during_searches) {
+    auto data = clustered(1000, 8, 6, 605);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(180, "c08", [&] {
+        std::thread changer([&] {
+            for (int round = 0; round < 3; ++round) {
+                for (std::size_t i = std::size_t(round); i < 1000; i += 9) h.remove(i);
+                h.compact();
+            }
+            stop = true;
+        });
+        run_threads(4, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                if (t == 3) {  // accessors and saves while compaction rebuilds the index
+                    if (h.deleted_count() > h.capacity() || h.size() > h.capacity()) ++p.unexpected_exception;
+                    (void)h.pooled_visited_lists();
+                    (void)h.max_level();
+                    auto g = load_hnsw(save_bytes(h));
+                    if (g->size() > 1000) ++p.unexpected_exception;
+                } else {
+                    check_results(h.search(data[q++ % 1000], 10, 32), 1000, p);
+                }
+            }
+        });
+        changer.join();
+    });
+    for (std::size_t i = 0; i < 1000; ++i)
+        if (h.contains(i)) f.add(i, data[i]);
+    CHECK(p.total() == 0 && h.deleted_count() == 0 && h.size() == f.size());
+    CHECK(recall(h, f, Vectors(data.begin(), data.begin() + 100), 10, 64) > 0.95);
+}
+
+TEST(concurrency, c09_internal_calls_never_deadlock) {
+    // update, upsert, compact and save each run internal steps under one lock.
+    auto data = clustered(600, 8, 6, 606);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    std::atomic<bool> stop{false};
+    with_watchdog(120, "c09", [&] {
+        std::thread searcher([&] {
+            std::size_t q = 0;
+            while (!stop) {
+                (void)h.search(data[q % 600], 5, 32);
+                (void)f.search(data[q++ % 600], 5);
+            }
+        });
+        for (std::size_t i = 0; i < 300; ++i) {
+            h.upsert(i % 2 ? i : 1000 + i, data[300 + i]);
+            f.upsert(i % 2 ? i : 1000 + i, data[300 + i]);
+            if (i % 50 == 0) {
+                h.compact();
+                f.compact();
+                (void)save_bytes(h);
+                (void)save_bytes(f);
+            }
+        }
+        stop = true;
+        searcher.join();
+    });
+    CHECK(h.size() == 450 && f.size() == 450);
+}
+
+TEST(concurrency, c10_flat_under_mixed_load) {
+    auto data = random_vectors(1500, 8, 607);
+    FlatIndex f(8, Metric::Cosine, Schema::dynamic({}));
+    Problems p;
+    with_watchdog(180, "c10", [&] {
+        run_threads(6, [&](std::size_t t) {
+            std::mt19937 rng(unsigned(t + 11));
+            const std::uint64_t base = t * 250;
+            for (std::uint64_t i = base; i < base + 250; ++i) {
+                try {
+                    f.add(i, data[i], Metadata().set("t", std::int64_t(t)));
+                    if (i % 3 == 0) f.update(i, data[rng() % 1500]);
+                    if (i % 5 == 0) f.upsert(i, data[rng() % 1500]);
+                    if (i % 7 == 0) f.remove(i);
+                    check_results(f.search(data[rng() % 1500], 10), 1500, p);
+                    check_results(f.search(data[rng() % 1500], 10, with_filter(Filter::eq("t", std::int64_t(t)))), 1500, p);
+                } catch (...) {
+                    ++p.unexpected_exception;
+                }
+            }
+        });
+    });
+    CHECK(p.total() == 0);
+    std::size_t expected = 0;
+    for (std::uint64_t i = 0; i < 1500; ++i) expected += (i % 7 != 0);
+    CHECK(f.size() == expected);
+    CHECK(f.search(data[3], 5).size() == 5);  // usable once quiet again
+}
+
+TEST(concurrency, c11_predicate_searches_while_a_writer_waits) {
+    // A predicate searching its own index while a change is queued must not deadlock:
+    // the nested search does not lock again (a writer-preferring lock would block it).
+    auto data = clustered(400, 8, 4, 608);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int batch = 0; batch < 2; ++batch) {
+        with_watchdog(60, "c11", [&] {
+            std::atomic<bool> writer_started{false};
+            std::thread writer;
+            SearchOptions o;
+            o.predicate = [&](std::uint64_t id) {
+                if (!writer_started.exchange(true)) {
+                    writer = std::thread([&] { h.add(1000, data[300]); f.add(1000, data[300]); });
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // the writer is now queued
+                }
+                return !h.search(data[id % 300], 1, 16).empty() && !f.search(data[id % 300], 1).empty();
+            };
+            if (batch == 0) {
+                (void)h.search(data[0], 5, 32, o);
+            } else {
+                (void)h.search_batch(flatten(Vectors(data.begin(), data.begin() + 8)), 5, 32, 4, o);
+            }
+            writer.join();
+            h.remove(1000);
+            f.remove(1000);
+        });
+    }
+    CHECK(h.size() == 300 && f.size() == 300);
+}
+
+TEST(concurrency, c12_changes_from_predicates_refused_exactly) {
+    // Refused on the calling thread and on batch worker threads, for every kind of change.
+    auto data = clustered(300, 8, 4, 609);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 200; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const std::string before_h = save_bytes(h), before_f = save_bytes(f);
+    const std::vector<std::function<void()>> changes = {
+        [&] { h.add(5000, data[0]); },          [&] { h.remove(1); },
+        [&] { h.update(2, data[3]); },          [&] { h.upsert(3, data[4]); },
+        [&] { h.set_metadata(4, Metadata().set("year", 1)); },
+        [&] { h.create_payload_index("category"); },
+        [&] { h.set_planner_params(PlannerParams{}); },
+        [&] { h.compact(); },
+    };
+    const std::vector<std::function<void()>> flat_changes = {
+        [&] { f.add(5000, data[0]); }, [&] { f.remove(1); }, [&] { f.update(2, data[3]); },
+        [&] { f.upsert(3, data[4]); }, [&] { f.set_metadata(4, Metadata().set("year", 1)); },
+        [&] { f.create_payload_index("category"); }, [&] { f.compact(); },
+    };
+    std::atomic<long> refused{0}, attempted{0};
+    auto predicate_for = [&](const std::vector<std::function<void()>>& list) {
+        return [&](std::uint64_t id) {
+            ++attempted;
+            try {
+                list[id % list.size()]();
+            } catch (const std::logic_error&) {
+                ++refused;
+            }
+            return true;
+        };
+    };
+    with_watchdog(60, "c12", [&] {
+        SearchOptions o;
+        o.predicate = predicate_for(changes);
+        (void)h.search(data[0], 10, 32, o);
+        (void)h.search_batch(flatten(Vectors(data.begin(), data.begin() + 16)), 5, 32, 4, o);  // worker threads
+        (void)h.search_range(data[0], 5.0f, kNoLimit, o);
+        SearchOptions of;
+        of.predicate = predicate_for(flat_changes);
+        (void)f.search(data[0], 10, of);
+        (void)f.search_batch(flatten(Vectors(data.begin(), data.begin() + 16)), 5, 4, of);
+        (void)f.search_range(data[0], 5.0f, kNoLimit, of);
+    });
+    CHECK(attempted > 0 && refused == attempted);  // every attempt refused, none slipped through
+    CHECK(save_bytes(h) == before_h && save_bytes(f) == before_f);  // nothing changed
+}
+
+TEST(concurrency, c13_writers_are_not_starved) {
+    // Under a steady stream of searches from 8 threads, every change still gets through.
+    auto data = clustered(600, 8, 4, 610);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    double worst_wait = 0;
+    with_watchdog(120, "c13", [&] {
+        std::vector<std::thread> readers;
+        for (int t = 0; t < 8; ++t)
+            readers.emplace_back([&, t] {
+                std::size_t q = std::size_t(t);
+                while (!stop) (void)h.search(data[q++ % 600], 10, 64);
+            });
+        for (std::size_t i = 300; i < 400; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            h.add(i, data[i]);
+            worst_wait = std::max(worst_wait, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        stop = true;
+        for (auto& r : readers) r.join();
+    });
+    CHECK(h.size() == 400);
+    CHECK(worst_wait < 10.0);  // generous: sanitizers slow everything; starvation would be unbounded
+}
+
+TEST(concurrency, c14_upsert_is_atomic) {
+    // Many threads upserting the same IDs: before the lock covered both steps,
+    // two threads could both find an ID missing, and the second add would throw.
+    auto data = clustered(200, 8, 4, 611);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    std::atomic<long> errors{0};
+    with_watchdog(120, "c14", [&] {
+        run_threads(8, [&](std::size_t t) {
+            for (int round = 0; round < 40; ++round)
+                for (std::uint64_t id = 0; id < 20; ++id) {
+                    try {
+                        h.upsert(id, data[(id + t + std::size_t(round)) % 200]);
+                        f.upsert(id, data[(id + t + std::size_t(round)) % 200]);
+                    } catch (...) {
+                        ++errors;
+                    }
+                }
+        });
+    });
+    CHECK(errors == 0 && h.size() == 20 && f.size() == 20);
+    check_graph(h, 1.0);
+}
+
+TEST(concurrency, c15_batch_and_range_during_changes) {
+    auto data = clustered(900, 8, 6, 612);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 400; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    std::atomic<bool> stop{false};
+    Problems p;
+    const auto buffer = flatten(Vectors(data.begin(), data.begin() + 12));
+    with_watchdog(180, "c15", [&] {
+        std::thread writer([&] {
+            for (std::size_t i = 400; i < 900; ++i) {
+                h.add(i, data[i]);
+                f.add(i, data[i]);
+                if (i % 4 == 0) {
+                    h.remove(i - 200);
+                    f.remove(i - 200);
+                }
+            }
+            stop = true;
+        });
+        run_threads(2, [&](std::size_t t) {
+            while (!stop) {
+                for (const auto& r : (t ? f.search_batch(buffer, 5, 2) : h.search_batch(buffer, 5, 32, 2))) check_results(r, 900, p);
+                check_results(t ? f.search_range(data[t], 1.0f) : h.search_range(data[t], 1.0f), 900, p);
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && h.size() == f.size());
+}
+
+TEST(concurrency, c16_metadata_and_settings_change_during_filtered_searches) {
+    // IDs 0-199 keep category "fixed"; IDs 200-399 flip between "a" and "b".
+    // A search for "a" must never return a "fixed" ID, whatever changes meanwhile.
+    auto data = clustered(400, 8, 4, 613);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        const Metadata m = Metadata().set("category", i < 200 ? "fixed" : "a");
+        h.add(i, data[i], m);
+        f.add(i, data[i], m);
+    }
+    std::atomic<bool> stop{false};
+    std::atomic<long> wrong{0};
+    Problems p;
+    with_watchdog(180, "c16", [&] {
+        std::thread writer([&] {
+            for (int round = 0; round < 6; ++round) {
+                for (std::uint64_t i = 200; i < 400; i += 3) {
+                    h.set_metadata(i, Metadata().set("category", round % 2 ? "a" : "b"));
+                    f.set_metadata(i, Metadata().set("category", round % 2 ? "a" : "b"));
+                }
+                if (round == 2) {
+                    h.create_payload_index("category");
+                    f.create_payload_index("category");
+                }
+                h.set_planner_params(PlannerParams{round % 2 ? std::size_t(10) : std::size_t(2000), 0.01, 256, 32.0});
+            }
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            const SearchOptions o = with_filter(Filter::eq("category", "a"));
+            std::size_t q = t;
+            while (!stop) {
+                const PlannerParams pp = h.planner_params();  // a consistent copy, read while it changes
+                if (pp.max_exact_matches != 10 && pp.max_exact_matches != 2000 && pp.max_exact_matches != PlannerParams{}.max_exact_matches)
+                    ++p.unexpected_exception;
+                for (const auto& r : {h.search(data[q % 400], 10, 32, o), f.search(data[q % 400], 10, o)}) {
+                    check_results(r, 400, p);
+                    for (const auto& x : r) wrong += x.id < 200;
+                }
+                ++q;
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && wrong == 0);
+}
+
+TEST(concurrency, c17_exceptions_release_the_lock) {
+    // Failed changes and failed searches must leave the lock free.
+    auto data = clustered(300, 8, 4, 614);
+    HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict({{"year", FieldType::Int}}));
+    for (std::size_t i = 0; i < 100; ++i) h.add(i, data[i]);
+    std::atomic<long> failures_seen{0};
+    with_watchdog(120, "c17", [&] {
+        std::thread failing([&] {
+            for (int round = 0; round < 200; ++round) {
+                auto expect_throw = [&](auto&& fn) {
+                    try {
+                        fn();
+                    } catch (const std::exception&) {
+                        ++failures_seen;
+                    }
+                };
+                expect_throw([&] { h.add(0, data[0]); });                                      // duplicate ID
+                expect_throw([&] { h.add(9000, std::vector<float>(3, 1.0f)); });                // wrong dimension
+                expect_throw([&] { h.add(9001, data[1], Metadata().set("other", 1)); });        // strict schema
+                expect_throw([&] { (void)h.search(std::vector<float>(3, 1.0f), 5); });          // wrong query dimension
+                expect_throw([&] { (void)h.search(data[0], 5, 32, with_filter(Filter::eq("nope", 1))); });  // unknown field
+            }
+        });
+        for (std::size_t i = 100; i < 300; ++i) h.add(i, data[i]);  // keeps working meanwhile
+        failing.join();
+        // A predicate's own exception, on the calling thread and on batch worker threads.
+        SearchOptions throws;
+        throws.predicate = [](std::uint64_t id) -> bool {
+            if (id % 3 == 0) throw std::runtime_error("predicate failed");
+            return true;
+        };
+        for (int round = 0; round < 20; ++round) {
+            try {
+                (void)h.search(data[0], 10, 32, throws);
+            } catch (const std::runtime_error&) {
+                ++failures_seen;
+            }
+            try {
+                (void)h.search_batch(flatten(Vectors(data.begin(), data.begin() + 8)), 5, 32, 4, throws);
+            } catch (const std::runtime_error&) {
+                ++failures_seen;
+            }
+        }
+        std::thread other([&] { h.add(5000, data[5]); });  // the lock is free again
+        other.join();
+    });
+    CHECK(failures_seen == 1040 && h.size() == 301);
+}
+
+TEST(concurrency, c18_several_indexes) {
+    // Predicates may search other indexes, crossed in both directions, while
+    // writers hammer both: no deadlock. (This exact pattern deadlocked an early
+    // version: nested reads queued behind waiting writers formed a cycle.)
+    auto data = clustered(300, 8, 4, 615);
+    HnswIndex a(8, Metric::L2), b(8, Metric::L2);
+    for (std::size_t i = 0; i < 200; ++i) {
+        a.add(i, data[i]);
+        b.add(i, data[i]);
+    }
+    SearchOptions on_a, on_b;
+    on_a.predicate = [&](std::uint64_t id) { return !b.search(data[id % 300], 1, 16).empty(); };
+    on_b.predicate = [&](std::uint64_t id) { return !a.search(data[id % 300], 1, 16).empty(); };
+    with_watchdog(120, "c18", [&] {
+        std::atomic<bool> stop{false};
+        std::thread writer_a([&] {
+            for (std::size_t i = 200; i < 300; ++i) a.add(i, data[i]);
+        });
+        std::thread writer_b([&] {
+            for (std::size_t i = 200; i < 300; ++i) b.add(i, data[i]);
+        });
+        std::thread stopper([&] {
+            writer_a.join();
+            writer_b.join();
+            stop = true;
+        });
+        run_threads(4, [&](std::size_t t) {
+            int rounds = 0;
+            while (!stop || rounds < 5) {
+                (void)(t % 2 ? b.search(data[std::size_t(rounds) % 300], 3, 16, on_b) : a.search(data[std::size_t(rounds) % 300], 3, 16, on_a));
+                ++rounds;
+            }
+        });
+        stopper.join();
+    });
+    CHECK(a.size() == 300 && b.size() == 300);
+    // Changing another index from a predicate is refused too: with another thread
+    // doing the reverse, it would be a lock-order cycle.
+    std::atomic<long> refused{0};
+    SearchOptions changes_b;
+    changes_b.predicate = [&](std::uint64_t id) {
+        try {
+            b.add(50000 + id, data[0]);
+        } catch (const std::logic_error&) {
+            ++refused;
+        }
+        return true;
+    };
+    const auto results = a.search(data[0], 5, 32, changes_b);
+    CHECK(refused > 0 && b.size() == 300 && results.size() == 5);
+}
+
+TEST(concurrency, c20_simultaneous_saves_to_one_file) {
+    // Saves run in parallel, so several may target the same file at once. Each
+    // must write its own temporary file (the last rename wins): with one shared
+    // temporary file, saves overwrite each other mid-write, and renames fail once
+    // another save has moved the file away. The index is large enough that each
+    // save spans many thread time slices, and all saves start together.
+    auto data = clustered(20000, 32, 10, 617);
+    HnswIndex h(32, Metric::L2, HnswParams{8, 40, 1}, Schema::dynamic({}));
+    FlatIndex f(32, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        h.add(i, data[i], Metadata().set("g", std::int64_t(i % 7)));
+        f.add(i, data[i]);
+    }
+    const std::string path = temp_path("c20"), flat_path = temp_path("c20_flat");
+    std::atomic<long> saved{0}, failed{0}, other_error{0};
+    with_watchdog(240, "c20", [&] {
+        for (int round = 0; round < 3; ++round) {
+            std::atomic<int> ready{0};
+            run_threads(6, [&](std::size_t t) {
+                ++ready;
+                while (ready < 6) std::this_thread::yield();  // start together
+                try {
+                    if (t % 3 == 2) f.save(flat_path);
+                    else h.save(path);
+                    ++saved;
+                } catch (const std::runtime_error&) {
+                    ++failed;
+                } catch (...) {
+                    ++other_error;
+                }
+            });
+        }
+    });
+    CHECK(other_error == 0 && saved > 0);
+#ifndef _WIN32
+    CHECK(failed == 0);  // POSIX renames over a file atomically, so every save must succeed
+#endif
+    // Windows may refuse two renames over one file at the same moment: such a save
+    // fails cleanly with std::runtime_error, and the file is still complete.
+    auto h2 = HnswIndex::load(path);
+    auto f2 = FlatIndex::load(flat_path);
+    CHECK(save_bytes(*h2) == save_bytes(h) && save_bytes(*f2) == save_bytes(f));  // complete, not mixed
+    CHECK(temporaries_left(path) == 0 && temporaries_left(flat_path) == 0);
+    std::filesystem::remove(path);
+    std::filesystem::remove(flat_path);
+}
+
+TEST(concurrency, c19_lock_limits_and_failures) {
+    // Nesting beyond IndexLock::kMaxNesting is refused cleanly, and everything is released.
+    {
+        std::vector<std::unique_ptr<IndexLock>> locks;
+        for (std::size_t i = 0; i <= IndexLock::kMaxNesting; ++i) locks.push_back(std::make_unique<IndexLock>());
+        std::vector<std::unique_ptr<IndexLock::ReadGuard>> guards;
+        for (std::size_t i = 0; i < IndexLock::kMaxNesting; ++i) guards.push_back(std::make_unique<IndexLock::ReadGuard>(*locks[i]));
+        CHECK_THROWS_AS(std::logic_error, IndexLock::WriteGuard(*locks.back(), "test"));
+        CHECK_THROWS_AS(std::logic_error, IndexLock::ReadGuard(*locks.back()));
+        guards.clear();
+        CHECK(!locks[0]->held() && !locks.back()->held());
+        with_watchdog(30, "c19 relock", [&] { const IndexLock::WriteGuard w(*locks.back(), "test"); });
+    }
+    // Running out of memory in the middle of a change releases the lock.
+    if constexpr (HNSW_ALLOC_HOOK) {
+        auto data = clustered(100, 8, 4, 616);
+        HnswIndex h(8, Metric::L2);
+        for (std::size_t i = 0; i < 50; ++i) h.add(i, data[i], meta_for(i));
+        std::uint64_t id = 1000;
+        CHECK(sweep_allocation_failures([&] { h.add(id, data[id % 100], meta_for(id)); },
+                                        [&] { CHECK(!h.contains(id)); }) > 0);
+        with_watchdog(30, "c19 after out-of-memory", [&] {
+            std::thread other([&] { h.add(2000, data[1]); });
+            other.join();
+            (void)h.search(data[0], 5);
+        });
+        CHECK(h.contains(2000));
+    }
+}
+
 
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit

@@ -70,7 +70,7 @@ CTest runs the tests as 20 groups:
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 499 tests
+./build/test_comprehensive                   # all 519 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```

@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 499 individually named tests** in 20 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 519 individually named tests** in 20 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -28,7 +28,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `hardening` | 14 | Edge cases E1 to E13 of the [hardening and performance plan](hardening-and-performance-plan.md): random levels identical on every platform, nested batches from predicates, changes during a search refused, cosine distances never negative, the `M` limit, extreme IDs, vectors taken from the index itself, dimension 0, thousands of fields and filter tags, throwing predicates in threaded batches, subnormal values, the deepest filter on pool threads, and the change detection released on every path |
 | `persistence` | 35 | Scenarios P1 to P42 from the [test plan](core-capabilities-test-plan.md), each named after its ID: round trips for every metric and index state (empty, one vector, removals, updates, compaction, extreme IDs, several dimensions), settings preserved, continuing after a load building the identical graph, deterministic bytes, safe overwriting, a file truncated at every byte and a bit flipped in every byte, wrong headers and kinds, extra bytes, inflated counts, invalid content behind valid checksums, unusable paths, out-of-memory sweeps of loading and saving, golden files reproduced byte for byte, and a 100,000-vector round trip. Plus P50 to P57: metadata, every search feature after loading, changes continuing identically, saving during a search, unseekable streams, metadata damage, failing streams and every validation rule |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
-| `concurrency` | 4 | Up to 8 threads searching HNSW and Flat at once, mixing indexes, metrics and ef values; every answer must match the single-threaded one |
+| `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
 
 Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 15 seconds in Release.
@@ -37,7 +37,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 499 test names
+test_comprehensive --list               # list all 519 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -51,13 +51,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 499 of 499 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 519 of 519 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-499 passed, 0 failed, 0 skipped, 0 not run, 29720 checks, 29.48 s
+519 passed, 0 failed, 0 skipped, 0 not run, 29922 checks, 26.14 s
 All selected tests passed.
 ```
 
@@ -189,6 +189,11 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 
 26. **A save could write a damaged file without reporting an error when memory ran out.** C++ streams catch an allocation failure inside their buffer and only set an error flag; the random generator's state, written through a string stream, could be silently cut short. Saving and loading now switch every stream they use to rethrow such errors (`StreamErrorsThrow`). Found by the out-of-memory sweep of saving.
 27. **Saved HNSW indexes were not portable between standard libraries.** The random generator's state was written through C++ streams, whose text form of `std::mt19937_64` differs between libstdc++ (Linux, MinGW) and libc++ (macOS): a file saved on one could not be loaded on the other. The golden files caught it on the macOS CI job before release. Random levels now come from SplitMix64, whose whole state is one 64-bit number saved as plain bytes; the fix was verified by building and testing against libc++. The same CI run showed that libc++ reports running out of memory inside a file stream as `std::ios_base::failure` rather than `std::bad_alloc`; the save still left the old file intact, and the test now accepts either.
+
+**Found while building thread safety:**
+
+28. **A deadlock in the first design of the index lock.** Thread 1, inside a search of index A, had a predicate that changed index B; thread 2, inside a search of B, had a predicate that searched A; a writer was queued on A. With writers preferred, each waited for the next. Found by test `c18` under its watchdog. Fixed with two rules: no change from inside any index operation, and nested reads skip the writer queue (see [Thread safety](architecture.md#thread-safety)).
+29. **Simultaneous saves to one file could corrupt it.** Once saves could run in parallel, two saves to the same path wrote into one shared temporary file (`<path>.tmp`), overwriting each other mid-write, and a rename failed once another save had moved the file away. Found by reviewing the edge cases of the new lock. Every save now writes its own uniquely named temporary file. Test `c20` was confirmed to fail against the old naming (3 runs out of 3) and to pass with the fix.
 
 ## Continuous integration
 

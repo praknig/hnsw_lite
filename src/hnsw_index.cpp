@@ -188,7 +188,11 @@ void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int l
 }
 
 void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
-    searches_.check_no_search("add");
+    const auto guard = lock_.write("add");
+    add_unlocked(id, vector, metadata);
+}
+
+void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything (or drawing a random level).
     scratch_.prepare(vector, metric_);
     metadata_.validate(metadata);
@@ -326,7 +330,7 @@ void HnswIndex::choose_new_entry() {
 }
 
 bool HnswIndex::remove(std::uint64_t id) {
-    searches_.check_no_search("remove");
+    const auto guard = lock_.write("remove");
     IdMap& ids = storage_.ids();
     const auto node = ids.find(id);
     if (!node) return false;
@@ -345,26 +349,31 @@ bool HnswIndex::remove(std::uint64_t id) {
     return true;
 }
 
-bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) { return replace(id, vector, nullptr); }
+bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("update");
+    return replace(id, vector, nullptr);
+}
 
 bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("update");
     return replace(id, vector, &metadata);
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, nullptr)) return false;
-    add(id, vector);
+    add_unlocked(id, vector, {});
     return true;
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, &metadata)) return false;
-    add(id, vector, metadata);
+    add_unlocked(id, vector, metadata);
     return true;
 }
 
 bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
-    searches_.check_no_search("update");
     // 1. Validate everything before changing anything.
     scratch_.prepare(vector, metric_);
     if (metadata) metadata_.validate(*metadata);
@@ -418,10 +427,13 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     return true;
 }
 
-bool HnswIndex::contains(std::uint64_t id) const { return storage_.ids().find(id).has_value(); }
+bool HnswIndex::contains(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    return storage_.ids().find(id).has_value();
+}
 
 bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
-    searches_.check_no_search("set_metadata");
+    const auto guard = lock_.write("set_metadata");
     const auto node = storage_.ids().find(id);
     if (!node) return false;
     metadata_.update(*node, metadata);
@@ -429,6 +441,7 @@ bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
 }
 
 std::optional<Metadata> HnswIndex::get_metadata(std::uint64_t id) const {
+    const auto guard = lock_.read();
     const auto node = storage_.ids().find(id);
     if (!node) return std::nullopt;
     return metadata_.read(*node);
@@ -448,7 +461,7 @@ Eligibility HnswIndex::eligibility(const SearchOptions& options, std::optional<C
 
 std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t ef,
                                             const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -527,13 +540,14 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
 std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const float> queries, std::size_t k,
                                                                std::size_t ef, std::size_t threads,
                                                                const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
     const PlannerParams& params = options.planner ? *options.planner : planner_;
     std::vector<std::vector<SearchResult>> results(nq);
     auto one = [&](std::size_t i) {
+        const IndexLock::Hold inside(lock_);  // pool threads work under the caller's read
         PreparedVector q(dim());
         q.prepare(queries.subspan(i * dim(), dim()), metric_);
         SearchStats stats;
@@ -549,7 +563,7 @@ std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const f
 
 std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
@@ -622,7 +636,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
 }
 
 CompactStats HnswIndex::compact() {
-    searches_.check_no_search("compact");
+    const auto guard = lock_.write("compact");
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
     HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());
@@ -630,7 +644,7 @@ CompactStats HnswIndex::compact() {
     fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
     for (NodeId n = 0; n < storage_.size(); ++n)
-        if (!ids.is_deleted(n)) fresh.add(ids.external(n), storage_.vectors().get(n), metadata_.read(n));
+        if (!ids.is_deleted(n)) fresh.add_unlocked(ids.external(n), storage_.vectors().get(n), metadata_.read(n));  // nobody else sees `fresh`
 
     // Commit: moves only, nothing can throw.
     storage_ = std::move(fresh.storage_);
