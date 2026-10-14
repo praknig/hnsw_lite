@@ -6,7 +6,7 @@
  *   Flat: CONF (dimension, metric), NODE (each vector with its user ID), META, END
  *   HNSW: CONF (dimension, metric, HNSW settings, planner settings),
  *         NODE (each slot: user ID, removed flag, level, vector, links per level),
- *         STAT (entry point, top level, free slots in order, random generator state),
+ *         STAT (entry point, top level, free slots in order, random generator state as one u64),
  *         META, END
  *   META: schema mode, fields (name, type, indexed), string dictionary, then each
  *         field's rows (slot and value), in slot order.
@@ -336,15 +336,12 @@ void HnswIndex::save(std::ostream& out) const {
             }
         }
     });
-    std::ostringstream rng_state;
-    const persist::StreamErrorsThrow rng_errors(rng_state);
-    rng_state << rng_;  // the standard's portable text form of the generator's state
     persist::write_section(out, kStat, [&](Writer& w) {
         w.put<std::uint32_t>(entry_);
         w.put<std::int32_t>(max_level_);
         w.put<std::uint64_t>(free_slots_.size());
         for (NodeId s : free_slots_) w.put<std::uint32_t>(s);
-        w.put_string(rng_state.str());
+        w.put<std::uint64_t>(rng_.state);  // the whole generator state: portable by construction
     });
     persist::write_section(out, kMeta, [&](Writer& w) { metadata_.save(w); });
     write_end(out);
@@ -450,10 +447,7 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
             seen[s] = true;
             free_slots.push_back(s);
         }
-        std::istringstream rng_state(r.get_string());
-        const persist::StreamErrorsThrow rng_errors(rng_state);
-        rng_state >> index->rng_;
-        if (rng_state.fail() || !(rng_state >> std::ws).eof()) throw FormatError("invalid random generator state");
+        index->rng_.state = r.get<std::uint64_t>();  // any value is a valid state
         r.end_section();
         index->entry_ = entry;
         index->max_level_ = max_level;

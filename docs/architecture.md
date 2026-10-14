@@ -337,7 +337,7 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 
 **Design choices:**
 - **The graph is saved logically** (levels and link lists) and rebuilt on load, so files do not depend on memory addresses. The arena's raw pointers are never written.
-- **Removed slots are saved:** other vectors may still link through them, and inserts reuse them in a fixed order. With the free list and the random generator's state (in the C++ standard's portable text form), a loaded index continues exactly as the original would have.
+- **Removed slots are saved:** other vectors may still link through them, and inserts reuse them in a fixed order. With the free list and the random generator's state, a loaded index continues exactly as the original would have. The generator is SplitMix64, whose whole state is one 64-bit number saved as plain bytes. (An earlier draft saved `std::mt19937_64` through C++ streams; its text form turned out to differ between libstdc++ and libc++, which the golden files caught on macOS before release.)
 - **Derived data is recomputed, not trusted:** payload-index counts and string reference counts are rebuilt from the rows on load.
 - **Each section's length is computed by a counting pass** before it is written, so saving needs no extra copy of the data.
 - **Streams rethrow their errors** (`StreamErrorsThrow`): by default a C++ stream that runs out of memory only sets a flag and stops writing, which would produce a damaged file without an error.

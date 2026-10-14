@@ -188,6 +188,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 **Found while building saving and loading:**
 
 26. **A save could write a damaged file without reporting an error when memory ran out.** C++ streams catch an allocation failure inside their buffer and only set an error flag; the random generator's state, written through a string stream, could be silently cut short. Saving and loading now switch every stream they use to rethrow such errors (`StreamErrorsThrow`). Found by the out-of-memory sweep of saving.
+27. **Saved HNSW indexes were not portable between standard libraries.** The random generator's state was written through C++ streams, whose text form of `std::mt19937_64` differs between libstdc++ (Linux, MinGW) and libc++ (macOS): a file saved on one could not be loaded on the other. The golden files caught it on the macOS CI job before release. Random levels now come from SplitMix64, whose whole state is one 64-bit number saved as plain bytes; the fix was verified by building and testing against libc++. The same CI run showed that libc++ reports running out of memory inside a file stream as `std::ios_base::failure` rather than `std::bad_alloc`; the save still left the old file intact, and the test now accepts either.
 
 ## Continuous integration
 

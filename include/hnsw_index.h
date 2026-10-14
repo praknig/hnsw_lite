@@ -24,6 +24,26 @@
 namespace vecdb {
 
 /**
+ * @brief SplitMix64 (Steele, Lea and Flood, 2014): a small, fast random number
+ *        generator whose entire state is one 64-bit number.
+ *
+ * Used for random levels. Its state is saved as plain bytes, so a saved index
+ * continues identically on every platform. (The text form that C++ streams
+ * write for std::mt19937_64 differs between standard libraries: a file saved
+ * with libstdc++ could not be loaded with libc++.)
+ */
+struct SplitMix64 {
+    std::uint64_t state;
+    explicit SplitMix64(std::uint64_t seed = 0) : state(seed) {}
+    std::uint64_t operator()() {
+        std::uint64_t z = (state += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    }
+};
+
+/**
  * @brief Settings that control HNSW graph quality, memory and speed.
  */
 struct HnswParams {
@@ -311,7 +331,7 @@ private:
     Storage storage_;
     std::size_t stride_;
     PreparedVector scratch_;  // reused by add(); search() uses its own copy
-    std::mt19937_64 rng_;
+    SplitMix64 rng_;  // random levels
     NodeId entry_ = kEmpty;
     int max_level_ = -1;
     std::size_t live_ = 0;

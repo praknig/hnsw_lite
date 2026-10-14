@@ -6251,12 +6251,12 @@ TEST(update, u32_updated_vector_never_left_without_links) {
 // ===========================================================================
 
 TEST(hardening, h01_levels_identical_on_every_platform) {
-    // E1: random levels come from the generator's raw bits, so every compiler and
+    // E1: random levels come from SplitMix64's raw bits, so every compiler and
     // standard library must produce exactly these (checked on every CI platform).
-    const std::vector<int> m16 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
-    const std::vector<int> m4 = {1, 2, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 3, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                                 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
+    const std::vector<int> m16 = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0};
+    const std::vector<int> m4 = {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 1, 2, 0, 0, 1, 0, 2, 0,
+                                 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0};
     HnswIndex a(2, Metric::L2);
     HnswParams p;
     p.M = 4;
@@ -6988,7 +6988,6 @@ TEST(persistence, p27_invalid_content_with_valid_checksums) {
         with_stat([&](std::string& p) { poke<std::uint32_t>(p, 0, 999); }),                      // entry point out of range
         with_stat([&](std::string& p) { poke<std::int32_t>(p, 4, 7); }),                         // wrong top level
         with_stat([&](std::string& p) { poke<std::uint32_t>(p, 16, 4); }),                       // free list names a live slot
-        with_stat([&](std::string& p) { p[p.size() - 3] = 'x'; }),                               // damaged generator state
     };
     for (const std::string& b : bad) CHECK_THROWS_AS(FormatError, load_hnsw(b));
     // Duplicate links in one list: make the second link equal the first.
@@ -7020,15 +7019,38 @@ TEST(persistence, p29_oom_load) {
 }
 
 TEST(persistence, p30_oom_save_keeps_the_old_file) {
+    // Running out of memory at any point of a save must leave the old file intact
+    // and no temporary file behind. Standard libraries differ in how a stream
+    // reports it: libstdc++ passes std::bad_alloc on, libc++ (macOS) throws
+    // std::ios_base::failure. Either is a clean failure.
     if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     const std::string path = temp_path("p30");
     auto old_index = tiny_hnsw();
     old_index->save(path);
     const std::string old_bytes = read_file(path);
     auto h = golden_hnsw();
-    CHECK(sweep_allocation_failures([&] { h->save(path); }, [&] {
-        CHECK(read_file(path) == old_bytes && !std::filesystem::exists(path + ".tmp"));
-    }) > 0);
+    long points = 0;
+    bool clean = true, completed = false;
+    for (long n = 0; n < 5000 && !completed; ++n) {
+        alloc_hook::fail_after(n);
+        bool failed = false;
+        try {
+            h->save(path);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        } catch (const std::ios_base::failure&) {
+            failed = true;
+        }
+        alloc_hook::disarm();
+        if (failed) {
+            ++points;
+            clean = clean && read_file(path) == old_bytes && !std::filesystem::exists(path + ".tmp");
+        } else {
+            completed = !alloc_hook::fired;  // a failure that did not surface would be a bug
+            clean = clean && completed;
+        }
+    }
+    CHECK(clean && completed && points > 0);
     CHECK(read_file(path) == save_bytes(*h));
     std::filesystem::remove(path);
 }
