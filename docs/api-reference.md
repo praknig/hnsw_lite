@@ -240,3 +240,16 @@ Not copyable, movable. Frees its memory in the destructor.
 | `SearchStats::stopped_early` | Whether a deadline or cancel flag stopped the search |
 | `OperationOptions` (`deadline`, `cancel`, `progress`) | Control of `add_batch`, `compact` and `save`; `progress(done, total)` is called in order, at most about 100 times |
 | `Cancelled` (a `std::runtime_error`) | Thrown by a cancelled or late operation, after undoing it |
+
+## Training and codecs
+
+These are building blocks for the quantized indexes planned in the [compression and index types plan](compression-and-index-types-plan.md); the indexes do not use them yet.
+
+| Name | Description |
+|---|---|
+| `kmeans(data, dim, KMeansParams)` | Clusters `data` (n * dim values) into `k` centroids; returns `KMeansResult` (`centroids`, `assignment`, `inertia`, `iterations_run`). Deterministic for a given seed, on every CPU and thread count |
+| `KMeansParams` | `k`, `iterations` (default 25), `seed`, `threads` (0: all cores) |
+| `nearest_centroid(centroids, dim, point, distance)` | Index of the nearest centroid (squared L2; ties to the lower index) |
+| `VectorCodec` | Interface: `kind()`, `code_size()`, `trained()`, `train(sample)`, `encode`, `decode`, `prepare(query, table)`, `distance(table, code)` |
+| `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
+| `CodecKind`, `make_codec(kind, dim, metric)` | Codec kinds (`None`, `SQ8`) and a factory |

@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -64,6 +64,8 @@
 #include "hnsw_index.h"
 #include "storage.h"
 #include "serialize.h"
+#include "kmeans.h"
+#include "codec.h"
 #include "thread_pool.h"
 
 using namespace vecdb;
@@ -10017,6 +10019,263 @@ TEST(control, t13_cancelling_a_parallel_batch) {
 }
 
 // ===========================================================================
+// Phase Q0: k-means and codecs (Q0-1 to Q0-14)
+// ===========================================================================
+
+namespace {
+
+/// Points around `centers` (each `dim` values), `per` points each, small spread.
+std::vector<float> blobs(const std::vector<std::vector<float>>& centers, std::size_t per, float spread, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-spread, spread);
+    std::vector<float> out;
+    for (std::size_t i = 0; i < per; ++i)
+        for (const auto& c : centers)
+            for (float x : c) out.push_back(x + u(rng));
+    return out;
+}
+
+}  // namespace
+
+TEST(codec, q0_01_kmeans_finds_separated_clusters) {
+    const std::vector<std::vector<float>> centers = {{0, 0, 0}, {10, 0, 0}, {0, 10, 0}, {0, 0, 10}, {10, 10, 10}};
+    const auto data = blobs(centers, 200, 0.5f, 1);
+    const auto r = kmeans(data, 3, KMeansParams{5, 50, 7, 1});
+    bool found = true;
+    for (const auto& c : centers) {
+        float d = 0;
+        (void)nearest_centroid(r.centroids, 3, c.data(), &d);
+        found = found && d < 0.05f;  // each true center has a centroid within about 0.2
+    }
+    CHECK(found && r.centroids.size() == 15 && r.assignment.size() == 1000);
+    bool consistent = true;  // points of one blob share a centroid
+    for (std::size_t i = 0; i < 1000; ++i) consistent = consistent && r.assignment[i] == r.assignment[i % 5];
+    CHECK(consistent && r.inertia < 1000 * 3 * 0.25);
+}
+
+TEST(codec, q0_02_kmeans_is_deterministic_and_independent_of_threads) {
+    std::mt19937 rng(2);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<float> data(20000 * 8);
+    for (float& x : data) x = nd(rng);
+    const KMeansParams one{64, 15, 42, 1};
+    KMeansParams many = one;
+    many.threads = 4;
+    const auto a = kmeans(data, 8, one), b = kmeans(data, 8, one), c = kmeans(data, 8, many);
+    CHECK(a.centroids == b.centroids && a.assignment == b.assignment);  // bit for bit
+    CHECK(a.centroids == c.centroids && a.assignment == c.assignment && a.inertia == c.inertia);
+    KMeansParams other = one;
+    other.seed = 43;
+    const auto d = kmeans(data, 8, other);
+    CHECK(d.centroids != a.centroids && d.centroids.size() == a.centroids.size());  // another seed: another valid result
+}
+
+TEST(codec, q0_03_kmeans_fixed_answer) {
+    // Whole numbers average exactly, so every CPU and compiler must give exactly these.
+    const std::vector<float> data = {0, 0, 1, 0, 0, 1, 1, 1, 10, 10, 11, 10, 10, 11, 11, 11, 20, 0, 21, 0, 20, 2, 21, 2};
+    const auto r = kmeans(data, 2, KMeansParams{3, 20, 5, 1});
+    std::vector<std::vector<float>> got;
+    for (std::size_t c = 0; c < 3; ++c) got.push_back({r.centroids[c * 2], r.centroids[c * 2 + 1]});
+    std::sort(got.begin(), got.end());
+    CHECK(got == (std::vector<std::vector<float>>{{0.5f, 0.5f}, {10.5f, 10.5f}, {20.5f, 1.0f}}));
+    CHECK(r.inertia == 9.0);  // 4 x 0.5 for each of the first two clusters, 4 x 1.25 for the third
+}
+
+TEST(codec, q0_04_kmeans_edge_cases) {
+    // k = n: every point is its own centroid. k = 1: the mean.
+    const std::vector<float> data = {1, 2, 3, 4, 5, 6, 7, 8};
+    const auto all = kmeans(data, 2, KMeansParams{4, 10, 1, 1});
+    CHECK(all.inertia == 0.0);
+    const auto one = kmeans(data, 2, KMeansParams{1, 10, 1, 1});
+    CHECK(one.centroids == (std::vector<float>{4, 5}));
+    // Identical points: no NaN, every centroid equal to the point.
+    const std::vector<float> same(50 * 4, 3.25f);
+    const auto s = kmeans(same, 4, KMeansParams{8, 10, 1, 1});
+    CHECK(std::all_of(s.centroids.begin(), s.centroids.end(), [](float x) { return x == 3.25f; }) && s.inertia == 0.0);
+    // Only 3 distinct values but 25 centroids: identical centroids tie, ties go to
+    // the lower index, so most stay empty. Every centroid is still a valid value
+    // (empty clusters are refilled before averaging: never NaN).
+    std::vector<float> dup;
+    for (int i = 0; i < 30; ++i) dup.push_back(float(i % 3));
+    const auto e = kmeans(dup, 1, KMeansParams{25, 10, 3, 1});
+    CHECK(e.inertia == 0.0 && std::all_of(e.centroids.begin(), e.centroids.end(), [](float x) { return x == 0 || x == 1 || x == 2; }));
+}
+
+TEST(codec, q0_05_kmeans_rejects_invalid_input) {
+    const std::vector<float> data = {1, 2, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 0, KMeansParams{1}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 3, KMeansParams{1}));  // not a multiple
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans({}, 2, KMeansParams{1}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{3}));  // more centroids than points
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{1, 0}));
+    const std::vector<float> bad = {1, kNaN, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(bad, 2, KMeansParams{1}));
+}
+
+TEST(codec, q0_06_kmeans_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    std::vector<float> data(3000 * 4);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = float((i * 7919) % 101);
+    KMeansResult r;
+    CHECK(sweep_allocation_failures([&] { r = kmeans(data, 4, KMeansParams{16, 5, 1, 2}); }, [] {}) > 0);
+    CHECK(r.centroids.size() == 64);
+}
+
+TEST(codec, q0_07_sq8_round_trip_error_is_bounded) {
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> u(-4, 9);
+    std::vector<float> sample(500 * 16);
+    for (float& x : sample) x = u(rng);
+    SQ8Codec c(16, Metric::L2);
+    c.train(sample);
+    std::vector<std::uint8_t> code(c.code_size());
+    std::vector<float> back(16);
+    float worst = 0;
+    for (std::size_t i = 0; i < 500; ++i) {
+        c.encode(std::span<const float>(&sample[i * 16], 16), code.data());
+        c.decode(code.data(), back);
+        for (std::size_t j = 0; j < 16; ++j) worst = std::max(worst, std::abs(back[j] - sample[i * 16 + j]) / c.step()[j]);
+    }
+    CHECK(c.code_size() == 16 && worst <= 0.5f + 1e-3f);  // at most half a level, plus float rounding
+}
+
+TEST(codec, q0_08_sq8_constant_dimensions_and_clamping) {
+    const std::vector<float> sample = {1, 5, 0, 1, 7, 10, 1, 6, 5};  // dimension 0 is constant
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    float back[3];
+    c.encode(std::vector<float>{1, 5, 0}, code);
+    c.decode(code, back);
+    CHECK(back[0] == 1.0f && code[0] == 0);  // a constant dimension is stored exactly
+    c.encode(std::vector<float>{-100, 100, 5.2f}, code);  // outside the range: clamped to its ends
+    CHECK(code[0] == 0 && code[1] == 255 && code[2] == 133);  // 5.2 / (10 / 255) = 132.6
+    c.decode(code, back);
+    CHECK(back[1] == 7.0f);
+}
+
+TEST(codec, q0_09_sq8_distances_match_decoded_vectors) {
+    std::mt19937 rng(4);
+    std::normal_distribution<float> nd(0, 1);
+    for (Metric m : kMetrics) {
+        std::vector<float> sample(400 * 24);
+        for (float& x : sample) x = nd(rng);
+        if (m == Metric::Cosine)  // cosine codecs receive normalized vectors
+            for (std::size_t i = 0; i < 400; ++i) {
+                float n2 = 0;
+                for (std::size_t j = 0; j < 24; ++j) n2 += sample[i * 24 + j] * sample[i * 24 + j];
+                for (std::size_t j = 0; j < 24; ++j) sample[i * 24 + j] /= std::sqrt(n2);
+            }
+        SQ8Codec c(24, m);
+        c.train(sample);
+        std::vector<std::uint8_t> code(24);
+        std::vector<float> table, back(24);
+        const std::span<const float> q(&sample[0], 24);
+        c.prepare(q, table);
+        bool close = true;
+        for (std::size_t i = 1; i < 400; ++i) {
+            const std::span<const float> v(&sample[i * 24], 24);
+            c.encode(v, code.data());
+            c.decode(code.data(), back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 24; ++j)
+                expected += m == Metric::L2 ? double(q[j] - back[j]) * (q[j] - back[j]) : double(q[j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code.data()) - expected) < 1e-4 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(codec, q0_10_sq8_ranks_like_full_precision) {
+    // Codes keep the ordering: the 10 nearest by code overlap the true 10 nearest.
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<float> data(2000 * 32);
+    for (float& x : data) x = nd(rng);
+    SQ8Codec c(32, Metric::L2);
+    c.train(data);
+    std::vector<std::uint8_t> codes(2000 * 32);
+    for (std::size_t i = 0; i < 2000; ++i) c.encode(std::span<const float>(&data[i * 32], 32), &codes[i * 32]);
+    double overlap = 0;
+    for (std::size_t q = 0; q < 20; ++q) {
+        std::vector<float> query(32);
+        for (float& x : query) x = nd(rng);
+        std::vector<float> table;
+        c.prepare(query, table);
+        std::vector<std::pair<float, std::size_t>> exact, coded;
+        for (std::size_t i = 0; i < 2000; ++i) {
+            float d = 0;
+            for (std::size_t j = 0; j < 32; ++j) d += (query[j] - data[i * 32 + j]) * (query[j] - data[i * 32 + j]);
+            exact.emplace_back(d, i);
+            coded.emplace_back(c.distance(table, &codes[i * 32]), i);
+        }
+        std::partial_sort(exact.begin(), exact.begin() + 10, exact.end());
+        std::partial_sort(coded.begin(), coded.begin() + 10, coded.end());
+        std::set<std::size_t> truth;
+        for (std::size_t i = 0; i < 10; ++i) truth.insert(exact[i].second);
+        for (std::size_t i = 0; i < 10; ++i) overlap += double(truth.count(coded[i].second));
+    }
+    CHECK(overlap / 200.0 > 0.9);
+}
+
+TEST(codec, q0_11_sq8_fixed_answer_codes) {
+    // Every CPU and compiler must produce exactly these codes (they are saved in files).
+    // Expected values computed independently with NumPy float32, with inputs away
+    // from exact halves between levels (where float rounding decides).
+    const std::vector<float> sample = {0, -1, 2.5f, 255, 1, 0.5f, 127.5f, 0, -0.25f};
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    c.encode(std::vector<float>{63.75f, 0.3f, 1.0f}, code);
+    CHECK(code[0] == 64 && code[1] == 166 && code[2] == 116);
+    c.encode(std::vector<float>{127.5f, 1.0f, -0.25f}, code);
+    CHECK(code[0] == 128 && code[1] == 255 && code[2] == 0);
+}
+
+TEST(codec, q0_12_sq8_rejects_misuse) {
+    SQ8Codec c(4, Metric::L2);
+    std::uint8_t code[4];
+    std::vector<float> table, out(4);
+    CHECK(!c.trained());
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(4, 1.0f), code));
+    CHECK_THROWS_AS(std::logic_error, c.prepare(std::vector<float>(4, 1.0f), table));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>(6, 1.0f)));  // not whole vectors
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{1, 2, kInf, 4}));
+    c.train(std::vector<float>{0, 0, 0, 0, 1, 1, 1, 1});
+    CHECK_THROWS_AS(std::invalid_argument, c.encode(std::vector<float>(3, 1.0f), code));
+    CHECK_THROWS_AS(std::invalid_argument, c.decode(code, std::span<float>(out.data(), 3)));
+    CHECK_THROWS_AS(std::invalid_argument, c.set_range(std::vector<float>(4, 0.0f), std::vector<float>(4, -1.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, c.set_range(std::vector<float>(3, 0.0f), std::vector<float>(4, 1.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, SQ8Codec(0, Metric::L2));
+}
+
+TEST(codec, q0_13_sq8_set_range_matches_training) {
+    std::vector<float> sample(100 * 6);
+    for (std::size_t i = 0; i < sample.size(); ++i) sample[i] = float((i * 37) % 23) - 5.0f;
+    SQ8Codec trained(6, Metric::InnerProduct), restored(6, Metric::InnerProduct);
+    trained.train(sample);
+    restored.set_range(trained.minimum(), trained.step());  // as when loading a saved index
+    std::uint8_t a[6], b[6];
+    bool same = true;
+    for (std::size_t i = 0; i < 100; ++i) {
+        trained.encode(std::span<const float>(&sample[i * 6], 6), a);
+        restored.encode(std::span<const float>(&sample[i * 6], 6), b);
+        same = same && std::equal(a, a + 6, b);
+    }
+    CHECK(same);
+}
+
+TEST(codec, q0_14_make_codec) {
+    CHECK(make_codec(CodecKind::None, 4, Metric::L2) == nullptr);
+    const auto c = make_codec(CodecKind::SQ8, 4, Metric::Cosine);
+    CHECK(c && c->kind() == CodecKind::SQ8 && c->dim() == 4 && c->metric() == Metric::Cosine && c->code_size() == 4);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -10362,7 +10621,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

@@ -106,6 +106,8 @@ hnsw-lite/
 │   ├── flat_index.h            # Layer 3: FlatIndex
 │   ├── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
 │   ├── serialize.h             # Saving: checksums, writer, untrusted-file reader, FormatError
+│   ├── kmeans.h                # k-means training (for PQ and IVF)
+│   ├── codec.h                 # Vector codecs: SQ8
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -120,10 +122,12 @@ hnsw-lite/
 │   ├── flat_index.cpp          # FlatIndex implementation
 │   ├── hnsw_index.cpp          # HnswIndex implementation
 │   ├── persistence.cpp         # Saving and loading (file format version 1)
+│   ├── kmeans.cpp              # k-means (built without floating-point contraction)
+│   ├── codec.cpp               # Codecs (built without floating-point contraction)
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 596 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 610 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -381,6 +385,14 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Searches** do not pass a deadline through every internal function. The public search installs a `detail::SearchStopScope` for its duration: a thread-local pointer to the search's deadline and cancel flag, restoring the previous one afterwards, so a search inside a predicate has its own. The inner loops (graph search, exact scans, range searches, Flat's tiles) call `detail::search_should_stop()` every 32 graph steps or 256 rows; with no deadline it costs one thread-local read. On stopping, a loop simply ends, so the results are the best found so far. When the scope ends, after the search has written its statistics, it sets `SearchStats::stopped_early`. Batch searches install one scope per worker task. Inserts use the same search code but never install a scope, so they are unaffected.
 
 **Long operations** use `detail::OperationControl`: it checks the cancel flag and deadline, throwing `Cancelled`, and reports progress under a mutex (monotonic, about once per percent). Each operation is built so that a throw at any check undoes it: `add_batch` rolls back, `compact` discards the replacement it was building, and a save to a path removes its temporary file. The final progress report happens before the work becomes permanent (inside `add_batch`'s rollback scope, before `compact`'s commit, before a save's rename), so a callback that throws then still undoes the operation.
+
+### Training and codecs
+
+**k-means** (`kmeans.h`) trains centroids for product quantization and the IVF index: k-means++ seeding (each new centroid drawn with probability proportional to its squared distance from the nearest so far), then Lloyd's refinement until no assignment changes. A cluster that becomes empty takes the point farthest from its own centroid. Points are assigned in fixed-size chunks, possibly on several threads; since each point's assignment is independent, the thread count never changes the result.
+
+**Codecs** (`codec.h`) store vectors compactly. A codec is trained once, encodes each vector into `code_size()` bytes, and computes distances between a full-precision query and a code (asymmetric distance): `prepare()` turns the query into a small table once, then `distance()` compares the table with each code in a single pass. Distances follow the library's conventions (squared L2, negative dot product, 1 minus dot product), so they are directly comparable with full-precision ones. **SQ8** maps each dimension onto 256 even levels between its smallest and largest trained value: one byte per dimension, with a rounding error of at most half a level.
+
+**Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ## Search features design
 
