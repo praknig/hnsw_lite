@@ -14,6 +14,7 @@ These are deliberate for the current stage:
 
 - **Changes run one at a time.** Indexes are thread-safe, and adds, updates and removes take the lock alone. `add_batch` links its vectors on several threads, but searches wait while it runs; letting searches run during inserts would need the lowest storage layer redesigned for concurrent readers.
 - **Heavy update churn gradually weakens the graph.** Each update links a new version and repairs around the old one, and these small losses add up: after 320 updates per vector on a 20-vector index, one or two vectors were unreachable from the entry point in 27 of 200 random update orders (worst 90% reachable), single-threaded as well as with threads. `compact()` rebuilds the graph and restores it fully, so call it after heavy update workloads. (hnswlib has the same weakness with repeated updates.)
+- **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
 - **Many exact copies of the same vector weaken the graph,** especially combined with heavy removal and update churn: graph reachability drops noticeably (hnswlib shares this limitation).
 - **HNSW build speed.** One-by-one adds are single-threaded (use `add_batch` to build on several threads), and every access is bounds-checked for safety. Unchecked accessors in the hot loops are future optimizations.
 - **Saving cannot force data onto the physical disk:** a save is atomic (temporary file, then rename), but a power cut right after `save` returns could lose that latest save. Loading is not memory-mapped, so a large index is read fully into memory.
@@ -47,6 +48,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Thread-safe indexes: one lock per index (stage A)
 - [x] Parallel building: `add_batch` links vectors on several threads (stage B)
 - [x] Bulk changes by filter: `remove_where`, `set_metadata_where`, `count_where`
+- [x] Reading records back: `get_vector`, `get`, `scan` (file format version 2)
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe

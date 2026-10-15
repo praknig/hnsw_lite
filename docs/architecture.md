@@ -123,7 +123,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 554 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 571 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -326,12 +326,12 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 
 ### Saving and loading
 
-**File format (version 1).** All numbers are little-endian. A 24-byte header (the magic text `HNSWLITE`, the format version, a byte-order mark, the index kind and a reserved field) is followed by sections, each a 4-letter tag, a 64-bit length, the payload and a CRC-32 of the payload, and finally an empty `END ` section; nothing may follow it.
+**File format (version 2; version 1 is still read).** All numbers are little-endian. A 24-byte header (the magic text `HNSWLITE`, the format version, a byte-order mark, the index kind and a reserved field) is followed by sections, each a 4-letter tag, a 64-bit length, the payload and a CRC-32 of the payload, and finally an empty `END ` section; nothing may follow it.
 
 | Section | Flat | HNSW |
 |---|---|---|
 | `CONF` | Dimension, metric | Dimension, metric, `M`, `ef_construction`, seed, graph repair, planner settings |
-| `NODE` | Each vector with its user ID | Each slot, live or removed: user ID, removed flag, level, vector, then the links on each level |
+| `NODE` | Each vector with its user ID; for cosine (version 2), then the vector as given | Each slot, live or removed: user ID, removed flag, level, vector, for cosine (version 2) the vector as given, then the links on each level |
 | `STAT` | | Entry point, top level, free slots in reuse order, the random generator's state |
 | `META` | Metadata | Metadata: schema mode, fields (name, type, indexed), string dictionary, then each field's rows in slot order |
 
@@ -345,7 +345,9 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 
 **Loading untrusted files.** `persist::Reader` knows the file's size before reading (hence seekable streams), and checks every read against the bytes left in the section and the file. Every count is checked against those bytes **before** allocating, so a damaged count cannot trigger a huge allocation. After the checksums, the content is validated: link targets, self-links, repeated links, list lengths, levels, removed flags, finite vector values, unique user IDs, an entry point that is live and on the top level, a free list naming exactly the removed slots, the generator state, and every metadata value. Any problem throws `FormatError`, and nothing partly built escapes.
 
-**Compatibility** is guarded by two small golden files in `tests/data/`, saved in format version 1. Their vectors are small whole numbers, which every distance kernel sums exactly, so every CI platform must rebuild them **byte for byte**; this checks the format, the determinism of saving and portability across platforms at once. `test_comprehensive --write-golden` rewrites them, for a deliberate format change only.
+**Versions.** Version 2 added each cosine vector as given, before normalization, so `get_vector` returns it exactly (`Storage` keeps these originals slot by slot, through every insert, reuse, update, removal and compaction; `compact` rebuilds from them). Version 1 files still load: for a cosine index, the stored normalized vector stands in for the original. For L2 and inner-product indexes the two versions differ only in the version number.
+
+**Compatibility** is guarded by small golden files in `tests/data/`: the version 1 files are frozen, proving that old files keep loading, and the version 2 files must be reproduced byte for byte. Their vectors are small whole numbers, which every distance kernel sums exactly, so every CI platform must rebuild the current version's files **byte for byte**; this checks the format, the determinism of saving and portability across platforms at once. `test_comprehensive --write-golden` writes the current version's files, for a deliberate format change only; older versions' files are never rewritten.
 
 ### Thread safety
 

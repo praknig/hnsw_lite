@@ -3,9 +3,11 @@
  * @brief Saving and loading indexes (file format version 1; see serialize.h).
  *
  * Sections, in order:
- *   Flat: CONF (dimension, metric), NODE (each vector with its user ID), META, END
+ *   Flat: CONF (dimension, metric), NODE (each vector with its user ID, and for
+ *         cosine in version 2 the vector as given), META, END
  *   HNSW: CONF (dimension, metric, HNSW settings, planner settings),
- *         NODE (each slot: user ID, removed flag, level, vector, links per level),
+ *         NODE (each slot: user ID, removed flag, level, vector, for cosine in
+ *         version 2 the vector as given, links per level),
  *         STAT (entry point, top level, free slots in order, random generator state as one u64),
  *         META, END
  *   META: schema mode, fields (name, type, indexed), string dictionary, then each
@@ -275,6 +277,7 @@ void FlatIndex::save(std::ostream& out) const {
         for (NodeId n = 0; n < vectors_.size(); ++n) {
             w.put<std::uint64_t>(ids_.external(n));
             w.put_floats(vectors_.get(n).data(), dim());
+            if (originals_) w.put_floats(originals_->get(n).data(), dim());  // version 2: cosine originals
         }
     });
     persist::write_section(out, kMeta, [&](Writer& w) { metadata_.save(w); });
@@ -299,13 +302,18 @@ std::unique_ptr<FlatIndex> FlatIndex::load(std::istream& in) {
 
         // Vectors are stored as saved (already normalized for cosine), bypassing add().
         r.begin_section(kNode, "NODE");
-        const auto n = r.get_count(8 + 4 * std::uint64_t(dim), "vectors");
-        std::vector<float> v(dim);
+        // Version 2 cosine files hold each original after the stored vector; for
+        // version 1 files the stored (normalized) vector stands in for it.
+        const bool has_original = r.version() >= 2 && metric == Metric::Cosine;
+        const auto n = r.get_count(8 + 4 * std::uint64_t(dim) * (has_original ? 2 : 1), "vectors");
+        std::vector<float> v(dim), original(dim);
         for (std::uint64_t i = 0; i < n; ++i) {
             const auto id = r.get<std::uint64_t>();
             r.get_floats(v.data(), dim);
+            if (has_original) r.get_floats(original.data(), dim);
             index->ids_.add(id);  // a repeated user ID throws (and becomes a FormatError)
             index->vectors_.add(v);
+            if (index->originals_) index->originals_->add(has_original ? original : v);
         }
         r.end_section();
         index->live_ = static_cast<std::size_t>(n);
@@ -352,6 +360,7 @@ void HnswIndex::save(std::ostream& out) const {
             w.put<std::uint8_t>(ids.is_deleted(n) ? 1 : 0);
             w.put<std::uint8_t>(static_cast<std::uint8_t>(level));
             w.put_floats(storage_.vectors().get(n).data(), dim());
+            if (storage_.originals()) w.put_floats(storage_.originals()->get(n).data(), dim());  // version 2: cosine originals
             for (int l = 0; l <= level; ++l) {
                 const auto links = graph.links(n, l);
                 const std::size_t count = GraphStorage::count(links);
@@ -403,10 +412,11 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
 
         // Every slot, live or removed, with its level, vector and links.
         r.begin_section(kNode, "NODE");
-        const auto n = r.get_count(8 + 1 + 1 + 4 * std::uint64_t(dim) + 4, "vectors");
+        const bool has_original = r.version() >= 2 && metric == Metric::Cosine;  // see FlatIndex::load
+        const auto n = r.get_count(8 + 1 + 1 + 4 * std::uint64_t(dim) * (has_original ? 2 : 1) + 4, "vectors");
         if (n >= kEmpty) throw FormatError("too many vectors");  // GCOVR_EXCL_BR_LINE: needs a file over 100 GB
         const std::size_t M0 = 2 * params.M;
-        std::vector<float> v(dim);
+        std::vector<float> v(dim), original(dim);
         std::vector<NodeId> links;
         std::vector<std::uint8_t> removed(static_cast<std::size_t>(n));
         std::vector<int> levels(static_cast<std::size_t>(n));
@@ -417,11 +427,13 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
             if (is_removed > 1) throw FormatError("invalid removed flag");
             const int level = r.get<std::uint8_t>();
             r.get_floats(v.data(), dim);
+            if (has_original) r.get_floats(original.data(), dim);
+            const std::span<const float> as_given = has_original ? std::span<const float>(original) : std::span<const float>(v);
             if (is_removed) {
-                st.insert_unmapped(id, v, level);  // holds its old user ID, not findable
+                st.insert_unmapped(id, v, level, as_given);  // holds its old user ID, not findable
                 st.ids().retire(slot);
             } else {
-                st.insert(id, v, level);  // a repeated live user ID throws
+                st.insert(id, v, level, as_given);  // a repeated live user ID throws
             }
             removed[slot] = is_removed;
             levels[slot] = level;

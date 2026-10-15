@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -6668,7 +6668,7 @@ std::vector<float> integer_vector(std::mt19937& rng, std::size_t dim) {
     return v;
 }
 
-/// The index stored in tests/data/golden_hnsw_v1.bin (format version 1).
+/// The index stored in tests/data/golden_hnsw_v1.bin and _v2.bin (format versions 1 and 2).
 std::unique_ptr<HnswIndex> golden_hnsw() {
     HnswParams p;
     p.M = 8;
@@ -6687,7 +6687,7 @@ std::unique_ptr<HnswIndex> golden_hnsw() {
     return h;
 }
 
-/// The index stored in tests/data/golden_flat_v1.bin (format version 1).
+/// The index stored in tests/data/golden_flat_v1.bin and _v2.bin (format versions 1 and 2).
 std::unique_ptr<FlatIndex> golden_flat() {
     auto f = std::make_unique<FlatIndex>(8, Metric::L2, Schema::strict({{"category", FieldType::Keyword}, {"n", FieldType::Int}}));
     std::mt19937 rng(2027);
@@ -6923,16 +6923,17 @@ TEST(persistence, p21_any_flipped_bit_is_detected) {
 
 TEST(persistence, p22_wrong_magic_version_or_byte_order) {
     const std::string bytes = save_bytes(*tiny_hnsw());
-    std::string magic = bytes, version = bytes, order = bytes, reserved = bytes;
+    std::string magic = bytes, version = bytes, zero = bytes, order = bytes, reserved = bytes;
     magic[0] = 'X';
-    poke<std::uint32_t>(version, 8, 2);
+    poke<std::uint32_t>(version, 8, 3);  // a future version
+    poke<std::uint32_t>(zero, 8, 0);
     poke<std::uint32_t>(order, 12, 0x04030201u);
     poke<std::uint32_t>(reserved, 20, 1);
-    for (const std::string& bad : {magic, version, order, reserved}) CHECK_THROWS_AS(FormatError, load_hnsw(bad));
+    for (const std::string& bad : {magic, version, zero, order, reserved}) CHECK_THROWS_AS(FormatError, load_hnsw(bad));
     try {
         load_hnsw(version);
     } catch (const FormatError& e) {
-        CHECK(std::string(e.what()).find("version 2") != std::string::npos);  // a clear message
+        CHECK(std::string(e.what()).find("version 3") != std::string::npos);  // a clear message
     }
 }
 
@@ -7072,8 +7073,11 @@ TEST(persistence, p30_oom_save_keeps_the_old_file) {
 }
 
 TEST(persistence, p40_golden_files_load) {
-    auto h = HnswIndex::load(golden_path("golden_hnsw_v1.bin"));
-    auto f = FlatIndex::load(golden_path("golden_flat_v1.bin"));
+  // Every format version this library reads: the version 1 files are frozen, to
+  // prove that files saved by older versions of the library keep loading.
+  for (const char* version : {"v1", "v2"}) {
+    auto h = HnswIndex::load(golden_path((std::string("golden_hnsw_") + version + ".bin").c_str()));
+    auto f = FlatIndex::load(golden_path((std::string("golden_flat_") + version + ".bin").c_str()));
     auto h_ref = golden_hnsw();
     auto f_ref = golden_flat();
     CHECK(h->size() == h_ref->size() && h->capacity() == h_ref->capacity() && h->deleted_count() == h_ref->deleted_count());
@@ -7090,13 +7094,15 @@ TEST(persistence, p40_golden_files_load) {
     CHECK(same);
     CHECK(*h->get_metadata(2) == *h_ref->get_metadata(2) && *f->get_metadata(1002) == *f_ref->get_metadata(1002));
     CHECK(h->metadata().is_indexed(*h->metadata().find_field("category")));
+    CHECK(*h->get_vector(2) == *h_ref->get_vector(2));
+  }
 }
 
 TEST(persistence, p41_identical_bytes_on_every_platform) {
     // Built from whole numbers, which every distance kernel sums exactly, so every
     // CI platform must reproduce the committed version 1 files byte for byte.
-    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v1.bin")));
-    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v1.bin")));
+    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v2.bin")));
+    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v2.bin")));
 }
 
 TEST(persistence, p42_large_round_trip) {
@@ -8980,6 +8986,459 @@ TEST(bulk, w16_flat_moves_metadata_with_vectors) {
 }
 
 // ===========================================================================
+// Reading records back: get_vector, get, scan (R1-R16)
+// ===========================================================================
+
+namespace {
+
+/// Every page of a scan, concatenated; also checks each page's shape.
+std::vector<Record> scan_all(const auto& index, ScanOptions o, bool& pages_ok) {
+    std::vector<Record> all;
+    for (int guard = 0; guard < 100000; ++guard) {
+        const Page page = index.scan(o);
+        pages_ok = pages_ok && page.records.size() <= o.limit;
+        if (page.next) pages_ok = pages_ok && page.records.size() == o.limit && page.records.back().id == *page.next;
+        all.insert(all.end(), page.records.begin(), page.records.end());
+        if (!page.next) return all;
+        o.after = page.next;
+    }
+    pages_ok = false;
+    return all;
+}
+
+std::vector<std::uint64_t> ids_of(const std::vector<Record>& records) {
+    std::vector<std::uint64_t> ids;
+    for (const Record& r : records) ids.push_back(r.id);
+    return ids;
+}
+
+/// A version 1 file made from a version 2 file of a cosine index, by removing the
+/// originals stored after each vector (version 1 did not store them).
+std::string as_version_1(const std::string& v2, bool hnsw, std::size_t dim) {
+    ParsedFile f = ParsedFile::parse(v2);
+    poke<std::uint32_t>(f.header, 8, 1);
+    std::string& node = f.payload("NODE");
+    std::string out = node.substr(0, 8);
+    const auto n = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(&node[0]));
+    std::size_t at = 8;
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::size_t head = hnsw ? 8 + 1 + 1 : 8;
+        const int level = hnsw ? static_cast<unsigned char>(node[at + 9]) : 0;
+        out += node.substr(at, head + 4 * dim);  // ID (and flags), stored vector
+        at += head + 8 * dim;                     // skip the original
+        if (hnsw)
+            for (int l = 0; l <= level; ++l) {
+                const auto count = persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(&node[at]));
+                out += node.substr(at, 4 + 4 * std::size_t(count));
+                at += 4 + 4 * std::size_t(count);
+            }
+    }
+    node = out;
+    return f.assemble();
+}
+
+}  // namespace
+
+TEST(records, r01_get_vector_returns_the_vector_as_given) {
+    auto data = random_vectors(300, 12, 900);
+    for (Metric m : kMetrics) {
+        HnswIndex h(12, m);
+        FlatIndex f(12, m);
+        for (std::uint64_t i = 0; i < 300; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        bool exact = true;
+        for (std::uint64_t i = 0; i < 300; ++i) exact = exact && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i];  // bit for bit
+        CHECK(exact);
+        CHECK(!h.get_vector(999) && !f.get_vector(999));
+        h.remove(5);
+        f.remove(5);
+        CHECK(!h.get_vector(5) && !f.get_vector(5));
+        // A vector read back finds itself.
+        CHECK(h.search(*h.get_vector(7), 1, 64)[0].id == 7 && f.search(*f.get_vector(7), 1)[0].id == 7);
+    }
+}
+
+TEST(records, r02_get_returns_vector_and_metadata) {
+    auto data = random_vectors(50, 6, 901);
+    HnswIndex h(6, Metric::Cosine);
+    FlatIndex f(6, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        h.add(100 + i, data[i], meta_for(i));
+        f.add(100 + i, data[i], meta_for(i));
+    }
+    for (auto r : {h.get(110), f.get(110)}) CHECK(r && r->id == 110 && r->vector == data[10] && r->metadata == meta_for(10));
+    CHECK(!h.get(1) && !f.get(1));
+}
+
+TEST(records, r03_paging_through_everything) {
+    auto data = random_vectors(500, 4, 902);
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    std::vector<std::uint64_t> ids;
+    std::mt19937_64 rng(3);
+    for (std::size_t i = 0; i < 500; ++i) ids.push_back(rng() % 1000000);
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+    std::vector<std::uint64_t> shuffled = ids;
+    std::shuffle(shuffled.begin(), shuffled.end(), rng);  // added out of order
+    for (std::size_t i = 0; i < shuffled.size(); ++i) {
+        h.add(shuffled[i], data[i]);
+        f.add(shuffled[i], data[i]);
+    }
+    for (std::size_t limit : {std::size_t(1), std::size_t(7), std::size_t(100), std::size_t(1000)}) {
+        ScanOptions o;
+        o.limit = limit;
+        bool pages_ok = true;
+        const auto hr = scan_all(h, o, pages_ok), fr = scan_all(f, o, pages_ok);
+        CHECK(pages_ok && ids_of(hr) == ids && ids_of(fr) == ids);  // each exactly once, ascending
+        bool vectors_ok = true;
+        for (const Record& r : hr) vectors_ok = vectors_ok && r.vector == *h.get_vector(r.id);
+        CHECK(vectors_ok);
+    }
+}
+
+TEST(records, r04_filtered_paging) {
+    auto data = clustered(600, 8, 6, 903);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (const FilterCase& c : filter_cases()) {
+        std::vector<std::uint64_t> expected;
+        for (std::uint64_t i = 0; i < 600; ++i)
+            if (c.expected(i)) expected.push_back(i);
+        ScanOptions o;
+        o.filter = c.filter;
+        o.limit = 37;
+        bool pages_ok = true;
+        const bool ok = ids_of(scan_all(h, o, pages_ok)) == expected && ids_of(scan_all(f, o, pages_ok)) == expected &&
+                        h.count_where(c.filter) == expected.size();
+        if (!(ok && pages_ok)) std::printf("    filter case '%s' failed\n", c.name);
+        CHECK(ok && pages_ok);
+    }
+}
+
+TEST(records, r05_edge_cases) {
+    HnswIndex empty(3, Metric::L2);
+    const Page none = empty.scan();
+    CHECK(none.records.empty() && !none.next);
+    HnswIndex h(3, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) h.add(i, std::vector<float>{float(i), 1, 2});
+    ScanOptions big;
+    big.limit = 1000;
+    const Page all = h.scan(big);
+    CHECK(all.records.size() == 10 && !all.next);  // fits in one page: no next
+    ScanOptions exact;
+    exact.limit = 10;
+    CHECK(h.scan(exact).records.size() == 10 && !h.scan(exact).next);  // exactly one full page: no next
+    ScanOptions zero;
+    zero.limit = 0;
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.scan(zero));
+    ScanOptions beyond;
+    beyond.after = 999;
+    CHECK(h.scan(beyond).records.empty() && !h.scan(beyond).next);
+    for (std::uint64_t i = 0; i < 10; ++i) h.remove(i);
+    CHECK(h.scan().records.empty() && !h.scan().next);
+}
+
+TEST(records, r06_cursor_on_a_removed_id) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i * 10, std::vector<float>{float(i), 0});
+    h.remove(50);
+    ScanOptions o;
+    o.after = 50;  // no longer stored
+    o.limit = 3;
+    CHECK(ids_of(h.scan(o).records) == (std::vector<std::uint64_t>{60, 70, 80}));
+    o.after = 55;  // never stored
+    CHECK(ids_of(h.scan(o).records) == (std::vector<std::uint64_t>{60, 70, 80}));
+}
+
+TEST(records, r07_without_vectors_or_metadata) {
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 30; ++i) {
+        h.add(i, std::vector<float>{float(i), 1, 2, 3}, meta_for(i));
+        f.add(i, std::vector<float>{float(i), 1, 2, 3}, meta_for(i));
+    }
+    ScanOptions ids_only;
+    ids_only.with_vectors = false;
+    ids_only.with_metadata = false;
+    bool empty_fields = true;
+    for (const Page& page : {h.scan(ids_only), f.scan(ids_only)})
+        for (const Record& r : page.records) empty_fields = empty_fields && r.vector.empty() && r.metadata == Metadata();
+    CHECK(empty_fields);
+    ScanOptions meta_only;
+    meta_only.with_vectors = false;
+    const Page m = h.scan(meta_only);
+    CHECK(m.records[3].vector.empty() && m.records[3].metadata == meta_for(3));
+}
+
+TEST(records, r08_extreme_ids) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t id : {kMaxId, std::uint64_t(0), kMaxId - 1, std::uint64_t(1)}) h.add(id, std::vector<float>{float(id % 7), 1});
+    ScanOptions o;
+    o.limit = 2;
+    bool pages_ok = true;
+    CHECK(ids_of(scan_all(h, o, pages_ok)) == (std::vector<std::uint64_t>{0, 1, kMaxId - 1, kMaxId}) && pages_ok);
+    o.after = kMaxId;
+    CHECK(h.scan(o).records.empty());
+    o.after = 0;
+    CHECK(h.scan(o).records.front().id == 1);  // `after` is exclusive
+}
+
+TEST(records, r09_changes_between_pages) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) h.add(i * 2, std::vector<float>{float(i), 1});  // even IDs 0..198
+    ScanOptions o;
+    o.limit = 10;
+    Page page = h.scan(o);  // 0..18
+    std::vector<std::uint64_t> seen = ids_of(page.records);
+    h.remove(20);       // next on the list: skipped
+    h.remove(4);        // already returned: nothing changes
+    h.add(21, std::vector<float>{0.5f, 1});  // after the cursor: included
+    h.add(3, std::vector<float>{0.7f, 1});   // before the cursor: not included
+    while (page.next) {
+        o.after = page.next;
+        page = h.scan(o);
+        const auto ids = ids_of(page.records);
+        seen.insert(seen.end(), ids.begin(), ids.end());
+    }
+    std::vector<std::uint64_t> expected;
+    for (std::uint64_t i = 0; i < 200; i += 2)
+        if (i != 20) expected.push_back(i);
+    expected.insert(std::upper_bound(expected.begin(), expected.end(), 21), 21);
+    CHECK(seen == expected);  // nothing repeated, nothing that stayed stored skipped
+}
+
+TEST(records, r10_paging_while_the_index_changes) {
+    auto data = clustered(2000, 8, 6, 904);
+    HnswIndex h(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i], meta_for(i));
+    std::atomic<bool> stop{false};
+    std::atomic<long> bad{0}, pages{0};
+    with_watchdog(120, "r10", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 1000; i < 2000; ++i) {
+                h.add(i, data[i], meta_for(i));
+                if (i % 3 == 0) h.remove(i - 900);
+                if (i % 5 == 0) h.update(i - 500, data[i - 1000]);
+            }
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            while (!stop) {
+                ScanOptions o;
+                o.limit = 50 + t;
+                o.filter = t == 2 ? std::optional<Filter>(Filter::eq("category", "tech")) : std::nullopt;
+                for (int k = 0; k < 10; ++k) {
+                    const Page page = h.scan(o);
+                    ++pages;
+                    for (std::size_t i = 0; i < page.records.size(); ++i) {
+                        const Record& r = page.records[i];
+                        if ((i > 0 && r.id <= page.records[i - 1].id) || r.vector.size() != 8 || (o.after && r.id <= *o.after)) ++bad;
+                    }
+                    if (!page.next) break;
+                    o.after = page.next;
+                }
+            }
+        });
+        writer.join();
+    });
+    CHECK(bad == 0 && pages > 0);
+}
+
+TEST(records, r11_unknown_filter_fields) {
+    HnswIndex strict(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    HnswIndex dyn(2, Metric::L2);
+    strict.add(1, std::vector<float>{1, 0}, meta_for(1));
+    dyn.add(1, std::vector<float>{1, 0}, meta_for(1));
+    ScanOptions o;
+    o.filter = Filter::eq("no_such_field", 1);
+    CHECK_THROWS_AS(std::invalid_argument, (void)strict.scan(o));
+    CHECK(dyn.scan(o).records.empty());
+}
+
+TEST(records, r12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(200, 8, 905);
+    HnswIndex h(8, Metric::Cosine);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    ScanOptions o;
+    o.filter = Filter::has_tag("tags", "a");
+    o.limit = 30;
+    Page page;
+    CHECK(sweep_allocation_failures([&] { page = h.scan(o); }, [&] { CHECK(save_bytes(h) == hb); }) > 0 && page.records.size() == 30);
+    std::optional<Record> got;
+    CHECK(sweep_allocation_failures([&] { got = f.get(10); }, [&] { CHECK(save_bytes(f) == fb); }) > 0 && got->vector == data[10]);
+    // Adding to a cosine index stores the original too, all or nothing. A failed
+    // HNSW add leaves the contents as they were, though its bookkeeping may move
+    // on (a slot kept free, a random level used up; identical for L2), so its
+    // contents are compared; Flat is restored exactly.
+    ScanOptions everything;
+    everything.limit = 1000;
+    auto contents = [&] {
+        std::vector<std::pair<std::uint64_t, std::vector<float>>> c;
+        for (const Record& r : h.scan(everything).records) c.emplace_back(r.id, r.vector);
+        return c;
+    };
+    const auto before = contents();
+    std::uint64_t id = 500;
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[150], meta_for(1)); },
+                                    [&] { CHECK(!h.contains(id) && h.size() == 100 && contents() == before); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[150], meta_for(1)); }, [&] { CHECK(!f.contains(id) && save_bytes(f) == fb); }) > 0);
+    CHECK(*h.get_vector(500) == data[150] && *f.get_vector(500) == data[150]);
+}
+
+TEST(records, r13_allowed_inside_a_search) {
+    auto data = random_vectors(50, 4, 906);
+    HnswIndex h(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) h.add(i, data[i]);
+    std::atomic<long> reads{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t id) {
+        reads += long(h.get_vector(id).has_value()) + long(h.get(id).has_value()) + long(!h.scan().records.empty());
+        return true;
+    };
+    (void)h.search(data[0], 5, 32, o);
+    CHECK(reads > 0 && reads % 3 == 0);
+}
+
+TEST(records, r14_after_save_and_load) {
+    auto data = random_vectors(300, 6, 907);
+    HnswIndex h(6, Metric::Cosine);
+    FlatIndex f(6, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (std::uint64_t i = 0; i < 300; i += 7) {
+        h.remove(i);
+        f.remove(i);
+    }
+    auto h2 = load_hnsw(save_bytes(h));
+    auto f2 = load_flat(save_bytes(f));
+    ScanOptions o;
+    o.limit = 1000;
+    const auto a = h.scan(o).records, b = h2->scan(o).records, c = f.scan(o).records, d = f2->scan(o).records;
+    bool same = a.size() == b.size() && c.size() == d.size();
+    for (std::size_t i = 0; same && i < a.size(); ++i) same = a[i].id == b[i].id && a[i].vector == b[i].vector && a[i].metadata == b[i].metadata;
+    for (std::size_t i = 0; same && i < c.size(); ++i) same = c[i].id == d[i].id && c[i].vector == d[i].vector && c[i].metadata == d[i].metadata;
+    CHECK(same && *h2->get_vector(1) == data[1] && *f2->get_vector(1) == data[1]);  // the originals survive saving
+}
+
+TEST(records, r15_version_1_cosine_files) {
+    // Version 1 did not store the original of a cosine vector: such files still
+    // load, and get_vector returns the stored (normalized) vector instead.
+    auto data = random_vectors(80, 5, 908);
+    HnswIndex h(5, Metric::Cosine);
+    FlatIndex f(5, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 80; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    h.remove(3);
+    auto h1 = load_hnsw(as_version_1(save_bytes(h), true, 5));
+    auto f1 = load_flat(as_version_1(save_bytes(f), false, 5));
+    bool normalized = h1->size() == 79 && f1->size() == 80;
+    for (std::uint64_t i = 4; i < 80; ++i) {
+        for (const auto& v : {*h1->get_vector(i), *f1->get_vector(i)}) {
+            double length = 0, dot = 0, original = 0;
+            for (std::size_t d = 0; d < 5; ++d) {
+                length += double(v[d]) * v[d];
+                dot += double(v[d]) * data[i][d];
+                original += double(data[i][d]) * data[i][d];
+            }
+            normalized = normalized && std::abs(length - 1.0) < 1e-5 && std::abs(dot - std::sqrt(original)) < 1e-4;  // same direction, length 1
+        }
+    }
+    CHECK(normalized);
+    CHECK(same_results(h1->search(data[9], 5, 64), h.search(data[9], 5, 64)));
+    // Saved again, they become version 2 files.
+    CHECK(persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(save_bytes(*h1).data() + 8)) == 2);
+}
+
+TEST(records, r16_originals_follow_every_path) {
+    // Cosine: after every way of storing, moving and freeing vectors, each stored
+    // vector reads back exactly as last given.
+    auto data = random_vectors(900, 8, 909);
+    std::map<std::uint64_t, std::vector<float>> want;
+    HnswIndex h(8, Metric::Cosine);
+    FlatIndex f(8, Metric::Cosine);
+    auto add = [&](std::uint64_t id, const std::vector<float>& v) { h.add(id, v); f.add(id, v); want[id] = v; };
+    for (std::uint64_t i = 0; i < 300; ++i) add(i, data[i]);
+    for (std::uint64_t i = 0; i < 300; i += 4) { h.remove(i); f.remove(i); want.erase(i); }       // Flat: swap with last
+    for (std::uint64_t i = 1000; i < 1040; ++i) add(i, data[i - 700]);                            // HNSW: reused slots
+    bool agree = true;
+    for (std::uint64_t i = 1; i < 300; i += 5) {  // update returns false for IDs removed above
+        const bool hu = h.update(i, data[i + 340]), fu = f.update(i, data[i + 340]);
+        agree = agree && hu == fu && hu == want.contains(i);
+        if (hu) want[i] = data[i + 340];
+    }
+    CHECK(agree);
+    for (std::uint64_t i = 2; i < 300; i += 9) { h.upsert(i, data[i + 600]); f.upsert(i, data[i + 600]); want[i] = data[i + 600]; }
+    std::vector<std::uint64_t> batch_ids;
+    std::vector<float> batch;
+    for (std::uint64_t i = 2000; i < 2100; ++i) {
+        batch_ids.push_back(i);
+        batch.insert(batch.end(), data[i - 1200].begin(), data[i - 1200].end());  // vectors 800-899
+        want[i] = data[i - 1200];
+    }
+    for (std::uint64_t i = 3; i < 300; i += 11) { h.remove(i); f.remove(i); want.erase(i); }      // slots for the batch to reuse
+    h.add_batch(std::span<const std::uint64_t>(batch_ids.data(), 50), std::span<const float>(batch.data(), 50 * 8), 1);
+    h.add_batch(std::span<const std::uint64_t>(batch_ids.data() + 50, 50), std::span<const float>(batch.data() + 50 * 8, 50 * 8), 4);
+    f.add_batch(batch_ids, batch);
+    auto all_exact = [&] {
+        bool exact = h.size() == want.size() && f.size() == want.size();
+        for (const auto& [id, v] : want) {
+            const bool ok = h.get_vector(id) == v && f.get_vector(id) == v;
+            if (!ok && exact) std::printf("    first mismatch: id %llu (stored in hnsw: %d, flat: %d)\n", (unsigned long long)id, int(h.contains(id)), int(f.contains(id)));
+            exact = exact && ok;
+        }
+        return exact;
+    };
+    CHECK(all_exact());
+    h.compact();  // rebuilt from the originals
+    CHECK(all_exact());
+    CHECK(h.search(want.begin()->second, 1, 64)[0].id == want.begin()->first);
+}
+
+TEST(records, r17_damaged_cosine_files) {
+    // The cosine-only part of the format (originals after each vector) read from
+    // damaged files: truncated at every byte, a bit flipped in every byte.
+    auto data = random_vectors(12, 3, 910);
+    HnswIndex h(3, Metric::Cosine, HnswParams{4, 16, 1});
+    FlatIndex f(3, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 12; ++i) {
+        h.add(i, data[i], Metadata().set("k", std::int64_t(i)));
+        f.add(i, data[i]);
+    }
+    h.remove(4);
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+    }
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -9325,7 +9784,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -9355,8 +9814,10 @@ int main(int argc, char** argv) {
         } else if (arg == "--write-golden") {
             // Rewrites the format version 1 golden files in tests/data. Only for a
             // deliberate format change: the files guard compatibility.
-            golden_hnsw()->save(golden_path("golden_hnsw_v1.bin"));
-            golden_flat()->save(golden_path("golden_flat_v1.bin"));
+            // Writes the current format version's files; older versions' files are
+            // frozen and must never be rewritten.
+            golden_hnsw()->save(golden_path("golden_hnsw_v2.bin"));
+            golden_flat()->save(golden_path("golden_flat_v2.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
         } else if (arg == "--group" || arg == "--exclude") {

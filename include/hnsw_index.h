@@ -151,6 +151,22 @@ public:
     void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                    std::span<const Metadata> metadata, std::size_t threads = 0);
 
+    /// The vector stored for `id`, exactly as it was given to add() or update()
+    /// (for cosine indexes, before normalization: the original is kept for this),
+    /// or nothing if `id` is not stored.
+    std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// The vector and metadata of `id` together, or nothing if it is not stored.
+    std::optional<Record> get(std::uint64_t id) const;
+
+    /// Lists stored records a page at a time, in ascending ID order, optionally
+    /// only those matching a filter (same rules as count_where). Each page
+    /// continues after the last ID of the previous one (ScanOptions::after =
+    /// Page::next), so changes between pages never repeat or skip a record that
+    /// stays stored. Each page costs one pass over the index. Throws
+    /// std::invalid_argument for a limit of 0.
+    Page scan(const ScanOptions& options = {}) const;
+
     /// Removes every vector whose metadata matches `filter` (like SQL's DELETE
     /// WHERE) and returns how many it removed. The filter is evaluated once,
     /// before anything changes. A filter naming an unknown field throws
@@ -408,6 +424,9 @@ private:
 
     /// Links one stored, not yet linked node in parallel with others (add_batch).
     void link_concurrently(NodeId node, int level, LinkLocks& locks);
+
+    /// Records for `slots` (in the given order), with vectors and metadata as requested.
+    Record record(NodeId slot, bool with_vector, bool with_metadata) const;
 
     /// Live slots matching `filter`; the caller holds a lock.
     std::vector<NodeId> matching_slots(const Filter& filter) const;
