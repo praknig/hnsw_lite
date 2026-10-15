@@ -202,6 +202,10 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 30. **Parallel linking let threads reach half-linked vectors.** Vectors were linked level by level, top-down; once linked on an upper level, other threads could reach a vector and descend to a level it had not linked yet, finding an empty list, and links they added to it could later be overwritten. Found under ThreadSanitizer, whose interleaving made it frequent (graph quality checks in `b07` and `b08` failed). Fixed by publishing a vector only when complete: all its levels are decided, then its own lists set, and only then the links that make it reachable.
 31. **A failed batch left links to its removed vectors.** Rolling back removed the batch's vectors without repairing the graph, so after many failures more than 2% of links pointed to removed vectors. Found by the out-of-memory sweep in `b11`. Rollback now repairs around them, best effort, as `remove` does.
 
+**Found on CI's multi-core machines:**
+
+32. **Two concurrency tests had flawed checks; the library was right in both.** `c08` compared two accessor calls (`deleted_count()` and `capacity()`) that a compaction on another thread could separate; it now checks invariants on one consistent snapshot (a save). `c14` demanded 100% graph reachability after thousands of upserts and used vectors shared between IDs. Running its upserts single-threaded in 200 random orders showed the cause was not threads but **update churn**, which weakens the graph whatever the order (see the [project notes](project-notes.md#limitations)); the test now uses unique vectors, accepts the measured degradation, and requires full reachability after `compact()`. A single-core machine rarely switches threads between two calls, which is why both only showed on CI.
+
 Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
 
 ## Continuous integration

@@ -7618,11 +7618,16 @@ TEST(concurrency, c08_compact_during_searches) {
             std::size_t q = t;
             while (!stop) {
                 if (t == 3) {  // accessors and saves while compaction rebuilds the index
-                    if (h.deleted_count() > h.capacity() || h.size() > h.capacity()) ++p.unexpected_exception;
+                    // Each accessor sees a consistent index, but two calls in a row may
+                    // straddle a compaction, so they are not compared with each other.
+                    (void)h.deleted_count();
+                    (void)h.capacity();
+                    (void)h.size();
                     (void)h.pooled_visited_lists();
                     (void)h.max_level();
+                    // A save is one consistent moment: check the invariants on it.
                     auto g = load_hnsw(save_bytes(h));
-                    if (g->size() > 1000) ++p.unexpected_exception;
+                    if (g->size() + g->deleted_count() != g->capacity() || g->size() > 1000) ++p.unexpected_exception;
                 } else {
                     check_results(h.search(data[q++ % 1000], 10, 32), 1000, p);
                 }
@@ -7814,6 +7819,7 @@ TEST(concurrency, c13_writers_are_not_starved) {
 TEST(concurrency, c14_upsert_is_atomic) {
     // Many threads upserting the same IDs: before the lock covered both steps,
     // two threads could both find an ID missing, and the second add would throw.
+    // Each ID draws from its own vectors, so no two IDs hold the same vector.
     auto data = clustered(200, 8, 4, 611);
     HnswIndex h(8, Metric::L2);
     FlatIndex f(8, Metric::L2);
@@ -7822,9 +7828,10 @@ TEST(concurrency, c14_upsert_is_atomic) {
         run_threads(8, [&](std::size_t t) {
             for (int round = 0; round < 40; ++round)
                 for (std::uint64_t id = 0; id < 20; ++id) {
+                    const auto& v = data[id + 20 * ((t + std::size_t(round)) % 10)];
                     try {
-                        h.upsert(id, data[(id + t + std::size_t(round)) % 200]);
-                        f.upsert(id, data[(id + t + std::size_t(round)) % 200]);
+                        h.upsert(id, v);
+                        f.upsert(id, v);
                     } catch (...) {
                         ++errors;
                     }
@@ -7832,6 +7839,11 @@ TEST(concurrency, c14_upsert_is_atomic) {
         });
     });
     CHECK(errors == 0 && h.size() == 20 && f.size() == 20);
+    // 320 updates per vector of a 20-vector index degrade the graph whatever the
+    // order (single-threaded too: in 27 of 200 random orders one or two vectors
+    // became unreachable, worst 90%; see the project notes). compact() rebuilds it.
+    check_graph(h, 0.85);
+    h.compact();
     check_graph(h, 1.0);
 }
 
