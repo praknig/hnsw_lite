@@ -143,6 +143,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
+| `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
 | `update(id, vector)`, `update(id, vector, metadata)` | Replaces the vector in place (and, with metadata, the whole metadata); `false` for an unknown ID; all-or-nothing |
@@ -160,6 +161,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
 | `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing, linking them on `threads` threads (0: all cores); one thread gives the same index as `add` in order |
+| `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
 | `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |

@@ -17,6 +17,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Filtered search](#filtered-search)
 - [Batch search](#batch-search)
 - [Range search](#range-search)
+- [Reading records back](#reading-records-back)
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
@@ -78,7 +79,7 @@ index.add(42, embedding);   // embedding: std::vector<float>, std::array, or any
 - `add` copies the vector, so your own buffer can be reused or freed afterwards.
 - Values extremely close to zero (subnormal floats, below about 1e-38) give correct results. They caused no slowdown on the CPUs tested, but some older CPUs process them many times slower; if you see that, round such values to 0.
 
-Any failure leaves the index exactly as it was. See [Errors and guarantees](#errors-and-guarantees).
+A failed `add` leaves every stored vector, its metadata and all search results as they were. See [Errors and guarantees](#errors-and-guarantees) for the details.
 
 ### Adding many vectors at once
 
@@ -278,6 +279,28 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 - `FlatIndex` is exact. `HnswIndex` is approximate, like its normal search; pass `Strategy::ForceExact` in the options when every vector within the radius must be found.
 - Filters and predicates work here too.
 
+## Reading records back
+
+```cpp
+std::optional<std::vector<float>> v = index.get_vector(42);   // exactly as given to add() or update()
+std::optional<Record> r = index.get(42);                      // r->id, r->vector, r->metadata
+
+ScanOptions o;
+o.filter = Filter::eq("category", "tech");   // optional
+o.limit = 100;                                // records per page
+for (Page page = index.scan(o); ; page = index.scan(o)) {
+    for (const Record& rec : page.records) { /* ... */ }
+    if (!page.next) break;
+    o.after = page.next;                      // continue after the last ID returned
+}
+```
+
+- **`get_vector` returns the vector exactly as it was given**, bit for bit. For cosine indexes, which normalize vectors for searching, the original is kept for this purpose, which **doubles the memory used for vectors** in cosine indexes.
+- **`scan` lists records in ascending ID order**, a page at a time, optionally only those matching a filter (same rules as `count_where`). Each page continues after the last ID of the previous one, so changes between pages never repeat a record or skip one that stays stored; records added later with a higher ID appear, removed ones don't.
+- **Set `with_vectors` or `with_metadata` to false** to leave those fields empty, for example to list only IDs.
+- **Each page costs one pass over the index**, which suits exports and administration; for finding similar vectors, use `search`.
+- All three are reads: they run alongside searches and are allowed inside them.
+
 ## Changing many vectors by filter
 
 ```cpp
@@ -309,7 +332,7 @@ auto flat = FlatIndex::load("exact.flat");           // the same for FlatIndex
 - **Loaded files are checked thoroughly.** Each section carries a checksum, every count is checked before memory is allocated, and every link, level and value is validated. A damaged, truncated or foreign file throws `vecdb::FormatError`; a failed load never produces a half-built index.
 - **Streams work too:** `save(std::ostream&)` and `load(std::istream&)`, for example with `std::stringstream`. A stream given to `load` must be seekable (files and string streams are).
 - A save reads the index, so searches and other saves run alongside it, and changes wait until it finishes. Several threads may save to the **same path** at once: each writes its own temporary file and the last to finish wins, so the file is always complete. (On Windows, two renames over one file at the very same moment can be refused; that save then throws `std::runtime_error` and the file stays complete.)
-- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned).
+- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned; this version writes format 2 and reads 1 and 2). A cosine index saved in format 1, before originals were kept, still loads; `get_vector` then returns its normalized vectors.
 
 ## Threads
 
@@ -335,7 +358,7 @@ Every index is safe to use from any number of threads at once, with no lock of y
 | `std::bad_alloc` | Out of memory |
 | `std::length_error` | More than about 4 billion vectors in one index |
 
-**All-or-nothing:** every change either completes or leaves the index exactly as it was, including when memory runs out partway through. A failed `add` never leaves a half-inserted vector or a new metadata field behind.
+**All-or-nothing:** every change either completes or leaves the index's contents as they were (every stored vector, its metadata, and search results), including when memory runs out partway through. A failed `add` never leaves a half-inserted vector or a new metadata field behind. With HNSW, internal bookkeeping may still move on: if memory runs out while a vector is being linked, its slot is kept free for the next add (so `capacity()` can grow by one), and the random level drawn for it is used up. A `FlatIndex` is restored exactly.
 
 Removing an ID that is not stored is not an error: `remove` returns `false`, as do `set_metadata` and (with an empty result) `get_metadata`.
 

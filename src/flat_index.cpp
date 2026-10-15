@@ -11,7 +11,9 @@
 namespace vecdb {
 
 FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema)
-    : metric_(metric), distance_(get_distance(metric)), vectors_(dim), metadata_(std::move(schema)), scratch_(dim) {}
+    : metric_(metric), distance_(get_distance(metric)), vectors_(dim), metadata_(std::move(schema)), scratch_(dim) {
+    if (metric == Metric::Cosine) originals_.emplace(dim);  // keep the vectors as given
+}
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     const auto guard = lock_.write("add");
@@ -34,7 +36,7 @@ void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
         throw;
     }
     try {
-        vectors_.add(scratch_.values());
+        add_vector(vector);
     } catch (...) {
         ids_.undo_last_add(id);
         metadata_.undo_write(slot, undo);
@@ -43,9 +45,72 @@ void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     ++live_;
 }
 
+void FlatIndex::add_vector(std::span<const float> original) {
+    vectors_.add(scratch_.values());
+    if (!originals_) return;
+    try {
+        originals_->add(original);
+    } catch (...) {
+        vectors_.undo_last_add();
+        throw;
+    }
+}
+
 bool FlatIndex::remove(std::uint64_t id) {
     const auto guard = lock_.write("remove");
     return remove_unlocked(id);
+}
+
+Record FlatIndex::record(NodeId slot, bool with_vector, bool with_metadata) const {
+    Record r;
+    r.id = ids_.external(slot);
+    if (with_vector) {
+        const auto v = original(slot);
+        r.vector.assign(v.begin(), v.end());
+    }
+    if (with_metadata) r.metadata = metadata_.read(slot);
+    return r;
+}
+
+std::optional<std::vector<float>> FlatIndex::get_vector(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = ids_.find(id);
+    if (!node) return std::nullopt;
+    const auto v = original(*node);
+    return std::vector<float>(v.begin(), v.end());
+}
+
+std::optional<Record> FlatIndex::get(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = ids_.find(id);
+    if (!node) return std::nullopt;
+    return record(*node, true, true);
+}
+
+Page FlatIndex::scan(const ScanOptions& options) const {
+    const auto guard = lock_.read();
+    if (options.limit == 0) throw std::invalid_argument("scan: limit must be at least 1");
+    std::optional<CompiledFilter> compiled;
+    if (options.filter) compiled.emplace(*options.filter, metadata_);  // throws for an unknown field under a strict schema
+    // Every candidate after the cursor; then the `limit` smallest IDs, in order.
+    std::vector<std::pair<std::uint64_t, NodeId>> candidates;
+    for (NodeId n = 0; n < vectors_.size(); ++n) {
+        const std::uint64_t id = ids_.external(n);
+        if (options.after && id <= *options.after) continue;
+        if (compiled && !compiled->matches(n)) continue;
+        candidates.emplace_back(id, n);
+    }
+    const bool more = candidates.size() > options.limit;
+    if (more) {
+        std::nth_element(candidates.begin(), candidates.begin() + std::ptrdiff_t(options.limit), candidates.end());
+        candidates.resize(options.limit);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    Page page;
+    page.records.reserve(candidates.size());
+    for (const auto& [id, n] : candidates) page.records.push_back(record(n, options.with_vectors, options.with_metadata));
+    if (more) page.next = page.records.back().id;
+    return page;
 }
 
 std::vector<NodeId> FlatIndex::matching_slots(const Filter& filter) const {
@@ -93,6 +158,7 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     ids_.release(id);
     if (*node != last) {
         vectors_.move_row(last, *node);
+        if (originals_) originals_->move_row(last, *node);
         ids_.move_slot(last, *node);
         metadata_.move_row(last, *node);
     } else {
@@ -100,6 +166,7 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     }
     ids_.pop_back_slot();
     vectors_.pop_back();
+    if (originals_) originals_->pop_back();
     --live_;
     return true;
 }
@@ -155,7 +222,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
                 throw;
             }
             try {
-                vectors_.add(scratch_.values());
+                add_vector(vectors.subspan(i * d, d));
             } catch (...) {
                 ids_.undo_last_add(ids[i]);
                 metadata_.undo_write(slot, undo.back());
@@ -168,6 +235,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         for (std::size_t k = undo.size(); k-- > 0;) {
             const auto slot = static_cast<NodeId>(vectors_.size() - 1);
             vectors_.pop_back();
+            if (originals_) originals_->pop_back();
             ids_.undo_last_add(ids[k]);
             metadata_.undo_write(slot, undo[k]);
             --live_;
@@ -207,6 +275,7 @@ bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     if (!node) return false;
     if (metadata) metadata_.write(*node, *metadata);  // all-or-nothing
     vectors_.overwrite(*node, scratch_.values());     // cannot fail: already validated
+    if (originals_) originals_->overwrite(*node, vector);
     return true;
 }
 

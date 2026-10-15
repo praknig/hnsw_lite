@@ -70,6 +70,22 @@ public:
     void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                    std::span<const Metadata> metadata, std::size_t threads = 0);
 
+    /// The vector stored for `id`, exactly as it was given to add() or update()
+    /// (for cosine indexes, before normalization: the original is kept for this),
+    /// or nothing if `id` is not stored.
+    std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// The vector and metadata of `id` together, or nothing if it is not stored.
+    std::optional<Record> get(std::uint64_t id) const;
+
+    /// Lists stored records a page at a time, in ascending ID order, optionally
+    /// only those matching a filter (same rules as count_where). Each page
+    /// continues after the last ID of the previous one (ScanOptions::after =
+    /// Page::next), so changes between pages never repeat or skip a record that
+    /// stays stored. Each page costs one pass over the index. Throws
+    /// std::invalid_argument for a limit of 0.
+    Page scan(const ScanOptions& options = {}) const;
+
     /// Removes every vector whose metadata matches `filter` (like SQL's DELETE
     /// WHERE) and returns how many it removed. The filter is evaluated once,
     /// before anything changes. A filter naming an unknown field throws
@@ -207,7 +223,10 @@ private:
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
     bool remove_unlocked(std::uint64_t id);  // caller holds the write lock; never allocates
+    void add_vector(std::span<const float> original);  // scratch_ (prepared) and its original; all-or-nothing
+    std::span<const float> original(NodeId slot) const { return originals_ ? originals_->get(slot) : vectors_.get(slot); }
     std::vector<NodeId> matching_slots(const Filter& filter) const;  // caller holds a lock
+    Record record(NodeId slot, bool with_vector, bool with_metadata) const;
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                             const Metadata* metadata);  // caller holds the write lock
 
@@ -221,6 +240,7 @@ private:
     Metric metric_;
     DistanceFn distance_;     // fastest kernel for this CPU, chosen once
     VectorStore vectors_;
+    std::optional<VectorStore> originals_;  // cosine: the vectors as given, slot by slot
     IdMap ids_;
     MetadataStore metadata_;
     PreparedVector scratch_;  // reused by add(); searches use their own copy

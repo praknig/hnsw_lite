@@ -276,6 +276,29 @@ struct SearchOptions {
     std::size_t range_expand_outside = 1;
 };
 
+/// One stored vector with its user ID and metadata, as returned by get() and scan().
+struct Record {
+    std::uint64_t id = 0;
+    std::vector<float> vector;  ///< as given when added (empty if not requested)
+    Metadata metadata;          ///< empty if not requested
+};
+
+/// What scan() returns and how: records in ascending ID order, a page at a time.
+struct ScanOptions {
+    std::optional<Filter> filter;          ///< only records matching it (all if empty)
+    std::size_t limit = 100;               ///< records per page, at least 1
+    std::optional<std::uint64_t> after;    ///< continue after this ID (Page::next of the previous page)
+    bool with_vectors = true;
+    bool with_metadata = true;
+};
+
+/// One page of scan(): pass `next` as ScanOptions::after to get the following
+/// page; it is empty on the last page.
+struct Page {
+    std::vector<Record> records;
+    std::optional<std::uint64_t> next;
+};
+
 /**
  * @brief "May this slot appear in results?": live, passes the compiled filter
  *        and passes the predicate (checked in that order, cheapest first).

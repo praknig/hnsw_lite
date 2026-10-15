@@ -4,7 +4,8 @@
  *
  * File layout (all numbers little-endian):
  *
- *   header:   magic "HNSWLITE" (8 bytes), format version (u32), byte-order mark
+ *   header:   magic "HNSWLITE" (8 bytes), format version (u32: this library writes
+ *             2 and reads 1 and 2), byte-order mark
  *             (u32 0x01020304), index kind (u32: 1 Flat, 2 HNSW), reserved (u32, 0)
  *   sections: tag (4 ASCII bytes), payload length (u64), payload, CRC-32 of the payload (u32)
  *   last:     an "END " section with an empty payload; nothing may follow it
@@ -43,7 +44,11 @@ public:
 namespace persist {
 
 inline constexpr char kMagic[8] = {'H', 'N', 'S', 'W', 'L', 'I', 'T', 'E'};
-inline constexpr std::uint32_t kVersion = 1;
+/// The version this library writes. Version 2 added, for cosine indexes, each
+/// vector as given (before normalization) right after the stored vector.
+inline constexpr std::uint32_t kVersion = 2;
+/// The oldest version this library still reads.
+inline constexpr std::uint32_t kOldestVersion = 1;
 inline constexpr std::uint32_t kByteOrderMark = 0x01020304u;
 
 enum class IndexKind : std::uint32_t { Flat = 1, Hnsw = 2 };
@@ -227,9 +232,10 @@ public:
         raw(buf, sizeof buf, "header");
         if (std::memcmp(buf, kMagic, 8) != 0) throw FormatError("not an hnsw-lite index file");
         const auto version = from_little_endian<std::uint32_t>(buf + 8);
-        if (version != kVersion)
-            throw FormatError("unsupported format version " + std::to_string(version) + " (this library reads version " +
-                              std::to_string(kVersion) + ")");
+        if (version < kOldestVersion || version > kVersion)
+            throw FormatError("unsupported format version " + std::to_string(version) + " (this library reads versions " +
+                              std::to_string(kOldestVersion) + " to " + std::to_string(kVersion) + ")");
+        version_ = version;
         if (from_little_endian<std::uint32_t>(buf + 12) != kByteOrderMark) throw FormatError("unsupported byte order");
         const auto kind = from_little_endian<std::uint32_t>(buf + 16);
         if (kind != static_cast<std::uint32_t>(expected))
@@ -312,6 +318,9 @@ public:
 
     std::uint64_t section_left() const { return section_left_; }
 
+    /// The file's format version (after read_header).
+    std::uint32_t version() const { return version_; }
+
 private:
     void raw(void* p, std::size_t n, const char* where) {
         if (n > file_left_) throw FormatError(std::string("the file ends early (in ") + where + ")");
@@ -326,6 +335,7 @@ private:
     std::uint64_t section_left_ = 0;
     std::uint32_t crc_ = 0;
     const char* name_ = "header";
+    std::uint32_t version_ = 0;
 };
 
 }  // namespace persist

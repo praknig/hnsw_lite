@@ -44,7 +44,7 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params, Schema s
       distance_(get_distance(metric)),
       params_(validated(params)),
       level_factor_(1.0 / std::log(static_cast<double>(params.M))),
-      storage_(dim, params.M),
+      storage_(dim, params.M, metric == Metric::Cosine),  // cosine keeps the originals
       stride_(storage_.vectors().stride()),
       scratch_(dim),
       rng_(params.seed),
@@ -235,10 +235,10 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     NodeId node;
     try {
         if (!free_slots_.empty()) {
-            node = storage_.insert_into(slot, id, scratch_.values(), level);
+            node = storage_.insert_into(slot, id, scratch_.values(), level, vector);
             free_slots_.pop_back();
         } else {
-            node = storage_.insert(id, scratch_.values(), level);
+            node = storage_.insert(id, scratch_.values(), level, vector);
         }
     } catch (...) {
         metadata_.undo_write(slot, undo);
@@ -321,7 +321,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
             try {
-                storage_.insert_into(slot, ids[i], scratch_.values(), level);
+                storage_.insert_into(slot, ids[i], scratch_.values(), level, vec(i));
             } catch (...) {
                 metadata_.undo_write(slot, undo.back());
                 undo.pop_back();
@@ -349,7 +349,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
             try {
-                storage_.insert(ids[i], scratch_.values(), level);
+                storage_.insert(ids[i], scratch_.values(), level, vec(i));
             } catch (...) {
                 metadata_.undo_write(slot, undo.back());
                 undo.pop_back();
@@ -603,8 +603,8 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     const auto undo = metadata_.write(slot, md);
     const int level = random_level();
     try {
-        if (reuse) storage_.insert_into_unmapped(slot, id, scratch_.values(), level);
-        else storage_.insert_unmapped(id, scratch_.values(), level);
+        if (reuse) storage_.insert_into_unmapped(slot, id, scratch_.values(), level, vector);
+        else storage_.insert_unmapped(id, scratch_.values(), level, vector);
     } catch (...) {
         metadata_.undo_write(slot, undo);
         throw;
@@ -642,6 +642,59 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
 bool HnswIndex::contains(std::uint64_t id) const {
     const auto guard = lock_.read();
     return storage_.ids().find(id).has_value();
+}
+
+Record HnswIndex::record(NodeId slot, bool with_vector, bool with_metadata) const {
+    Record r;
+    r.id = storage_.ids().external(slot);
+    if (with_vector) {
+        const auto v = storage_.original(slot);
+        r.vector.assign(v.begin(), v.end());
+    }
+    if (with_metadata) r.metadata = metadata_.read(slot);
+    return r;
+}
+
+std::optional<std::vector<float>> HnswIndex::get_vector(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = storage_.ids().find(id);
+    if (!node) return std::nullopt;
+    const auto v = storage_.original(*node);
+    return std::vector<float>(v.begin(), v.end());
+}
+
+std::optional<Record> HnswIndex::get(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = storage_.ids().find(id);
+    if (!node) return std::nullopt;
+    return record(*node, true, true);
+}
+
+Page HnswIndex::scan(const ScanOptions& options) const {
+    const auto guard = lock_.read();
+    if (options.limit == 0) throw std::invalid_argument("scan: limit must be at least 1");
+    std::optional<CompiledFilter> compiled;
+    if (options.filter) compiled.emplace(*options.filter, metadata_);  // throws for an unknown field under a strict schema
+    // Every candidate after the cursor; then the `limit` smallest IDs, in order.
+    std::vector<std::pair<std::uint64_t, NodeId>> candidates;
+    for (NodeId n = 0; n < storage_.size(); ++n) {
+        if (storage_.ids().is_deleted(n)) continue;
+        const std::uint64_t id = storage_.ids().external(n);
+        if (options.after && id <= *options.after) continue;
+        if (compiled && !compiled->matches(n)) continue;
+        candidates.emplace_back(id, n);
+    }
+    const bool more = candidates.size() > options.limit;
+    if (more) {
+        std::nth_element(candidates.begin(), candidates.begin() + std::ptrdiff_t(options.limit), candidates.end());
+        candidates.resize(options.limit);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    Page page;
+    page.records.reserve(candidates.size());
+    for (const auto& [id, n] : candidates) page.records.push_back(record(n, options.with_vectors, options.with_metadata));
+    if (more) page.next = page.records.back().id;
+    return page;
 }
 
 std::vector<NodeId> HnswIndex::matching_slots(const Filter& filter) const {
@@ -909,7 +962,7 @@ CompactStats HnswIndex::compact() {
     fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
     for (NodeId n = 0; n < storage_.size(); ++n)
-        if (!ids.is_deleted(n)) fresh.add_unlocked(ids.external(n), storage_.vectors().get(n), metadata_.read(n));  // nobody else sees `fresh`
+        if (!ids.is_deleted(n)) fresh.add_unlocked(ids.external(n), storage_.original(n), metadata_.read(n));  // nobody else sees `fresh`
 
     // Commit: moves only, nothing can throw.
     storage_ = std::move(fresh.storage_);
