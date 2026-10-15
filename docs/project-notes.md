@@ -33,6 +33,8 @@ These are deliberate for the current stage:
 
 ## Roadmap
 
+Every feature that could come next, consolidated and in a suggested order, is in the [feature catalog](feature-catalog.md).
+
 - [x] **Layer 1:** aligned vector store, arena allocator, graph storage, ID mapping, tests
 - [x] **Layer 2:** SIMD distance kernels (scalar, AVX2, AVX-512, NEON), runtime dispatch, tests, benchmark
 - [x] **Layer 3a:** Flat index with top-k heap, used as ground truth
