@@ -147,14 +147,27 @@ public:
     /// none of them remains, and every earlier vector is still stored and
     /// searchable. The graph is repaired around them when memory allows, as by
     /// remove(); some links may differ from before, as after any removal.
-    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0);
+    /// `options` adds a deadline, cancellation and progress reports (see
+    /// OperationOptions); a cancelled batch is undone and throws Cancelled.
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0,
+                   const OperationOptions& options = {});
     void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                   std::span<const Metadata> metadata, std::size_t threads = 0);
+                   std::span<const Metadata> metadata, std::size_t threads = 0, const OperationOptions& options = {});
 
     /// The vector stored for `id`, exactly as it was given to add() or update()
     /// (for cosine indexes, before normalization: the original is kept for this),
     /// or nothing if `id` is not stored.
+    /// "More like this": searches with the vector stored for `id`, under one lock
+    /// (so it cannot change in between). Returns nothing if `id` is not stored.
+    /// The record itself is left out unless `include_self` is true.
+    std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, std::size_t ef = 64,
+                                                         const SearchOptions& options = {}, bool include_self = false) const;
+
     std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// Removes every listed ID that is stored and returns how many it removed;
+    /// unknown and repeated IDs are skipped. Always completes, like remove_where.
+    std::size_t remove_batch(std::span<const std::uint64_t> ids);
 
     /// The vector and metadata of `id` together, or nothing if it is not stored.
     std::optional<Record> get(std::uint64_t id) const;
@@ -291,7 +304,9 @@ public:
     /// numbers and no free slots. User IDs are kept. The new index is built
     /// completely before replacing the old one, so if memory runs out the old
     /// index is left intact.
-    CompactStats compact();
+    /// `options`: a deadline, cancellation and progress reports; a cancelled
+    /// compaction leaves the index untouched and throws Cancelled.
+    CompactStats compact(const OperationOptions& options = {});
 
     /// Number of live vectors.
     /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
@@ -301,10 +316,13 @@ public:
     /// produce a complete file (the last one wins). Searches may run during a save;
     /// changes attempted during one throw std::logic_error. Throws
     /// std::runtime_error if the file cannot be written.
-    void save(const std::string& path) const;
+    void save(const std::string& path, const OperationOptions& options = {}) const;
 
     /// Saves to a stream (for example a std::ostringstream).
-    void save(std::ostream& out) const;
+    /// With `options`: a deadline, cancellation and progress reports; a cancelled
+    /// save throws Cancelled, leaving any existing file untouched and no temporary
+    /// file (a stream may hold an incomplete index).
+    void save(std::ostream& out, const OperationOptions& options = {}) const;
 
     /// Loads an index saved by save(). Throws FormatError if the file is damaged,
     /// truncated, from an unsupported version or of the other index kind (a
@@ -420,13 +438,17 @@ private:
     /// add_batch's work; the caller holds the write lock. `metadata` is an array
     /// of ids.size() entries, or null.
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                            const Metadata* metadata, std::size_t threads);
+                            const Metadata* metadata, std::size_t threads, const OperationOptions& options);
 
     /// Links one stored, not yet linked node in parallel with others (add_batch).
     void link_concurrently(NodeId node, int level, LinkLocks& locks);
 
     /// Records for `slots` (in the given order), with vectors and metadata as requested.
     Record record(NodeId slot, bool with_vector, bool with_metadata) const;
+
+    /// Removes the given live slots (no repeats), then repairs around them, best
+    /// effort; the caller holds the write lock. Always completes.
+    std::size_t remove_slots(const std::vector<NodeId>& slots);
 
     /// Live slots matching `filter`; the caller holds a lock.
     std::vector<NodeId> matching_slots(const Filter& filter) const;

@@ -49,6 +49,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Parallel building: `add_batch` links vectors on several threads (stage B)
 - [x] Bulk changes by filter: `remove_where`, `set_metadata_where`, `count_where`
 - [x] Reading records back: `get_vector`, `get`, `scan` (file format version 2)
+- [x] `remove_batch`, `search_by_id`, and deadlines, cancellation and progress
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe

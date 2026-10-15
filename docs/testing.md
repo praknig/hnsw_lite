@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 571 individually named tests** in 23 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 596 individually named tests** in 24 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -30,6 +30,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `add_batch` | 19 | Scenarios B1 to B19: 1 to 8 threads giving graphs as good as one-by-one adds; one thread byte-identical to one-by-one adds (every metric, with and without metadata, into removed slots, into an index with every vector removed); duplicate IDs, NaN, infinity, wrong sizes, invalid or inconsistently typed metadata changing nothing; empty batches; reused slots; entry point and top level with many high-level vectors racing; searches seeing all of a batch or none; refusal inside a search; out of memory at every point, on 1 and 4 threads, into a filled and an empty index, with and without graph repair (no batch vector remains, earlier vectors intact and searchable); payload counts; save and load; later changes; re-added IDs; Flat restored exactly; batches mixed with single adds; 8 threads with every metric |
 | `bulk` | 16 | Scenarios W1 to W16 for `remove_where`, `set_metadata_where` and `count_where`, on HNSW and Flat: exactly the matching vectors removed or changed (checked against expected matches computed independently for eight kinds of filter); no match changing nothing; everything matching; unknown fields under strict and dynamic schemas; removing 30% (including the entry point, and with graph repair off) with the graph healthy and the IDs reusable; payload counts; only the given fields changed; invalid changes rejected even when nothing matches; changing the filtered field itself; out of memory at every point (removal completes, metadata changes all or nothing: confirmed to fail against an in-place version); refusal inside a search; searches seeing all of a change or none; save and load; later changes; Flat moving metadata with vectors |
 | `records` | 17 | Scenarios R1 to R17 for `get_vector`, `get` and `scan`: vectors read back bit for bit for every metric (cosine originals included); paging through everything with several page sizes, each ID once and ascending; filtered paging for eight kinds of filter; edge cases (empty, exact fit, limit 0, cursors beyond the end or on removed IDs, extreme IDs); records without vectors or metadata; changes between pages; paging while another thread changes the index; unknown filter fields; out of memory; reads inside a search; save and load; version 1 cosine files; originals following every path (confirmed to catch a missing move and a compaction from normalized vectors); damaged cosine files |
+| `control` | 25 | `remove_batch` (K1 to K6): exactly the listed IDs, unknown and repeated IDs, empty lists, everything, out of memory, refusal inside a search. `search_by_id` (S1 to S6): the same as searching with the stored vector (every metric), including or excluding the record, filters and predicates, unknown IDs, the largest k, duplicates of the record, atomic while another thread updates it. Deadlines, cancellation and progress (T1 to T13): searches of every kind stop early with valid results (checked by work done, not timing), a cancel from another thread, no change without a deadline, a nested search's own deadline; `add_batch`, `compact` and `save` cancelled at the start, middle and end, by flag, deadline or a throwing progress callback, always undone; progress in order; cancelling 8 linking threads |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -40,7 +41,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 571 test names
+test_comprehensive --list               # list all 596 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -54,13 +55,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 571 of 571 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 596 of 596 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-571 passed, 0 failed, 0 skipped, 0 not run, 30670 checks, 39.54 s
+596 passed, 0 failed, 0 skipped, 0 not run, 30894 checks, 45.46 s
 All selected tests passed.
 ```
 
@@ -108,33 +109,34 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 23 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 24 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/23 Test # 1: comprehensive.layer1 ................   Passed
- 2/23 Test # 2: comprehensive.layer2 ................   Passed
- 3/23 Test # 3: comprehensive.helpers ...............   Passed
- 4/23 Test # 4: comprehensive.flat ..................   Passed
- 5/23 Test # 5: comprehensive.hnsw ..................   Passed
- 6/23 Test # 6: comprehensive.robustness ............   Passed
- 7/23 Test # 7: comprehensive.deletion ..............   Passed
- 8/23 Test # 8: comprehensive.concurrency ...........   Passed
- 9/23 Test # 9: comprehensive.metadata ..............   Passed
-10/23 Test #10: comprehensive.filter ................   Passed
-11/23 Test #11: comprehensive.planner ...............   Passed
-12/23 Test #12: comprehensive.payload ...............   Passed
-13/23 Test #13: comprehensive.batch .................   Passed
-14/23 Test #14: comprehensive.range .................   Passed
-15/23 Test #15: comprehensive.search_e2e ............   Passed
-16/23 Test #16: comprehensive.update ................   Passed
-17/23 Test #17: comprehensive.hardening .............   Passed
-18/23 Test #18: comprehensive.persistence ...........   Passed
-19/23 Test #19: comprehensive.add_batch .............   Passed
-20/23 Test #20: comprehensive.bulk ..................   Passed
-21/23 Test #21: comprehensive.records ...............   Passed
-22/23 Test #22: comprehensive.stress ................   Passed
-23/23 Test #23: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 23
+ 1/24 Test # 1: comprehensive.layer1 ................   Passed
+ 2/24 Test # 2: comprehensive.layer2 ................   Passed
+ 3/24 Test # 3: comprehensive.helpers ...............   Passed
+ 4/24 Test # 4: comprehensive.flat ..................   Passed
+ 5/24 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/24 Test # 6: comprehensive.robustness ............   Passed
+ 7/24 Test # 7: comprehensive.deletion ..............   Passed
+ 8/24 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/24 Test # 9: comprehensive.metadata ..............   Passed
+10/24 Test #10: comprehensive.filter ................   Passed
+11/24 Test #11: comprehensive.planner ...............   Passed
+12/24 Test #12: comprehensive.payload ...............   Passed
+13/24 Test #13: comprehensive.batch .................   Passed
+14/24 Test #14: comprehensive.range .................   Passed
+15/24 Test #15: comprehensive.search_e2e ............   Passed
+16/24 Test #16: comprehensive.update ................   Passed
+17/24 Test #17: comprehensive.hardening .............   Passed
+18/24 Test #18: comprehensive.persistence ...........   Passed
+19/24 Test #19: comprehensive.add_batch .............   Passed
+20/24 Test #20: comprehensive.bulk ..................   Passed
+21/24 Test #21: comprehensive.records ...............   Passed
+22/24 Test #22: comprehensive.control ...............   Passed
+23/24 Test #23: comprehensive.stress ................   Passed
+24/24 Test #24: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 24
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -213,6 +215,12 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 **Found while building record reading:**
 
 33. **The user guide overstated what a failed HNSW `add` restores.** It promised the index "exactly as it was"; the contents are (every vector, its metadata, search results), but if memory runs out while a vector is linked, its slot is kept free for the next add and its random level is used up, so the saved bytes differ. Found when a new test compared bytes after failed adds; an experiment showed the same for L2 and cosine, so it predates this work. The guide now states the guarantee precisely.
+
+**Found while building deadlines and cancellation:**
+
+34. **A progress callback could report failure for completed work.** The final progress report of `compact` was first made after its commit, so a throwing callback would have signalled failure for a compaction that had happened; likewise after `add_batch`'s rollback scope. Found by reviewing the code before testing. The final report now comes while the work can still be undone (test `t11` throws from it).
+
+A test also looped over `*f.search_by_id(...)` directly and read freed memory, failing at random (about 60% of runs): a range-based `for` destroys the temporary optional before the loop body. The test stores the result first now, and the [user guide](user-guide.md#searching-by-stored-id) warns about this trap.
 
 Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
 

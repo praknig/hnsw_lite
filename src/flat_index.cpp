@@ -72,6 +72,26 @@ Record FlatIndex::record(NodeId slot, bool with_vector, bool with_metadata) cons
     return r;
 }
 
+std::optional<std::vector<SearchResult>> FlatIndex::search_by_id(std::uint64_t id, std::size_t k, const SearchOptions& options,
+                                                                 bool include_self) const {
+    const auto guard = lock_.read();  // the search below nests inside this read: the vector cannot change
+    const auto node = ids_.find(id);
+    if (!node) return std::nullopt;
+    const std::span<const float> v = original(*node);  // normalized again by search, exactly as when stored
+    if (include_self || k == 0) return search(v, k, options);
+    auto results = search(v, k == SIZE_MAX ? k : k + 1, options);  // one more, in case the record itself is among them
+    std::erase_if(results, [&](const SearchResult& r) { return r.id == id; });
+    if (results.size() > k) results.resize(k);
+    return results;
+}
+
+std::size_t FlatIndex::remove_batch(std::span<const std::uint64_t> ids) {
+    const auto guard = lock_.write("remove_batch");
+    std::size_t removed = 0;
+    for (std::uint64_t id : ids) removed += remove_unlocked(id) ? 1 : 0;  // unknown or already removed: skipped
+    return removed;
+}
+
 std::optional<std::vector<float>> FlatIndex::get_vector(std::uint64_t id) const {
     const auto guard = lock_.read();
     const auto node = ids_.find(id);
@@ -171,22 +191,23 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     return true;
 }
 
-void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads) {
+void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads,
+                          const OperationOptions& options) {
     (void)threads;  // Flat inserts are copies, done on the calling thread
     const auto guard = lock_.write("add_batch");
-    add_batch_unlocked(ids, vectors, nullptr);
+    add_batch_unlocked(ids, vectors, nullptr, options);
 }
 
 void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                          std::span<const Metadata> metadata, std::size_t threads) {
+                          std::span<const Metadata> metadata, std::size_t threads, const OperationOptions& options) {
     (void)threads;
     if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
     const auto guard = lock_.write("add_batch");
-    add_batch_unlocked(ids, vectors, metadata.data());
+    add_batch_unlocked(ids, vectors, metadata.data(), options);
 }
 
 void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                                   const Metadata* metadata) {
+                                   const Metadata* metadata, const OperationOptions& options) {
     const std::size_t n = ids.size(), d = dim();
     if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
     if (n == 0) return;
@@ -209,6 +230,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     //    newest first, which restores the index exactly.
     std::vector<MetadataStore::WriteUndo> undo;
     undo.reserve(n);
+    detail::OperationControl control(options, n);  // may throw Cancelled before any change
     try {
         for (std::size_t i = 0; i < n; ++i) {
             scratch_.prepare(vectors.subspan(i * d, d), metric_);
@@ -230,7 +252,9 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
                 throw;
             }
             ++live_;
+            control.advance();  // may throw Cancelled: everything added is taken out again
         }
+        control.finish();  // inside: a throwing progress callback undoes the batch too
     } catch (...) {
         for (std::size_t k = undo.size(); k-- > 0;) {
             const auto slot = static_cast<NodeId>(vectors_.size() - 1);
@@ -317,6 +341,7 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
         std::size_t matches = 0;
         for (NodeId node = 0; node < count; ++node) {
+            if ((node & 255) == 255 && detail::search_should_stop()) break;  // deadline or cancel: best so far
             if (eligible.filtered() && !eligible(node)) continue;
             ++matches;
             top.push({index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine), node});
@@ -340,6 +365,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k,
                                             const SearchOptions& options) const {
     const auto guard = lock_.read();
+    const detail::SearchStopScope stop(options, options.stats);  // records stopped_early last
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -364,7 +390,14 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
     constexpr std::size_t kQueryChunk = 16, kRowBlock = 256;
     const std::size_t chunks = (nq + kQueryChunk - 1) / kQueryChunk;
     const std::size_t count = vectors_.size(), stride = vectors_.stride();
+    std::atomic<bool> any_stopped{false};
     auto run_chunk = [&](std::size_t chunk) {
+        const detail::SearchStopScope stop(options, nullptr);
+        struct Note {
+            const detail::SearchStopScope& s;
+            std::atomic<bool>& any;
+            ~Note() { if (s.stopped()) any = true; }
+        } note{stop, any_stopped};
         const IndexLock::Hold inside(lock_);  // pool threads work under the caller's read
         const std::size_t q0 = chunk * kQueryChunk, q1 = std::min(nq, q0 + kQueryChunk);
         std::vector<PreparedVector> prepared;
@@ -378,6 +411,7 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
         }
         std::vector<std::uint8_t> ok(kRowBlock);
         for (std::size_t r0 = 0; r0 < count; r0 += kRowBlock) {
+            if (detail::search_should_stop()) break;  // deadline or cancel: best so far
             const std::size_t r1 = std::min(count, r0 + kRowBlock);
             for (std::size_t r = r0; r < r1; ++r) ok[r - r0] = !eligible.filtered() || eligible(NodeId(r));
             for (std::size_t q = 0; q < tops.size(); ++q)
@@ -395,12 +429,14 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
     } else {
         pool_.get(threads)->parallel_for(chunks, run_chunk);
     }
+    if (options.stats) options.stats->stopped_early = any_stopped.load();
     return results;
 }
 
 std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
     const auto guard = lock_.read();
+    const detail::SearchStopScope stop(options, options.stats);
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
@@ -413,6 +449,7 @@ std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, 
     if (max_results > 0 && live_ > 0) {
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
         for (NodeId node = 0; node < count; ++node) {
+            if ((node & 255) == 255 && detail::search_should_stop()) break;
             if (eligible.filtered() && !eligible(node)) continue;
             ++st.distance_computations;
             const float d = index_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);

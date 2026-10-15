@@ -143,6 +143,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
+| `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
@@ -161,6 +162,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
 | `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing, linking them on `threads` threads (0: all cores); one thread gives the same index as `add` in order |
+| `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
@@ -229,3 +231,12 @@ Not copyable, movable. Frees its memory in the destructor.
 | `FormatError` (`serialize.h`) | Derived from `std::runtime_error` |
 | `MetadataStore::save(w)`, `MetadataStore::load(r, slots, live)` | Used by the indexes to save and load metadata |
 | `persist::Writer`, `persist::Reader`, `persist::crc32`, `persist::StreamErrorsThrow` (`serialize.h`) | The format's building blocks; see [Architecture and design](architecture.md#saving-and-loading) |
+
+## Deadlines, cancellation and progress
+
+| Name | Description |
+|---|---|
+| `SearchOptions::deadline`, `SearchOptions::cancel` | Stop a search at a moment, or when an `std::atomic<bool>` becomes true; it returns the best results found so far |
+| `SearchStats::stopped_early` | Whether a deadline or cancel flag stopped the search |
+| `OperationOptions` (`deadline`, `cancel`, `progress`) | Control of `add_batch`, `compact` and `save`; `progress(done, total)` is called in order, at most about 100 times |
+| `Cancelled` (a `std::runtime_error`) | Thrown by a cancelled or late operation, after undoing it |

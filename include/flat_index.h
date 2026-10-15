@@ -66,14 +66,27 @@ public:
     /// again, and the index is exactly as before. Inserting into a Flat index
     /// is a copy, so it runs on the calling thread; `threads` is accepted for
     /// symmetry with HnswIndex.
-    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0);
+    /// `options` adds a deadline, cancellation and progress reports (see
+    /// OperationOptions); a cancelled batch is undone and throws Cancelled.
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0,
+                   const OperationOptions& options = {});
     void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                   std::span<const Metadata> metadata, std::size_t threads = 0);
+                   std::span<const Metadata> metadata, std::size_t threads = 0, const OperationOptions& options = {});
 
     /// The vector stored for `id`, exactly as it was given to add() or update()
     /// (for cosine indexes, before normalization: the original is kept for this),
     /// or nothing if `id` is not stored.
+    /// "More like this": searches with the vector stored for `id`, under one lock
+    /// (so it cannot change in between). Returns nothing if `id` is not stored.
+    /// The record itself is left out unless `include_self` is true.
+    std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, const SearchOptions& options = {},
+                                                         bool include_self = false) const;
+
     std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// Removes every listed ID that is stored and returns how many it removed;
+    /// unknown and repeated IDs are skipped. Always completes, like remove_where.
+    std::size_t remove_batch(std::span<const std::uint64_t> ids);
 
     /// The vector and metadata of `id` together, or nothing if it is not stored.
     std::optional<Record> get(std::uint64_t id) const;
@@ -178,9 +191,11 @@ public:
 
     /// Swap-with-last never leaves holes in the vectors, so this only reclaims
     /// metadata strings no vector uses any more. Reports 0 vectors reclaimed.
-    CompactStats compact() {
+    CompactStats compact(const OperationOptions& options = {}) {
         const auto guard = lock_.write("compact");
+        detail::OperationControl control(options, 1);  // nothing to rebuild: one step
         metadata_.compact_dictionary();
+        control.finish();
         return {live_, 0};
     }
 
@@ -191,10 +206,13 @@ public:
     /// produce a complete file (the last one wins). Searches may run during a save;
     /// changes attempted during one throw std::logic_error. Throws
     /// std::runtime_error if the file cannot be written.
-    void save(const std::string& path) const;
+    void save(const std::string& path, const OperationOptions& options = {}) const;
 
     /// Saves to a stream (for example a std::ostringstream).
-    void save(std::ostream& out) const;
+    /// With `options`: a deadline, cancellation and progress reports; a cancelled
+    /// save throws Cancelled, leaving any existing file untouched and no temporary
+    /// file (a stream may hold an incomplete index).
+    void save(std::ostream& out, const OperationOptions& options = {}) const;
 
     /// Loads an index saved by save(). Throws FormatError if the file is damaged,
     /// truncated, from an unsupported version or of the other index kind (a
@@ -228,7 +246,7 @@ private:
     std::vector<NodeId> matching_slots(const Filter& filter) const;  // caller holds a lock
     Record record(NodeId slot, bool with_vector, bool with_metadata) const;
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
-                            const Metadata* metadata);  // caller holds the write lock
+                            const Metadata* metadata, const OperationOptions& options);  // caller holds the write lock
 
     /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;

@@ -141,6 +141,8 @@ public:
     }
 
     std::uint64_t count() const { return count_; }
+    /// True in the counting pass, which only measures a section's length.
+    bool counting() const { return out_ == nullptr; }
     std::uint32_t crc() const { return crc_; }
 
 private:

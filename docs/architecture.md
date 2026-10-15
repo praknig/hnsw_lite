@@ -123,7 +123,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 571 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 596 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -375,6 +375,12 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Publish when complete.** A node first searches every level and decides all its neighbors without changing anything, then sets its own lists, and only then adds the reverse links that make it reachable. Until then no other thread can reach it, so none descends into a level it has not linked yet, and none adds a link that its own list would later overwrite. (An earlier version linked level by level; under ThreadSanitizer's interleaving, other threads reached half-linked nodes and graph quality dropped.) Deferring changes nothing else, since each level's search starts from the previous level's results, never from links the node created; one thread therefore gives exactly the same graph as `add` in order.
 
 **Rollback.** If anything fails after step 2, every node the batch stored is removed (newest first, undoing metadata exactly), which cannot fail; then the graph is repaired around them as `remove` does, best effort. All batch nodes are already removed then, so no repair links to one of them.
+
+### Deadlines, cancellation and progress
+
+**Searches** do not pass a deadline through every internal function. The public search installs a `detail::SearchStopScope` for its duration: a thread-local pointer to the search's deadline and cancel flag, restoring the previous one afterwards, so a search inside a predicate has its own. The inner loops (graph search, exact scans, range searches, Flat's tiles) call `detail::search_should_stop()` every 32 graph steps or 256 rows; with no deadline it costs one thread-local read. On stopping, a loop simply ends, so the results are the best found so far. When the scope ends, after the search has written its statistics, it sets `SearchStats::stopped_early`. Batch searches install one scope per worker task. Inserts use the same search code but never install a scope, so they are unaffected.
+
+**Long operations** use `detail::OperationControl`: it checks the cancel flag and deadline, throwing `Cancelled`, and reports progress under a mutex (monotonic, about once per percent). Each operation is built so that a throw at any check undoes it: `add_batch` rolls back, `compact` discards the replacement it was building, and a save to a path removes its temporary file. The final progress report happens before the work becomes permanent (inside `add_batch`'s rollback scope, before `compact`'s commit, before a save's rename), so a callback that throws then still undoes the operation.
 
 ## Search features design
 

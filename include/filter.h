@@ -5,6 +5,9 @@
  */
 #pragma once
 #include <algorithm>
+#include <mutex>
+#include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -251,6 +254,7 @@ struct SearchStats {
     std::size_t ef = 0;                  // beam width used by a graph search
     std::size_t nodes_visited = 0;
     std::size_t distance_computations = 0;
+    bool stopped_early = false;          // a deadline or cancel flag stopped the search: results may be incomplete
 };
 
 /**
@@ -274,7 +278,132 @@ struct SearchOptions {
     std::optional<PlannerParams> planner;
     SearchStats* stats = nullptr;
     std::size_t range_expand_outside = 1;
+    /// Stop when this moment passes: the search returns the best results found
+    /// so far (sorted and valid, possibly incomplete) and sets
+    /// SearchStats::stopped_early. Checked every few dozen steps.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    /// Stop when another thread sets this to true; same behavior as a deadline.
+    const std::atomic<bool>* cancel = nullptr;
 };
+
+/// Thrown when a long operation (add_batch, compact, save) is cancelled or
+/// passes its deadline. The operation is undone first: the index is as before,
+/// and a save leaves no temporary file.
+class Cancelled : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+/// Control of a long operation: add_batch, compact, save.
+struct OperationOptions {
+    /// Give up when this moment passes: the operation is undone and throws Cancelled.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    /// Give up when another thread sets this to true; same as a deadline.
+    const std::atomic<bool>* cancel = nullptr;
+    /// Called with (done, total) as work proceeds: starting at (0, total),
+    /// never decreasing, at most about 100 times, ending at (total, total) when
+    /// the operation succeeds. Calls never overlap, but may come from worker
+    /// threads. It must not use the index (other threads may be changing it).
+    /// If it throws, the operation is undone and the exception passed on.
+    std::function<void(std::size_t done, std::size_t total)> progress;
+};
+
+namespace detail {
+
+/// The deadline and cancel flag of the search running on this thread. Inner
+/// search loops call search_should_stop() every few dozen steps.
+struct SearchStop {
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool stopped = false;
+};
+
+inline SearchStop*& current_search_stop() {
+    thread_local SearchStop* stop = nullptr;
+    return stop;
+}
+
+/// Whether the search running on this thread should stop. Cheap when no
+/// deadline or cancel flag is set (one thread-local read).
+inline bool search_should_stop() {
+    SearchStop* s = current_search_stop();
+    if (!s) return false;
+    if (!s->stopped && ((s->cancel && s->cancel->load(std::memory_order_relaxed)) ||
+                        (s->deadline && std::chrono::steady_clock::now() >= *s->deadline)))
+        s->stopped = true;
+    return s->stopped;
+}
+
+/// Installs a search's deadline and cancel flag on this thread for its
+/// lifetime, restoring the previous ones afterwards (a search inside a
+/// predicate has its own). On destruction, records in `stats` whether the
+/// search stopped early, after the search has written its other statistics.
+class SearchStopScope {
+public:
+    SearchStopScope(const SearchOptions& o, SearchStats* stats) : prev_(current_search_stop()), stats_(stats) {
+        stop_.deadline = o.deadline;
+        stop_.cancel = o.cancel;
+        current_search_stop() = (o.deadline || o.cancel) ? &stop_ : nullptr;
+    }
+    ~SearchStopScope() {
+        current_search_stop() = prev_;
+        if (stats_) stats_->stopped_early = stop_.stopped;
+    }
+    bool stopped() const { return stop_.stopped; }
+    SearchStopScope(const SearchStopScope&) = delete;
+    SearchStopScope& operator=(const SearchStopScope&) = delete;
+
+private:
+    SearchStop stop_;
+    SearchStop* prev_;
+    SearchStats* stats_;
+};
+
+/// Progress, cancellation and deadline of one long operation. Thread-safe.
+class OperationControl {
+public:
+    OperationControl(const OperationOptions& o, std::size_t total) : o_(o), total_(total > 0 ? total : 1) {
+        check();
+        report(0);
+    }
+    /// Throws Cancelled if the operation was cancelled or passed its deadline.
+    void check() const {
+        if (o_.cancel && o_.cancel->load(std::memory_order_relaxed)) throw Cancelled("vecdb: operation cancelled");
+        if (o_.deadline && std::chrono::steady_clock::now() >= *o_.deadline)
+            throw Cancelled("vecdb: operation passed its deadline");
+    }
+    /// Records `n` more units of work done, reports progress, and checks.
+    void advance(std::size_t n = 1) {
+        const std::size_t done = std::min(done_.fetch_add(n, std::memory_order_relaxed) + n, total_);
+        report(done);
+        check();
+    }
+    /// The operation succeeded: reports (total, total).
+    void finish() { report(total_); }
+
+private:
+    void report(std::size_t done) {
+        if (!o_.progress) return;
+        const std::size_t percent = done * 100 / total_;
+        if (done != 0 && done != total_ && percent <= last_percent_.load(std::memory_order_relaxed)) return;
+        const std::lock_guard<std::mutex> lock(m_);
+        if (reported_any_ && done <= last_done_) return;  // never backwards, never twice
+        last_percent_.store(percent, std::memory_order_relaxed);
+        last_done_ = done;
+        reported_any_ = true;
+        o_.progress(done, total_);
+    }
+
+    const OperationOptions& o_;
+    const std::size_t total_;
+    std::atomic<std::size_t> done_{0};
+    std::atomic<std::size_t> last_percent_{0};
+    std::mutex m_;
+    std::size_t last_done_ = 0;
+    bool reported_any_ = false;
+};
+
+}  // namespace detail
 
 /// One stored vector with its user ID and metadata, as returned by get() and scan().
 struct Record {
