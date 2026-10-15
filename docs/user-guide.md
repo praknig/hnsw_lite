@@ -9,6 +9,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Core ideas](#core-ideas)
 - [Creating an index](#creating-an-index)
 - [Adding vectors](#adding-vectors)
+  - [Adding many vectors at once](#adding-many-vectors-at-once)
 - [Searching](#searching)
 - [Updating vectors](#updating-vectors)
 - [Removing vectors and compacting](#removing-vectors-and-compacting)
@@ -77,6 +78,22 @@ index.add(42, embedding);   // embedding: std::vector<float>, std::array, or any
 - Values extremely close to zero (subnormal floats, below about 1e-38) give correct results. They caused no slowdown on the CPUs tested, but some older CPUs process them many times slower; if you see that, round such values to 0.
 
 Any failure leaves the index exactly as it was. See [Errors and guarantees](#errors-and-guarantees).
+
+### Adding many vectors at once
+
+```cpp
+std::vector<std::uint64_t> ids = {1, 2, 3};
+std::vector<float> vectors = ...;           // ids.size() * dim() values, back to back
+index.add_batch(ids, vectors);              // all cores (HnswIndex)
+index.add_batch(ids, vectors, metadata, 8); // with one Metadata per vector, on 8 threads
+```
+
+- **All or nothing:** every vector, ID (against the index and within the batch) and metadata entry is checked first; any problem throws `std::invalid_argument` and changes nothing. With a dynamic schema, a field that is new must have the same type throughout the batch.
+- **HNSW links vectors on several threads** (`threads = 0`, the default, uses all cores). Vectors that reuse slots of removed vectors are linked one at a time first, exactly as `add` would; the rest in parallel.
+- **One thread gives exactly the same index as calling `add` for each vector in order.** With more threads the graph differs slightly from run to run (which vector links first depends on timing), while search quality is the same.
+- **Searches wait** while a batch is added, then see all of it or none of it.
+- **If memory runs out**, an HNSW index removes the batch's vectors again (repairing the graph around them when memory allows): none of the batch remains, and every earlier vector is still stored and searchable. A Flat index is restored exactly. Either way, the exception is passed on.
+- On `FlatIndex`, `add_batch` has the same checks and guarantees; inserting is a copy, so it runs on the calling thread.
 
 ## Searching
 
@@ -269,16 +286,24 @@ auto flat = FlatIndex::load("exact.flat");           // the same for FlatIndex
 ```
 
 - **Everything is saved:** vectors, the HNSW graph, removed slots and the order they will be reused in, metadata with its schema and payload indexes, HNSW and planner settings, and the random generator's state. A loaded index continues exactly as if the program had never stopped: adding the same vectors afterwards builds the same graph.
-- **Saving never damages an existing file.** The index is written to `<path>.tmp` and renamed over `path` only when complete, so a crash or a full disk leaves the previous file intact. (Standard C++ cannot force data onto the physical disk, so a power cut immediately after `save` returns could still lose that latest save.)
+- **Saving never damages an existing file.** The index is written to a temporary file next to it (`<path>.tmp-` and a unique suffix) and renamed over `path` only when complete, so a crash or a full disk leaves the previous file intact. (Standard C++ cannot force data onto the physical disk, so a power cut immediately after `save` returns could still lose that latest save.)
 - **Loaded files are checked thoroughly.** Each section carries a checksum, every count is checked before memory is allocated, and every link, level and value is validated. A damaged, truncated or foreign file throws `vecdb::FormatError`; a failed load never produces a half-built index.
 - **Streams work too:** `save(std::ostream&)` and `load(std::istream&)`, for example with `std::stringstream`. A stream given to `load` must be seekable (files and string streams are).
-- A save reads the index, so searches may run during it; changes attempted during a save throw `std::logic_error`, as during a search.
+- A save reads the index, so searches and other saves run alongside it, and changes wait until it finishes. Several threads may save to the **same path** at once: each writes its own temporary file and the last to finish wins, so the file is always complete. (On Windows, two renames over one file at the very same moment can be refused; that save then throws `std::runtime_error` and the file stays complete.)
 - Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned).
 
 ## Threads
 
-- **Searches** (all kinds) may run from any number of threads at the same time.
-- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`; `save` counts as a search) must not run at the same time as anything else, including searches. A change attempted while a search is running throws `std::logic_error`; this is detected reliably from a predicate, and on a best-effort basis from another thread (only if the two actually overlap). If your program changes an index from several threads, protect it with a lock, for example a `std::shared_mutex`: shared for searches, exclusive for changes. (Built-in support for concurrent inserts is on the [roadmap](project-notes.md#roadmap).)
+Every index is safe to use from any number of threads at once, with no lock of your own.
+
+- **Searches** of every kind, **saves**, and lookups (`contains`, `get_metadata`, `size` and so on) run in parallel with each other.
+- **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) run one at a time: a change waits until the searches running when it arrived have finished, and searches arriving after it wait until it is done. A queued change is never starved by a steady stream of searches.
+- **`upsert` is atomic:** the check for an existing vector and the update or insert happen under one lock, so two threads upserting the same ID never collide.
+- **Changes cannot be made from inside a search**, for example from a filter predicate, on that index or any other: this throws `std::logic_error`. Waiting would deadlock (the change would wait for the very search that called it), and changes nested inside searches are what create lock cycles between threads. Predicates may still **search** any index, including the one they are filtering.
+- **Batch searches** use their own thread pool; predicates in batch searches run on several threads at once, so they must be thread-safe.
+- **References** returned by `storage()` and `metadata()` are for inspection while no other thread changes the index: the lock covers the call, not later use of the reference. From concurrent code, use `get_metadata`, `planner_params()` (which returns a copy) and the counting functions.
+- **Destroying an index** while another thread still uses it is undefined behavior, as for any C++ object: make sure all searches and changes have returned first.
+- Changes run one at a time. To build an HNSW index faster, use [`add_batch`](#adding-many-vectors-at-once), which links vectors on several threads inside a single change.
 
 ## Errors and guarantees
 

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <random>
 #include <span>
@@ -128,6 +129,28 @@ public:
     /// out (std::bad_alloc), the index stays consistent and `id` is not stored.
     void add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata = {});
 
+    /// Adds many vectors at once. `vectors` holds ids.size() vectors back to
+    /// back; `metadata`, if given, has one entry per vector. The index's lock is
+    /// held throughout, so searches wait and then see all of the batch or none of it.
+    ///
+    /// **All or nothing.** Every vector, ID (against the index and within the
+    /// batch) and metadata entry is checked before anything changes; any problem
+    /// throws std::invalid_argument and leaves the index unchanged.
+    ///
+    /// **Threads.** Vectors that reuse removed slots are linked one at a time,
+    /// exactly as add() would; the rest are linked into the graph on `threads`
+    /// threads (0: all cores). With one thread the result is identical to calling
+    /// add() for each vector in order; with more, the graph differs between runs
+    /// (search quality does not).
+    ///
+    /// If memory runs out while linking, the batch's vectors are removed again:
+    /// none of them remains, and every earlier vector is still stored and
+    /// searchable. The graph is repaired around them when memory allows, as by
+    /// remove(); some links may differ from before, as after any removal.
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0);
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                   std::span<const Metadata> metadata, std::size_t threads = 0);
+
     /// Deletes `id` for real: repairs the graph around it (if enabled), frees
     /// the ID for reuse and puts its slot on the free list. Returns false if the
     /// ID is not stored. If memory runs out during repair, the vector stays
@@ -200,17 +223,21 @@ public:
     /// Keeps exact value counts for a keyword, boolean or tag-set field, so the
     /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
     void create_payload_index(std::string_view field) {
-        searches_.check_no_search("create_payload_index");
+        const auto guard = lock_.write("create_payload_index");
         metadata_.index_field(field);
     }
 
     /// The index's planner settings (per-query settings in SearchOptions override them).
     void set_planner_params(const PlannerParams& p) {
-        searches_.check_no_search("set_planner_params");
+        const auto guard = lock_.write("set_planner_params");
         validate(p);
         planner_ = p;
     }
-    const PlannerParams& planner_params() const { return planner_; }
+    /// A copy, so it is safe to call while other threads change the settings.
+    PlannerParams planner_params() const {
+        const auto guard = lock_.read();
+        return planner_;
+    }
     const MetadataStore& metadata() const { return metadata_; }
     /// Visited lists kept for reuse by searches (released by compact()).
     std::size_t pooled_visited_lists() const { return visited_pool_.idle_count(); }
@@ -223,8 +250,10 @@ public:
 
     /// Number of live vectors.
     /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
-    /// written to "<path>.tmp" first and then renamed into place, so a failure
-    /// never damages an existing file at `path`. Searches may run during a save;
+    /// written to a temporary file next to it ("<path>.tmp-" and a unique
+    /// suffix) and then renamed into place, so a failure never damages an
+    /// existing file at `path`, and saves to one path at the same time each
+    /// produce a complete file (the last one wins). Searches may run during a save;
     /// changes attempted during one throw std::logic_error. Throws
     /// std::runtime_error if the file cannot be written.
     void save(const std::string& path) const;
@@ -241,20 +270,35 @@ public:
     /// Loads from a stream, which must be seekable (files and string streams are).
     static std::unique_ptr<HnswIndex> load(std::istream& in);
 
-    std::size_t size() const { return live_; }
+    std::size_t size() const {
+        const auto guard = lock_.read();
+        return live_;
+    }
     /// Slots of removed vectors still occupying memory (waiting to be reused).
-    std::size_t deleted_count() const { return storage_.size() - live_; }
+    std::size_t deleted_count() const {
+        const auto guard = lock_.read();
+        return storage_.size() - live_;
+    }
     /// All slots, live or removed.
-    std::size_t capacity() const { return storage_.size(); }
+    std::size_t capacity() const {
+        const auto guard = lock_.read();
+        return storage_.size();
+    }
 
     std::size_t dim() const { return storage_.vectors().dim(); }
     Metric metric() const { return metric_; }
     const HnswParams& params() const { return params_; }
 
     /// Highest level of a live node, or -1 when the index has no live vectors.
-    int max_level() const { return max_level_; }
+    int max_level() const {
+        const auto guard = lock_.read();
+        return max_level_;
+    }
     /// Node where every search starts, or kEmpty when there are no live vectors.
-    NodeId entry_point() const { return entry_; }
+    NodeId entry_point() const {
+        const auto guard = lock_.read();
+        return entry_;
+    }
     /// Read-only access to the underlying storage (used by tests to check the graph).
     const Storage& storage() const { return storage_; }
 
@@ -271,9 +315,22 @@ private:
     /// True if two stored nodes hold bit-identical vectors.
     bool same_vector(NodeId a, NodeId b) const;
 
+    /// Locks for linking many vectors in parallel (add_batch): each node's link
+    /// lists are guarded by one of a fixed array of mutexes (lock striping, as in
+    /// hnswlib), and the entry point and top level by `top`.
+    struct LinkLocks {
+        explicit LinkLocks(std::size_t stripes) : lists(stripes) {}
+        std::mutex& of(NodeId n) { return lists[n & (lists.size() - 1)]; }
+        std::vector<std::mutex> lists;  // size: a power of two
+        std::mutex top;
+    };
+    static constexpr std::size_t kLinkStripes = std::size_t(1) << 16;
+
     /// Greedy walk on one level: moves to any closer neighbor until none is
-    /// closer. Never steps onto `exclude` or onto a node below `level`.
-    Candidate greedy_closest(const float* query, Candidate start, int level, NodeId exclude) const;
+    /// closer. Never steps onto `exclude` or onto a node below `level`. With
+    /// `locks`, each link list is read under its lock (parallel linking).
+    Candidate greedy_closest(const float* query, Candidate start, int level, NodeId exclude,
+                             LinkLocks* locks = nullptr) const;
 
     /// Beam search on one level. Returns up to `ef` closest eligible nodes,
     /// closest first. Ineligible nodes (removed, or failing the filter) are
@@ -282,7 +339,7 @@ private:
     std::vector<Candidate> search_level(const float* query, const std::vector<Candidate>& entries,
                                         std::size_t ef, int level, VisitedList& visited,
                                         NodeId exclude, const Eligibility& eligible,
-                                        SearchStats* stats = nullptr) const;
+                                        SearchStats* stats = nullptr, LinkLocks* locks = nullptr) const;
 
     /// Eligibility with no filter: "not removed".
     Eligibility live_only() const { return Eligibility{&storage_.ids()}; }
@@ -309,12 +366,37 @@ private:
     /// both ways, and makes it the entry point if it is the highest node.
     void link_new_node(NodeId node, int level, NodeId ignore = kEmpty);
 
+    /// Links `node` on its levels, starting from `entry` on level `top`, reading
+    /// the vector from `query`. With `locks`, every link list is read and written
+    /// under its lock. Does not update the entry point.
+    void link_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry, int top,
+                     LinkLocks* locks);
+
+    /// add_batch's work; the caller holds the write lock. `metadata` is an array
+    /// of ids.size() entries, or null.
+    void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                            const Metadata* metadata, std::size_t threads);
+
+    /// Links one stored, not yet linked node in parallel with others (add_batch).
+    void link_concurrently(NodeId node, int level, LinkLocks& locks);
+
+    /// Undoes a failed batch: removes every node it stored (newest first), then
+    /// repairs the graph around them if memory allows.
+    void roll_back_batch(std::span<const std::uint64_t> ids, const std::vector<NodeId>& nodes,
+                         const std::vector<MetadataStore::WriteUndo>& undo) noexcept;
+
     /// update() and upsert(): `metadata` null keeps the old metadata.
-    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.
-    void connect(NodeId node, const std::vector<NodeId>& neighbors, int level);
+    void connect(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks = nullptr);
+    /// The two halves of connect(): set the node's own list, then add the reverse
+    /// links (shrinking full lists). Parallel linking does all of the first before
+    /// any of the second.
+    void set_own_links(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks);
+    void link_back(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks);
 
     /// Before `node` is removed: each live neighbor re-chooses its links from
     /// its own links plus `node`'s links, minus `node`, on every level.
@@ -340,7 +422,7 @@ private:
     PlannerParams planner_;
     mutable VisitedListPool visited_pool_;
     mutable SharedPool pool_;
-    SearchCounter searches_;  // refuses changes made during a search
+    IndexLock lock_;  // reads share it, changes take it alone (see IndexLock)
 };
 
 }  // namespace vecdb

@@ -181,9 +181,13 @@ Added during implementation: P50 metadata round trip (both schema modes, payload
 | C9 | No deadlock when operations call each other internally (update calling remove and add), enforced by a watchdog timeout | N |
 | C10 | The same scenarios for Flat | S |
 
+Added for stage A: C11 predicates searching their own index while a writer is queued (single and batch searches), C12 changes from predicates refused on every thread and for every kind of change, C13 writers not starved by continuous searches, C14 atomic `upsert`, C15 batch and range searches during changes, C16 metadata and planner changes during filtered searches, C17 exceptions releasing the lock, C18 several indexes with crossed predicates (the case that deadlocked an early design), C19 the nesting limit and running out of memory under the lock, C20 simultaneous saves to one file. Also covered: a predicate's own exception on batch worker threads (C17), and accessors and saves during compaction (C8).
+
 ### Stage B: fine-grained locking
 
 `add_batch` is all-or-nothing: if any vector or ID in the batch is invalid, nothing is inserted.
+
+**As built:** these scenarios became the `add_batch` group, numbered B1 to B19 (test `c20` already existed). Scenarios about searches running during inserts (C25, C28, C29) are deferred with that option, since searches wait for a batch. B20, the build speedup, is measured with `bench_baseline --threads=N` rather than a test.
 
 | ID | Scenario | Type |
 |---|---|---|

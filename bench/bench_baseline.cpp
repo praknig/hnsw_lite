@@ -3,6 +3,9 @@
  * @brief Baseline benchmark for performance work: build time, memory, and for
  *        several ef values, queries per second, latency percentiles and recall.
  *
+ * Add --threads=N anywhere to build with add_batch on N threads (0: all cores)
+ * instead of adding vectors one by one.
+ *
  * Usage, generated data:
  *   bench_baseline [n] [dim] [l2|cosine] [queries] [M] [ef_construction]
  *   Defaults: 200000 vectors, 128 dimensions, l2, 1000 queries, M 16, ef_construction 200.
@@ -25,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <numeric>
 #include <random>
 #include <set>
 #include <string>
@@ -120,7 +124,21 @@ double percentile(std::vector<double> v, double p) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main(int argc_in, char** argv_in) {
+    // --threads=N (anywhere): build with add_batch on N threads (0: all cores);
+    // without it, vectors are added one by one.
+    std::size_t threads = 1;
+    std::vector<char*> kept;
+    for (int i = 0; i < argc_in; ++i) {
+        const std::string a = argv_in[i];
+        if (a.rfind("--threads=", 0) == 0) {
+            threads = std::strtoull(a.c_str() + 10, nullptr, 10);
+        } else {
+            kept.push_back(argv_in[i]);
+        }
+    }
+    const int argc = static_cast<int>(kept.size());
+    char** argv = kept.data();
     const bool files = argc > 1 && std::string(argv[1]) == "--files";
     if (files && argc < 5) {
         std::fprintf(stderr, "usage: bench_baseline --files <base.fvecs> <query.fvecs> <truth.ivecs> [l2|cosine] [queries] [M] [ef_construction]\n");
@@ -155,9 +173,10 @@ int main(int argc, char** argv) {
         data = clustered(n, dim, 1);
         queries = clustered(nq, dim, 2);
     }
-    std::printf("hnsw-lite baseline | kernel: %s | %zu x %zu %s | %zu queries | M %zu, ef_construction %zu\n",
+    std::printf("hnsw-lite baseline | kernel: %s | %zu x %zu %s | %zu queries | M %zu, ef_construction %zu | build: %s\n",
                 isa_name(active_isa()), n, dim, metric == Metric::L2 ? "l2" : "cosine", nq, params.M,
-                params.ef_construction);
+                params.ef_construction,
+                threads == 1 ? "one by one" : ("add_batch, " + (threads == 0 ? std::string("all cores") : std::to_string(threads) + " threads")).c_str());
 
     if (!files) {  // exact answers for recall by brute force (not timed)
         FlatIndex flat(dim, metric);
@@ -170,7 +189,13 @@ int main(int argc, char** argv) {
     const double rss_before = rss_mib();
     HnswIndex index(dim, metric, params);
     const auto t0 = Clock::now();
-    for (std::size_t i = 0; i < n; ++i) index.add(i, std::span<const float>(&data[i * dim], dim));
+    if (threads == 1) {
+        for (std::size_t i = 0; i < n; ++i) index.add(i, std::span<const float>(&data[i * dim], dim));
+    } else {
+        std::vector<std::uint64_t> ids(n);
+        std::iota(ids.begin(), ids.end(), std::uint64_t(0));
+        index.add_batch(ids, data, threads);
+    }
     const double build_s = std::chrono::duration<double>(Clock::now() - t0).count();
     const double rss_after = rss_mib();
     std::printf("build: %.2f s (%.0f vectors/s) | index memory: %.1f MiB\n\n", build_s, double(n) / build_s,

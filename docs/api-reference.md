@@ -142,6 +142,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
+| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
 | `update(id, vector)`, `update(id, vector, metadata)` | Replaces the vector in place (and, with metadata, the whole metadata); `false` for an unknown ID; all-or-nothing |
 | `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
@@ -157,6 +158,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `HnswParams { M = 16, ef_construction = 200, seed = 42, repair_on_remove = true }` | Graph settings; `M >= 2` and `ef_construction >= 1` are required, `M >= 8` is recommended |
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
 | `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
+| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing, linking them on `threads` threads (0: all cores); one thread gives the same index as `add` in order |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
 | `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |
 | `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
@@ -199,7 +201,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `search(query, k, options)` (Flat), `search(query, k, ef, options)` (HNSW) | Filtered search |
 | `search_batch(queries, k, threads, options)` (Flat), `search_batch(queries, k, ef, threads, options)` (HNSW) | Batch search |
 | `search_range(query, radius, max_results = kNoLimit, options)` | Range search |
-| `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings |
+| `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings; `planner_params()` returns a copy, safe while other threads change them |
 
 `thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
 
@@ -207,7 +209,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Header | Description |
 |---|---|---|
-| `SearchCounter` | `search_result.h` | Counts searches in progress; every index uses one to refuse changes made during a search (`std::logic_error`) |
+| `IndexLock` | `thread_pool.h` | The lock inside every index: reads in parallel, changes one at a time, writers preferred. `ReadGuard`, `WriteGuard` (throws `std::logic_error` inside any index operation), `Hold` (batch tasks), `held()`, `inside_any()`, `kMaxNesting` (64) |
 | `index_distance(raw, cosine)` | `search_result.h` | A distance as indexes report it: cosine clamped at 0, NaN mapped like `ordered_distance()`. `get_distance()` kernels are unchanged |
 | `in_pool_task()` | `thread_pool.h` | True on a thread running a pool task; `parallel_for()` called there runs inline, so nested batches cannot deadlock |
 | `HnswParams::M` | `hnsw_index.h` | Now limited to 2 to 2048 |
@@ -216,7 +218,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Description |
 |---|---|
-| `index.save(path)` | Writes the whole index to `path` (through `<path>.tmp` and a rename, so an existing file is never damaged). Throws `std::runtime_error` if the file cannot be written |
+| `index.save(path)` | Writes the whole index to `path`, through a temporary file of its own (`<path>.tmp-` and a unique suffix) and a rename, so an existing file is never damaged and simultaneous saves to one path each produce a complete file. Throws `std::runtime_error` if the file cannot be written |
 | `index.save(std::ostream&)` | Writes to a stream |
 | `HnswIndex::load(path)`, `FlatIndex::load(path)` | Return a `std::unique_ptr` to the loaded index. Throw `FormatError` for a damaged, truncated, unsupported or wrong-kind file, and `std::runtime_error` if the file cannot be opened |
 | `HnswIndex::load(std::istream&)`, `FlatIndex::load(std::istream&)` | The same from a seekable stream |

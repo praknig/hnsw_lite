@@ -73,7 +73,7 @@ tar -xzf sift.tar.gz
 .\build\bench_baseline.exe --files sift\sift_base.fvecs sift\sift_query.fvecs sift\sift_groundtruth.ivecs l2 1000
 ```
 
-The ground-truth file holds the exact nearest neighbors, so recall is measured without a brute-force search over a million vectors. Building the index takes several minutes on one thread.
+Add `--threads=N` to any of these commands to build with `add_batch` on N threads (`--threads=0`: all cores) instead of adding vectors one by one; the header line shows which was used. The ground-truth file holds the exact nearest neighbors, so recall is measured without a brute-force search over a million vectors. Building the index takes several minutes on one thread.
 
 ## Tuning guide
 

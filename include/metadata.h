@@ -252,6 +252,23 @@ public:
     /// std::invalid_argument for an unknown field (strict mode), a type that
     /// differs from the field's type, or a float that is NaN or infinite.
     /// An integer value is accepted for a float field.
+    /// Validates rows that will be written in this order: each as validate()
+    /// does, and a field the schema does not have yet (dynamic schemas) must have
+    /// the same type in every row, since the first row to use it creates it.
+    void validate_batch(const Metadata* rows, std::size_t count) const {
+        std::map<std::string, FieldType> created;
+        for (std::size_t i = 0; i < count; ++i) {
+            validate(rows[i]);
+            for (const auto& [name, value] : rows[i].fields()) {
+                if (!value || find_field(name)) continue;
+                const auto [it, inserted] = created.emplace(name, value->type);
+                if (!inserted && !compatible(it->second, value->type))
+                    throw std::invalid_argument("metadata field '" + name + "' has different types within the batch (" +
+                                                field_type_name(it->second) + " and " + field_type_name(value->type) + ")");
+            }
+        }
+    }
+
     void validate(const Metadata& md) const {
         for (const auto& [name, value] : md.fields()) {
             if (name.empty()) throw std::invalid_argument("field name must not be empty");

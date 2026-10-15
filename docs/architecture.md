@@ -123,7 +123,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 499 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 538 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -309,7 +309,7 @@ Cost: one distance per stored vector. Exact, with equal distances ordered by ins
 
 One addition beyond hnswlib: a candidate that is a **bit-identical copy** of an already-kept neighbor is skipped. Identical vectors are all at distance 0 from each other, a tie, so the plain rule keeps every copy, and lists near a cluster of duplicates fill up with copies of one point. In testing with 200 identical vectors among 200 random ones, this cut links to the rest of the graph and made 44 of the random vectors unreachable; with the copy check, every random vector stays reachable. The check uses `memcmp`, which stops at the first differing byte, so it costs almost nothing, and on data without duplicates the graph is unchanged.
 
-**Threading.** One writer at a time, with no searches running. Several searches may run at once when no writer is active; each borrows its own `VisitedList` from a mutex-protected pool, and returns it automatically through an RAII handle.
+**Threading.** Each search borrows its own `VisitedList` from a mutex-protected pool and returns it automatically through an RAII handle, so any number of searches run at once. How searches and changes share an index is described in [Thread safety](#thread-safety).
 
 ### Updating vectors
 
@@ -340,11 +340,39 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 - **Removed slots are saved:** other vectors may still link through them, and inserts reuse them in a fixed order. With the free list and the random generator's state, a loaded index continues exactly as the original would have. The generator is SplitMix64, whose whole state is one 64-bit number saved as plain bytes. (An earlier draft saved `std::mt19937_64` through C++ streams; its text form turned out to differ between libstdc++ and libc++, which the golden files caught on macOS before release.)
 - **Derived data is recomputed, not trusted:** payload-index counts and string reference counts are rebuilt from the rows on load.
 - **Each section's length is computed by a counting pass** before it is written, so saving needs no extra copy of the data.
+- **Every save writes its own temporary file** (`<path>.tmp-<counter>-<mix>`: a per-process counter, mixed with the thread, the time and a memory address to separate processes), then renames it over the target. Saves run in parallel, and with one shared temporary name two saves to the same path overwrote each other mid-write.
 - **Streams rethrow their errors** (`StreamErrorsThrow`): by default a C++ stream that runs out of memory only sets a flag and stops writing, which would produce a damaged file without an error.
 
 **Loading untrusted files.** `persist::Reader` knows the file's size before reading (hence seekable streams), and checks every read against the bytes left in the section and the file. Every count is checked against those bytes **before** allocating, so a damaged count cannot trigger a huge allocation. After the checksums, the content is validated: link targets, self-links, repeated links, list lengths, levels, removed flags, finite vector values, unique user IDs, an entry point that is live and on the top level, a free list naming exactly the removed slots, the generator state, and every metadata value. Any problem throws `FormatError`, and nothing partly built escapes.
 
 **Compatibility** is guarded by two small golden files in `tests/data/`, saved in format version 1. Their vectors are small whole numbers, which every distance kernel sums exactly, so every CI platform must rebuild them **byte for byte**; this checks the format, the determinism of saving and portability across platforms at once. `test_comprehensive --write-golden` rewrites them, for a deliberate format change only.
+
+### Thread safety
+
+Each index holds an `IndexLock`: searches, saves and lookups take it shared, changes take it alone. Public changes lock once and call unlocked internals (`add_unlocked`, `replace`), so `upsert` (look up, then update or insert) is atomic, and `compact` fills its fresh index without locking it, since no other thread can see it.
+
+**Why not `std::shared_mutex`?** With glibc it prefers readers, so a change could wait forever behind overlapping searches. `IndexLock` prefers writers: while a change is queued, new top-level searches wait.
+
+**Nesting and deadlock freedom.** Predicates may search indexes, including the one being filtered, and batch tasks run on pool threads on behalf of a caller that already holds the lock. Each thread therefore records which indexes it is inside (a small fixed array, no allocation; nesting deeper than 64 throws `std::logic_error`), and two rules apply:
+
+1. **No change from inside any index operation.** It throws `std::logic_error`. A change nested in a read is what creates lock cycles: thread 1 inside a search of A changes B while thread 2 inside a search of B searches A.
+2. **Nested reads skip the writer queue.** A search started from inside an index operation waits only for a change that is running, not for queued ones. A read of the same index does not lock again at all, and batch tasks inherit their caller's read (`IndexLock::Hold`).
+
+Together these make a cycle impossible: a thread holding a lock waits only for a running change, and a running change, which by rule 1 holds no other lock and starts no nested operation, always finishes. An early version without rule 2 deadlocked in exactly the crossed-predicate pattern; test `c18` now checks it under a watchdog.
+
+### Parallel building (`add_batch`)
+
+The whole batch runs inside one change, holding the index lock alone, so searches never see a half-built batch, and the lowest storage layer needs no redesign for concurrent readers. Inside, it works in phases:
+
+1. **Validate everything:** vectors, IDs against the index and within the batch, metadata (`MetadataStore::validate_batch` also requires a new dynamic field to have one type throughout). Nothing has changed yet.
+2. **Reserve everything a rollback needs** (the free list, undo records), so undoing cannot fail.
+3. **Vectors that reuse removed slots are inserted and linked one at a time**, exactly as `add` does. A reused slot keeps its old links (other nodes route through it) until the moment it is reused, so preparing it in advance would change the graph.
+4. **The rest are stored, unlinked, in order:** vectors, metadata, empty link lists, levels drawn in order. All storage grows here, so nothing reallocates while threads link.
+5. **Linking, on a thread pool.** Each node's link lists are guarded by one of 65,536 striped mutexes (`LinkLocks`, as in hnswlib); a thread holds one list lock at a time, so threads cannot deadlock. Searches read each list as a copy taken under its lock. A node that raises the top level holds the entry-point lock while it links, so two such nodes cannot each build an upper level the other cannot reach.
+
+**Publish when complete.** A node first searches every level and decides all its neighbors without changing anything, then sets its own lists, and only then adds the reverse links that make it reachable. Until then no other thread can reach it, so none descends into a level it has not linked yet, and none adds a link that its own list would later overwrite. (An earlier version linked level by level; under ThreadSanitizer's interleaving, other threads reached half-linked nodes and graph quality dropped.) Deferring changes nothing else, since each level's search starts from the previous level's results, never from links the node created; one thread therefore gives exactly the same graph as `add` in order.
+
+**Rollback.** If anything fails after step 2, every node the batch stored is removed (newest first, undoing metadata exactly), which cannot fail; then the graph is repaired around them as `remove` does, best effort. All batch nodes are already removed then, so no repair links to one of them.
 
 ## Search features design
 

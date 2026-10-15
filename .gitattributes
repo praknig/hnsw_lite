@@ -1,2 +1,4 @@
 # Golden files for the saved-format tests: never convert line endings.
-*.bin binary*.sh text eol=lf
+*.bin binary
+# Shell scripts run on Linux CI machines: always store them with LF line endings.
+*.sh text eol=lf

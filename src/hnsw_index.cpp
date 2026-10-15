@@ -8,6 +8,8 @@
  * level, lists may grow to 2*M on level 0 through reverse links, and removal
  * repairs the removed node's neighbors.
  */
+#include <unordered_set>
+#include <mutex>
 #include "hnsw_index.h"
 
 #include <algorithm>
@@ -71,12 +73,19 @@ bool HnswIndex::same_vector(NodeId a, NodeId b) const {
 }
 
 Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int level,
-                                    NodeId exclude) const {
+                                    NodeId exclude, LinkLocks* locks) const {
     const GraphStorage& graph = storage_.graph();
     Candidate best = start;
+    std::vector<NodeId> copy;  // parallel linking: each list is copied under its lock
     for (bool moved = true; moved;) {
         moved = false;
-        for (NodeId neighbor : graph.links(best.id, level)) {
+        std::span<const NodeId> links = graph.links(best.id, level);
+        if (locks) {
+            const std::lock_guard<std::mutex> l(locks->of(best.id));
+            copy.assign(links.begin(), links.end());
+            links = copy;
+        }
+        for (NodeId neighbor : links) {
             if (neighbor == kEmpty) break;
             if (neighbor == exclude || graph.level(neighbor) < level) continue;  // stale link
             const float d = distance_to(query, neighbor);
@@ -93,7 +102,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                const std::vector<Candidate>& entries,
                                                std::size_t ef, int level, VisitedList& visited,
                                                NodeId exclude, const Eligibility& eligible,
-                                               SearchStats* stats) const {
+                                               SearchStats* stats, LinkLocks* locks) const {
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
     const GraphStorage& graph = storage_.graph();
@@ -110,6 +119,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
     }
 
     std::size_t expanded = 0, computed = 0;
+    std::vector<NodeId> copy;  // parallel linking: each list is copied under its lock
     while (!candidates.empty()) {
         const Candidate current = candidates.top();
         // Nothing left can beat the current results: stop.
@@ -117,7 +127,13 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
         candidates.pop();
         ++expanded;
 
-        for (NodeId neighbor : graph.links(current.id, level)) {
+        std::span<const NodeId> links = graph.links(current.id, level);
+        if (locks) {
+            const std::lock_guard<std::mutex> l(locks->of(current.id));
+            copy.assign(links.begin(), links.end());
+            links = copy;
+        }
+        for (NodeId neighbor : links) {
             if (neighbor == kEmpty) break;
             if (graph.level(neighbor) < level) continue;  // stale link to a reused slot
             if (!visited.visit(neighbor)) continue;
@@ -157,13 +173,25 @@ std::vector<NodeId> HnswIndex::select_neighbors(const std::vector<Candidate>& so
     return kept;
 }
 
-void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int level) {
+void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks) {
+    set_own_links(node, neighbors, level, locks);
+    link_back(node, neighbors, level, locks);
+}
+
+void HnswIndex::set_own_links(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks) {
+    std::unique_lock<std::mutex> own;
+    if (locks) own = std::unique_lock<std::mutex>(locks->of(node));
+    storage_.graph().set_links(node, level, neighbors);
+}
+
+void HnswIndex::link_back(NodeId node, const std::vector<NodeId>& neighbors, int level, LinkLocks* locks) {
     GraphStorage& graph = storage_.graph();
     const IdMap& ids = storage_.ids();
-    graph.set_links(node, level, neighbors);
-
     const std::size_t capacity = level == 0 ? graph.M0() : graph.M();
     for (NodeId neighbor : neighbors) {
+        // One list lock at a time, never two: no lock-order deadlock between threads.
+        std::unique_lock<std::mutex> guard;
+        if (locks) guard = std::unique_lock<std::mutex>(locks->of(neighbor));
         std::span<NodeId> slots = graph.links(neighbor, level);
         const std::size_t count = GraphStorage::count(slots);
         const auto used_end = slots.begin() + static_cast<std::ptrdiff_t>(count);
@@ -188,7 +216,11 @@ void HnswIndex::connect(NodeId node, const std::vector<NodeId>& neighbors, int l
 }
 
 void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
-    searches_.check_no_search("add");
+    const auto guard = lock_.write("add");
+    add_unlocked(id, vector, metadata);
+}
+
+void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything (or drawing a random level).
     scratch_.prepare(vector, metric_);
     metadata_.validate(metadata);
@@ -236,46 +268,230 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
     }
 }
 
+void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads) {
+    const auto guard = lock_.write("add_batch");
+    add_batch_unlocked(ids, vectors, nullptr, threads);
+}
+
+void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                          std::span<const Metadata> metadata, std::size_t threads) {
+    if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
+    const auto guard = lock_.write("add_batch");
+    add_batch_unlocked(ids, vectors, metadata.data(), threads);
+}
+
+void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                                   const Metadata* metadata, std::size_t threads) {
+    const std::size_t n = ids.size(), d = dim();
+    if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
+    if (n == 0) return;
+    const Metadata none;  // for batches without metadata
+    auto row = [&](std::size_t i) -> const Metadata& { return metadata ? metadata[i] : none; };
+    auto vec = [&](std::size_t i) { return vectors.subspan(i * d, d); };
+
+    // 1. Validate everything before changing anything (or drawing a random level).
+    {
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            scratch_.prepare(vec(i), metric_);
+            if (storage_.ids().find(ids[i]) || !seen.insert(ids[i]).second)
+                throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
+        }
+        if (metadata) metadata_.validate_batch(metadata, n);
+    }
+
+    // 2. Reserve everything a rollback needs, so undoing a failure cannot fail.
+    std::vector<NodeId> nodes;
+    std::vector<int> levels;
+    std::vector<MetadataStore::WriteUndo> undo;
+    nodes.reserve(n);
+    levels.reserve(n);
+    undo.reserve(n);
+    free_slots_.reserve(free_slots_.size() + n);
+
+    const std::size_t reuse = std::min(n, free_slots_.size());
+    try {
+        // 3. Vectors that reuse removed slots: one at a time, exactly as add() does,
+        //    since a reused slot keeps its old links (other nodes route through it)
+        //    until the moment it is reused.
+        for (std::size_t i = 0; i < reuse; ++i) {
+            scratch_.prepare(vec(i), metric_);
+            const NodeId slot = free_slots_.back();
+            undo.push_back(metadata_.write(slot, row(i)));
+            const int level = random_level();
+            try {
+                storage_.insert_into(slot, ids[i], scratch_.values(), level);
+            } catch (...) {
+                metadata_.undo_write(slot, undo.back());
+                undo.pop_back();
+                throw;
+            }
+            free_slots_.pop_back();
+            nodes.push_back(slot);
+            levels.push_back(level);
+            ++live_;
+            if (entry_ == kEmpty) {
+                entry_ = slot;
+                max_level_ = level;
+            } else {
+                link_new_node(slot, level);
+            }
+        }
+
+        // 4. The rest: store every vector, its metadata and its empty link lists,
+        //    appended in order, with levels drawn in order. Nothing links to them
+        //    yet, so the graph does not change. All storage grows here, so nothing
+        //    reallocates while threads link in step 5.
+        for (std::size_t i = reuse; i < n; ++i) {
+            scratch_.prepare(vec(i), metric_);
+            const auto slot = static_cast<NodeId>(storage_.size());
+            undo.push_back(metadata_.write(slot, row(i)));
+            const int level = random_level();
+            try {
+                storage_.insert(ids[i], scratch_.values(), level);
+            } catch (...) {
+                metadata_.undo_write(slot, undo.back());
+                undo.pop_back();
+                throw;
+            }
+            nodes.push_back(slot);
+            levels.push_back(level);
+            ++live_;
+        }
+
+        // 5. Link them, from their stored vectors (already normalized for cosine).
+        const std::size_t count = n - reuse;
+        const std::size_t workers = std::min(effective_threads(threads), count);
+        if (workers <= 1) {
+            for (std::size_t i = reuse; i < n; ++i) {
+                if (entry_ == kEmpty) {
+                    entry_ = nodes[i];
+                    max_level_ = levels[i];
+                    continue;
+                }
+                link_levels(nodes[i], levels[i], kEmpty, storage_.vectors().get_padded(nodes[i]).data(), entry_,
+                            max_level_, nullptr);
+                if (levels[i] > max_level_) {
+                    max_level_ = levels[i];
+                    entry_ = nodes[i];
+                }
+            }
+        } else {
+            auto locks = std::make_unique<LinkLocks>(kLinkStripes);
+            pool_.get(workers)->parallel_for(count, [&](std::size_t i) {
+                link_concurrently(nodes[reuse + i], levels[reuse + i], *locks);
+            });
+        }
+    } catch (...) {
+        roll_back_batch(ids, nodes, undo);
+        throw;
+    }
+}
+
+void HnswIndex::link_concurrently(NodeId node, int level, LinkLocks& locks) {
+    std::unique_lock<std::mutex> top(locks.top);
+    if (entry_ == kEmpty) {  // the very first vector of an empty index
+        entry_ = node;
+        max_level_ = level;
+        return;
+    }
+    const NodeId entry = entry_;
+    const int top_level = max_level_;
+    // As in hnswlib: a node that raises the top level keeps `top` while it links,
+    // so two such nodes cannot each build an upper level the other cannot reach.
+    if (level <= top_level) top.unlock();
+    link_levels(node, level, kEmpty, storage_.vectors().get_padded(node).data(), entry, top_level, &locks);
+    if (level > top_level) {  // still holding `top`
+        max_level_ = level;
+        entry_ = node;
+    }
+}
+
+void HnswIndex::roll_back_batch(std::span<const std::uint64_t> ids, const std::vector<NodeId>& nodes,
+                                const std::vector<MetadataStore::WriteUndo>& undo) noexcept {
+    // 1. Remove every node of the batch. Newest first, so each metadata undo
+    //    removes exactly what its write created. Nothing here allocates (the free
+    //    list was reserved in step 2), so this part always completes.
+    for (std::size_t k = nodes.size(); k-- > 0;) {
+        storage_.ids().release(ids[k]);
+        metadata_.undo_write(nodes[k], undo[k]);
+        --live_;
+        free_slots_.push_back(nodes[k]);
+    }
+    if (entry_ != kEmpty && storage_.ids().is_deleted(entry_)) choose_new_entry();
+
+    // 2. Repair around them, as remove() does, best effort. All of them are
+    //    removed by now, so no repair links to another node of the batch. If
+    //    memory is still short, stop: removed nodes stay traversable and every
+    //    list touched so far is valid, so the graph is valid either way.
+    if (!params_.repair_on_remove) return;
+    try {
+        for (NodeId node : nodes) repair_neighbors(node);
+    } catch (...) {  // GCOVR_EXCL_LINE: the allocation hook fails one allocation per attempt
+    }
+}
+
 void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore) {
+    link_levels(node, level, ignore, scratch_.data(), entry_, max_level_, nullptr);
+    // 6. A node higher than all others becomes the new entry point.
+    if (level > max_level_) {
+        max_level_ = level;
+        entry_ = node;
+    }
+}
+
+void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry, int top,
+                            LinkLocks* locks) {
     // `ignore` (the old version of an updated vector) is traversed but never
     // chosen as a neighbor, since it is about to be removed.
     const Eligibility eligible{&storage_.ids(), nullptr, nullptr, ignore};
     // 4. Greedy descent through the levels above the new node's level.
-    const float* query = scratch_.data();
-    Candidate current{distance_to(query, entry_), entry_};
-    for (int l = max_level_; l > level; --l) current = greedy_closest(query, current, l, node);
+    Candidate current{distance_to(query, entry), entry};
+    for (int l = top; l > level; --l) current = greedy_closest(query, current, l, node, locks);
 
     // 5. On each shared level, find candidates, pick neighbors, link both ways.
+    //    In parallel linking (locks), every level is decided first and the node is
+    //    published only when complete: its own lists are set, and only then do
+    //    other nodes link to it. Until then no other thread can reach it, so none
+    //    sees a half-linked node or writes a link that would later be overwritten.
+    //    (Deferring changes nothing else: each level's search starts from the
+    //    previous level's results, never from links this node created.)
     auto visited = visited_pool_.acquire(storage_.size());
     std::vector<Candidate> entries{current};
-    for (int l = std::min(level, max_level_); l >= 0; --l) {
+    std::vector<std::vector<NodeId>> chosen;  // parallel linking: per level, top-down
+    for (int l = std::min(level, top); l >= 0; --l) {
         // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
         // so new nodes do not waste link slots on them.
         std::vector<Candidate> found =
-            search_level(query, entries, params_.ef_construction, l, *visited, node, eligible);
+            search_level(query, entries, params_.ef_construction, l, *visited, node, eligible, nullptr, locks);
         if (found.empty()) {
             // Every node reachable from here is removed (possible after many
             // removals without repair). Search again from the entry point too,
             // which is always live, so the new node links to live nodes.
-            entries.push_back({distance_to(query, entry_), entry_});
-            found = search_level(query, entries, params_.ef_construction, l, *visited, node, eligible);
+            entries.push_back({distance_to(query, entry), entry});
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, eligible, nullptr, locks);
         }
         if (found.empty() && ignore != kEmpty) {
             // Updating, and the old version is the only live node reachable: link
             // through it as a last resort. After it is retired it stays
             // traversable, bridging to the new version, which would otherwise
             // have no links at all and could never be found.
-            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only());
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only(), nullptr, locks);
         }
-        connect(node, select_neighbors(found, params_.M), l);
+        if (locks) {
+            chosen.push_back(select_neighbors(found, params_.M));
+        } else {
+            connect(node, select_neighbors(found, params_.M), l);
+        }
         if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
     }
-
-    // 6. A node higher than all others becomes the new entry point.
-    if (level > max_level_) {
-        max_level_ = level;
-        entry_ = node;
+    if (locks) {
+        const int highest = std::min(level, top);
+        for (int l = highest; l >= 0; --l) set_own_links(node, chosen[std::size_t(highest - l)], l, locks);
+        for (int l = highest; l >= 0; --l) link_back(node, chosen[std::size_t(highest - l)], l, locks);
     }
+
 }
 
 void HnswIndex::repair_neighbors(NodeId node) {
@@ -326,7 +542,7 @@ void HnswIndex::choose_new_entry() {
 }
 
 bool HnswIndex::remove(std::uint64_t id) {
-    searches_.check_no_search("remove");
+    const auto guard = lock_.write("remove");
     IdMap& ids = storage_.ids();
     const auto node = ids.find(id);
     if (!node) return false;
@@ -345,26 +561,31 @@ bool HnswIndex::remove(std::uint64_t id) {
     return true;
 }
 
-bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) { return replace(id, vector, nullptr); }
+bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("update");
+    return replace(id, vector, nullptr);
+}
 
 bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("update");
     return replace(id, vector, &metadata);
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, nullptr)) return false;
-    add(id, vector);
+    add_unlocked(id, vector, {});
     return true;
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     if (replace(id, vector, &metadata)) return false;
-    add(id, vector, metadata);
+    add_unlocked(id, vector, metadata);
     return true;
 }
 
 bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
-    searches_.check_no_search("update");
     // 1. Validate everything before changing anything.
     scratch_.prepare(vector, metric_);
     if (metadata) metadata_.validate(*metadata);
@@ -418,10 +639,13 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     return true;
 }
 
-bool HnswIndex::contains(std::uint64_t id) const { return storage_.ids().find(id).has_value(); }
+bool HnswIndex::contains(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    return storage_.ids().find(id).has_value();
+}
 
 bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
-    searches_.check_no_search("set_metadata");
+    const auto guard = lock_.write("set_metadata");
     const auto node = storage_.ids().find(id);
     if (!node) return false;
     metadata_.update(*node, metadata);
@@ -429,6 +653,7 @@ bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
 }
 
 std::optional<Metadata> HnswIndex::get_metadata(std::uint64_t id) const {
+    const auto guard = lock_.read();
     const auto node = storage_.ids().find(id);
     if (!node) return std::nullopt;
     return metadata_.read(*node);
@@ -448,7 +673,7 @@ Eligibility HnswIndex::eligibility(const SearchOptions& options, std::optional<C
 
 std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t ef,
                                             const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
@@ -527,13 +752,14 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
 std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const float> queries, std::size_t k,
                                                                std::size_t ef, std::size_t threads,
                                                                const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
     const PlannerParams& params = options.planner ? *options.planner : planner_;
     std::vector<std::vector<SearchResult>> results(nq);
     auto one = [&](std::size_t i) {
+        const IndexLock::Hold inside(lock_);  // pool threads work under the caller's read
         PreparedVector q(dim());
         q.prepare(queries.subspan(i * dim(), dim()), metric_);
         SearchStats stats;
@@ -549,7 +775,7 @@ std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const f
 
 std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, float radius,
                                                   std::size_t max_results, const SearchOptions& options) const {
-    const auto running = searches_.enter();
+    const auto guard = lock_.read();
     PreparedVector q(dim());
     q.prepare(query, metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
@@ -622,7 +848,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
 }
 
 CompactStats HnswIndex::compact() {
-    searches_.check_no_search("compact");
+    const auto guard = lock_.write("compact");
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
     HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());
@@ -630,7 +856,7 @@ CompactStats HnswIndex::compact() {
     fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
     for (NodeId n = 0; n < storage_.size(); ++n)
-        if (!ids.is_deleted(n)) fresh.add(ids.external(n), storage_.vectors().get(n), metadata_.read(n));
+        if (!ids.is_deleted(n)) fresh.add_unlocked(ids.external(n), storage_.vectors().get(n), metadata_.read(n));  // nobody else sees `fresh`
 
     // Commit: moves only, nothing can throw.
     storage_ = std::move(fresh.storage_);
