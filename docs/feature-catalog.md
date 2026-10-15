@@ -24,7 +24,7 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
 | 1.1 | **Read back records:** `get_vector(id)`; list and page through all records, optionally filtered; `count(filter)` | **done** (`get_vector`, `get`, `scan`, `count_where`) | A gap today: a stored vector can only be read through internal storage | 1 day |
-| 1.2 | **Bulk changes:** `remove_batch`, plus removing and updating metadata by filter (`remove_where`, `set_metadata_where`) | **done**, except `remove_batch` | Delete or update by filter | Half a day left |
+| 1.2 | **Bulk changes:** `remove_batch`, plus removing and updating metadata by filter (`remove_where`, `set_metadata_where`) | **done** | Delete or update by filter | |
 | 1.3 | **String and UUID IDs**, alongside 64-bit numbers | new | | 2 days |
 | 1.4 | **Multi-vector records:** several vectors per record, either named (for example title and body) or as chunks of one document, with results grouped per record | new | Named vectors; several vectors per document | 4–5 days |
 | 1.5 | **Expiry (TTL):** records removed automatically after a set time | new | | 1 day |
@@ -33,11 +33,11 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 2.1 | **Search by stored ID:** "more like record 42", without fetching its vector first | new | | Half a day |
+| 2.1 | **Search by stored ID:** "more like record 42", without fetching its vector first | **done** (`search_by_id`) | | Half a day |
 | 2.2 | **Recommendations:** several positive and negative examples, given as vectors or IDs (as in Qdrant) | new | Builds on 2.1 | 1–2 days |
 | 2.3 | **Diversity re-ranking (MMR):** results that are relevant and different from each other | new | | 1 day |
 | 2.4 | **Hybrid search:** keyword matching (BM25) and sparse vectors (such as SPLADE), merged with dense results by rank fusion | new | Hybrid keyword search; sparse vectors | 1–1.5 weeks |
-| 2.5 | **Deadlines and cancellation:** for searches (returning the best results found so far) and for long operations (`add_batch`, `compact`, `save`), with progress reports | new | Search deadlines; progress and cancellation | 1–2 days |
+| 2.5 | **Deadlines and cancellation:** for searches (returning the best results found so far) and for long operations (`add_batch`, `compact`, `save`), with progress reports | **done** | Search deadlines; progress and cancellation | 1–2 days |
 | 2.6 | **Automatic ef:** choose `ef` per query or per index to reach a target recall | new | | 1–2 days |
 | 2.7 | **More metrics:** Hamming for binary vectors, Manhattan (L1) | new | | 1–2 days |
 

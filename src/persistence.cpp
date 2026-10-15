@@ -260,13 +260,14 @@ MetadataStore MetadataStore::load(Reader& r, std::size_t slots, const std::funct
 // FlatIndex
 // ---------------------------------------------------------------------------
 
-void FlatIndex::save(const std::string& path) const {
-    save_to_file(path, [&](std::ostream& out) { save(out); });
+void FlatIndex::save(const std::string& path, const OperationOptions& options) const {
+    save_to_file(path, [&](std::ostream& out) { save(out, options); });  // a Cancelled save removes the temporary file
 }
 
-void FlatIndex::save(std::ostream& out) const {
+void FlatIndex::save(std::ostream& out, const OperationOptions& options) const {
     const auto guard = lock_.read();  // a save reads: searches continue, changes wait
     const persist::StreamErrorsThrow errors(out);
+    detail::OperationControl control(options, vectors_.size());  // progress counts records written
     persist::write_header(out, IndexKind::Flat);
     persist::write_section(out, kConf, [&](Writer& w) {
         w.put<std::uint64_t>(dim());
@@ -278,10 +279,12 @@ void FlatIndex::save(std::ostream& out) const {
             w.put<std::uint64_t>(ids_.external(n));
             w.put_floats(vectors_.get(n).data(), dim());
             if (originals_) w.put_floats(originals_->get(n).data(), dim());  // version 2: cosine originals
+            if (!w.counting()) control.advance();
         }
     });
     persist::write_section(out, kMeta, [&](Writer& w) { metadata_.save(w); });
     write_end(out);
+    control.finish();
 }
 
 std::unique_ptr<FlatIndex> FlatIndex::load(const std::string& path) {
@@ -330,13 +333,14 @@ std::unique_ptr<FlatIndex> FlatIndex::load(std::istream& in) {
 // HnswIndex
 // ---------------------------------------------------------------------------
 
-void HnswIndex::save(const std::string& path) const {
-    save_to_file(path, [&](std::ostream& out) { save(out); });
+void HnswIndex::save(const std::string& path, const OperationOptions& options) const {
+    save_to_file(path, [&](std::ostream& out) { save(out, options); });  // a Cancelled save removes the temporary file
 }
 
-void HnswIndex::save(std::ostream& out) const {
+void HnswIndex::save(std::ostream& out, const OperationOptions& options) const {
     const auto guard = lock_.read();  // a save reads: searches continue, changes wait
     const persist::StreamErrorsThrow errors(out);
+    detail::OperationControl control(options, storage_.size());  // progress counts records written
     const IdMap& ids = storage_.ids();
     const GraphStorage& graph = storage_.graph();
     persist::write_header(out, IndexKind::Hnsw);
@@ -361,6 +365,7 @@ void HnswIndex::save(std::ostream& out) const {
             w.put<std::uint8_t>(static_cast<std::uint8_t>(level));
             w.put_floats(storage_.vectors().get(n).data(), dim());
             if (storage_.originals()) w.put_floats(storage_.originals()->get(n).data(), dim());  // version 2: cosine originals
+            if (!w.counting()) control.advance();
             for (int l = 0; l <= level; ++l) {
                 const auto links = graph.links(n, l);
                 const std::size_t count = GraphStorage::count(links);
@@ -378,6 +383,7 @@ void HnswIndex::save(std::ostream& out) const {
     });
     persist::write_section(out, kMeta, [&](Writer& w) { metadata_.save(w); });
     write_end(out);
+    control.finish();
 }
 
 std::unique_ptr<HnswIndex> HnswIndex::load(const std::string& path) {

@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -9439,6 +9439,584 @@ TEST(records, r17_damaged_cosine_files) {
 }
 
 // ===========================================================================
+// remove_batch, search_by_id, deadlines, cancellation and progress
+// (K1-K6, S1-S6, T1-T13)
+// ===========================================================================
+
+namespace {
+
+using SteadyClock = std::chrono::steady_clock;
+
+/// Every stored (ID, vector) pair, for comparing contents across a failed change.
+std::vector<std::pair<std::uint64_t, std::vector<float>>> contents_of(const auto& index) {
+    ScanOptions o;
+    o.limit = 1000000;
+    std::vector<std::pair<std::uint64_t, std::vector<float>>> c;
+    for (const Record& r : index.scan(o).records) c.emplace_back(r.id, r.vector);
+    return c;
+}
+
+bool sorted_and_unique(const std::vector<SearchResult>& r) {
+    std::set<std::uint64_t> seen;
+    for (std::size_t i = 0; i < r.size(); ++i)
+        if ((i > 0 && r[i].distance < r[i - 1].distance) || !seen.insert(r[i].id).second) return false;
+    return true;
+}
+
+/// OperationOptions that cancel once progress reaches `at` (of total).
+OperationOptions cancel_at(std::atomic<bool>& flag, std::size_t at) {
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&flag, at](std::size_t done, std::size_t) {
+        if (done >= at) flag = true;
+    };
+    return o;
+}
+
+}  // namespace
+
+TEST(control, k01_remove_batch_removes_exactly_the_listed_ids) {
+    auto data = clustered(800, 8, 6, 950);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    std::vector<std::uint64_t> gone;
+    for (std::uint64_t i = 0; i < 800; i += 3) gone.push_back(i);
+    CHECK(h.remove_batch(gone) == gone.size() && f.remove_batch(gone) == gone.size());
+    bool exact = true;
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        exact = exact && h.contains(i) == (i % 3 != 0) && f.contains(i) == (i % 3 != 0);
+        if (i % 3) exact = exact && *h.get_vector(i) == data[i] && *f.get_metadata(i) == meta_for(i);
+    }
+    CHECK(exact);
+    check_graph(h, 0.98);
+}
+
+TEST(control, k02_unknown_and_repeated_ids) {
+    HnswIndex h(2, Metric::L2);
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, std::vector<float>{float(i), 0});
+        f.add(i, std::vector<float>{float(i), 0});
+    }
+    const std::vector<std::uint64_t> ids = {3, 3, 999, 5, 3, 12345, 5};  // 3 and 5 once each
+    CHECK(h.remove_batch(ids) == 2 && f.remove_batch(ids) == 2 && h.size() == 8 && f.size() == 8);
+    CHECK(h.remove_batch(ids) == 0 && f.remove_batch(ids) == 0);  // already removed
+}
+
+TEST(control, k03_empty_list_changes_nothing) {
+    HnswIndex h(2, Metric::L2);
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, std::vector<float>{float(i), 1});
+        f.add(i, std::vector<float>{float(i), 1});
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    CHECK(h.remove_batch({}) == 0 && f.remove_batch({}) == 0 && save_bytes(h) == hb && save_bytes(f) == fb);
+}
+
+TEST(control, k04_removing_everything) {
+    auto data = clustered(300, 8, 4, 951);
+    HnswIndex h(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    CHECK(h.remove_batch(id_range(0, 300)) == 300 && h.size() == 0 && h.entry_point() == kEmpty && h.max_level() == -1);
+    h.add(5, data[5]);
+    CHECK(h.search(data[5], 1)[0].id == 5);
+}
+
+TEST(control, k05_out_of_memory_always_completes) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(200, 8, 4, 952);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 200; ++i) h.add(i, data[i]);
+    const std::string before = save_bytes(h);
+    std::vector<std::uint64_t> gone;
+    for (std::uint64_t i = 0; i < 200; i += 4) gone.push_back(i);
+    bool clean = true, completed = false;
+    long failures = 0;
+    for (long n = 0; n < 20000 && !completed; ++n) {
+        alloc_hook::fail_after(n);
+        bool failed = false;
+        try {
+            (void)h.remove_batch(gone);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        alloc_hook::disarm();
+        if (failed) {
+            ++failures;
+            clean = clean && save_bytes(h) == before;  // failed before changing anything
+        } else {
+            completed = true;  // done, whether or not a repair ran out of memory
+        }
+    }
+    CHECK(clean && completed && failures > 0 && h.size() == 150);
+    check_graph(h, 0.97);
+}
+
+TEST(control, k06_refused_inside_a_search) {
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{float(i), 0});
+    std::atomic<long> refused{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        try {
+            (void)h.remove_batch(std::vector<std::uint64_t>{1, 2});
+        } catch (const std::logic_error&) {
+            ++refused;
+        }
+        return true;
+    };
+    (void)h.search(std::vector<float>{0, 0}, 3, 16, o);
+    CHECK(refused > 0 && h.size() == 20);
+}
+
+TEST(control, s01_same_as_searching_with_the_stored_vector) {
+    auto data = clustered(1000, 8, 6, 953);
+    for (Metric m : kMetrics) {
+        HnswIndex h(8, m);
+        FlatIndex f(8, m);
+        for (std::uint64_t i = 0; i < 1000; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        bool same = true;
+        for (std::uint64_t id = 0; id < 1000; id += 97) {
+            auto expected_h = h.search(*h.get_vector(id), 11, 64);
+            auto expected_f = f.search(*f.get_vector(id), 11);
+            std::erase_if(expected_h, [&](const SearchResult& r) { return r.id == id; });
+            std::erase_if(expected_f, [&](const SearchResult& r) { return r.id == id; });
+            expected_h.resize(std::min<std::size_t>(expected_h.size(), 10));
+            expected_f.resize(std::min<std::size_t>(expected_f.size(), 10));
+            same = same && same_results(*h.search_by_id(id, 10, 64), expected_h) && same_results(*f.search_by_id(id, 10), expected_f);
+        }
+        CHECK(same);
+    }
+}
+
+TEST(control, s02_including_the_record_itself) {
+    auto data = clustered(500, 8, 4, 954);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const auto hs = *h.search_by_id(42, 5, 64, {}, true);
+    const auto fs = *f.search_by_id(42, 5, {}, true);
+    CHECK(hs[0].id == 42 && hs[0].distance == 0.0f && fs[0].id == 42 && fs[0].distance == 0.0f);
+    CHECK(same_results(hs, h.search(data[42], 5, 64)) && same_results(fs, f.search(data[42], 5)));
+    const auto without = *f.search_by_id(42, 5);
+    CHECK(without.size() == 5 && std::none_of(without.begin(), without.end(), [](const SearchResult& r) { return r.id == 42; }));
+}
+
+TEST(control, s03_filters_and_predicates) {
+    auto data = clustered(600, 8, 6, 955);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    SearchOptions tech = with_filter(Filter::eq("category", "tech"));
+    bool ok = true;
+    for (std::uint64_t id : {std::uint64_t(2), std::uint64_t(3)}) {  // 2 is "tech" itself, 3 is not
+        for (const auto& r : {*h.search_by_id(id, 10, 64, tech), *f.search_by_id(id, 10, tech)}) {
+            ok = ok && r.size() == 10 && sorted_and_unique(r);
+            for (const SearchResult& x : r) ok = ok && x.id % 5 == 2 && x.id != id;
+        }
+    }
+    SearchOptions even;
+    even.predicate = [](std::uint64_t id) { return id % 2 == 0; };
+    // Keep the optional alive: `for (x : *f.search_by_id(...))` would loop over a
+    // destroyed temporary (a range-for keeps only the outermost result alive).
+    const auto by_even = f.search_by_id(10, 8, even);
+    ok = ok && by_even && by_even->size() == 8;
+    for (const SearchResult& x : *by_even) ok = ok && x.id % 2 == 0 && x.id != 10;
+    CHECK(ok);
+}
+
+TEST(control, s04_unknown_or_removed_ids) {
+    HnswIndex h(2, Metric::L2);
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, std::vector<float>{float(i), 0});
+        f.add(i, std::vector<float>{float(i), 0});
+    }
+    h.remove(4);
+    f.remove(4);
+    CHECK(!h.search_by_id(4, 3) && !f.search_by_id(4, 3) && !h.search_by_id(99, 3) && !f.search_by_id(99, 3));
+    CHECK(h.search_by_id(5, 0)->empty() && f.search_by_id(5, 0)->empty());  // k = 0: stored, nothing asked for
+    // The largest k: every other record (no overflow when asking for one extra).
+    CHECK(f.search_by_id(5, SIZE_MAX)->size() == 8 && h.search_by_id(5, SIZE_MAX, 64)->size() == 8);
+}
+
+TEST(control, s05_duplicates_of_the_record) {
+    FlatIndex f(3, Metric::L2);
+    HnswIndex h(3, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        const std::vector<float> v{float(i), 1, 2};
+        f.add(i, v);
+        h.add(i, v);
+    }
+    for (std::uint64_t dup : {std::uint64_t(100), std::uint64_t(101)}) {  // exact copies of record 7
+        f.add(dup, std::vector<float>{7, 1, 2});
+        h.add(dup, std::vector<float>{7, 1, 2});
+    }
+    for (const auto& r : {*f.search_by_id(7, 2), *h.search_by_id(7, 2, 64)}) {
+        CHECK(r.size() == 2 && r[0].distance == 0.0f && r[1].distance == 0.0f);
+        CHECK((r[0].id == 100 || r[0].id == 101) && (r[1].id == 100 || r[1].id == 101) && r[0].id != r[1].id);
+    }
+}
+
+TEST(control, s06_atomic_while_the_record_changes) {
+    // The vector is read and searched under one lock: with the record included,
+    // it always finds itself at distance 0, even while another thread updates it.
+    auto data = clustered(300, 8, 4, 956);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    // Readers do a fixed number of checks; the writer keeps updating until they finish.
+    std::atomic<bool> readers_done{false};
+    std::atomic<long> wrong{0}, checks{0}, updates{0};
+    with_watchdog(120, "s06", [&] {
+        std::thread writer([&] {
+            for (int k = 0; !readers_done; ++k) {
+                f.update(7, data[std::size_t(k % 2 ? 50 : 150)]);
+                ++updates;
+            }
+        });
+        run_threads(3, [&](std::size_t) {
+            for (int i = 0; i < 300; ++i) {
+                const auto r = *f.search_by_id(7, 1, {}, true);
+                wrong += long(r.empty() || r[0].id != 7 || r[0].distance > 1e-6f);
+                ++checks;
+            }
+        });
+        readers_done = true;
+        writer.join();
+    });
+    CHECK(wrong == 0 && checks == 900 && updates > 0);
+}
+
+TEST(control, t01_passed_deadline_stops_quickly_with_valid_results) {
+    auto data = clustered(20000, 16, 20, 957);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    h.add_batch(id_range(0, 20000), flatten(data), 0);
+    f.add_batch(id_range(0, 20000), flatten(data));
+    SearchStats full, cut, fcut;
+    SearchOptions normal;
+    normal.stats = &full;
+    (void)h.search(data[0], 10, 400, normal);
+    SearchOptions late;
+    late.deadline = SteadyClock::now() - std::chrono::seconds(1);
+    late.stats = &cut;
+    const auto hr = h.search(data[0], 10, 400, late);
+    late.stats = &fcut;
+    const auto fr = f.search(data[0], 10, late);
+    CHECK(cut.stopped_early && fcut.stopped_early && !full.stopped_early);
+    CHECK(sorted_and_unique(hr) && sorted_and_unique(fr) && hr.size() <= 10 && fr.size() <= 10);
+    CHECK(cut.distance_computations * 4 < full.distance_computations);  // stopped well before the end
+    CHECK(fcut.distance_computations <= 512);                            // Flat checks every 256 rows
+}
+
+TEST(control, t02_cancel_from_another_thread) {
+    // A slow predicate makes the search long; another thread cancels it.
+    FlatIndex f(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) f.add(i, std::vector<float>{float(i % 97), float(i % 13), 1, 2});
+    std::atomic<bool> cancel{false};
+    std::atomic<long> calls{0};
+    SearchStats stats;
+    SearchOptions o;
+    o.cancel = &cancel;
+    o.stats = &stats;
+    o.predicate = [&](std::uint64_t) {
+        ++calls;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        return true;
+    };
+    with_watchdog(60, "t02", [&] {
+        std::thread canceller([&] {
+            while (calls < 100) std::this_thread::yield();
+            cancel = true;
+        });
+        const auto r = f.search(std::vector<float>{0, 0, 1, 2}, 5, o);
+        canceller.join();
+        CHECK(stats.stopped_early && sorted_and_unique(r) && r.size() == 5 && calls < 3000);
+    });
+}
+
+TEST(control, t03_batch_range_and_by_id_searches_stop) {
+    auto data = clustered(5000, 8, 10, 958);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    h.add_batch(id_range(0, 5000), flatten(data), 0);
+    f.add_batch(id_range(0, 5000), flatten(data));
+    SearchStats a, b, c, d, e;
+    SearchOptions late;
+    late.deadline = SteadyClock::now() - std::chrono::seconds(1);
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 8));
+    late.stats = &a;
+    for (const auto& r : h.search_batch(queries, 5, 200, 4, late)) CHECK(sorted_and_unique(r));
+    late.stats = &b;
+    for (const auto& r : f.search_batch(queries, 5, 4, late)) CHECK(sorted_and_unique(r));
+    late.stats = &c;
+    CHECK(sorted_and_unique(h.search_range(data[0], 1e9f, kNoLimit, late)));
+    late.stats = &d;
+    CHECK(sorted_and_unique(*h.search_by_id(3, 5, 200, late)));
+    late.stats = &e;
+    CHECK(f.search_range(data[0], 1e9f, kNoLimit, late).size() < 5000);
+    SearchStats g;
+    SearchOptions exact = late;
+    exact.strategy = Strategy::ForceExact;  // the exact path of an HNSW range search
+    exact.stats = &g;
+    CHECK(h.search_range(data[0], 1e9f, kNoLimit, exact).size() < 5000);
+    CHECK(a.stopped_early && b.stopped_early && c.stopped_early && d.stopped_early && e.stopped_early && g.stopped_early);
+}
+
+TEST(control, t04_no_deadline_changes_nothing) {
+    auto data = clustered(2000, 8, 6, 959);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    std::atomic<bool> never{false};
+    SearchStats st;
+    SearchOptions far = with_filter(Filter::has_tag("tags", "a"));
+    far.deadline = SteadyClock::now() + std::chrono::hours(1);
+    far.cancel = &never;
+    far.stats = &st;
+    const SearchOptions plain = with_filter(Filter::has_tag("tags", "a"));
+    SearchOptions only_cancel = plain, only_deadline = plain;  // each alone, neither firing
+    only_cancel.cancel = &never;
+    only_deadline.deadline = far.deadline;
+    bool same = true;
+    for (std::size_t q = 0; q < 5; ++q)
+        same = same && same_results(h.search(data[q], 10, 64, only_cancel), h.search(data[q], 10, 64, plain)) &&
+               same_results(f.search(data[q], 10, only_deadline), f.search(data[q], 10, plain));
+    for (std::size_t q = 0; q < 20; ++q) {
+        same = same && same_results(h.search(data[q], 10, 64, far), h.search(data[q], 10, 64, plain));
+        same = same && same_results(f.search(data[q], 10, far), f.search(data[q], 10, plain));
+        same = same && !st.stopped_early;
+    }
+    CHECK(same);
+}
+
+TEST(control, t05_filtered_exact_scans_stop) {
+    auto data = clustered(5000, 8, 6, 960);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) h.add(i, data[i], meta_for(i));
+    SearchStats st;
+    SearchOptions o = with_filter(Filter::eq("category", "tech"));
+    o.strategy = Strategy::ForceExact;
+    o.deadline = SteadyClock::now() - std::chrono::seconds(1);
+    o.stats = &st;
+    const auto r = h.search(data[0], 10, 64, o);
+    CHECK(st.stopped_early && sorted_and_unique(r) && st.distance_computations < 1000);
+}
+
+TEST(control, t06_a_search_inside_a_predicate_has_its_own_deadline) {
+    auto data = clustered(2000, 8, 6, 961);
+    FlatIndex f(8, Metric::L2);
+    HnswIndex inner(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        f.add(i, data[i]);
+        inner.add(i, data[i]);
+    }
+    std::atomic<long> complete{0}, calls{0};
+    SearchOptions outer;
+    outer.deadline = SteadyClock::now() - std::chrono::seconds(1);
+    outer.predicate = [&](std::uint64_t id) {
+        ++calls;
+        SearchStats st;
+        SearchOptions own;
+        own.stats = &st;
+        complete += long(inner.search(data[id], 10, 64, own).size() == 10 && !st.stopped_early);
+        return true;
+    };
+    SearchStats outer_stats;
+    outer.stats = &outer_stats;
+    (void)f.search(data[0], 5, outer);
+    CHECK(outer_stats.stopped_early && calls > 0 && complete == calls);
+    SearchStats after;
+    SearchOptions next;
+    next.stats = &after;
+    CHECK(f.search(data[0], 5, next).size() == 5 && !after.stopped_early);  // nothing left behind on this thread
+}
+
+TEST(control, t07_add_batch_cancelled_at_every_stage) {
+    auto data = clustered(900, 8, 6, 962);
+    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+        for (std::size_t at : {std::size_t(0), std::size_t(1), std::size_t(250), std::size_t(599)}) {
+            HnswIndex h(8, Metric::Cosine);
+            FlatIndex f(8, Metric::Cosine);
+            for (std::uint64_t i = 0; i < 300; ++i) {
+                h.add(i, data[i], meta_for(i));
+                f.add(i, data[i], meta_for(i));
+            }
+            for (std::uint64_t i = 0; i < 300; i += 10) h.remove(i);  // slots the batch reuses one at a time
+            const auto h_before = contents_of(h);
+            const std::string f_before = save_bytes(f);
+            std::vector<Metadata> meta(600);
+            for (std::size_t i = 0; i < 600; ++i) meta[i] = meta_for(i).set("batch", true);
+            std::atomic<bool> flag{false};
+            const OperationOptions o = cancel_at(flag, at);
+            CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(1000, 600), flatten(Vectors(data.begin() + 300, data.end())), meta, threads, o));
+            flag = false;
+            CHECK_THROWS_AS(Cancelled, f.add_batch(id_range(1000, 600), flatten(Vectors(data.begin() + 300, data.end())), meta, threads, o));
+            CHECK(contents_of(h) == h_before && h.count_where(Filter::exists("batch")) == 0 && h.metadata().find_field("batch") == std::nullopt);
+            CHECK(save_bytes(f) == f_before);  // Flat: restored exactly
+            check_graph(h, 0.97);
+        }
+    }
+}
+
+TEST(control, t08_compact_cancelled_leaves_the_index_untouched) {
+    auto data = clustered(1000, 8, 6, 963);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 1000; i += 3) h.remove(i);
+    const std::string before = save_bytes(h);
+    for (std::size_t at : {std::size_t(0), std::size_t(300), std::size_t(666)}) {
+        std::atomic<bool> flag{false};
+        CHECK_THROWS_AS(Cancelled, h.compact(cancel_at(flag, at)));
+        CHECK(save_bytes(h) == before);
+    }
+    CHECK(h.compact().reclaimed > 0 && h.deleted_count() == 0);  // and it still works
+}
+
+TEST(control, t09_save_cancelled_keeps_the_old_file) {
+    auto data = clustered(1500, 8, 6, 964);
+    HnswIndex h(8, Metric::Cosine);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1500; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string path = temp_path("t09");
+    write_file(path, "the previous file");
+    for (std::size_t at : {std::size_t(0), std::size_t(700), std::size_t(1499)}) {
+        std::atomic<bool> flag{false};
+        CHECK_THROWS_AS(Cancelled, h.save(path, cancel_at(flag, at)));
+        flag = false;
+        CHECK_THROWS_AS(Cancelled, f.save(path, cancel_at(flag, at)));
+        CHECK(read_file(path) == "the previous file" && temporaries_left(path) == 0);
+    }
+    std::atomic<bool> flag{false};
+    std::ostringstream out;
+    CHECK_THROWS_AS(Cancelled, h.save(out, cancel_at(flag, 10)));  // a stream may hold an incomplete index
+    h.save(path);
+    CHECK(load_hnsw(read_file(path))->size() == 1500);
+    std::filesystem::remove(path);
+}
+
+TEST(control, t10_progress_is_reported_in_order) {
+    auto data = clustered(2000, 8, 6, 965);
+    HnswIndex h(8, Metric::L2);
+    std::vector<std::pair<std::size_t, std::size_t>> calls;
+    OperationOptions o;
+    o.progress = [&](std::size_t done, std::size_t total) { calls.emplace_back(done, total); };  // calls never overlap
+    auto in_order = [&](std::size_t total) {
+        bool ok = calls.size() >= 2 && calls.size() <= 102 && calls.front().first == 0 && calls.back().first == total;
+        for (std::size_t i = 0; i < calls.size(); ++i) ok = ok && calls[i].second == total && (i == 0 || calls[i].first > calls[i - 1].first);
+        calls.clear();
+        return ok;
+    };
+    h.add_batch(id_range(0, 2000), flatten(data), 4, o);
+    CHECK(in_order(2000));
+    for (std::uint64_t i = 0; i < 2000; i += 2) h.remove(i);
+    h.compact(o);
+    CHECK(in_order(1000));
+    std::ostringstream out;
+    h.save(out, o);
+    CHECK(in_order(1000));
+    FlatIndex f(8, Metric::L2);
+    f.add_batch(id_range(0, 2000), flatten(data), 0, o);
+    CHECK(in_order(2000));
+    f.compact(o);
+    CHECK(in_order(1));
+}
+
+TEST(control, t11_a_throwing_progress_callback_undoes_the_operation) {
+    auto data = clustered(600, 8, 6, 966);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 300; i += 3) h.remove(i);
+    for (std::size_t at : {std::size_t(0), std::size_t(150), std::size_t(300)}) {  // 300: the final report
+        OperationOptions o;
+        o.progress = [at](std::size_t done, std::size_t) {
+            if (done >= at) throw std::runtime_error("stop here");
+        };
+        const auto before = contents_of(h);
+        CHECK_THROWS_AS(std::runtime_error, h.add_batch(id_range(1000, 300), flatten(Vectors(data.begin() + 300, data.end())), 4, o));
+        CHECK(contents_of(h) == before);  // a rolled-back HNSW batch keeps the contents; bookkeeping may move on
+        const std::string bytes = save_bytes(h);  // so compare compact() with the state right before it
+        if (at <= 200) {
+            CHECK_THROWS_AS(std::runtime_error, h.compact(o));
+            CHECK(save_bytes(h) == bytes);
+        }
+        const std::string path = temp_path("t11");
+        write_file(path, "old");
+        CHECK_THROWS_AS(std::runtime_error, h.save(path, o));
+        CHECK(read_file(path) == "old" && temporaries_left(path) == 0);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(control, t12_deadlines_on_operations) {
+    auto data = clustered(400, 8, 4, 967);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 200; ++i) h.add(i, data[i]);
+    h.remove(3);
+    const std::string before = save_bytes(h);
+    OperationOptions late;
+    late.deadline = SteadyClock::now() - std::chrono::seconds(1);
+    CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(1000, 200), flatten(Vectors(data.begin() + 200, data.end())), 2, late));
+    CHECK_THROWS_AS(Cancelled, h.compact(late));
+    std::ostringstream out;
+    CHECK_THROWS_AS(Cancelled, h.save(out, late));
+    CHECK(save_bytes(h) == before);  // a passed deadline stops before any change
+    OperationOptions soon;
+    soon.deadline = SteadyClock::now() + std::chrono::hours(1);
+    h.add_batch(id_range(1000, 200), flatten(Vectors(data.begin() + 200, data.end())), 2, soon);
+    CHECK(h.size() == 399);
+}
+
+TEST(control, t13_cancelling_a_parallel_batch) {
+    // Many threads linking when the cancel arrives; run under ThreadSanitizer in CI.
+    auto data = clustered(3000, 8, 8, 968);
+    for (int round = 0; round < 3; ++round) {
+        HnswIndex h(8, Metric::L2);
+        for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i]);
+        const auto before = contents_of(h);
+        std::atomic<bool> flag{false};
+        std::thread canceller;
+        OperationOptions o;
+        o.cancel = &flag;
+        o.progress = [&](std::size_t done, std::size_t) {
+            if (done > 600 + std::size_t(round) * 400 && !canceller.joinable()) canceller = std::thread([&] { flag = true; });
+        };
+        bool cancelled = false;
+        with_watchdog(120, "t13", [&] {
+            try {
+                h.add_batch(id_range(10000, 2500), flatten(Vectors(data.begin() + 500, data.end())), 8, o);
+            } catch (const Cancelled&) {
+                cancelled = true;
+            }
+            if (canceller.joinable()) canceller.join();
+        });
+        if (cancelled) CHECK(contents_of(h) == before);
+        else CHECK(h.size() == 3000);  // the cancel came after the last vector: the batch completed
+        check_graph(h, 0.97);
+    }
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -9784,7 +10362,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

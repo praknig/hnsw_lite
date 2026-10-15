@@ -18,6 +18,8 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Batch search](#batch-search)
 - [Range search](#range-search)
 - [Reading records back](#reading-records-back)
+- [Searching by stored ID](#searching-by-stored-id)
+- [Deadlines, cancellation and progress](#deadlines-cancellation-and-progress)
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
@@ -301,17 +303,55 @@ for (Page page = index.scan(o); ; page = index.scan(o)) {
 - **Each page costs one pass over the index**, which suits exports and administration; for finding similar vectors, use `search`.
 - All three are reads: they run alongside searches and are allowed inside them.
 
+## Searching by stored ID
+
+```cpp
+auto similar = index.search_by_id(42, 10);              // "more like record 42", without record 42
+auto with_it = index.search_by_id(42, 10, 64, {}, true); // including record 42 itself
+if (similar) for (const SearchResult& r : *similar) { /* ... */ }
+```
+
+- It searches with the vector stored for the ID, under one lock, so the record cannot change in between. Filters, predicates, deadlines and every other search option work as in `search`.
+- It returns nothing (an empty `std::optional`) if the ID is not stored.
+- The record itself is left out unless the last argument is `true`; other records with an identical vector are kept.
+
+**A C++ trap with functions returning `std::optional`** (`search_by_id`, `get_vector`, `get`): do not loop directly over `*index.search_by_id(...)`. A range-based `for` keeps only its outermost value alive, here a reference into the temporary optional, which is destroyed before the loop body runs (fixed in C++23). Store the result in a variable first, as above.
+
+## Deadlines, cancellation and progress
+
+```cpp
+SearchOptions o;
+o.deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(20);
+SearchStats stats;
+o.stats = &stats;
+auto results = index.search(query, 10, 64, o);   // best found within 20 ms
+if (stats.stopped_early) { /* results may be incomplete */ }
+
+std::atomic<bool> cancel{false};                 // set to true from any thread
+OperationOptions op;
+op.cancel = &cancel;
+op.progress = [](std::size_t done, std::size_t total) { std::printf("%zu/%zu\n", done, total); };
+try {
+    index.add_batch(ids, vectors, 0, op);
+} catch (const vecdb::Cancelled&) { /* undone: the index is as before */ }
+```
+
+- **Searches** (single, batch, range and by ID) take a `deadline` and a `cancel` flag in `SearchOptions`. When either fires, the search stops and returns the best results found so far, sorted and valid but possibly incomplete, and sets `SearchStats::stopped_early`. They are checked every few dozen steps, so a search stops within microseconds. A search started inside a predicate has its own deadline, not its caller's.
+- **`add_batch`, `compact` and `save`** take `OperationOptions`: a `deadline`, a `cancel` flag and a `progress` callback. A cancelled or late operation is **undone** and throws `vecdb::Cancelled`: a batch is rolled back, a compaction discarded, a save leaves any existing file untouched and no temporary file (a stream may hold an incomplete index).
+- **Progress** is reported as `(done, total)`: from 0, never decreasing, at most about 100 times, ending at `(total, total)` on success. Calls never overlap but may come from worker threads, and the callback must not use the index. If it throws, the operation is undone and its exception passed on.
+
 ## Changing many vectors by filter
 
 ```cpp
 using vecdb::Filter;
+index.remove_batch(std::vector<std::uint64_t>{4, 8, 15});              // by ID: unknown IDs are skipped
 std::size_t n = index.count_where(Filter::eq("category", "old"));     // preview: how many match
 index.remove_where(Filter::eq("category", "old"));                    // like SQL's DELETE ... WHERE
 index.set_metadata_where(Filter::lt("year", 2000),                    // like SQL's UPDATE ... WHERE
                          Metadata().set("archived", true).unset("featured"));
 ```
 
-All three take the same filters as searches and return how many vectors matched.
+The three `_where` functions take the same filters as searches; all four return how many vectors matched. `remove_batch` skips unknown and repeated IDs, and like `remove_where` always completes.
 
 - **The filter is evaluated once, before anything changes.** So `set_metadata_where` applies to each matching vector exactly once, even when it changes the very field the filter tests (for example renaming a category).
 - **A filter naming an unknown field** throws `std::invalid_argument` under a strict schema, and matches nothing under a dynamic one, as in searches.
