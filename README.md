@@ -165,6 +165,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [Testing](docs/testing.md) | The 538 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | The next phases of work: open edge cases, planned optimizations, and their order |
+| [Feature catalog](docs/feature-catalog.md) | Every feature that could come next, with overlaps merged, efforts, and a suggested order |
 
 ## Project status
 

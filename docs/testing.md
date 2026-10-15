@@ -220,7 +220,11 @@ Every change is built and tested automatically by GitHub Actions ([`.github/work
 
 It does not run on pushes to a branch without a pull request; that would run everything twice once a pull request exists. To get feedback early, open a **draft pull request** as soon as the branch is created. A newer run for the same branch cancels an older one that is still running.
 
-**What it runs (14 jobs in parallel):**
+**Documentation-only changes skip the builds.** A first job, *Detect changes*, lists the files a pull request (or push) changes, using [classify_changes.sh](../.github/scripts/classify_changes.sh). Documentation is `docs/`, any `.md` file and `LICENSE`; everything else is code, including the workflows themselves. The builds and tests below run only when code changed; the *Documentation links* job runs only when documentation changed, checking every relative link and anchor in every Markdown file with [check_links.py](../.github/scripts/check_links.py) (run it locally from the repository root the same way). Skipped jobs count as passed. Manual runs, the first push of a branch, and any case where the base commit is unknown run everything.
+
+**The one check to require** in branch protection (Settings, Branches, the rule for `master`, "Require status checks to pass") is **CI passed**: it passes when every job that ran succeeded, and fails if any job failed or was cancelled, including the change detection itself.
+
+**What it runs when code changed (14 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
