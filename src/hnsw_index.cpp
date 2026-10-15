@@ -644,6 +644,59 @@ bool HnswIndex::contains(std::uint64_t id) const {
     return storage_.ids().find(id).has_value();
 }
 
+std::vector<NodeId> HnswIndex::matching_slots(const Filter& filter) const {
+    const CompiledFilter compiled(filter, metadata_);  // throws for an unknown field under a strict schema
+    const IdMap& ids = storage_.ids();
+    std::vector<NodeId> slots;
+    for (NodeId n = 0; n < storage_.size(); ++n)
+        if (!ids.is_deleted(n) && compiled.matches(n)) slots.push_back(n);
+    return slots;
+}
+
+std::size_t HnswIndex::count_where(const Filter& filter) const {
+    const auto guard = lock_.read();
+    return matching_slots(filter).size();
+}
+
+std::size_t HnswIndex::remove_where(const Filter& filter) {
+    const auto guard = lock_.write("remove_where");
+    const std::vector<NodeId> slots = matching_slots(filter);
+    if (slots.empty()) return 0;
+    free_slots_.reserve(free_slots_.size() + slots.size());  // the last step that can fail
+
+    // 1. Remove every match. Nothing here allocates, so this always completes.
+    IdMap& ids = storage_.ids();
+    for (NodeId n : slots) {
+        ids.release(ids.external(n));
+        metadata_.clear(n);
+        --live_;
+        free_slots_.push_back(n);
+    }
+    if (ids.is_deleted(entry_)) choose_new_entry();  // something matched, so there was an entry point
+
+    // 2. Repair around them, as remove() does, best effort. All are removed by
+    //    now, so no repair links to another match. If memory runs out, stop:
+    //    removed nodes stay traversable, so the graph is valid either way.
+    if (params_.repair_on_remove) {
+        try {
+            for (NodeId n : slots) repair_neighbors(n);
+        } catch (const std::bad_alloc&) {  // GCOVR_EXCL_BR_LINE: repair can only fail by running out of memory
+        }
+    }
+    return slots.size();
+}
+
+std::size_t HnswIndex::set_metadata_where(const Filter& filter, const Metadata& changes) {
+    const auto guard = lock_.write("set_metadata_where");
+    metadata_.validate(changes);  // rejected even when nothing matches
+    const std::vector<NodeId> slots = matching_slots(filter);
+    if (slots.empty()) return 0;
+    MetadataStore staged = metadata_;  // all or nothing: change a copy, swap it in when complete
+    for (NodeId n : slots) staged.update(n, changes);
+    metadata_ = std::move(staged);
+    return slots.size();
+}
+
 bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
     const auto guard = lock_.write("set_metadata");
     const auto node = storage_.ids().find(id);

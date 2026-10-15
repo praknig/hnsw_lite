@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 538 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 554 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -18,6 +18,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Metadata and filtered search:** integer, float, boolean, keyword and tag fields; filters like `Filter::eq("topic", "tech") && Filter::ge("year", 2020)`; a query planner that picks the fastest strategy.
 - **Batch search** on a thread pool and **range search** (everything within a radius).
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
+- **Bulk changes by filter:** `remove_where`, `set_metadata_where` and `count_where`, like SQL's DELETE and UPDATE with a WHERE clause.
 - **Save and load:** one call writes the whole index to a file and one reads it back, checked against damage and portable between platforms.
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
 
@@ -162,7 +163,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 538 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 554 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | The next phases of work: open edge cases, planned optimizations, and their order |
 | [Feature catalog](docs/feature-catalog.md) | Every feature that could come next, with overlaps merged, efforts, and a suggested order |

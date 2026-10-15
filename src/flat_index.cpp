@@ -45,6 +45,46 @@ void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
 
 bool FlatIndex::remove(std::uint64_t id) {
     const auto guard = lock_.write("remove");
+    return remove_unlocked(id);
+}
+
+std::vector<NodeId> FlatIndex::matching_slots(const Filter& filter) const {
+    const CompiledFilter compiled(filter, metadata_);  // throws for an unknown field under a strict schema
+    std::vector<NodeId> slots;
+    for (NodeId n = 0; n < vectors_.size(); ++n)
+        if (compiled.matches(n)) slots.push_back(n);
+    return slots;
+}
+
+std::size_t FlatIndex::count_where(const Filter& filter) const {
+    const auto guard = lock_.read();
+    return matching_slots(filter).size();
+}
+
+std::size_t FlatIndex::remove_where(const Filter& filter) {
+    const auto guard = lock_.write("remove_where");
+    // Collect the user IDs first: removing swaps the last vector into the freed
+    // slot, so slot numbers change as we go. After this, nothing allocates.
+    const std::vector<NodeId> slots = matching_slots(filter);
+    std::vector<std::uint64_t> ids;
+    ids.reserve(slots.size());
+    for (NodeId n : slots) ids.push_back(ids_.external(n));
+    for (std::uint64_t id : ids) remove_unlocked(id);
+    return ids.size();
+}
+
+std::size_t FlatIndex::set_metadata_where(const Filter& filter, const Metadata& changes) {
+    const auto guard = lock_.write("set_metadata_where");
+    metadata_.validate(changes);  // rejected even when nothing matches
+    const std::vector<NodeId> slots = matching_slots(filter);
+    if (slots.empty()) return 0;
+    MetadataStore staged = metadata_;  // all or nothing: change a copy, swap it in when complete
+    for (NodeId n : slots) staged.update(n, changes);
+    metadata_ = std::move(staged);
+    return slots.size();
+}
+
+bool FlatIndex::remove_unlocked(std::uint64_t id) {
     const auto node = ids_.find(id);
     if (!node) return false;
     // Swap-with-last: move the last vector (and its metadata) into the freed slot,

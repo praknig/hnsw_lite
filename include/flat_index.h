@@ -70,6 +70,34 @@ public:
     void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                    std::span<const Metadata> metadata, std::size_t threads = 0);
 
+    /// Removes every vector whose metadata matches `filter` (like SQL's DELETE
+    /// WHERE) and returns how many it removed. The filter is evaluated once,
+    /// before anything changes. A filter naming an unknown field throws
+    /// std::invalid_argument under a strict schema (nothing changes) and matches
+    /// nothing under a dynamic one. Searches see the index before or after, never
+    /// in between.
+    ///
+    /// **Always complete:** once the filter is accepted, every match is removed
+    /// (removal never allocates).
+    std::size_t remove_where(const Filter& filter);
+
+    /// Merges `changes` into the metadata of every vector matching `filter`, as
+    /// set_metadata() does for one (Metadata::unset() removes a field), and
+    /// returns how many it changed. The filter is evaluated once, before
+    /// anything changes, so a change to the very field it tests applies to each
+    /// matching vector exactly once.
+    ///
+    /// **All or nothing:** invalid changes throw std::invalid_argument, even if
+    /// nothing matches; if memory runs out, no vector has changed. To achieve
+    /// this the change is made on a copy of the metadata, swapped in when
+    /// complete, so it needs extra memory about the size of the index's metadata
+    /// while it runs.
+    std::size_t set_metadata_where(const Filter& filter, const Metadata& changes);
+
+    /// How many vectors match `filter`: a preview of remove_where or
+    /// set_metadata_where. Same filter rules as those.
+    std::size_t count_where(const Filter& filter) const;
+
     /// Deletes `id` for real (swap-with-last). Returns false if it is not stored.
     bool remove(std::uint64_t id);
 
@@ -178,6 +206,8 @@ private:
     /// update() and upsert(): `metadata` null keeps the old metadata.
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
+    bool remove_unlocked(std::uint64_t id);  // caller holds the write lock; never allocates
+    std::vector<NodeId> matching_slots(const Filter& filter) const;  // caller holds a lock
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                             const Metadata* metadata);  // caller holds the write lock
 

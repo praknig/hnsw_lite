@@ -17,6 +17,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Filtered search](#filtered-search)
 - [Batch search](#batch-search)
 - [Range search](#range-search)
+- [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
 - [Errors and guarantees](#errors-and-guarantees)
@@ -276,6 +277,24 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 - Without `max_results`, there is no limit: a large radius can return the whole index.
 - `FlatIndex` is exact. `HnswIndex` is approximate, like its normal search; pass `Strategy::ForceExact` in the options when every vector within the radius must be found.
 - Filters and predicates work here too.
+
+## Changing many vectors by filter
+
+```cpp
+using vecdb::Filter;
+std::size_t n = index.count_where(Filter::eq("category", "old"));     // preview: how many match
+index.remove_where(Filter::eq("category", "old"));                    // like SQL's DELETE ... WHERE
+index.set_metadata_where(Filter::lt("year", 2000),                    // like SQL's UPDATE ... WHERE
+                         Metadata().set("archived", true).unset("featured"));
+```
+
+All three take the same filters as searches and return how many vectors matched.
+
+- **The filter is evaluated once, before anything changes.** So `set_metadata_where` applies to each matching vector exactly once, even when it changes the very field the filter tests (for example renaming a category).
+- **A filter naming an unknown field** throws `std::invalid_argument` under a strict schema, and matches nothing under a dynamic one, as in searches.
+- **`remove_where` always completes:** once the filter is accepted, every match is removed. If memory runs out while repairing the HNSW graph around them, the repair is cut short (as by `remove`); no match is left behind.
+- **`set_metadata_where` is all or nothing:** invalid changes throw `std::invalid_argument`, even when nothing matches, and if memory runs out no vector has changed. It works on a copy of the metadata and swaps it in when complete, so it briefly needs extra memory about the size of the index's metadata.
+- **Searches see the index before or after a change, never in between**, and like all changes these cannot be made from inside a search (`std::logic_error`); `count_where` is a read and can.
 
 ## Saving and loading
 
