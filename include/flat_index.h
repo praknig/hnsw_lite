@@ -55,6 +55,21 @@ public:
     /// currently stored, or invalid metadata. All-or-nothing.
     void add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata = {});
 
+    /// Adds many vectors at once. `vectors` holds ids.size() vectors back to
+    /// back; `metadata`, if given, has one entry per vector. The index's lock is
+    /// held throughout, so searches wait and then see all of the batch or none of it.
+    ///
+    /// **All or nothing.** Every vector, ID (against the index and within the
+    /// batch) and metadata entry is checked before anything changes; any problem
+    /// throws std::invalid_argument and leaves the index unchanged.
+    /// If memory runs out partway, every vector added so far is taken out
+    /// again, and the index is exactly as before. Inserting into a Flat index
+    /// is a copy, so it runs on the calling thread; `threads` is accepted for
+    /// symmetry with HnswIndex.
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads = 0);
+    void add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                   std::span<const Metadata> metadata, std::size_t threads = 0);
+
     /// Deletes `id` for real (swap-with-last). Returns false if it is not stored.
     bool remove(std::uint64_t id);
 
@@ -163,6 +178,8 @@ private:
     /// update() and upsert(): `metadata` null keeps the old metadata.
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
+    void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                            const Metadata* metadata);  // caller holds the write lock
 
     /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;

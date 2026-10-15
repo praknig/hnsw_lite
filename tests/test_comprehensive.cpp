@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -8097,6 +8097,480 @@ TEST(concurrency, c19_lock_limits_and_failures) {
 
 
 // ===========================================================================
+// add_batch: parallel inserts (B1-B19; B20 is the benchmark's threads option)
+// ===========================================================================
+
+namespace {
+
+std::vector<std::uint64_t> id_range(std::uint64_t first, std::uint64_t count) {
+    std::vector<std::uint64_t> ids(count);
+    std::iota(ids.begin(), ids.end(), first);
+    return ids;
+}
+
+/// The fraction of live nodes reachable on level 0 from the entry point.
+double level0_reachable(const HnswIndex& h) {
+    const GraphStorage& g = h.storage().graph();
+    const IdMap& ids = h.storage().ids();
+    std::vector<char> seen(h.storage().size(), 0);
+    std::vector<NodeId> stack{h.entry_point()};
+    seen[h.entry_point()] = 1;
+    while (!stack.empty()) {
+        const NodeId n = stack.back();
+        stack.pop_back();
+        for (NodeId m : g.links(n, 0)) {
+            if (m == kEmpty) break;
+            if (!seen[m]) {
+                seen[m] = 1;
+                stack.push_back(m);
+            }
+        }
+    }
+    std::size_t live = 0, reached = 0;
+    for (NodeId n = 0; n < h.storage().size(); ++n)
+        if (!ids.is_deleted(n)) {
+            ++live;
+            reached += std::size_t(seen[n]);
+        }
+    return double(reached) / double(live);
+}
+
+/// The highest level among live nodes, computed from scratch.
+int highest_live_level(const HnswIndex& h) {
+    int top = -1;
+    for (NodeId n = 0; n < h.storage().size(); ++n)
+        if (!h.storage().ids().is_deleted(n)) top = std::max(top, h.storage().graph().level(n));
+    return top;
+}
+
+}  // namespace
+
+TEST(add_batch, b01_any_thread_count_builds_a_good_graph) {
+    auto data = clustered(3000, 16, 10, 700);
+    auto queries = clustered(100, 16, 10, 701);
+    const auto all = flatten(data);
+    const auto ids = id_range(0, 3000);
+    FlatIndex f(16, Metric::L2);
+    HnswIndex one_by_one(16, Metric::L2);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        f.add(i, data[i]);
+        one_by_one.add(i, data[i]);
+    }
+    const double reference = recall(one_by_one, f, queries, 10, 64);
+    for (std::size_t threads : {std::size_t(1), std::size_t(2), std::size_t(4), std::size_t(8)}) {
+        HnswIndex h(16, Metric::L2);
+        h.add_batch(ids, all, threads);
+        bool all_present = h.size() == 3000;
+        for (std::uint64_t i = 0; i < 3000; i += 7) all_present = all_present && h.contains(i);
+        CHECK(all_present);
+        check_graph(h, 0.99);
+        CHECK(recall(h, f, queries, 10, 64) >= reference - 0.01);
+        CHECK(h.max_level() == highest_live_level(h) && !h.storage().ids().is_deleted(h.entry_point()));
+    }
+}
+
+TEST(add_batch, b02_one_thread_is_identical_to_one_by_one) {
+    auto data = clustered(1200, 8, 6, 702);
+    const auto ids = id_range(100, 1200);
+    std::vector<Metadata> meta;
+    for (std::size_t i = 0; i < data.size(); ++i) meta.push_back(meta_for(i));
+    for (Metric m : kMetrics) {
+        HnswIndex a(8, m), b(8, m), c(8, m), d(8, m);
+        for (std::size_t i = 0; i < data.size(); ++i) {
+            a.add(ids[i], data[i]);
+            c.add(ids[i], data[i], meta[i]);
+        }
+        b.add_batch(ids, flatten(data), 1);
+        d.add_batch(ids, flatten(data), meta, 1);
+        CHECK(save_bytes(a) == save_bytes(b));
+        CHECK(save_bytes(c) == save_bytes(d));
+    }
+}
+
+TEST(add_batch, b03_duplicate_ids_change_nothing) {
+    auto data = clustered(200, 8, 4, 703);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 100; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    auto inside = id_range(100, 100);
+    inside[60] = inside[10];  // twice within the batch
+    auto stored = id_range(100, 100);
+    stored[99] = 5;  // already in the index
+    const auto vecs = flatten(Vectors(data.begin() + 100, data.end()));
+    for (const auto& bad : {inside, stored}) {
+        CHECK_THROWS_AS(std::invalid_argument, h.add_batch(bad, vecs, 4));
+        CHECK_THROWS_AS(std::invalid_argument, f.add_batch(bad, vecs));
+    }
+    CHECK(save_bytes(h) == hb && save_bytes(f) == fb);
+}
+
+TEST(add_batch, b04_invalid_vectors_change_nothing) {
+    auto data = clustered(200, 8, 4, 704);
+    HnswIndex h(8, Metric::Cosine);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::size_t i = 0; i < 100; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    const auto ids = id_range(100, 100);
+    auto with_nan = flatten(Vectors(data.begin() + 100, data.end()));
+    auto with_inf = with_nan;
+    auto zero = with_nan;
+    with_nan[8 * 50 + 3] = kNaN;
+    with_inf[8 * 99 + 7] = kInf;
+    auto short_buffer = with_inf;
+    short_buffer.resize(short_buffer.size() - 1);
+    for (const auto& bad : {with_nan, with_inf, short_buffer}) {
+        CHECK_THROWS_AS(std::invalid_argument, h.add_batch(ids, bad, 4));
+        CHECK_THROWS_AS(std::invalid_argument, f.add_batch(ids, bad));
+    }
+    CHECK(save_bytes(h) == hb && save_bytes(f) == fb);
+    // A zero vector is accepted with cosine, as by add() (it has no direction and
+    // sits at distance 1 from everything): a batch treats it the same way.
+    std::fill(zero.begin() + 8 * 70, zero.begin() + 8 * 71, 0.0f);
+    h.add_batch(ids, zero, 4);
+    f.add_batch(ids, zero);
+    CHECK(h.size() == 200 && f.size() == 200);
+}
+
+TEST(add_batch, b05_invalid_metadata_changes_nothing) {
+    auto data = clustered(200, 8, 4, 705);
+    const auto ids = id_range(100, 100);
+    const auto vecs = flatten(Vectors(data.begin() + 100, data.end()));
+    // Strict schema: an unknown field in the middle of the batch.
+    HnswIndex strict(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    for (std::size_t i = 0; i < 100; ++i) strict.add(i, data[i], meta_for(i));
+    std::vector<Metadata> meta;
+    for (std::size_t i = 0; i < 100; ++i) meta.push_back(meta_for(100 + i));
+    meta[40].set("unknown", 1);
+    const std::string sb = save_bytes(strict);
+    CHECK_THROWS_AS(std::invalid_argument, strict.add_batch(ids, vecs, meta, 4));
+    CHECK(save_bytes(strict) == sb);
+    // Dynamic schema: a new field with two types within one batch (each row alone is fine).
+    HnswIndex dyn(8, Metric::L2);
+    FlatIndex fdyn(8, Metric::L2);
+    for (std::size_t i = 0; i < 100; ++i) {
+        dyn.add(i, data[i]);
+        fdyn.add(i, data[i]);
+    }
+    std::vector<Metadata> mixed(100);
+    mixed[3].set("fresh", std::int64_t(1));
+    mixed[90].set("fresh", "text");
+    const std::string db = save_bytes(dyn), fb = save_bytes(fdyn);
+    CHECK_THROWS_AS(std::invalid_argument, dyn.add_batch(ids, vecs, mixed, 4));
+    CHECK_THROWS_AS(std::invalid_argument, fdyn.add_batch(ids, vecs, mixed));
+    // A metadata count that does not match the vectors.
+    CHECK_THROWS_AS(std::invalid_argument, dyn.add_batch(ids, vecs, std::vector<Metadata>(99), 4));
+    CHECK_THROWS_AS(std::invalid_argument, fdyn.add_batch(ids, vecs, std::vector<Metadata>(101)));
+    CHECK(save_bytes(dyn) == db && save_bytes(fdyn) == fb && dyn.metadata().field_count() == 0);
+}
+
+TEST(add_batch, b06_empty_batch_changes_nothing) {
+    auto data = clustered(50, 8, 2, 706);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    HnswIndex empty(8, Metric::L2);
+    for (std::size_t i = 0; i < 50; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f), eb = save_bytes(empty);
+    h.add_batch({}, {}, 4);
+    f.add_batch({}, {});
+    empty.add_batch({}, {}, std::span<const Metadata>{}, 4);
+    CHECK(save_bytes(h) == hb && save_bytes(f) == fb && save_bytes(empty) == eb);
+}
+
+TEST(add_batch, b07_empty_index_and_reused_slots) {
+    auto data = clustered(800, 8, 6, 707);
+    // Into an index with removed slots: they are reused in the same order as one-by-one adds.
+    HnswIndex a(8, Metric::L2), b(8, Metric::L2), c(8, Metric::L2);
+    for (HnswIndex* h : {&a, &b, &c}) {
+        for (std::size_t i = 0; i < 500; ++i) h->add(i, data[i]);
+        for (std::uint64_t i = 0; i < 500; i += 10) h->remove(i);
+    }
+    const auto ids = id_range(1000, 300);
+    const auto vecs = flatten(Vectors(data.begin() + 500, data.end()));
+    for (std::size_t i = 0; i < 300; ++i) a.add(ids[i], data[500 + i]);
+    b.add_batch(ids, vecs, 1);
+    c.add_batch(ids, vecs, 4);
+    CHECK(save_bytes(a) == save_bytes(b));
+    CHECK(c.size() == 750 && c.capacity() == 750 && c.deleted_count() == 0);  // all 50 removed slots reused
+    check_graph(c, 0.99);
+    // Into an empty index, on many threads.
+    HnswIndex e(8, Metric::L2);
+    e.add_batch(id_range(0, 800), flatten(data), 8);
+    CHECK(e.size() == 800);
+    check_graph(e, 0.99);
+    // Into an index whose vectors were all removed: free slots but no entry point.
+    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+        HnswIndex r(8, Metric::L2), r_ref(8, Metric::L2);
+        for (HnswIndex* h : {&r, &r_ref}) {
+            for (std::size_t i = 0; i < 100; ++i) h->add(i, data[i]);
+            for (std::uint64_t i = 0; i < 100; ++i) h->remove(i);
+        }
+        r.add_batch(id_range(2000, 300), flatten(Vectors(data.begin() + 100, data.begin() + 400)), threads);
+        for (std::size_t i = 0; i < 300; ++i) r_ref.add(2000 + i, data[100 + i]);
+        CHECK(r.size() == 300 && r.capacity() == 300);
+        if (threads == 1) CHECK(save_bytes(r) == save_bytes(r_ref));
+        check_graph(r, 0.99);
+    }
+}
+
+TEST(add_batch, b08_entry_point_with_many_high_levels) {
+    // M = 2 makes high levels common, so threads race to raise the top level. Such
+    // small M gives poorly connected graphs however they are built (about 89% of
+    // vectors reachable even one by one), so quality is compared with one-by-one adds.
+    auto data = clustered(4000, 8, 10, 708);
+    for (int round = 0; round < 3; ++round) {
+        const HnswParams params{2, 32, std::uint64_t(round)};
+        HnswIndex h(8, Metric::L2, params), one_by_one(8, Metric::L2, params);
+        h.add_batch(id_range(0, 4000), flatten(data), 8);
+        for (std::size_t i = 0; i < data.size(); ++i) one_by_one.add(i, data[i]);
+        CHECK(!h.storage().ids().is_deleted(h.entry_point()));
+        CHECK(h.storage().graph().level(h.entry_point()) == h.max_level());
+        CHECK(h.max_level() == highest_live_level(h));
+        CHECK(level0_reachable(h) >= level0_reachable(one_by_one) - 0.02);
+        check_graph(h, 0.8);  // structure: valid links, levels and entry point
+    }
+}
+
+TEST(add_batch, b09_searches_see_all_of_a_batch_or_none) {
+    auto data = clustered(1200, 8, 6, 709);
+    HnswIndex h(8, Metric::L2);
+    for (std::size_t i = 0; i < 200; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    std::atomic<long> partial{0}, observations{0};
+    Problems p;
+    with_watchdog(120, "b09", [&] {
+        std::thread batches([&] {
+            for (std::uint64_t k = 0; k < 5; ++k)  // five batches of 200
+                h.add_batch(id_range(200 + 200 * k, 200), flatten(Vectors(data.begin() + std::ptrdiff_t(200 + 200 * k), data.begin() + std::ptrdiff_t(400 + 200 * k))), 4);
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                const std::size_t n = h.size();
+                if (n % 200 != 0) ++partial;  // never part of a batch
+                ++observations;
+                check_results(h.search(data[q++ % 1200], 10, 32), 1200, p);
+            }
+        });
+        batches.join();
+    });
+    CHECK(partial == 0 && observations > 0 && p.total() == 0 && h.size() == 1200);
+}
+
+TEST(add_batch, b10_refused_inside_a_search) {
+    auto data = clustered(100, 8, 2, 710);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::size_t i = 0; i < 50; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    std::atomic<long> refused{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        for (auto&& attempt : {std::function<void()>([&] { h.add_batch(id_range(500, 1), data[60], 2); }),
+                               std::function<void()>([&] { f.add_batch(id_range(500, 1), data[60]); })}) {
+            try {
+                attempt();
+            } catch (const std::logic_error&) {
+                ++refused;
+            }
+        }
+        return true;
+    };
+    (void)h.search(data[0], 3, 16, o);
+    CHECK(refused > 0 && h.size() == 50 && f.size() == 50);
+}
+
+TEST(add_batch, b11_out_of_memory_removes_the_batch) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(140, 8, 4, 711);
+    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+        HnswIndex h(8, Metric::L2);
+        for (std::size_t i = 0; i < 80; ++i) h.add(i, data[i], meta_for(i));
+        for (std::uint64_t i = 0; i < 80; i += 8) h.remove(i);  // some slots to reuse
+        const std::size_t before = h.size(), fields = h.metadata().field_count();
+        const auto ids = id_range(1000, 60);
+        const auto vecs = flatten(Vectors(data.begin() + 80, data.end()));
+        std::vector<Metadata> meta(60);
+        for (std::size_t i = 0; i < 60; ++i) meta[i] = meta_for(i).set("batch_only", std::int64_t(i));  // a new field
+        bool clean = true;
+        const long points = sweep_allocation_failures([&] { h.add_batch(ids, vecs, meta, threads); }, [&] {
+            clean = clean && h.size() == before && h.metadata().field_count() == fields;
+            for (std::uint64_t id : ids) clean = clean && !h.contains(id);
+            for (std::uint64_t i = 1; i < 80; i += 8) clean = clean && h.contains(i) && h.get_metadata(i).has_value();
+            clean = clean && !h.search(data[1], 5, 32).empty();
+            clean = clean && !h.storage().ids().is_deleted(h.entry_point()) && h.max_level() == highest_live_level(h);
+        });
+        CHECK(points > 0 && clean);
+        CHECK(h.size() == before + 60);  // the final, unhindered attempt succeeded
+        check_graph(h, 0.97);
+        h.add(5000, data[0]);  // still fully usable
+        CHECK(h.contains(5000));
+    }
+    // Into an empty index (a failure may come before any vector is the entry point),
+    // and with graph repair turned off.
+    for (bool repair : {true, false}) {
+        HnswParams params;
+        params.repair_on_remove = repair;
+        HnswIndex h(8, Metric::L2, params);
+        const auto ids = id_range(0, 50);
+        const auto vecs = flatten(Vectors(data.begin(), data.begin() + 50));
+        bool clean = true;
+        CHECK(sweep_allocation_failures([&] { h.add_batch(ids, vecs, 4); }, [&] {
+            clean = clean && h.size() == 0 && h.entry_point() == kEmpty && h.max_level() == -1;
+        }) > 0);
+        CHECK(clean && h.size() == 50);
+        check_graph(h, 0.97, repair ? 0.02 : 1.0);  // without repair, links to removed vectors may remain
+    }
+}
+
+TEST(add_batch, b12_thread_counts) {
+    auto data = clustered(40, 8, 2, 712);
+    for (std::size_t threads : {std::size_t(0), std::size_t(64), std::size_t(1000000)}) {
+        HnswIndex h(8, Metric::L2);
+        h.add_batch(id_range(0, 40), flatten(data), threads);  // more threads than vectors; 0 = all cores
+        CHECK(h.size() == 40);
+        check_graph(h, 1.0);
+    }
+}
+
+TEST(add_batch, b13_metadata_and_payload_counts) {
+    auto data = clustered(900, 8, 6, 713);
+    std::vector<Metadata> meta;
+    for (std::size_t i = 0; i < 900; ++i) meta.push_back(meta_for(i));
+    HnswIndex a(8, Metric::L2), b(8, Metric::L2);
+    for (HnswIndex* h : {&a, &b}) {
+        for (std::size_t i = 0; i < 300; ++i) h->add(i, data[i], meta[i]);
+        h->create_payload_index("category");
+        h->create_payload_index("tags");
+    }
+    for (std::size_t i = 300; i < 900; ++i) a.add(i, data[i], meta[i]);
+    b.add_batch(id_range(300, 600), flatten(Vectors(data.begin() + 300, data.end())),
+                std::span<const Metadata>(meta.data() + 300, 600), 4);
+    const MetadataStore &ma = a.metadata(), &mb = b.metadata();
+    for (const char* cat : kCategories)
+        CHECK(mb.value_count(*mb.find_field("category"), *mb.find_string(cat)) ==
+              ma.value_count(*ma.find_field("category"), *ma.find_string(cat)));
+    bool same = true;
+    for (std::uint64_t i = 0; i < 900; i += 13) same = same && *b.get_metadata(i) == *a.get_metadata(i);
+    CHECK(same);
+    const SearchOptions o = with_filter(Filter::eq("category", "tech"));
+    CHECK(b.search(data[5], 10, 64, o).size() == 10);
+}
+
+TEST(add_batch, b14_save_and_load_after_a_parallel_batch) {
+    auto data = clustered(1500, 8, 6, 714);
+    HnswIndex h(8, Metric::Cosine);
+    std::vector<Metadata> meta;
+    for (std::size_t i = 0; i < 1500; ++i) meta.push_back(meta_for(i));
+    h.add_batch(id_range(0, 1500), flatten(data), meta, 4);
+    const std::string bytes = save_bytes(h);
+    auto g = load_hnsw(bytes);
+    CHECK(save_bytes(*g) == bytes && all_links(*g) == all_links(h));
+    bool same = true;
+    for (std::size_t i = 0; i < 20; ++i) same = same && same_results(g->search(data[i * 50], 10, 64), h.search(data[i * 50], 10, 64));
+    CHECK(same);
+}
+
+TEST(add_batch, b15_later_changes_work_normally) {
+    auto data = clustered(1600, 8, 6, 715);
+    HnswIndex h(8, Metric::L2);
+    h.add_batch(id_range(0, 1200), flatten(Vectors(data.begin(), data.begin() + 1200)), 4);
+    for (std::uint64_t i = 0; i < 1200; i += 5) h.remove(i);
+    for (std::uint64_t i = 1; i < 1200; i += 7) h.update(i, data[1200 + i % 400]);
+    for (std::uint64_t i = 0; i < 1200; i += 25) h.upsert(i, data[i]);
+    check_graph(h, 0.98);
+    h.compact();
+    check_graph(h, 0.99);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1200; ++i)
+        if (h.contains(i)) f.add(i, std::vector<float>(h.storage().vectors().get(*h.storage().ids().find(i)).begin(),
+                                                      h.storage().vectors().get(*h.storage().ids().find(i)).end()));
+    CHECK(recall(h, f, Vectors(data.begin(), data.begin() + 100), 10, 64) > 0.95);
+}
+
+TEST(add_batch, b16_re_adding_removed_ids) {
+    auto data = clustered(600, 8, 4, 716);
+    HnswIndex h(8, Metric::L2);
+    h.add_batch(id_range(0, 300), flatten(Vectors(data.begin(), data.begin() + 300)), 4);
+    for (std::uint64_t i = 0; i < 300; i += 3) h.remove(i);
+    std::vector<std::uint64_t> again;
+    Vectors fresh;
+    for (std::uint64_t i = 0; i < 300; i += 3) {
+        again.push_back(i);
+        fresh.push_back(data[300 + i]);
+    }
+    h.add_batch(again, flatten(fresh), 4);
+    CHECK(h.size() == 300 && h.capacity() == 300);
+    bool updated = true;
+    for (std::size_t k = 0; k < again.size(); ++k)
+        updated = updated && h.search(fresh[k], 1, 64)[0].id == again[k];
+    CHECK(updated);
+}
+
+TEST(add_batch, b17_flat_identical_and_exact_on_failure) {
+    auto data = clustered(400, 8, 4, 717);
+    std::vector<Metadata> meta;
+    for (std::size_t i = 0; i < 400; ++i) meta.push_back(meta_for(i));
+    FlatIndex a(8, Metric::L2), b(8, Metric::L2);
+    for (std::size_t i = 0; i < 400; ++i) a.add(i, data[i], meta[i]);
+    b.add_batch(id_range(0, 400), flatten(data), meta, 8);
+    CHECK(save_bytes(a) == save_bytes(b));
+    if constexpr (HNSW_ALLOC_HOOK) {  // running out of memory restores the index exactly
+        FlatIndex c(8, Metric::L2);
+        for (std::size_t i = 0; i < 100; ++i) c.add(i, data[i], meta[i]);
+        const std::string before = save_bytes(c);
+        std::vector<Metadata> extra(100);
+        for (std::size_t i = 0; i < 100; ++i) extra[i] = meta[100 + i].set("batch_only", true);
+        bool exact = true;
+        CHECK(sweep_allocation_failures([&] { c.add_batch(id_range(100, 100), flatten(Vectors(data.begin() + 100, data.begin() + 200)), extra); },
+                                        [&] { exact = exact && save_bytes(c) == before; }) > 0);
+        CHECK(exact && c.size() == 200);
+    }
+}
+
+TEST(add_batch, b18_batches_mixed_with_single_adds) {
+    auto data = clustered(2000, 8, 8, 718);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    std::uint64_t next = 0;
+    for (int round = 0; round < 5; ++round) {
+        h.add_batch(id_range(next, 300), flatten(Vectors(data.begin() + std::ptrdiff_t(next), data.begin() + std::ptrdiff_t(next + 300))), 4);
+        next += 300;
+        for (int k = 0; k < 100; ++k, ++next) h.add(next, data[next]);
+    }
+    for (std::uint64_t i = 0; i < next; ++i) f.add(i, data[i]);
+    CHECK(h.size() == 2000);
+    check_graph(h, 0.99);
+    CHECK(recall(h, f, Vectors(data.begin(), data.begin() + 100), 10, 64) > 0.95);
+}
+
+TEST(add_batch, b19_many_threads_every_metric) {
+    // The ThreadSanitizer CI jobs run this group: 8 threads linking at once.
+    auto data = clustered(2500, 12, 8, 719);
+    auto queries = clustered(60, 12, 8, 720);
+    for (Metric m : kMetrics) {
+        HnswIndex h(12, m);
+        FlatIndex f(12, m);
+        h.add_batch(id_range(0, 2500), flatten(data), 8);
+        for (std::size_t i = 0; i < 2500; ++i) f.add(i, data[i]);
+        check_graph(h, 0.99);
+        CHECK(recall(h, f, queries, 10, 64) > 0.9);
+    }
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -8442,7 +8916,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

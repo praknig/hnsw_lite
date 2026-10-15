@@ -123,7 +123,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 519 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 538 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -359,6 +359,20 @@ Each index holds an `IndexLock`: searches, saves and lookups take it shared, cha
 2. **Nested reads skip the writer queue.** A search started from inside an index operation waits only for a change that is running, not for queued ones. A read of the same index does not lock again at all, and batch tasks inherit their caller's read (`IndexLock::Hold`).
 
 Together these make a cycle impossible: a thread holding a lock waits only for a running change, and a running change, which by rule 1 holds no other lock and starts no nested operation, always finishes. An early version without rule 2 deadlocked in exactly the crossed-predicate pattern; test `c18` now checks it under a watchdog.
+
+### Parallel building (`add_batch`)
+
+The whole batch runs inside one change, holding the index lock alone, so searches never see a half-built batch, and the lowest storage layer needs no redesign for concurrent readers. Inside, it works in phases:
+
+1. **Validate everything:** vectors, IDs against the index and within the batch, metadata (`MetadataStore::validate_batch` also requires a new dynamic field to have one type throughout). Nothing has changed yet.
+2. **Reserve everything a rollback needs** (the free list, undo records), so undoing cannot fail.
+3. **Vectors that reuse removed slots are inserted and linked one at a time**, exactly as `add` does. A reused slot keeps its old links (other nodes route through it) until the moment it is reused, so preparing it in advance would change the graph.
+4. **The rest are stored, unlinked, in order:** vectors, metadata, empty link lists, levels drawn in order. All storage grows here, so nothing reallocates while threads link.
+5. **Linking, on a thread pool.** Each node's link lists are guarded by one of 65,536 striped mutexes (`LinkLocks`, as in hnswlib); a thread holds one list lock at a time, so threads cannot deadlock. Searches read each list as a copy taken under its lock. A node that raises the top level holds the entry-point lock while it links, so two such nodes cannot each build an upper level the other cannot reach.
+
+**Publish when complete.** A node first searches every level and decides all its neighbors without changing anything, then sets its own lists, and only then adds the reverse links that make it reachable. Until then no other thread can reach it, so none descends into a level it has not linked yet, and none adds a link that its own list would later overwrite. (An earlier version linked level by level; under ThreadSanitizer's interleaving, other threads reached half-linked nodes and graph quality dropped.) Deferring changes nothing else, since each level's search starts from the previous level's results, never from links the node created; one thread therefore gives exactly the same graph as `add` in order.
+
+**Rollback.** If anything fails after step 2, every node the batch stored is removed (newest first, undoing metadata exactly), which cannot fail; then the graph is repaired around them as `remove` does, best effort. All batch nodes are already removed then, so no repair links to one of them.
 
 ## Search features design
 

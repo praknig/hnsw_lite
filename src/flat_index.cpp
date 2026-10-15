@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_set>
 
 namespace vecdb {
 
@@ -61,6 +62,78 @@ bool FlatIndex::remove(std::uint64_t id) {
     vectors_.pop_back();
     --live_;
     return true;
+}
+
+void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads) {
+    (void)threads;  // Flat inserts are copies, done on the calling thread
+    const auto guard = lock_.write("add_batch");
+    add_batch_unlocked(ids, vectors, nullptr);
+}
+
+void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                          std::span<const Metadata> metadata, std::size_t threads) {
+    (void)threads;
+    if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
+    const auto guard = lock_.write("add_batch");
+    add_batch_unlocked(ids, vectors, metadata.data());
+}
+
+void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                                   const Metadata* metadata) {
+    const std::size_t n = ids.size(), d = dim();
+    if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
+    if (n == 0) return;
+    const Metadata none;  // for batches without metadata
+    auto row = [&](std::size_t i) -> const Metadata& { return metadata ? metadata[i] : none; };
+
+    // 1. Validate everything before changing anything.
+    {
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            scratch_.prepare(vectors.subspan(i * d, d), metric_);
+            if (ids_.find(ids[i]) || !seen.insert(ids[i]).second)
+                throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
+        }
+        if (metadata) metadata_.validate_batch(metadata, n);
+    }
+
+    // 2. Add in order; if memory runs out, take every added vector out again,
+    //    newest first, which restores the index exactly.
+    std::vector<MetadataStore::WriteUndo> undo;
+    undo.reserve(n);
+    try {
+        for (std::size_t i = 0; i < n; ++i) {
+            scratch_.prepare(vectors.subspan(i * d, d), metric_);
+            const auto slot = static_cast<NodeId>(vectors_.size());
+            undo.push_back(metadata_.write(slot, row(i)));
+            try {
+                ids_.add(ids[i]);
+            } catch (...) {
+                metadata_.undo_write(slot, undo.back());
+                undo.pop_back();
+                throw;
+            }
+            try {
+                vectors_.add(scratch_.values());
+            } catch (...) {
+                ids_.undo_last_add(ids[i]);
+                metadata_.undo_write(slot, undo.back());
+                undo.pop_back();
+                throw;
+            }
+            ++live_;
+        }
+    } catch (...) {
+        for (std::size_t k = undo.size(); k-- > 0;) {
+            const auto slot = static_cast<NodeId>(vectors_.size() - 1);
+            vectors_.pop_back();
+            ids_.undo_last_add(ids[k]);
+            metadata_.undo_write(slot, undo[k]);
+            --live_;
+        }
+        throw;
+    }
 }
 
 bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) {

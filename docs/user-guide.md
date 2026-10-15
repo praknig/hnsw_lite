@@ -9,6 +9,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Core ideas](#core-ideas)
 - [Creating an index](#creating-an-index)
 - [Adding vectors](#adding-vectors)
+  - [Adding many vectors at once](#adding-many-vectors-at-once)
 - [Searching](#searching)
 - [Updating vectors](#updating-vectors)
 - [Removing vectors and compacting](#removing-vectors-and-compacting)
@@ -77,6 +78,22 @@ index.add(42, embedding);   // embedding: std::vector<float>, std::array, or any
 - Values extremely close to zero (subnormal floats, below about 1e-38) give correct results. They caused no slowdown on the CPUs tested, but some older CPUs process them many times slower; if you see that, round such values to 0.
 
 Any failure leaves the index exactly as it was. See [Errors and guarantees](#errors-and-guarantees).
+
+### Adding many vectors at once
+
+```cpp
+std::vector<std::uint64_t> ids = {1, 2, 3};
+std::vector<float> vectors = ...;           // ids.size() * dim() values, back to back
+index.add_batch(ids, vectors);              // all cores (HnswIndex)
+index.add_batch(ids, vectors, metadata, 8); // with one Metadata per vector, on 8 threads
+```
+
+- **All or nothing:** every vector, ID (against the index and within the batch) and metadata entry is checked first; any problem throws `std::invalid_argument` and changes nothing. With a dynamic schema, a field that is new must have the same type throughout the batch.
+- **HNSW links vectors on several threads** (`threads = 0`, the default, uses all cores). Vectors that reuse slots of removed vectors are linked one at a time first, exactly as `add` would; the rest in parallel.
+- **One thread gives exactly the same index as calling `add` for each vector in order.** With more threads the graph differs slightly from run to run (which vector links first depends on timing), while search quality is the same.
+- **Searches wait** while a batch is added, then see all of it or none of it.
+- **If memory runs out**, an HNSW index removes the batch's vectors again (repairing the graph around them when memory allows): none of the batch remains, and every earlier vector is still stored and searchable. A Flat index is restored exactly. Either way, the exception is passed on.
+- On `FlatIndex`, `add_batch` has the same checks and guarantees; inserting is a copy, so it runs on the calling thread.
 
 ## Searching
 
@@ -286,7 +303,7 @@ Every index is safe to use from any number of threads at once, with no lock of y
 - **Batch searches** use their own thread pool; predicates in batch searches run on several threads at once, so they must be thread-safe.
 - **References** returned by `storage()` and `metadata()` are for inspection while no other thread changes the index: the lock covers the call, not later use of the reference. From concurrent code, use `get_metadata`, `planner_params()` (which returns a copy) and the counting functions.
 - **Destroying an index** while another thread still uses it is undefined behavior, as for any C++ object: make sure all searches and changes have returned first.
-- Changes still run one at a time, so building an index is single-threaded. Parallel inserts (`add_batch`) are on the [roadmap](project-notes.md#roadmap).
+- Changes run one at a time. To build an HNSW index faster, use [`add_batch`](#adding-many-vectors-at-once), which links vectors on several threads inside a single change.
 
 ## Errors and guarantees
 

@@ -185,6 +185,8 @@ Layer 1 changes this requires:
 
 ### `add_batch`
 
+**As built:** the batch holds the index's write lock throughout, so searches wait (running them during inserts would need the stable shelf storage below, and was deferred). Slots of removed vectors are reused, but linked one at a time first, exactly as `add` would, then the rest in parallel. Nodes are published only when complete. If memory runs out while linking, the batch's vectors are removed again and the graph repaired around them, best effort. See [Parallel building](architecture.md#parallel-building-add_batch).
+
 `add_batch(ids, vectors, threads)` builds in parallel. **Decision:** it is **all-or-nothing**. Every vector is validated and every ID checked (against the index and within the batch) before anything is inserted; if any check fails, nothing is inserted.
 
 ### Determinism

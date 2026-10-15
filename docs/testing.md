@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 519 individually named tests** in 20 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 538 individually named tests** in 21 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -27,6 +27,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `update` | 32 | Scenarios U1 to U20 from the [test plan](core-capabilities-test-plan.md), each named after its ID: Flat and HNSW `update` and `upsert`, unknown IDs, invalid input, the entry point, every vector updated, one ID updated 1,000 times, small and large moves, copies of other vectors, a one-vector index, every metric, reproducibility, and an out-of-memory sweep proving the old vector survives every failure. Plus U21 to U27: metadata kept or replaced, invalid metadata, the new ID-map operations, updates without graph repair, 5,000 mixed operations against a reference, and five edge cases: a zero vector with cosine, `upsert` with an invalid vector for a new ID, `compact()` after many updates, the dictionary cleanup during an update, and an updated vector never left without links |
 | `hardening` | 14 | Edge cases E1 to E13 of the [hardening and performance plan](hardening-and-performance-plan.md): random levels identical on every platform, nested batches from predicates, changes during a search refused, cosine distances never negative, the `M` limit, extreme IDs, vectors taken from the index itself, dimension 0, thousands of fields and filter tags, throwing predicates in threaded batches, subnormal values, the deepest filter on pool threads, and the change detection released on every path |
 | `persistence` | 35 | Scenarios P1 to P42 from the [test plan](core-capabilities-test-plan.md), each named after its ID: round trips for every metric and index state (empty, one vector, removals, updates, compaction, extreme IDs, several dimensions), settings preserved, continuing after a load building the identical graph, deterministic bytes, safe overwriting, a file truncated at every byte and a bit flipped in every byte, wrong headers and kinds, extra bytes, inflated counts, invalid content behind valid checksums, unusable paths, out-of-memory sweeps of loading and saving, golden files reproduced byte for byte, and a 100,000-vector round trip. Plus P50 to P57: metadata, every search feature after loading, changes continuing identically, saving during a search, unseekable streams, metadata damage, failing streams and every validation rule |
+| `add_batch` | 19 | Scenarios B1 to B19: 1 to 8 threads giving graphs as good as one-by-one adds; one thread byte-identical to one-by-one adds (every metric, with and without metadata, into removed slots, into an index with every vector removed); duplicate IDs, NaN, infinity, wrong sizes, invalid or inconsistently typed metadata changing nothing; empty batches; reused slots; entry point and top level with many high-level vectors racing; searches seeing all of a batch or none; refusal inside a search; out of memory at every point, on 1 and 4 threads, into a filled and an empty index, with and without graph repair (no batch vector remains, earlier vectors intact and searchable); payload counts; save and load; later changes; re-added IDs; Flat restored exactly; batches mixed with single adds; 8 threads with every metric |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -37,7 +38,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 519 test names
+test_comprehensive --list               # list all 538 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -51,13 +52,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 519 of 519 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 538 of 538 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-519 passed, 0 failed, 0 skipped, 0 not run, 29922 checks, 26.14 s
+538 passed, 0 failed, 0 skipped, 0 not run, 30175 checks, 34.07 s
 All selected tests passed.
 ```
 
@@ -105,30 +106,31 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 20 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 21 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/20 Test # 1: comprehensive.layer1 ................   Passed
- 2/20 Test # 2: comprehensive.layer2 ................   Passed
- 3/20 Test # 3: comprehensive.helpers ...............   Passed
- 4/20 Test # 4: comprehensive.flat ..................   Passed
- 5/20 Test # 5: comprehensive.hnsw ..................   Passed
- 6/20 Test # 6: comprehensive.robustness ............   Passed
- 7/20 Test # 7: comprehensive.deletion ..............   Passed
- 8/20 Test # 8: comprehensive.concurrency ...........   Passed
- 9/20 Test # 9: comprehensive.metadata ..............   Passed
-10/20 Test #10: comprehensive.filter ................   Passed
-11/20 Test #11: comprehensive.planner ...............   Passed
-12/20 Test #12: comprehensive.payload ...............   Passed
-13/20 Test #13: comprehensive.batch .................   Passed
-14/20 Test #14: comprehensive.range .................   Passed
-15/20 Test #15: comprehensive.search_e2e ............   Passed
-16/20 Test #16: comprehensive.update ................   Passed
-17/20 Test #17: comprehensive.hardening .............   Passed
-18/20 Test #18: comprehensive.persistence ...........   Passed
-19/20 Test #19: comprehensive.stress ................   Passed
-20/20 Test #20: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 20
+ 1/21 Test # 1: comprehensive.layer1 ................   Passed
+ 2/21 Test # 2: comprehensive.layer2 ................   Passed
+ 3/21 Test # 3: comprehensive.helpers ...............   Passed
+ 4/21 Test # 4: comprehensive.flat ..................   Passed
+ 5/21 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/21 Test # 6: comprehensive.robustness ............   Passed
+ 7/21 Test # 7: comprehensive.deletion ..............   Passed
+ 8/21 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/21 Test # 9: comprehensive.metadata ..............   Passed
+10/21 Test #10: comprehensive.filter ................   Passed
+11/21 Test #11: comprehensive.planner ...............   Passed
+12/21 Test #12: comprehensive.payload ...............   Passed
+13/21 Test #13: comprehensive.batch .................   Passed
+14/21 Test #14: comprehensive.range .................   Passed
+15/21 Test #15: comprehensive.search_e2e ............   Passed
+16/21 Test #16: comprehensive.update ................   Passed
+17/21 Test #17: comprehensive.hardening .............   Passed
+18/21 Test #18: comprehensive.persistence ...........   Passed
+19/21 Test #19: comprehensive.add_batch .............   Passed
+20/21 Test #20: comprehensive.stress ................   Passed
+21/21 Test #21: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 21
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -195,6 +197,13 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 28. **A deadlock in the first design of the index lock.** Thread 1, inside a search of index A, had a predicate that changed index B; thread 2, inside a search of B, had a predicate that searched A; a writer was queued on A. With writers preferred, each waited for the next. Found by test `c18` under its watchdog. Fixed with two rules: no change from inside any index operation, and nested reads skip the writer queue (see [Thread safety](architecture.md#thread-safety)).
 29. **Simultaneous saves to one file could corrupt it.** Once saves could run in parallel, two saves to the same path wrote into one shared temporary file (`<path>.tmp`), overwriting each other mid-write, and a rename failed once another save had moved the file away. Found by reviewing the edge cases of the new lock. Every save now writes its own uniquely named temporary file. Test `c20` was confirmed to fail against the old naming (3 runs out of 3) and to pass with the fix.
 
+**Found while building parallel inserts:**
+
+30. **Parallel linking let threads reach half-linked vectors.** Vectors were linked level by level, top-down; once linked on an upper level, other threads could reach a vector and descend to a level it had not linked yet, finding an empty list, and links they added to it could later be overwritten. Found under ThreadSanitizer, whose interleaving made it frequent (graph quality checks in `b07` and `b08` failed). Fixed by publishing a vector only when complete: all its levels are decided, then its own lists set, and only then the links that make it reachable.
+31. **A failed batch left links to its removed vectors.** Rolling back removed the batch's vectors without repairing the graph, so after many failures more than 2% of links pointed to removed vectors. Found by the out-of-memory sweep in `b11`. Rollback now repairs around them, best effort, as `remove` does.
+
+Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
+
 ## Continuous integration
 
 Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
@@ -221,7 +230,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
 | Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
 | Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
-| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers and deletion groups |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion and add_batch groups |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.

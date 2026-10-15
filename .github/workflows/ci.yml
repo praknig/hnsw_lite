@@ -254,4 +254,4 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive
 
       - name: Test threaded groups
-        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion
+        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion --group add_batch

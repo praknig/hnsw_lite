@@ -187,6 +187,8 @@ Added for stage A: C11 predicates searching their own index while a writer is qu
 
 `add_batch` is all-or-nothing: if any vector or ID in the batch is invalid, nothing is inserted.
 
+**As built:** these scenarios became the `add_batch` group, numbered B1 to B19 (test `c20` already existed). Scenarios about searches running during inserts (C25, C28, C29) are deferred with that option, since searches wait for a batch. B20, the build speedup, is measured with `bench_baseline --threads=N` rather than a test.
+
 | ID | Scenario | Type |
 |---|---|---|
 | C20 | `add_batch` with 1, 2, 4 and 8 threads: all present, graph valid, recall high | P |

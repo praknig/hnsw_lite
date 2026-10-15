@@ -183,5 +183,5 @@ Decisions applied: **D1** (levels identical on every platform; a fixed-answer te
 | 3. Concurrency stage A (one lock) | **Done** (see [Thread safety](architecture.md#thread-safety)) |
 | 4. Layout decision | Not started |
 | 5. Persistence | **Done** (file format version 1; see [Architecture and design](architecture.md#saving-and-loading)) |
-| 6. Parallel build | Not started |
+| 6. Parallel build | **Done** (`add_batch`; see [Parallel building](architecture.md#parallel-building-add_batch)) |
 | 7. Filtered and Flat speed | Not started |

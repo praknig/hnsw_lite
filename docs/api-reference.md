@@ -142,6 +142,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
+| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
 | `update(id, vector)`, `update(id, vector, metadata)` | Replaces the vector in place (and, with metadata, the whole metadata); `false` for an unknown ID; all-or-nothing |
 | `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
@@ -157,6 +158,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `HnswParams { M = 16, ef_construction = 200, seed = 42, repair_on_remove = true }` | Graph settings; `M >= 2` and `ef_construction >= 1` are required, `M >= 8` is recommended |
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
 | `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
+| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing, linking them on `threads` threads (0: all cores); one thread gives the same index as `add` in order |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
 | `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |
 | `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
