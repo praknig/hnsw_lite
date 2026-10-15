@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -8583,6 +8583,403 @@ TEST(add_batch, b19_many_threads_every_metric) {
 }
 
 // ===========================================================================
+// Bulk changes by filter: remove_where, set_metadata_where, count_where (W1-W16)
+// ===========================================================================
+
+namespace {
+
+/// Filters with their expected matches, computed from meta_for(i) directly
+/// (IDs divisible by 11 have only a category).
+struct FilterCase {
+    const char* name;
+    Filter filter;
+    std::function<bool(std::uint64_t)> expected;
+};
+
+std::vector<FilterCase> filter_cases() {
+    auto full = [](std::uint64_t i) { return i % 11 != 0; };
+    return {
+        {"eq", Filter::eq("category", "tech"), [](std::uint64_t i) { return i % 5 == 2; }},
+        {"range", Filter::ge("year", 2005) && Filter::lt("year", 2010),
+         [=](std::uint64_t i) { return full(i) && 2000 + i % 25 >= 2005 && 2000 + i % 25 < 2010; }},
+        {"in", Filter::in("category", {"news", "food"}), [](std::uint64_t i) { return i % 5 == 0 || i % 5 == 4; }},
+        {"tag", Filter::has_tag("tags", "a"), [=](std::uint64_t i) { return full(i) && i % 2 == 1; }},
+        {"all_tags", Filter::has_all_tags("tags", {"a", "b"}), [=](std::uint64_t i) { return full(i) && i % 2 == 1 && i % 3 == 0; }},
+        {"not_exists", !Filter::exists("year"), [](std::uint64_t i) { return i % 11 == 0; }},
+        {"or", Filter::eq("category", "music") || Filter::has_tag("tags", "c"),
+         [=](std::uint64_t i) { return i % 5 == 3 || (full(i) && i % 7 == 0); }},
+        {"and", Filter::eq("in_stock", true) && Filter::gt("price", 100.0),
+         [=](std::uint64_t i) { return full(i) && i % 3 == 0 && double(i % 100) * 1.5 > 100.0; }},
+    };
+}
+
+}  // namespace
+
+TEST(bulk, w01_remove_where_removes_exactly_the_matches) {
+    auto data = clustered(1000, 8, 6, 800);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const Filter tech = Filter::eq("category", "tech");
+    CHECK(h.count_where(tech) == 200 && f.count_where(tech) == 200);
+    CHECK(h.remove_where(tech) == 200 && f.remove_where(tech) == 200);
+    bool exact = h.size() == 800 && f.size() == 800;
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        const bool gone = i % 5 == 2;
+        exact = exact && h.contains(i) == !gone && f.contains(i) == !gone;
+        if (!gone) exact = exact && *h.get_metadata(i) == meta_for(i) && *f.get_metadata(i) == meta_for(i);
+    }
+    CHECK(exact && h.count_where(tech) == 0 && f.count_where(tech) == 0);
+    check_graph(h, 0.98);
+}
+
+TEST(bulk, w02_no_match_changes_nothing) {
+    auto data = clustered(300, 8, 4, 801);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    const Filter none = Filter::eq("category", "no-such-category");
+    CHECK(h.count_where(none) == 0 && h.remove_where(none) == 0 && f.remove_where(none) == 0);
+    CHECK(h.set_metadata_where(none, Metadata().set("year", 1)) == 0 && f.set_metadata_where(none, Metadata().set("year", 1)) == 0);
+    CHECK(save_bytes(h) == hb && save_bytes(f) == fb);
+}
+
+TEST(bulk, w03_everything_matches) {
+    auto data = clustered(300, 8, 4, 802);
+    HnswIndex h(8, Metric::Cosine);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const Filter all = Filter::exists("category");
+    CHECK(h.remove_where(all) == 300 && f.remove_where(all) == 300);
+    CHECK(h.size() == 0 && f.size() == 0 && h.entry_point() == kEmpty && h.max_level() == -1);
+    CHECK(h.search(data[0], 5).empty() && f.search(data[0], 5).empty());
+    h.add(7, data[7]);
+    f.add(7, data[7]);
+    CHECK(h.search(data[7], 1)[0].id == 7 && f.search(data[7], 1)[0].id == 7);
+}
+
+TEST(bulk, w04_every_kind_of_filter) {
+    auto data = clustered(600, 8, 6, 803);
+    for (const FilterCase& c : filter_cases()) {
+        HnswIndex h(8, Metric::L2);
+        FlatIndex f(8, Metric::L2);
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        std::size_t expected = 0;
+        for (std::uint64_t i = 0; i < 600; ++i) expected += c.expected(i);
+        const bool counts = h.count_where(c.filter) == expected && f.count_where(c.filter) == expected;
+        const bool removed = h.remove_where(c.filter) == expected && f.remove_where(c.filter) == expected;
+        bool exact = true;
+        for (std::uint64_t i = 0; i < 600; ++i) exact = exact && h.contains(i) == !c.expected(i) && f.contains(i) == !c.expected(i);
+        if (!(counts && removed && exact)) std::printf("    filter case '%s' failed\n", c.name);
+        CHECK(counts && removed && exact);
+    }
+}
+
+TEST(bulk, w05_unknown_fields) {
+    auto data = clustered(100, 8, 2, 804);
+    HnswIndex strict(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    FlatIndex fstrict(8, Metric::L2, Schema::strict(search_fields()));
+    HnswIndex dyn(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        strict.add(i, data[i], meta_for(i));
+        fstrict.add(i, data[i], meta_for(i));
+        dyn.add(i, data[i], meta_for(i));
+    }
+    const std::string sb = save_bytes(strict), fb = save_bytes(fstrict), db = save_bytes(dyn);
+    const Filter unknown = Filter::eq("no_such_field", 1);
+    CHECK_THROWS_AS(std::invalid_argument, strict.remove_where(unknown));
+    CHECK_THROWS_AS(std::invalid_argument, strict.set_metadata_where(unknown, Metadata().set("year", 1)));
+    CHECK_THROWS_AS(std::invalid_argument, (void)strict.count_where(unknown));
+    CHECK_THROWS_AS(std::invalid_argument, fstrict.remove_where(unknown));
+    CHECK(save_bytes(strict) == sb && save_bytes(fstrict) == fb);
+    CHECK(dyn.count_where(unknown) == 0 && dyn.remove_where(unknown) == 0 && save_bytes(dyn) == db);
+}
+
+TEST(bulk, w06_large_removal_keeps_the_graph_healthy) {
+    auto data = clustered(3000, 16, 10, 805);
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
+    // Make sure the entry point is among the removed.
+    const std::uint64_t entry_id = h.storage().ids().external(h.entry_point());
+    h.set_metadata(entry_id, Metadata().set("g", std::int64_t(0)));
+    const Filter some = Filter::lt("g", 3);  // about 30%
+    const std::size_t removed = h.remove_where(some);
+    CHECK(removed >= 900 && !h.contains(entry_id) && !h.storage().ids().is_deleted(h.entry_point()));
+    check_graph(h, 0.98);
+    FlatIndex f(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (h.contains(i)) f.add(i, data[i]);
+    CHECK(recall(h, f, Vectors(data.begin(), data.begin() + 100), 10, 64) > 0.95);
+    const std::size_t capacity = h.capacity();
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (!h.contains(i)) h.add(i, data[i]);  // removed IDs are usable again, in the freed slots
+    CHECK(h.size() == 3000 && h.capacity() == capacity);
+    check_graph(h, 0.98);
+    // With graph repair turned off: every match is still removed; links to them remain.
+    HnswParams no_repair;
+    no_repair.repair_on_remove = false;
+    HnswIndex r(16, Metric::L2, no_repair);
+    for (std::uint64_t i = 0; i < 1000; ++i) r.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
+    CHECK(r.remove_where(some) == 300 && r.size() == 700 && r.count_where(some) == 0);
+    check_graph(r, 0.95, 1.0);
+}
+
+TEST(bulk, w07_payload_counts_stay_exact) {
+    auto data = clustered(800, 8, 6, 806);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i], meta_for(i));
+    h.create_payload_index("category");
+    h.remove_where(Filter::has_tag("tags", "c"));
+    h.set_metadata_where(Filter::eq("category", "news"), Metadata().set("category", "sports"));
+    const MetadataStore& m = h.metadata();
+    bool exact = true;
+    for (const char* cat : kCategories) {
+        const auto id = m.find_string(cat);
+        const std::size_t counted = id ? m.value_count(*m.find_field("category"), *id).value_or(SIZE_MAX) : 0;  // empty would mean no index: fail
+        exact = exact && counted == h.count_where(Filter::eq("category", cat));
+    }
+    CHECK(exact && h.count_where(Filter::eq("category", "news")) == 0);
+}
+
+TEST(bulk, w08_set_metadata_where_changes_only_the_given_fields) {
+    auto data = clustered(500, 8, 4, 807);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const Filter tech = Filter::eq("category", "tech");
+    const Metadata change = Metadata().set("year", std::int64_t(1999)).unset("tags");
+    CHECK(h.set_metadata_where(tech, change) == 100 && f.set_metadata_where(tech, change) == 100);
+    // Compared field by field: in a change, unset("tags") is a "remove this field"
+    // marker, while a stored row simply has no such field.
+    bool exact = true;
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        const Metadata original = meta_for(i);
+        for (const Metadata& got : {*h.get_metadata(i), *f.get_metadata(i)}) {
+            for (const char* field : {"category", "price", "in_stock"}) {
+                const auto a = got.get(field), b = original.get(field);
+                exact = exact && a.has_value() == b.has_value() && (!a || *a == *b);
+            }
+            if (i % 5 == 2) {
+                exact = exact && got.get("year") && got.get("year")->i == 1999 && !got.get("tags");
+            } else {
+                const auto a = got.get("year"), b = original.get("year");
+                const auto ta = got.get("tags"), tb = original.get("tags");
+                exact = exact && a.has_value() == b.has_value() && (!a || *a == *b) && ta.has_value() == tb.has_value() && (!ta || *ta == *tb);
+            }
+        }
+    }
+    CHECK(exact && h.size() == 500 && f.size() == 500);
+}
+
+TEST(bulk, w09_invalid_changes_change_nothing) {
+    auto data = clustered(200, 8, 4, 808);
+    HnswIndex strict(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
+    FlatIndex f(8, Metric::L2, Schema::strict(search_fields()));
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        strict.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const std::string sb = save_bytes(strict), fb = save_bytes(f);
+    const std::vector<Metadata> bad = {Metadata().set("year", "not a number"), Metadata().set("unknown", 1),
+                                       Metadata().set("price", double(kNaN))};
+    for (const Filter& where : {Filter::eq("category", "tech"), Filter::eq("category", "no-such-category")}) {
+        for (const Metadata& b : bad) {
+            CHECK_THROWS_AS(std::invalid_argument, strict.set_metadata_where(where, b));  // even when nothing matches
+            CHECK_THROWS_AS(std::invalid_argument, f.set_metadata_where(where, b));
+        }
+    }
+    CHECK(save_bytes(strict) == sb && save_bytes(f) == fb);
+}
+
+TEST(bulk, w10_changing_the_filtered_field) {
+    auto data = clustered(500, 8, 4, 809);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i], meta_for(i));
+    const std::size_t sports = h.count_where(Filter::eq("category", "sports"));
+    CHECK(h.set_metadata_where(Filter::eq("category", "news"), Metadata().set("category", "sports")) == 100);
+    CHECK(h.count_where(Filter::eq("category", "news")) == 0);
+    CHECK(h.count_where(Filter::eq("category", "sports")) == sports + 100);
+    // A change that keeps rows matching is applied once: a counter goes up by exactly 1.
+    CHECK(h.set_metadata_where(Filter::eq("category", "sports"), Metadata().set("year", std::int64_t(3000))) == sports + 100);
+    CHECK(h.count_where(Filter::eq("year", 3000)) == h.count_where(Filter::eq("category", "sports") && Filter::exists("year")));
+}
+
+TEST(bulk, w11_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    // remove_where either fails before changing anything, or removes every match
+    // (a repair that runs out of memory is skipped, as by remove()).
+    // set_metadata_where either changes every match or nothing.
+    auto data = clustered(150, 8, 4, 810);
+    for (int index_kind = 0; index_kind < 2; ++index_kind) {
+        for (int op = 0; op < 2; ++op) {
+            HnswIndex h(8, Metric::L2);
+            FlatIndex f(8, Metric::L2);
+            for (std::uint64_t i = 0; i < 150; ++i) {
+                if (index_kind == 0) h.add(i, data[i], meta_for(i));
+                else f.add(i, data[i], meta_for(i));
+            }
+            auto bytes = [&] { return index_kind == 0 ? save_bytes(h) : save_bytes(f); };
+            const std::string before = bytes();
+            const Filter where = Filter::eq("category", "tech") || Filter::has_tag("tags", "c");
+            const Metadata change = Metadata().set("category", "brand-new-value").set("fresh_field", true);
+            bool clean = true, completed = false;
+            long failures = 0;
+            for (long n = 0; n < 20000 && !completed; ++n) {
+                alloc_hook::fail_after(n);
+                bool failed = false;
+                try {
+                    if (op == 0) (void)(index_kind == 0 ? h.remove_where(where) : f.remove_where(where));
+                    else (void)(index_kind == 0 ? h.set_metadata_where(where, change) : f.set_metadata_where(where, change));
+                } catch (const std::bad_alloc&) {
+                    failed = true;
+                }
+                const bool fired = alloc_hook::fired;
+                alloc_hook::disarm();
+                if (failed) {
+                    ++failures;
+                    clean = clean && bytes() == before;  // nothing changed
+                } else {
+                    completed = true;  // done, whether or not a repair ran out of memory
+                    (void)fired;
+                }
+            }
+            // Afterwards: removal leaves no match; the change gave every match the new category.
+            std::size_t matched = 0;  // tech, or tag c (IDs divisible by 11 have no tags)
+            for (std::uint64_t i = 0; i < 150; ++i) matched += (i % 5 == 2 || (i % 11 != 0 && i % 7 == 0));
+            const std::size_t outcome = op == 0 ? (index_kind == 0 ? h.count_where(where) : f.count_where(where))
+                                                : (index_kind == 0 ? h.count_where(Filter::eq("category", "brand-new-value"))
+                                                                   : f.count_where(Filter::eq("category", "brand-new-value")));
+            CHECK(clean && completed && failures > 0 && outcome == (op == 0 ? 0 : matched));
+            if (index_kind == 0) check_graph(h, 0.97);
+        }
+    }
+}
+
+TEST(bulk, w12_inside_a_search) {
+    auto data = clustered(100, 8, 2, 811);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    std::atomic<long> refused{0}, counted{0};
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        counted += long(h.count_where(Filter::eq("category", "tech")) == 20);  // reading is allowed
+        for (auto&& change : {std::function<void()>([&] { h.remove_where(Filter::eq("category", "tech")); }),
+                              std::function<void()>([&] { h.set_metadata_where(Filter::eq("category", "tech"), Metadata().set("year", 1)); }),
+                              std::function<void()>([&] { f.remove_where(Filter::eq("category", "tech")); })}) {
+            try {
+                change();
+            } catch (const std::logic_error&) {
+                ++refused;
+            }
+        }
+        return true;
+    };
+    (void)h.search(data[0], 5, 32, o);
+    CHECK(counted > 0 && refused == 3 * counted && h.size() == 100 && f.size() == 100);
+}
+
+TEST(bulk, w13_searches_see_all_of_a_change_or_none) {
+    auto data = clustered(2000, 8, 6, 812);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 2000; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 4)).set("flag", false));
+    std::atomic<bool> stop{false};
+    std::atomic<long> partial{0}, observations{0};
+    with_watchdog(120, "w13", [&] {
+        std::thread changer([&] {
+            for (std::int64_t g = 0; g < 3; ++g) {
+                h.set_metadata_where(Filter::eq("g", g), Metadata().set("flag", true));  // 500 rows at once
+                h.remove_where(Filter::eq("g", g));                                     // then remove them
+            }
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t) {
+            while (!stop) {
+                const std::size_t size = h.size(), flagged = h.count_where(Filter::eq("flag", true));
+                if (size % 500 != 0 || (flagged != 0 && flagged != 500)) ++partial;
+                ++observations;
+            }
+        });
+        changer.join();
+    });
+    CHECK(partial == 0 && observations > 0 && h.size() == 500);
+}
+
+TEST(bulk, w14_save_and_load_afterwards) {
+    auto data = clustered(600, 8, 4, 813);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (HnswIndex* x : {&h}) {
+        x->remove_where(Filter::eq("category", "food"));
+        x->set_metadata_where(Filter::has_tag("tags", "a"), Metadata().set("note", "odd"));
+    }
+    f.remove_where(Filter::eq("category", "food"));
+    f.set_metadata_where(Filter::has_tag("tags", "a"), Metadata().set("note", "odd"));
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    auto h2 = load_hnsw(hb);
+    auto f2 = load_flat(fb);
+    CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb);
+    CHECK(h2->count_where(Filter::eq("note", "odd")) == h.count_where(Filter::eq("note", "odd")));
+    CHECK(f2->count_where(Filter::eq("category", "food")) == 0);
+}
+
+TEST(bulk, w15_later_changes_work_normally) {
+    auto data = clustered(1200, 8, 6, 814);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i], meta_for(i));
+    h.remove_where(Filter::in("category", {"news", "tech"}));
+    h.set_metadata_where(Filter::eq("category", "music"), Metadata().set("category", "news"));
+    for (std::uint64_t i = 1000; i < 1200; ++i) h.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 1; i < 1000; i += 9)
+        if (h.contains(i)) h.update(i, data[(i * 3) % 1200]);
+    check_graph(h, 0.98);
+    h.compact();
+    check_graph(h, 0.99);
+    std::size_t new_music = 0;  // music was renamed, but the 200 vectors added afterwards bring new ones
+    for (std::uint64_t i = 1000; i < 1200; ++i) new_music += (i % 5 == 3);
+    CHECK(h.deleted_count() == 0 && h.count_where(Filter::eq("category", "music")) == new_music);
+}
+
+TEST(bulk, w16_flat_moves_metadata_with_vectors) {
+    // Flat removal moves the last vector into each freed slot: every survivor must
+    // keep its own vector and metadata.
+    auto data = random_vectors(700, 8, 815);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 700; ++i) f.add(i, data[i], meta_for(i));
+    CHECK(f.remove_where(Filter::has_tag("tags", "b") || Filter::eq("category", "music")) > 0);
+    bool intact = true;
+    for (std::uint64_t i = 0; i < 700; ++i) {
+        if (!f.contains(i)) continue;
+        const auto r = f.search(data[i], 1);
+        intact = intact && r[0].id == i && r[0].distance == 0.0f && *f.get_metadata(i) == meta_for(i);
+    }
+    CHECK(intact && f.capacity() == f.size());
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -8928,7 +9325,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

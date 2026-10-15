@@ -23,8 +23,8 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 1.1 | **Read back records:** `get_vector(id)`; list and page through all records, optionally filtered; `count(filter)` | new | A gap today: a stored vector can only be read through internal storage | 1 day |
-| 1.2 | **Bulk changes:** `remove_batch`, plus removing and updating metadata by filter (`remove_where`, `set_metadata_where`) | new | Delete or update by filter | 1–2 days |
+| 1.1 | **Read back records:** `get_vector(id)`; list and page through all records, optionally filtered; `count(filter)` (**done** as `count_where`) | new | A gap today: a stored vector can only be read through internal storage | 1 day |
+| 1.2 | **Bulk changes:** `remove_batch`, plus removing and updating metadata by filter (`remove_where`, `set_metadata_where`) | **done**, except `remove_batch` | Delete or update by filter | Half a day left |
 | 1.3 | **String and UUID IDs**, alongside 64-bit numbers | new | | 2 days |
 | 1.4 | **Multi-vector records:** several vectors per record, either named (for example title and body) or as chunks of one document, with results grouped per record | new | Named vectors; several vectors per document | 4–5 days |
 | 1.5 | **Expiry (TTL):** records removed automatically after a set time | new | | 1 day |
