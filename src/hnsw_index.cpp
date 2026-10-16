@@ -31,6 +31,7 @@ const HnswParams& validated(const HnswParams& p) {
     if (p.M < 2) throw std::invalid_argument("HnswParams::M must be at least 2");
     if (p.M > kMaxM) throw std::invalid_argument("HnswParams::M must be at most 2048");
     if (p.ef_construction < 1) throw std::invalid_argument("HnswParams::ef_construction must be >= 1");
+    validate(p.quantization);
     return p;
 }
 
@@ -40,14 +41,18 @@ constexpr int kMaxLevel = 255;
 }  // namespace
 
 HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params, Schema schema)
-    : metric_(metric),
+    : input_dim_(dim),
+      metric_(metric),
       distance_(get_distance(metric)),
       params_(validated(params)),
       level_factor_(1.0 / std::log(static_cast<double>(params.M))),
-      storage_(dim, params.M, metric == Metric::Cosine),  // cosine keeps the originals
+      // Cosine and truncation keep the vectors as given (for get_vector).
+      storage_(vecdb::indexed_dim(params.quantization, dim), params.M,
+               metric == Metric::Cosine || vecdb::indexed_dim(params.quantization, dim) < dim, dim),
       stride_(storage_.vectors().stride()),
-      scratch_(dim),
+      scratch_(vecdb::indexed_dim(params.quantization, dim)),
       rng_(params.seed),
+      codec_(make_codec(params.quantization.codec, vecdb::indexed_dim(params.quantization, dim), metric)),
       metadata_(std::move(schema)) {}
 
 int HnswIndex::random_level() {
@@ -58,7 +63,36 @@ int HnswIndex::random_level() {
     return static_cast<int>(std::min(level, static_cast<double>(kMaxLevel)));
 }
 
+namespace {
+/// The code table of the search running on this thread, if it searches with
+/// codes; distance_to() then compares codes instead of full vectors. Only
+/// search_impl installs it, so building the graph always uses full precision.
+struct CodeQuery {
+    const HnswIndex* index;
+    const VectorCodec* codec;
+    const std::vector<float>* table;
+    const std::uint8_t* codes;
+    std::size_t code_size;
+};
+const CodeQuery*& current_code_query() {
+    thread_local const CodeQuery* q = nullptr;
+    return q;
+}
+class CodeQueryScope {
+public:
+    explicit CodeQueryScope(const CodeQuery* q) : prev_(current_code_query()) { current_code_query() = q; }
+    ~CodeQueryScope() { current_code_query() = prev_; }
+    CodeQueryScope(const CodeQueryScope&) = delete;
+    CodeQueryScope& operator=(const CodeQueryScope&) = delete;
+
+private:
+    const CodeQuery* prev_;
+};
+}  // namespace
+
 float HnswIndex::distance_to(const float* query, NodeId node) const {
+    if (const CodeQuery* cq = current_code_query(); cq && cq->index == this)
+        return cq->codec->distance(*cq->table, cq->codes + std::size_t(node) * cq->code_size);
     return index_distance(distance_(query, storage_.vectors().get_padded(node).data(), stride_), metric_ == Metric::Cosine);
 }
 
@@ -224,7 +258,7 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 
 void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything (or drawing a random level).
-    scratch_.prepare(vector, metric_);
+    prepare_truncated(scratch_, vector, dim(), metric_);
     metadata_.validate(metadata);
     if (storage_.ids().find(id)) throw std::invalid_argument("external id already exists");
     reserve_one_more(free_slots_);  // so a failed insert can always hand its slot back
@@ -232,6 +266,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     // 2. Metadata first (into the slot the vector will take), then the vector and
     //    its empty neighbor lists, reusing a free slot if any. All-or-nothing.
     const NodeId slot = free_slots_.empty() ? static_cast<NodeId>(storage_.size()) : free_slots_.back();
+    reserve_code(slot);  // may throw: before any change
     const auto undo = metadata_.write(slot, metadata);
     const int level = random_level();
     NodeId node;
@@ -246,6 +281,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
         metadata_.undo_write(slot, undo);
         throw;
     }
+    encode_slot(node);
     ++live_;
 
     // 3. No live node yet: this one becomes the entry point.
@@ -268,6 +304,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
         free_slots_.push_back(node);  // cannot throw: capacity reserved in step 1
         throw;
     }
+    maybe_train();
 }
 
 void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads,
@@ -297,7 +334,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         std::unordered_set<std::uint64_t> seen;
         seen.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            scratch_.prepare(vec(i), metric_);
+            prepare_truncated(scratch_, vec(i), dim(), metric_);
             if (storage_.ids().find(ids[i]) || !seen.insert(ids[i]).second)
                 throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
         }
@@ -314,13 +351,14 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     free_slots_.reserve(free_slots_.size() + n);
 
     const std::size_t reuse = std::min(n, free_slots_.size());
+    if (n > reuse) reserve_code(static_cast<NodeId>(storage_.size() + (n - reuse) - 1));  // codes for every appended vector
     detail::OperationControl control(options, n);  // progress counts linked vectors; may throw Cancelled
     try {
         // 3. Vectors that reuse removed slots: one at a time, exactly as add() does,
         //    since a reused slot keeps its old links (other nodes route through it)
         //    until the moment it is reused.
         for (std::size_t i = 0; i < reuse; ++i) {
-            scratch_.prepare(vec(i), metric_);
+            prepare_truncated(scratch_, vec(i), dim(), metric_);
             const NodeId slot = free_slots_.back();
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
@@ -332,6 +370,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
                 throw;
             }
             free_slots_.pop_back();
+            encode_slot(slot);
             nodes.push_back(slot);
             levels.push_back(level);
             ++live_;
@@ -349,7 +388,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         //    yet, so the graph does not change. All storage grows here, so nothing
         //    reallocates while threads link in step 5.
         for (std::size_t i = reuse; i < n; ++i) {
-            scratch_.prepare(vec(i), metric_);
+            prepare_truncated(scratch_, vec(i), dim(), metric_);
             const auto slot = static_cast<NodeId>(storage_.size());
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
@@ -360,6 +399,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
                 undo.pop_back();
                 throw;
             }
+            encode_slot(slot);
             nodes.push_back(slot);
             levels.push_back(level);
             ++live_;
@@ -397,6 +437,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         roll_back_batch(ids, nodes, undo);
         throw;
     }
+    maybe_train();
 }
 
 void HnswIndex::link_concurrently(NodeId node, int level, LinkLocks& locks) {
@@ -597,7 +638,7 @@ bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 
 bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
     // 1. Validate everything before changing anything.
-    scratch_.prepare(vector, metric_);
+    prepare_truncated(scratch_, vector, dim(), metric_);
     if (metadata) metadata_.validate(*metadata);
     IdMap& ids = storage_.ids();
     const auto found = ids.find(id);
@@ -610,11 +651,13 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     const Metadata md = metadata ? *metadata : metadata_.read(old);
     const bool reuse = !free_slots_.empty();
     const NodeId slot = reuse ? free_slots_.back() : static_cast<NodeId>(storage_.size());
+    reserve_code(slot);  // may throw: before any change
     const auto undo = metadata_.write(slot, md);
     const int level = random_level();
     try {
         if (reuse) storage_.insert_into_unmapped(slot, id, scratch_.values(), level, vector);
         else storage_.insert_unmapped(id, scratch_.values(), level, vector);
+        encode_slot(slot);
     } catch (...) {
         metadata_.undo_write(slot, undo);
         throw;
@@ -677,6 +720,65 @@ std::optional<std::vector<SearchResult>> HnswIndex::search_by_id(std::uint64_t i
     std::erase_if(results, [&](const SearchResult& r) { return r.id == id; });
     if (results.size() > k) results.resize(k);
     return results;
+}
+
+void HnswIndex::reserve_code(NodeId slot) {
+    if (!codec_ || !codec_->trained()) return;
+    const std::size_t needed = (std::size_t(slot) + 1) * codec_->code_size();
+    if (codes_.size() < needed) codes_.resize(std::max(needed, codes_.size() + codes_.size() / 2));  // grow geometrically
+}
+
+void HnswIndex::encode_slot(NodeId slot) {
+    if (codec_ && codec_->trained()) codec_->encode(storage_.vectors().get(slot), codes_.data() + std::size_t(slot) * codec_->code_size());
+}
+
+void HnswIndex::maybe_train() noexcept {
+    const QuantizationParams& q = params_.quantization;
+    if (!codec_ || codec_->trained() || q.train_after == 0 || live_ < q.train_after) return;
+    try {
+        train_codec_unlocked();
+    } catch (...) {  // out of memory: stay untrained (searches use full precision) and try again on a later add
+    }
+}
+
+void HnswIndex::train_codec_unlocked() {
+    if (!codec_) throw std::logic_error("train_codec: this index has no codec (see HnswParams::quantization)");
+    if (live_ == 0) throw std::invalid_argument("train_codec: the index is empty");
+    // A deterministic sample of at most 100,000 live vectors, evenly spaced.
+    std::vector<NodeId> live;
+    live.reserve(live_);
+    for (NodeId n = 0; n < storage_.size(); ++n)
+        if (!storage_.ids().is_deleted(n)) live.push_back(n);
+    const std::size_t take = std::min<std::size_t>(live.size(), 100000), d = indexed_dim();
+    std::vector<float> sample(take * d);
+    for (std::size_t i = 0; i < take; ++i) {
+        const auto v = storage_.vectors().get(live[i * live.size() / take]);
+        std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
+    }
+    auto trained = make_codec(codec_->kind(), d, metric_);
+    trained->train(sample);
+    std::vector<std::uint8_t> codes(storage_.size() * trained->code_size());
+    for (NodeId n = 0; n < storage_.size(); ++n) trained->encode(storage_.vectors().get(n), codes.data() + std::size_t(n) * trained->code_size());
+    codec_ = std::move(trained);  // commit: moves only
+    codes_ = std::move(codes);
+}
+
+void HnswIndex::train_codec() {
+    const auto guard = lock_.write("train_codec");
+    train_codec_unlocked();
+}
+
+bool HnswIndex::codec_trained() const {
+    const auto guard = lock_.read();
+    return codec_ && codec_->trained();
+}
+
+std::optional<std::vector<std::uint8_t>> HnswIndex::get_code(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = storage_.ids().find(id);
+    if (!node || !codec_ || !codec_->trained()) return std::nullopt;
+    const std::uint8_t* c = codes_.data() + std::size_t(*node) * codec_->code_size();
+    return std::vector<std::uint8_t>(c, c + codec_->code_size());
 }
 
 std::optional<std::vector<float>> HnswIndex::get_vector(std::uint64_t id) const {
@@ -819,8 +921,8 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
                                             const SearchOptions& options) const {
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);  // records stopped_early last
-    PreparedVector q(dim());
-    q.prepare(query, metric_);  // validates even when the index is empty
+    PreparedVector q(indexed_dim());
+    prepare_truncated(q, query, dim(), metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
     SearchStats stats;
@@ -866,9 +968,22 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
     }
     stats.strategy = run;
 
+    // With a trained codec, distances come from codes while the search runs
+    // (code_query below), then the candidates are re-ranked at full precision.
+    const bool coded = codec_ && codec_->trained();
+    std::vector<float> table;
+    CodeQuery code_query{this, codec_.get(), &table, codes_.data(), coded ? codec_->code_size() : 0};
+    std::optional<CodeQueryScope> code_scope;
+    if (coded) {
+        codec_->prepare(std::span<const float>(query, indexed_dim()), table);
+        code_scope.emplace(&code_query);
+    }
+    const bool rerank = coded && params_.quantization.rerank;
+
     std::vector<Candidate> found;
     if (run == Strategy::ForceExact) {
-        found = exact_scan(query, k, eligible, stats);
+        const std::size_t wanted = rerank ? std::min(live_, k * params_.quantization.rerank_factor) : k;
+        found = exact_scan(query, wanted, eligible, stats);
     } else {
         stats.ef = ef;
         // Greedy descent from the entry point to level 1.
@@ -886,6 +1001,11 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
             found = search_level(query, {current, {distance_to(query, entry_), entry_}}, ef, 0,
                                  *visited, kEmpty, eligible, &stats);
         }
+    }
+    code_scope.reset();  // full precision from here on
+    if (rerank) {
+        for (Candidate& c : found) c.distance = distance_to(query, c.id);
+        std::sort(found.begin(), found.end());
     }
     if (found.size() > k) found.resize(k);
 
@@ -913,8 +1033,8 @@ std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const f
             ~Note() { if (s.stopped()) any = true; }
         } note{stop, any_stopped};
         const IndexLock::Hold inside(lock_);  // pool threads work under the caller's read
-        PreparedVector q(dim());
-        q.prepare(queries.subspan(i * dim(), dim()), metric_);
+        PreparedVector q(indexed_dim());
+        prepare_truncated(q, queries.subspan(i * dim(), dim()), dim(), metric_);
         SearchStats stats;
         results[i] = search_impl(q.data(), k, ef, eligible, options.strategy, params, stats);
     };
@@ -931,8 +1051,8 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
                                                   std::size_t max_results, const SearchOptions& options) const {
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);
-    PreparedVector q(dim());
-    q.prepare(query, metric_);
+    PreparedVector q(indexed_dim());
+    prepare_truncated(q, query, dim(), metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -1008,7 +1128,8 @@ CompactStats HnswIndex::compact(const OperationOptions& options) {
     const auto guard = lock_.write("compact");
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
-    HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());
+    HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());  // the same truncation
+    if (codec_ && codec_->trained()) fresh.codec_ = codec_->clone();  // keeps its training; encodes as it fills
     for (const std::string& field : metadata_.indexed_fields()) fresh.metadata_.index_field(field);
     fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
@@ -1021,6 +1142,8 @@ CompactStats HnswIndex::compact(const OperationOptions& options) {
 
     control.finish();  // before the commit: a throwing progress callback leaves this index untouched
     // Commit: moves only, nothing can throw.
+    codec_ = std::move(fresh.codec_);
+    codes_ = std::move(fresh.codes_);
     storage_ = std::move(fresh.storage_);
     metadata_ = std::move(fresh.metadata_);
     rng_ = fresh.rng_;
