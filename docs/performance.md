@@ -118,15 +118,14 @@ Removed HNSW slots are reused by later inserts, so memory stays bounded by the p
 
 ### Compression
 
-Measured recall@10 on synthetic clustered data (see the `sq8`, `binary`, `pq` and `codes_only` test groups). Code distances use SIMD kernels (AVX2, AVX-512, NEON). `bench_codecs [dimension]` times them against full-precision distances; a first run on a shared cloud machine (AVX-512, 768 dimensions, so indicative only) gave, in nanoseconds per distance:
+Measured recall@10 on synthetic clustered data (see the `sq8`, `binary`, `pq` and `codes_only` test groups). Code distances use SIMD kernels (AVX2, AVX-512, NEON). `bench_codecs [dimension]` times them against full-precision distances. Measured on a Windows desktop PC (AVX2, MinGW GCC, Release build), 768 dimensions, nanoseconds per distance:
 
 | Kernels | Float L2 | SQ8 L2 | SQ8 dot | Binary |
 |---|---|---|---|---|
-| Plain C++ | 630 | 618 | 588 | 4,866 |
-| AVX2 | 123 | 104 | 93 | 105 |
-| AVX-512 | 115 | 70 | 57 | 51 |
+| Plain C++ | 467 | 471 | 459 | 4,169 |
+| AVX2 | 149 | 93 | 79 | 99 |
 
-So with SIMD, SQ8 and binary distances are faster than full-precision ones (less memory to read); binary codes without SIMD were about 8 times slower. Measure on your own hardware before relying on these numbers; whole-search speed has not been measured yet.
+With AVX2, SQ8 distances were 1.6 to 1.9 times faster than full-precision ones and binary distances 1.5 times faster, while reading 4 and 32 times less memory; binary distances without SIMD were about 9 times slower than floats (the AVX2 kernel is 42 times faster). An earlier run on a shared cloud machine with AVX-512 gave a similar picture (floats 115 ns; SQ8 70 and 57 ns; binary 51 ns). Whole-search speed has not been measured yet.
 
 | Setting | Recall@10 | Memory for vectors |
 |---|---|---|

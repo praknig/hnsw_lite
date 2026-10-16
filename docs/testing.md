@@ -261,7 +261,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 
 **Found while building the SIMD kernels and PQ:**
 
-42. **Binary distances were about 8 times slower than full-precision ones.** The plain version tested bits one at a time (4.9 microseconds per 768-dimension distance, against 0.63 for floats), so binary codes saved memory at a real cost in speed. Found by the new `bench_codecs`; the SIMD kernels made them faster than float distances.
+42. **Binary distances were about 8 times slower than full-precision ones.** The plain version tested bits one at a time (4.2 microseconds per 768-dimension distance on a desktop PC, against 0.47 for floats), so binary codes saved memory at a real cost in speed. Found by the new `bench_codecs`; the SIMD kernels made them faster than float distances.
 43. **A damaged-file test would have stopped testing its rule.** Adding the number of PQ parts at the end of `CODC` made `c05`'s deliberately inconsistent file too short, so it would have been rejected for that instead of the rule it exists for; the test now appends the field.
 
 **Found while building IVF:**
