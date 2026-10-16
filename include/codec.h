@@ -32,6 +32,7 @@ namespace vecdb {
 enum class CodecKind : std::uint8_t {
     None = 0,  ///< full-precision floats (no codec)
     SQ8 = 1,   ///< 8-bit scalar quantization: one byte per dimension
+    Binary = 2,  ///< binary quantization: one bit per dimension
 };
 
 /// How an index stores its vectors in compact form (see the compression and
@@ -53,7 +54,22 @@ struct QuantizationParams {
     /// trained to work shortened. Vectors and queries are still given in full,
     /// and get_vector() returns them in full. 0, or the full dimension: off.
     std::size_t truncate_to = 0;
+    /// Keep each vector exactly as given (cosine indexes, which normalize, and
+    /// truncating indexes otherwise store a changed copy), so get_vector() returns
+    /// it exactly. false saves that memory: get_vector(), get() and scan() then
+    /// return the stored vector (normalized for cosine; the first truncate_to
+    /// values when truncating). With a codec it also drops the full-precision
+    /// vectors once the codec is trained, keeping only codes: re-ranking is then
+    /// off, vectors read back decoded, and that first training is final.
+    bool keep_full_vectors = true;
 };
+
+/// Whether an index keeps each vector as given besides the stored one: when it
+/// changes them (cosine normalizes, truncation shortens) and keep_full_vectors.
+inline std::size_t indexed_dim(const QuantizationParams& q, std::size_t dim);
+inline bool keeps_originals(const QuantizationParams& q, Metric metric, std::size_t dim) {
+    return q.keep_full_vectors && (metric == Metric::Cosine || indexed_dim(q, dim) < dim);
+}
 
 /// The number of dimensions an index stores and searches: `dim`, or the
 /// truncation if one is set. Throws std::invalid_argument if the truncation
@@ -63,9 +79,14 @@ inline std::size_t indexed_dim(const QuantizationParams& q, std::size_t dim) {
     return q.truncate_to == 0 ? dim : q.truncate_to;
 }
 
+/// a * b, or SIZE_MAX if that would overflow (k * rerank_factor must never wrap).
+inline std::size_t saturating_mul(std::size_t a, std::size_t b) {
+    return (b != 0 && a > SIZE_MAX / b) ? SIZE_MAX : a * b;
+}
+
 /// Throws std::invalid_argument for settings that cannot work.
 inline void validate(const QuantizationParams& q) {
-    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::SQ8)) throw std::invalid_argument("QuantizationParams: unknown codec");
+    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::Binary)) throw std::invalid_argument("QuantizationParams: unknown codec");
     if (q.rerank_factor < 1) throw std::invalid_argument("QuantizationParams::rerank_factor must be at least 1");
 }
 
@@ -166,6 +187,46 @@ public:
 
 private:
     std::vector<float> min_, step_;
+};
+
+/**
+ * @brief Binary quantization: one bit per dimension, 32 times smaller than floats.
+ *
+ * Training learns, for each dimension, a threshold (the mean of the sample)
+ * and a spread (the mean absolute distance from it). A bit records whether a
+ * value lies above its threshold, and decodes to threshold + spread or
+ * threshold - spread. Distances compare the full-precision query with that
+ * reconstruction (asymmetric, more accurate than comparing bits). Coarse:
+ * meant to be combined with re-ranking at full precision.
+ *
+ * Decoding then encoding reproduces a code exactly, even for a dimension that
+ * was constant in training (spread 0): a set bit then decodes to the smallest
+ * value above the threshold.
+ */
+class BinaryCodec final : public VectorCodec {
+public:
+    BinaryCodec(std::size_t dim, Metric metric) : VectorCodec(dim, metric) {}
+
+    CodecKind kind() const override { return CodecKind::Binary; }
+    std::unique_ptr<VectorCodec> clone() const override { return std::make_unique<BinaryCodec>(*this); }
+    /// The threshold of each dimension, then its spread.
+    std::vector<float> state() const override {
+        std::vector<float> s(threshold_);
+        s.insert(s.end(), spread_.begin(), spread_.end());
+        return s;
+    }
+    void restore(std::span<const float> state) override;
+    std::size_t code_size() const override { return (dim() + 7) / 8; }
+    bool trained() const override { return !threshold_.empty(); }
+    void train(std::span<const float> sample) override;
+    void encode(std::span<const float> v, std::uint8_t* code) const override;
+    void decode(const std::uint8_t* code, std::span<float> out) const override;
+    void prepare(std::span<const float> query, std::vector<float>& table) const override;
+    float distance(const std::vector<float>& table, const std::uint8_t* code) const override;
+
+private:
+    float high(std::size_t j) const;  // what a set bit decodes to
+    std::vector<float> threshold_, spread_;
 };
 
 /// Creates an untrained codec of the given kind (nullptr for CodecKind::None).

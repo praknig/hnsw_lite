@@ -116,6 +116,24 @@ Removed HNSW slots are reused by later inserts, so memory stays bounded by the p
 
 `search_batch` with `threads = 0` uses one thread per CPU core. For `FlatIndex`, batches are also faster per query on one thread, because each stored vector loaded into the cache is compared with 16 queries at once.
 
+### Compression
+
+Measured recall@10 (3,000 clustered vectors; see the `sq8`, `binary` and `codes_only` test groups). Speed has not been measured yet: the code distances still use plain C++ (SIMD kernels are planned), so measure before relying on any speed-up.
+
+| Setting | Recall@10 | Memory for vectors |
+|---|---|---|
+| Full precision (HNSW, `ef` 64) | 0.93 to 0.99 | 4 bytes per dimension |
+| SQ8, re-ranked (default) | the same as full precision | 5 bytes per dimension (codes and floats) |
+| SQ8, codes only (`keep_full_vectors = false`) | 0.972 to 0.976 (about 1.5% lower) | 1 byte per dimension |
+| Binary, re-ranked, Flat `rerank_factor` 32 or HNSW `ef` 400 | 0.96 to 0.99 | 4 bytes and 1 bit per dimension |
+| Binary, re-ranked with the defaults (`rerank_factor` 4, `ef` 64) | 0.63 to 0.79 | the same |
+| Binary, codes only | 0.34 to 0.39: not recommended | 1 bit per dimension |
+
+- **SQ8** is the safe choice: re-ranked, it matches full precision; with codes only it saves three quarters of the vector memory for about 1.5% recall.
+- **Binary codes** need a large re-ranking budget: a `rerank_factor` of 16 to 32 for Flat, a larger `ef` for HNSW. Keep the full vectors with them.
+- **Matryoshka truncation** (`truncate_to`) cuts the cost of every distance in proportion, for embeddings trained for it; add `keep_full_vectors = false` to save the memory too.
+- With codes only, training is final: train on a representative sample (`train_after`).
+
 ### Build type
 
 Always measure Release builds. Debug builds are many times slower.

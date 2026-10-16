@@ -54,7 +54,7 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 4.1 | **Quantization:** 8-bit (SQ8), binary and product quantization (PQ), each optional per index and with optional re-ranking at full precision. Needs file format version 3 (version 2 added cosine originals). **In progress:** SQ8 done (SIMD kernels to follow); see the [compression and index types plan](compression-and-index-types-plan.md) | roadmap + new | SQ8 (roadmap, decision D4: an option); binary quantization; PQ | 3–4 days for SQ8; 2–3 more for binary; 1 week more for PQ |
+| 4.1 | **Quantization:** 8-bit (SQ8), binary and product quantization (PQ), each optional per index and with optional re-ranking at full precision. Needs file format version 3 (version 2 added cosine originals). **In progress:** SQ8 and binary done (SIMD kernels to follow); see the [compression and index types plan](compression-and-index-types-plan.md) | roadmap + new | SQ8 (roadmap, decision D4: an option); binary quantization; PQ | 3–4 days for SQ8; 2–3 more for binary; 1 week more for PQ |
 | 4.2 | **Shorter vectors (Matryoshka truncation):** keep only the first N dimensions of embeddings trained for it | **done** ([plan](compression-and-index-types-plan.md)) | | 1 day |
 | 4.3 | **An IVF index:** a second index type, for very large datasets and fast builds. **Planned** ([plan](compression-and-index-types-plan.md)) | new | | 1 week |
 | 4.4 | **A disk-based index (DiskANN-style):** indexes larger than memory. **Planned** ([plan](compression-and-index-types-plan.md)), read-only at first | new | | 4–6 weeks (re-estimated) |
@@ -115,12 +115,12 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 ## Suggested order
 
-| Stage | Features | Why | Total effort |
-|---|---|---|---|
-| **A. Complete the basics** | 1.1, 1.2, 2.1, 2.5, 7.1, 7.2, 10.1 | Small gaps any user notices, the update-churn finding, and fuzzing the code most exposed to untrusted input | About 1.5 weeks |
-| **B. Easier to adopt** | 9.1, 9.3, 5.4 | Python and a command-line tool open the library to far more people | About 1 week |
-| **C. Smaller indexes** | 4.1 (SQ8 first), 5.2 | Memory is usually the first limit users reach | About 1.5 weeks |
-| **D. Better results for text** | 1.4, 2.4, 3.1 | What retrieval-augmented generation (RAG) and search applications need most | About 3 weeks |
-| **E. Scale and speed** | 3.3, 3.4, 6.1, 8.1–8.4, 4.3 | Worth doing once there is real usage to measure | Several weeks |
+| Stage | Features | Why | Total effort | Progress |
+|---|---|---|---|---|
+| **A. Complete the basics** | 1.1, 1.2, 2.1, 2.5, 7.1, 7.2, 10.1 | Small gaps any user notices, the update-churn finding, and fuzzing the code most exposed to untrusted input | About 1.5 weeks | 1.1, 1.2, 2.1, 2.5 done; 7.1, 7.2, 10.1 to do |
+| **B. Easier to adopt** | 9.1, 9.3, 5.4 | Python and a command-line tool open the library to far more people | About 1 week | Not started |
+| **C. Smaller indexes** | 4.1 (SQ8 first), 5.2 | Memory is usually the first limit users reach | About 1.5 weeks | 4.1: SQ8 and binary done (PQ to do); 4.2 done too; 5.2 to do |
+| **D. Better results for text** | 1.4, 2.4, 3.1 | What retrieval-augmented generation (RAG) and search applications need most | About 3 weeks | Not started |
+| **E. Scale and speed** | 3.3, 3.4, 6.1, 8.1–8.4, 4.3 | Worth doing once there is real usage to measure | Several weeks | Not started (4.3 planned) |
 
-The remaining features (1.3, 1.5, 2.2, 2.3, 2.6, 2.7, 3.2, 4.2, 4.4, 5.1, 5.3, 6.2, 7.3, 9.2, 9.4, 10.2, 10.3) fit in wherever a user asks for them.
+The remaining features (1.3, 1.5, 2.2, 2.3, 2.6, 2.7, 3.2, 4.4, 5.1, 5.3, 6.2, 7.3, 9.2, 9.4, 10.2, 10.3) fit in wherever a user asks for them.

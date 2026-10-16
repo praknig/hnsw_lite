@@ -111,6 +111,10 @@ public:
 
     const VectorStore& vectors() const { return vectors_; }
 
+    /// Keeps only slots, no vector values (see VectorStore::drop_values): for
+    /// indexes that keep only codes. Cannot fail.
+    void drop_vector_values() noexcept { vectors_.drop_values(); }
+
     /// The vectors as given, before normalization; null unless kept (cosine).
     const VectorStore* originals() const { return originals_ ? &*originals_ : nullptr; }
 
@@ -125,8 +129,8 @@ public:
 private:
     void check_insert(std::span<const float> v, int level, std::span<const float> original) const {
         if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
-        if (!original.empty() && original.size() != (originals_ ? originals_->dim() : vectors_.dim()))
-            throw std::invalid_argument("original has wrong dimension");
+        if (!original.empty() && originals_ && original.size() != originals_->dim())
+            throw std::invalid_argument("original has wrong dimension");  // without originals, it is not stored
         if (original.empty() && originals_ && originals_->dim() != vectors_.dim())
             throw std::logic_error("a truncating index needs the vector as given");
         if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");

@@ -22,7 +22,10 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Deadlines, cancellation and progress](#deadlines-cancellation-and-progress)
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
+- [Binary quantization](#binary-quantization)
 - [Shorter vectors (Matryoshka truncation)](#shorter-vectors-matryoshka-truncation)
+- [Keeping only the stored vectors](#keeping-only-the-stored-vectors)
+- [Keeping only codes (SQ8 without full precision)](#keeping-only-codes-sq8-without-full-precision)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
 - [Errors and guarantees](#errors-and-guarantees)
@@ -305,6 +308,8 @@ for (Page page = index.scan(o); ; page = index.scan(o)) {
 - **Each page costs one pass over the index**, which suits exports and administration; for finding similar vectors, use `search`.
 - All three are reads: they run alongside searches and are allowed inside them.
 
+**Ties.** Results with exactly equal distances (for example, copies of the same vector) come in an unspecified order, which may differ between HNSW and Flat and change after `compact()`. When a tie straddles the k-th place, any of the tied vectors is a correct answer.
+
 ## Searching by stored ID
 
 ```cpp
@@ -379,6 +384,21 @@ flat.train_codec();                      // or train now, on the stored vectors
 - Range searches use full precision. Batch, filtered and exact searches use codes. Saved files keep the codec, its training and the codes (file format version 3).
 - **Setting `HnswParams` positionally** (`HnswParams{16, 200, 42}`) leaves out `quantization`, and compilers warn about that with `-Wextra`. Set fields by name instead, as above.
 
+## Binary quantization
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::Binary;  // one bit per dimension
+p.quantization.rerank_factor = 32;         // binary needs many candidates re-ranked
+HnswIndex index(768, Metric::Cosine, p);
+auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: use a larger ef
+```
+
+- **One bit per dimension**, 32 times smaller than floats. Each dimension gets a threshold (its mean in the training sample); a bit records whether a value lies above it. Distances compare the full-precision query with each code's reconstruction (threshold plus or minus the dimension's average spread).
+- **Binary codes are coarse, so re-ranking at full precision is essential, with many candidates.** Measured recall@10 on 3,000 clustered vectors: Flat with `rerank_factor` 4 (the default, suited to SQ8) reached 0.63 to 0.73, with 16 about 0.86, and with 32 0.96 to 0.99; HNSW re-ranks its whole beam, and reached 0.74 to 0.79 at `ef` 64 and 0.98 to 0.99 at `ef` 400.
+- **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
+- Training, saving, truncation and everything else work as for SQ8.
+
 ## Shorter vectors (Matryoshka truncation)
 
 ```cpp
@@ -393,8 +413,45 @@ auto v = index.get_vector(id);           // all 768 values, exactly as given
 - **Only for embeddings trained for it**, such as OpenAI's `text-embedding-3` models or Nomic Embed: these put the most important information first, so a prefix of the vector is still a good, slightly less precise embedding. With other embeddings, truncation damages results.
 - The index stores and searches only the first `truncate_to` values (re-normalized for cosine), so each distance costs proportionally less and building is faster. `dim()` stays the full dimension; `indexed_dim()` reports the truncated one.
 - Inputs are checked in full: a vector of the wrong size, or with NaN or infinity anywhere (even in the part that is cut off), is rejected.
-- **Memory:** the full vectors are kept too, so that `get_vector` returns them, so for now truncation uses more memory, not less.
+- **Memory:** by default the full vectors are kept too, so that `get_vector` returns them, which uses more memory, not less. Set `keep_full_vectors = false` (below) to keep only the truncated vectors: about a third of the memory for 768 to 256.
 - It combines with SQ8 (the codes then cover the first `truncate_to` dimensions), and is saved with the index (file format version 3). `0`, or the full dimension, means no truncation.
+
+## Keeping only the stored vectors
+
+```cpp
+HnswParams p;
+p.quantization.truncate_to = 256;
+p.quantization.keep_full_vectors = false;  // keep only the 256 stored values
+HnswIndex index(768, Metric::Cosine, p);
+index.get_vector(id);                      // 256 values (normalized, for cosine)
+```
+
+Cosine indexes (which normalize vectors) and truncating indexes keep a second copy of each vector exactly as given, so that `get_vector` can return it. `keep_full_vectors = false` drops that copy:
+
+- **Memory:** a cosine index stores about half as much; a truncating index only the truncated vectors.
+- **`get_vector`, `get` and `scan` return the stored vector:** normalized for cosine, and the first `truncate_to` values when truncating. Search results are identical, since the stored vectors are the same.
+- It changes nothing for L2 and inner-product indexes without truncation or a codec, which keep no second copy. With SQ8 it goes further: see the next section.
+- It is saved with the index.
+
+## Keeping only codes (SQ8 without full precision)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::SQ8;
+p.quantization.train_after = 10000;        // train on a representative sample: this training is final
+p.quantization.keep_full_vectors = false;  // after training, keep only the codes
+HnswIndex index(768, Metric::Cosine, p);
+// ... add vectors ...
+index.has_vector_values();                 // false once trained: floats dropped
+```
+
+With a codec and `keep_full_vectors = false`, an index keeps full-precision vectors only until its codec is trained; then it drops them and keeps only the codes, one byte per dimension:
+
+- **Memory and files:** about a quarter of full precision for the vectors (in tests a saved index was 3.7 times smaller).
+- **Results:** searches compare codes and cannot re-rank (there is nothing left to re-rank with). In tests, recall@10 was about 1.5% below full precision (0.972 to 0.976 against 0.984 to 0.990).
+- **Reading back:** `get_vector`, `get` and `scan` return decoded vectors, within half a step of the stored ones; values outside the trained range come back clamped to it.
+- **Training is final.** `train_codec()` is refused once only codes are kept: training again could only use decoded vectors and lose more precision (a sample of a few vectors would collapse every code for good). So train on a representative sample: automatically at `train_after` vectors, or with `train_codec()` while the floats are still there. Vectors added later with values outside the trained range are clamped.
+- Everything else works from codes: adds, removals, updates, batches, `compact`, and every kind of search. `has_vector_values()` tells whether the floats are still kept.
 
 ## Saving and loading
 

@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 633 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 665 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -20,7 +20,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
 - **Bulk changes by filter:** `remove_where`, `set_metadata_where` and `count_where`, like SQL's DELETE and UPDATE with a WHERE clause.
 - **Reading records back:** `get_vector` (exactly as given), `get`, and `scan` to page through records by ID, optionally filtered.
-- **Compression (SQ8) and Matryoshka truncation:** one byte per dimension, searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
+- **Compression (SQ8, binary) and Matryoshka truncation:** one byte (or one bit) per dimension, searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it; optionally keep only the codes (about a quarter of the memory) (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
 - **Search by stored ID, deadlines and cancellation:** "more like record 42"; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
 - **Save and load:** one call writes the whole index to a file and one reads it back, checked against damage and portable between platforms.
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
@@ -166,15 +166,16 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 633 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 665 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
-| [Hardening and performance plan](docs/hardening-and-performance-plan.md) | The next phases of work: open edge cases, planned optimizations, and their order |
+| [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
+| [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
 | [Feature catalog](docs/feature-catalog.md) | Every feature that could come next, with overlaps merged, efforts, and a suggested order |
 | [Compression and index types plan](docs/compression-and-index-types-plan.md) | Quantization (SQ8, binary, PQ), Matryoshka truncation, an IVF index and a disk-based index: phases, decisions and testing |
 
 ## Project status
 
-Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, saving and loading, thread-safe indexes and parallel building (`add_batch`). Next: see the [roadmap](docs/project-notes.md#roadmap). See the [roadmap](docs/project-notes.md#roadmap).
+Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, saving and loading (file format version 3), thread-safe indexes and parallel building (`add_batch`), bulk changes by filter, reading records back, search by stored ID, deadlines and cancellation, and compression (SQ8 and binary codes, Matryoshka truncation, keeping only codes). Next: product quantization, an IVF index and a disk-based index (see the [compression and index types plan](docs/compression-and-index-types-plan.md)), and the rest of the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

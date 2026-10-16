@@ -90,6 +90,12 @@ public:
     /// Codec functions: as on HnswIndex (train now, whether trained, a stored code).
     void train_codec();
     bool codec_trained() const;
+    /// Whether full-precision vector values are stored: false once an index that
+    /// keeps only codes (a codec, keep_full_vectors off) has been trained.
+    bool has_vector_values() const {
+        const auto guard = lock_.read();
+        return vectors_.has_values();
+    }
     const VectorCodec* codec() const { return codec_.get(); }  // for inspection, like HnswIndex::codec()
     std::optional<std::vector<std::uint8_t>> get_code(std::uint64_t id) const;
     const QuantizationParams& quantization() const { return quant_; }
@@ -250,6 +256,11 @@ public:
     const MetadataStore& metadata() const { return metadata_; }
 
 private:
+    /// A stored vector as input again (for compact and search_by_id): the vector as
+    /// given if kept, otherwise the stored one, padded with zeros to dim() when
+    /// truncating (truncation ignores those values).
+    std::vector<float> as_input(NodeId slot) const;
+
     /// update() and upsert(): `metadata` null keeps the old metadata.
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
@@ -257,7 +268,13 @@ private:
     void add_vector(std::span<const float> original);  // scratch_ (prepared) and its original; all-or-nothing
     void maybe_train() noexcept;
     void train_codec_unlocked();
-    std::span<const float> original(NodeId slot) const { return originals_ ? originals_->get(slot) : vectors_.get(slot); }
+    /// Whether only codes are kept (see HnswIndex::codes_only).
+    bool codes_only() const { return !vectors_.has_values(); }
+    /// The stored vector of row `slot` (indexed_dim() values), as a copy: the
+    /// floats, or decoded from its code.
+    std::vector<float> stored_copy(NodeId slot) const;
+    /// A vector to read back: the vector as given if kept, otherwise the stored one.
+    std::vector<float> read_back(NodeId slot) const;
     std::vector<NodeId> matching_slots(const Filter& filter) const;  // caller holds a lock
     Record record(NodeId slot, bool with_vector, bool with_metadata) const;
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,

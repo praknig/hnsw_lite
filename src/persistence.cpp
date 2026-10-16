@@ -3,12 +3,14 @@
  * @brief Saving and loading indexes (file format version 1; see serialize.h).
  *
  * Sections, in order:
- *   Flat: CONF (dimension, metric; version 3: truncation), NODE (each vector with its user ID, and for
+ *   Flat: CONF (dimension, metric; version 3: truncation, keep-full-vectors and
+ *         vector-values flags), NODE (each vector with its user ID, and for
  *         cosine in version 2 the vector as given), META, END
  *   (Version 3 adds CODC after NODE for both kinds: quantization settings, and
  *   when trained the codec state and every slot's code.)
  *   HNSW: CONF (dimension, metric, HNSW settings, planner settings; version 3:
- *         truncation),
+ *         truncation, keep-full-vectors and vector-values flags; with codes only,
+ *         NODE records hold no vector values),
  *         NODE (each slot: user ID, removed flag, level, vector, for cosine in
  *         version 2 the vector as given, links per level),
  *         STAT (entry point, top level, free slots in order, random generator state as one u64),
@@ -68,6 +70,13 @@ void write_codec(Writer& w, const QuantizationParams& q, const VectorCodec* code
     w.bytes(codes.data(), slots * codec->code_size());
 }
 
+/// A 0 or 1 byte; anything else is damage.
+bool read_flag(Reader& r, const char* what) {
+    const auto b = r.get<std::uint8_t>();
+    if (b > 1) throw FormatError(std::string("invalid ") + what);
+    return b == 1;
+}
+
 /// Reads what write_codec wrote; every value is checked.
 struct LoadedCodec {
     QuantizationParams params;
@@ -77,7 +86,7 @@ struct LoadedCodec {
 LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t slots) {
     LoadedCodec c;
     const auto kind = r.get<std::uint8_t>();
-    if (kind > static_cast<std::uint8_t>(CodecKind::SQ8)) throw FormatError("unknown codec");
+    if (kind > static_cast<std::uint8_t>(CodecKind::Binary)) throw FormatError("unknown codec");
     c.params.codec = static_cast<CodecKind>(kind);
     c.params.train_after = static_cast<std::size_t>(r.get<std::uint64_t>());
     const auto rerank = r.get<std::uint8_t>();
@@ -327,12 +336,14 @@ void FlatIndex::save(std::ostream& out, const OperationOptions& options) const {
         w.put<std::uint64_t>(dim());
         w.put<std::uint32_t>(static_cast<std::uint32_t>(metric_));
         w.put<std::uint64_t>(quant_.truncate_to);  // version 3: Matryoshka truncation
+        w.put<std::uint8_t>(quant_.keep_full_vectors ? 1 : 0);
+        w.put<std::uint8_t>(codes_only() ? 0 : 1);  // vector values follow in NODE (0: codes only)
     });
     persist::write_section(out, kNode, [&](Writer& w) {
         w.put<std::uint64_t>(vectors_.size());
         for (NodeId n = 0; n < vectors_.size(); ++n) {
             w.put<std::uint64_t>(ids_.external(n));
-            w.put_floats(vectors_.get(n).data(), indexed_dim());
+            if (!codes_only()) w.put_floats(vectors_.get(n).data(), indexed_dim());
             if (originals_) w.put_floats(originals_->get(n).data(), dim());  // version 2: cosine originals (3: and truncation)
             if (!w.counting()) control.advance();
         }
@@ -357,21 +368,29 @@ std::unique_ptr<FlatIndex> FlatIndex::load(std::istream& in) {
         const std::size_t dim = read_dim(r);
         const Metric metric = read_metric(r);
         QuantizationParams truncation;
-        if (r.version() >= 3) truncation.truncate_to = static_cast<std::size_t>(r.get<std::uint64_t>());
+        bool values = true;  // versions 1 and 2 always hold vector values
+        if (r.version() >= 3) {
+            truncation.truncate_to = static_cast<std::size_t>(r.get<std::uint64_t>());
+            truncation.keep_full_vectors = read_flag(r, "keep-full-vectors flag");
+            values = read_flag(r, "vector-values flag");
+        }
         r.end_section();
         auto index = std::make_unique<FlatIndex>(dim, metric, Schema::dynamic(), truncation);  // checks the truncation
         const std::size_t stored = index->indexed_dim();
+        if (!values) index->vectors_.drop_values();  // codes only: checked against CODC below
 
         // Vectors are stored as saved (already normalized for cosine), bypassing add().
         r.begin_section(kNode, "NODE");
         // Version 2 cosine files hold each original after the stored vector; for
         // version 1 files the stored (normalized) vector stands in for it.
-        const bool has_original = (r.version() >= 2 && metric == Metric::Cosine) || stored < dim;
-        const auto n = r.get_count(8 + 4 * std::uint64_t(stored) + (has_original ? 4 * std::uint64_t(dim) : 0), "vectors");
+        // Version 2 and later hold each vector as given exactly when the index keeps
+        // them (version 1 never did: the stored vector stands in, for cosine).
+        const bool has_original = r.version() >= 2 && index->originals_.has_value();
+        const auto n = r.get_count(8 + (values ? 4 * std::uint64_t(stored) : 0) + (has_original ? 4 * std::uint64_t(dim) : 0), "vectors");
         std::vector<float> v(stored), original(dim);
         for (std::uint64_t i = 0; i < n; ++i) {
             const auto id = r.get<std::uint64_t>();
-            r.get_floats(v.data(), stored);
+            if (values) r.get_floats(v.data(), stored);  // codes only: v stays zero, and is not stored
             if (has_original) r.get_floats(original.data(), dim);
             index->ids_.add(id);  // a repeated user ID throws (and becomes a FormatError)
             index->vectors_.add(v);
@@ -383,12 +402,16 @@ std::unique_ptr<FlatIndex> FlatIndex::load(std::istream& in) {
         if (r.version() >= 3) {
             r.begin_section(kCodec, "CODC");
             LoadedCodec c = read_codec(r, stored, metric, index->vectors_.size());
-            c.params.truncate_to = index->quant_.truncate_to;  // set by CONF
+            c.params.truncate_to = index->quant_.truncate_to;  // set by CONF, like the next one
+            c.params.keep_full_vectors = index->quant_.keep_full_vectors;
             r.end_section();
             index->quant_ = c.params;
             index->codec_ = std::move(c.codec);
             index->codes_ = std::move(c.codes);
         }
+        // Codes only: there must be codes, and only when full vectors are not kept.
+        if (!values && (!index->codec_ || !index->codec_->trained() || index->quant_.keep_full_vectors))
+            throw FormatError("an index without vector values needs a trained codec and keep_full_vectors off");
         r.begin_section(kMeta, "META");
         index->metadata_ = MetadataStore::load(r, index->vectors_.size(), [](NodeId) { return true; });
         r.end_section();
@@ -424,6 +447,8 @@ void HnswIndex::save(std::ostream& out, const OperationOptions& options) const {
         w.put<std::uint64_t>(planner_.sample_size);
         w.put<double>(planner_.max_ef_multiplier);
         w.put<std::uint64_t>(params_.quantization.truncate_to);  // version 3: Matryoshka truncation
+        w.put<std::uint8_t>(params_.quantization.keep_full_vectors ? 1 : 0);
+        w.put<std::uint8_t>(codes_only() ? 0 : 1);  // vector values follow in NODE (0: codes only)
     });
     persist::write_section(out, kNode, [&](Writer& w) {
         w.put<std::uint64_t>(storage_.size());
@@ -432,7 +457,7 @@ void HnswIndex::save(std::ostream& out, const OperationOptions& options) const {
             w.put<std::uint64_t>(ids.external(n));
             w.put<std::uint8_t>(ids.is_deleted(n) ? 1 : 0);
             w.put<std::uint8_t>(static_cast<std::uint8_t>(level));
-            w.put_floats(storage_.vectors().get(n).data(), indexed_dim());
+            if (!codes_only()) w.put_floats(storage_.vectors().get(n).data(), indexed_dim());
             if (storage_.originals()) w.put_floats(storage_.originals()->get(n).data(), dim());  // version 2: cosine originals (3: and truncation)
             if (!w.counting()) control.advance();
             for (int l = 0; l <= level; ++l) {
@@ -483,17 +508,23 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
         planner.max_exact_fraction = r.get<double>();
         planner.sample_size = static_cast<std::size_t>(r.get<std::uint64_t>());
         planner.max_ef_multiplier = r.get<double>();
-        if (r.version() >= 3) params.quantization.truncate_to = static_cast<std::size_t>(r.get<std::uint64_t>());
+        bool values = true;  // versions 1 and 2 always hold vector values
+        if (r.version() >= 3) {
+            params.quantization.truncate_to = static_cast<std::size_t>(r.get<std::uint64_t>());
+            params.quantization.keep_full_vectors = read_flag(r, "keep-full-vectors flag");
+            values = read_flag(r, "vector-values flag");
+        }
         r.end_section();
         validate(planner);
         auto index = std::make_unique<HnswIndex>(dim, metric, params);  // checks the settings, including the truncation
         const std::size_t stored = index->indexed_dim();
+        if (!values) index->storage_.drop_vector_values();  // codes only: checked against CODC below
         index->planner_ = planner;
 
         // Every slot, live or removed, with its level, vector and links.
         r.begin_section(kNode, "NODE");
-        const bool has_original = (r.version() >= 2 && metric == Metric::Cosine) || stored < dim;  // see FlatIndex::load
-        const auto n = r.get_count(8 + 1 + 1 + 4 * std::uint64_t(stored) + (has_original ? 4 * std::uint64_t(dim) : 0) + 4, "vectors");
+        const bool has_original = r.version() >= 2 && index->storage_.originals() != nullptr;  // see FlatIndex::load
+        const auto n = r.get_count(8 + 1 + 1 + (values ? 4 * std::uint64_t(stored) : 0) + (has_original ? 4 * std::uint64_t(dim) : 0) + 4, "vectors");
         if (n >= kEmpty) throw FormatError("too many vectors");  // GCOVR_EXCL_BR_LINE: needs a file over 100 GB
         const std::size_t M0 = 2 * params.M;
         std::vector<float> v(stored), original(dim);
@@ -506,7 +537,7 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
             const auto is_removed = r.get<std::uint8_t>();
             if (is_removed > 1) throw FormatError("invalid removed flag");
             const int level = r.get<std::uint8_t>();
-            r.get_floats(v.data(), stored);
+            if (values) r.get_floats(v.data(), stored);  // codes only: v stays zero, and is not stored
             if (has_original) r.get_floats(original.data(), dim);
             const std::span<const float> as_given = has_original ? std::span<const float>(original) : std::span<const float>(v);
             if (is_removed) {
@@ -537,12 +568,16 @@ std::unique_ptr<HnswIndex> HnswIndex::load(std::istream& in) {
         if (r.version() >= 3) {
             r.begin_section(kCodec, "CODC");
             LoadedCodec c = read_codec(r, stored, metric, static_cast<std::size_t>(n));
-            c.params.truncate_to = index->params_.quantization.truncate_to;  // set by CONF
+            c.params.truncate_to = index->params_.quantization.truncate_to;  // set by CONF, like the next one
+            c.params.keep_full_vectors = index->params_.quantization.keep_full_vectors;
             r.end_section();
             index->params_.quantization = c.params;
             index->codec_ = std::move(c.codec);
             index->codes_ = std::move(c.codes);
         }
+        // Codes only: there must be codes, and only when full vectors are not kept.
+        if (!values && (!index->codec_ || !index->codec_->trained() || index->params_.quantization.keep_full_vectors))
+            throw FormatError("an index without vector values needs a trained codec and keep_full_vectors off");
 
         r.begin_section(kStat, "STAT");
         const auto entry = r.get<std::uint32_t>();

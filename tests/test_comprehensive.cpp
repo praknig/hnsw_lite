@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -33,6 +33,7 @@
  *  - The exit code is 0 only if every selected test passed.
  */
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -6702,6 +6703,23 @@ std::unique_ptr<FlatIndex> golden_flat() {
 
 std::string golden_path(const char* name) { return std::string(HNSW_TEST_DATA_DIR) + "/" + name; }
 
+/// The index stored in tests/data/golden_hnsw_binary_v3.bin: binary codes only,
+/// from whole numbers (thresholds are means: exact here), identical on every CPU.
+std::unique_ptr<HnswIndex> golden_binary() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 11;
+    p.quantization.codec = CodecKind::Binary;
+    p.quantization.train_after = 64;
+    p.quantization.keep_full_vectors = false;
+    auto h = std::make_unique<HnswIndex>(16, Metric::L2, p);
+    std::mt19937 rng(2029);
+    for (std::uint64_t i = 0; i < 200; ++i) h->add(i, integer_vector(rng, 16));
+    for (std::uint64_t i = 0; i < 200; i += 17) h->remove(i);
+    return h;
+}
+
 /// The index stored in tests/data/golden_hnsw_sq8_v3.bin: SQ8-trained, from whole
 /// numbers, so its codes are identical on every CPU.
 std::unique_ptr<HnswIndex> golden_sq8() {
@@ -7123,6 +7141,7 @@ TEST(persistence, p41_identical_bytes_on_every_platform) {
     CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v3.bin")));
     // SQ8 codes are part of the file: every CPU's encoding must match byte for byte.
     CHECK(save_bytes(*golden_sq8()) == read_file(golden_path("golden_hnsw_sq8_v3.bin")));
+    CHECK(save_bytes(*golden_binary()) == read_file(golden_path("golden_hnsw_binary_v3.bin")));
     auto loaded = HnswIndex::load(golden_path("golden_hnsw_sq8_v3.bin"));
     CHECK(loaded->codec_trained() && *loaded->get_code(5) == *golden_sq8()->get_code(5));
 }
@@ -9042,7 +9061,7 @@ std::string as_version_1(const std::string& v2, bool hnsw, std::size_t dim) {
     poke<std::uint32_t>(f.header, 8, 1);
     std::erase_if(f.sections, [](const auto& sec) { return sec.first == persist::tag("CODC"); });  // version 3 only
     std::string& conf = f.payload("CONF");
-    conf.resize(conf.size() - 8);  // version 3 ends CONF with the truncation setting
+    conf.resize(conf.size() - 10);  // version 3 ends CONF with the truncation setting and two flags
     std::string& node = f.payload("NODE");
     std::string out = node.substr(0, 8);
     const auto n = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(&node[0]));
@@ -10319,14 +10338,22 @@ HnswParams hnsw_sq8(std::size_t train_after = 1000, bool rerank = true) {
     return p;
 }
 
-/// Every live vector's code equals a fresh encoding of its stored vector.
+/// Every live vector's code equals a fresh encoding of its stored vector (with
+/// codes only, of its decoded vector: decoding then encoding must be lossless).
 bool codes_match(const HnswIndex& h) {
     const VectorCodec* c = h.codec();
     if (!c || !c->trained()) return false;
     std::vector<std::uint8_t> expected(c->code_size());
+    const bool codes_only = !h.storage().vectors().has_values();
+    std::vector<float> decoded(c->dim());
     for (NodeId n = 0; n < h.storage().size(); ++n) {
         if (h.storage().ids().is_deleted(n)) continue;
-        c->encode(h.storage().vectors().get(n), expected.data());
+        if (codes_only) {
+            c->decode(h.get_code(h.storage().ids().external(n))->data(), decoded);
+            c->encode(decoded, expected.data());
+        } else {
+            c->encode(h.storage().vectors().get(n), expected.data());
+        }
         if (*h.get_code(h.storage().ids().external(n)) != expected) return false;
     }
     return true;
@@ -10846,11 +10873,12 @@ TEST(matryoshka, m08_damaged_files) {
         }
         CHECK(rejected == tried);
     }
-    // A truncation larger than the dimension, behind a valid checksum (the last 8 bytes of CONF).
+    // A truncation larger than the dimension, behind a valid checksum (CONF ends with
+    // the truncation, 8 bytes, then the keep-full-vectors and vector-values flags, 1 byte each).
     for (int kind = 0; kind < 2; ++kind) {
         ParsedFile p = ParsedFile::parse(kind == 0 ? save_bytes(h) : save_bytes(f));
         std::string& conf = p.payload("CONF");
-        poke<std::uint64_t>(conf, conf.size() - 8, 7);
+        poke<std::uint64_t>(conf, conf.size() - 10, 7);
         if (kind == 0) CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
         else CHECK_THROWS_AS(FormatError, load_flat(p.assemble()));
     }
@@ -10897,6 +10925,1077 @@ TEST(matryoshka, m11_out_of_memory) {
     CHECK(sweep_allocation_failures([&] { f.add(id, data[55]); }, [&] { CHECK(save_bytes(f) == fb); }) > 0);
     CHECK(sweep_allocation_failures([&] { h.add(id, data[55]); }, [&] { CHECK(!h.contains(id) && h.size() == 50); }) > 0);
     CHECK(*h.get_vector(500) == data[55] && *f.get_vector(500) == data[55]);
+}
+
+// ===========================================================================
+// keep_full_vectors = false (L1-L8)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams lean(std::size_t truncate = 0) {
+    QuantizationParams q;
+    q.truncate_to = truncate;
+    q.keep_full_vectors = false;
+    return q;
+}
+
+HnswParams hnsw_lean(std::size_t truncate = 0) {
+    HnswParams p;
+    p.quantization = lean(truncate);
+    return p;
+}
+
+bool unit_and_same_direction(const std::vector<float>& stored, const std::vector<float>& given, std::size_t n) {
+    double len = 0, dot = 0, g = 0;
+    for (std::size_t d = 0; d < n; ++d) {
+        len += double(stored[d]) * stored[d];
+        dot += double(stored[d]) * given[d];
+        g += double(given[d]) * given[d];
+    }
+    return stored.size() == n && std::abs(len - 1.0) < 1e-5 && std::abs(dot - std::sqrt(g)) < 1e-4 * (1 + std::sqrt(g));
+}
+
+}  // namespace
+
+TEST(lean, l01_truncation_without_full_vectors) {
+    auto data = clustered(1200, 48, 8, 1100);
+    for (Metric m : kMetrics) {
+        HnswIndex slim(48, m, hnsw_lean(16)), full(48, m, hnsw_truncate(16));
+        FlatIndex fslim(48, m, Schema::dynamic(), lean(16)), ffull(48, m, Schema::dynamic(), truncate_to(16));
+        for (std::uint64_t i = 0; i < 1200; ++i) {
+            slim.add(i, data[i]);
+            full.add(i, data[i]);
+            fslim.add(i, data[i]);
+            ffull.add(i, data[i]);
+        }
+        CHECK(slim.storage().originals() == nullptr && full.storage().originals() != nullptr);  // the saving
+        bool same = true;  // the same stored vectors: identical results
+        for (std::size_t q = 0; q < 20; ++q)
+            same = same && same_results(slim.search(data[q], 10, 64), full.search(data[q], 10, 64)) &&
+                   same_results(fslim.search(data[q], 10), ffull.search(data[q], 10));
+        CHECK(same);
+        bool prefix = true;  // get_vector: the stored first 16 values
+        for (std::uint64_t i = 0; i < 1200; i += 101) {
+            const auto v = *slim.get_vector(i), fv = *fslim.get_vector(i);
+            if (m == Metric::Cosine) prefix = prefix && unit_and_same_direction(v, data[i], 16) && unit_and_same_direction(fv, data[i], 16);
+            else prefix = prefix && v == std::vector<float>(data[i].begin(), data[i].begin() + 16) && fv == v;
+        }
+        CHECK(prefix);
+    }
+}
+
+TEST(lean, l02_cosine_without_originals) {
+    auto data = random_vectors(500, 24, 1101);
+    HnswIndex slim(24, Metric::Cosine, hnsw_lean()), full(24, Metric::Cosine);
+    FlatIndex fslim(24, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        slim.add(i, data[i]);
+        full.add(i, data[i]);
+        fslim.add(i, data[i]);
+    }
+    CHECK(slim.storage().originals() == nullptr);
+    bool ok = true;
+    for (std::uint64_t i = 0; i < 500; i += 37)
+        ok = ok && unit_and_same_direction(*slim.get_vector(i), data[i], 24) && unit_and_same_direction(*fslim.get_vector(i), data[i], 24);
+    for (std::size_t q = 0; q < 15; ++q) ok = ok && same_results(slim.search(data[q], 10, 64), full.search(data[q], 10, 64));
+    CHECK(ok);
+    // L2 and inner product change nothing: there is no copy to drop.
+    HnswIndex l2(24, Metric::L2, hnsw_lean());
+    l2.add(1, data[1]);
+    CHECK(*l2.get_vector(1) == data[1]);
+}
+
+TEST(lean, l03_every_path) {
+    auto data = clustered(1500, 20, 6, 1102);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        HnswIndex h(20, m, hnsw_lean(8));
+        FlatIndex f(20, m, Schema::dynamic(), lean(8));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        for (std::uint64_t i = 0; i < 400; i += 4) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {  // reused slots
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 400; i += 6) {
+            h.update(i, data[i + 1000]);
+            f.update(i, data[i + 1000]);
+        }
+        h.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1400, data.begin() + 1500)), 4);
+        f.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1400, data.begin() + 1500)));
+        // search_by_id and compact rebuild inputs from the stored vectors.
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && f.search_by_id(5001, 5)->size() == 5);
+        const auto before = h.search(data[1450], 5, 128);
+        h.compact();
+        const auto after = h.search(data[1450], 5, 128);
+        CHECK(h.deleted_count() == 0 && h.size() == 450 && after[0].id == before[0].id);  // 400 - 100 + 50 + 100
+        CHECK(h.get_vector(5050)->size() == 8 && f.get_vector(5050)->size() == 8);
+    }
+}
+
+TEST(lean, l04_save_and_load) {
+    auto data = random_vectors(300, 32, 1103);
+    HnswIndex slim(32, Metric::Cosine, hnsw_lean(8)), full(32, Metric::Cosine, hnsw_truncate(8));
+    FlatIndex fslim(32, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        slim.add(i, data[i]);
+        full.add(i, data[i]);
+        fslim.add(i, data[i]);
+    }
+    const std::string sb = save_bytes(slim), fb = save_bytes(fslim);
+    auto s2 = load_hnsw(sb);
+    auto f2 = load_flat(fb);
+    CHECK(save_bytes(*s2) == sb && save_bytes(*f2) == fb);
+    CHECK(!s2->params().quantization.keep_full_vectors && s2->storage().originals() == nullptr && !f2->quantization().keep_full_vectors);
+    CHECK(*s2->get_vector(3) == *slim.get_vector(3) && same_results(s2->search(data[4], 10, 64), slim.search(data[4], 10, 64)));
+    CHECK(sb.size() + 300 * 32 * 4 <= save_bytes(full).size());  // the full vectors are not saved either
+}
+
+TEST(lean, l05_damaged_files) {
+    auto data = random_vectors(10, 6, 1104);
+    HnswIndex h(6, Metric::Cosine, hnsw_lean(2));
+    FlatIndex f(6, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+        ParsedFile p = ParsedFile::parse(bytes);  // the keep-full-vectors flag (next to last byte of CONF) set to 2
+        std::string& conf = p.payload("CONF");
+        poke<std::uint8_t>(conf, conf.size() - 2, 2);
+        try {
+            load(p.assemble());
+            CHECK(false);
+        } catch (const FormatError& e) {
+            CHECK(std::string(e.what()).find("keep-full-vectors") != std::string::npos);
+        }
+    }
+}
+
+TEST(lean, l06_flag_flip_is_detected) {
+    // A file saved keeping full vectors, with the flag flipped to "not kept" (and
+    // vice versa): the records no longer match their expected size, never misread.
+    auto data = random_vectors(20, 6, 1105);
+    HnswIndex full(6, Metric::Cosine), slim(6, Metric::Cosine, hnsw_lean());
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        full.add(i, data[i]);
+        slim.add(i, data[i]);
+    }
+    for (const auto* index : {&full, &slim}) {
+        ParsedFile p = ParsedFile::parse(save_bytes(*index));
+        std::string& conf = p.payload("CONF");
+        poke<std::uint8_t>(conf, conf.size() - 2, std::uint8_t(conf[conf.size() - 2] == 1 ? 0 : 1));  // the keep-full-vectors flag
+        CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+    }
+}
+
+TEST(lean, l07_with_sq8) {
+    // With SQ8, keeping only codes: after training the floats are dropped.
+    auto data = clustered(800, 16, 6, 1106);
+    HnswParams p = hnsw_lean(8);
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 200;
+    HnswIndex h(16, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    CHECK(h.codec_trained() && h.storage().originals() == nullptr && h.codec()->dim() == 8);
+    CHECK(!h.storage().vectors().has_values() && h.get_vector(7)->size() == 8);
+    CHECK(h.search(data[7], 1, 64)[0].id == 7);
+    auto h2 = load_hnsw(save_bytes(h));
+    CHECK(save_bytes(*h2) == save_bytes(h) && h2->codec_trained());
+}
+
+TEST(lean, l08_default_keeps_everything) {
+    CHECK(QuantizationParams{}.keep_full_vectors);
+    HnswIndex h(4, Metric::Cosine);
+    h.add(1, std::vector<float>{3, 4, 0, 0});
+    CHECK(*h.get_vector(1) == (std::vector<float>{3, 4, 0, 0}) && h.storage().originals() != nullptr);
+}
+
+// ===========================================================================
+// Review of phases Q0-Q2 and keep_full_vectors (V1-V3)
+// ===========================================================================
+
+TEST(review, v01_range_search_inside_a_coded_search) {
+    // A coded search marks its thread "distances from codes, with this query's
+    // table". A range search started inside its predicate must use full
+    // precision with its own query, not the outer search's codes.
+    auto data = clustered(800, 16, 6, 1200);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 100;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    const auto expected = h.search_range(data[5], 3.0f);
+    long calls = 0, wrong = 0;  // on every call: some come from the planner's sampling, before the search
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        ++calls;
+        wrong += long(!same_results(h.search_range(data[5], 3.0f), expected));
+        return true;
+    };
+    (void)h.search(data[400], 5, 64, o);
+    CHECK(!expected.empty() && calls > 0 && wrong == 0);
+}
+
+TEST(review, v02_huge_rerank_factor) {
+    // k * rerank_factor must not wrap around (10 * 2^63 wraps to exactly 0).
+    auto data = clustered(300, 8, 4, 1201);
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 50;
+    q.rerank_factor = std::size_t(1) << 63;
+    HnswParams p;
+    p.quantization = q;
+    HnswIndex h(8, Metric::L2, p);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), q);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    SearchOptions exact;
+    exact.strategy = Strategy::ForceExact;
+    CHECK(h.search(data[3], 10, 64, exact).size() == 10 && f.search(data[3], 10).size() == 10);
+    CHECK(same_results(h.search(data[3], 10, 64, exact), f.search(data[3], 10)));  // both exact, both re-ranked
+}
+
+namespace {
+
+/// The same results up to the order of ties: identical distances, and the same
+/// IDs in each group of equal distance (except the last group, which the k
+/// cutoff may split differently: any of its members is a correct answer).
+bool same_up_to_ties(const std::vector<SearchResult>& a, const std::vector<SearchResult>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i].distance != b[i].distance) return false;
+    for (std::size_t i = 0; i < a.size();) {
+        std::size_t j = i;
+        while (j < a.size() && a[j].distance == a[i].distance) ++j;
+        if (j < a.size()) {  // a complete group: the same members
+            std::multiset<std::uint64_t> x, y;
+            for (std::size_t t = i; t < j; ++t) { x.insert(a[t].id); y.insert(b[t].id); }
+            if (x != y) return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/// What get_vector should return for `given`: the vector itself when the index
+/// keeps vectors as given (or never changes them), otherwise the stored form.
+struct ReadModel {
+    Metric metric;
+    std::size_t n;  // indexed dimensions
+    bool exact;
+    double tolerance = 0;  // codes only: the bound on decoding errors so far
+    bool matches(const std::vector<float>& got, const std::vector<float>& given) const {
+        if (exact && tolerance == 0) return got == given;
+        if (got.size() != n) return false;
+        std::vector<double> want(given.begin(), given.begin() + std::ptrdiff_t(n));
+        if (metric == Metric::Cosine) {
+            double len = 0;
+            for (double x : want) len += x * x;
+            if (len > 0) for (double& x : want) x /= std::sqrt(len);
+        }
+        for (std::size_t d = 0; d < n; ++d)
+            if (std::abs(got[d] - want[d]) > tolerance * 1.001 + 1e-5 * (1 + std::abs(want[d]))) return false;
+        return true;
+    }
+};
+
+/// Half the largest SQ8 step of an index's codec (its decoding error bound).
+double half_step(const VectorCodec& c) {
+    const auto state = c.state();  // minimums, then steps
+    double largest = 0;
+    for (std::size_t d = c.dim(); d < state.size(); ++d) largest = std::max(largest, double(state[d]));
+    return largest / 2;
+}
+
+}  // namespace
+
+TEST(review, v03_model_based_random_operations) {
+    long configs = 0, ops = 0, checks_done = 0;
+    for (unsigned seed = 1; seed <= 24; ++seed) {
+        std::mt19937_64 rng(seed * 7919);
+        auto pick = [&](std::size_t n) { return std::size_t(rng() % n); };
+        const Metric metric = kMetrics[pick(3)];
+        const std::size_t dim = pick(2) ? 12 : 6;
+        QuantizationParams q;
+        q.truncate_to = pick(3) == 0 ? dim / 2 : 0;
+        q.codec = std::array{CodecKind::None, CodecKind::SQ8, CodecKind::Binary}[pick(3)];
+        q.train_after = pick(2) ? 30 : 0;
+        q.rerank = pick(4) != 0;
+        q.keep_full_vectors = pick(2) == 0;
+        HnswParams hp;
+        hp.M = 6;
+        hp.ef_construction = 40;
+        hp.seed = seed;
+        hp.quantization = q;
+        auto h = std::make_unique<HnswIndex>(dim, metric, hp);
+        auto f = std::make_unique<FlatIndex>(dim, metric, Schema::dynamic(), q);
+        const std::size_t n = vecdb::indexed_dim(q, dim);
+        std::map<std::uint64_t, std::vector<float>> model;
+        const ReadModel read{metric, n, q.keep_full_vectors || (metric != Metric::Cosine && n == dim)};
+        // Codes only: each index's stored vectors are simulated with its own codec,
+        // decode(encode(v)), clamping included: from the stored form when a vector is
+        // added, and again from the previous simulation when the codec is retrained
+        // (the library retrains from decoded vectors). One map per index: each trains
+        // its own codec.
+        struct CodesOnly {
+            bool active = false;
+            std::vector<float> state;  // the codec's state, to notice retraining
+            std::map<std::uint64_t, std::vector<float>> expected;
+        } sim_h, sim_f;
+        auto stored_form = [&](const std::vector<float>& v) {
+            std::vector<float> s2(v.begin(), v.begin() + std::ptrdiff_t(n));
+            if (metric == Metric::Cosine) {
+                double len = 0;
+                for (float x : s2) len += double(x) * x;
+                if (len > 0) for (float& x : s2) x = float(x / std::sqrt(len));
+            }
+            return s2;
+        };
+        auto simulate = [](const VectorCodec& c, const std::vector<float>& v) {
+            std::vector<std::uint8_t> code(c.code_size());
+            c.encode(v, code.data());
+            std::vector<float> out(c.dim());
+            c.decode(code.data(), out);
+            return out;
+        };
+        std::vector<std::uint64_t> touched;  // IDs whose vector the last operation set
+        auto follow = [&](CodesOnly& sim, bool codes_only, const VectorCodec* c) {
+            if (!codes_only) return;
+            if (!sim.active) {  // just dropped its floats: encoded from the stored floats
+                for (const auto& [id, v] : model) sim.expected[id] = simulate(*c, stored_form(v));
+                sim.active = true;
+                sim.state = c->state();
+            } else if (c->state() != sim.state) {  // retrained: re-encoded from decoded vectors
+                for (auto& [id, e] : sim.expected) e = simulate(*c, e);
+                sim.state = c->state();
+            }
+            for (auto id : touched) if (model.contains(id)) sim.expected[id] = simulate(*c, stored_form(model[id]));
+        };
+        std::normal_distribution<float> nd(0, 1);
+        auto vec = [&] {
+            std::vector<float> v(dim);
+            for (float& x : v) x = nd(rng) * (pick(20) == 0 ? 1000.0f : 1.0f);  // now and then, large values
+            if (!model.empty() && pick(15) == 0) v = std::next(model.begin(), std::ptrdiff_t(pick(model.size())))->second;  // a duplicate
+            return v;
+        };
+        auto some_id = [&] { return pick(4) == 0 || model.empty() ? std::uint64_t(pick(400)) : std::next(model.begin(), std::ptrdiff_t(pick(model.size())))->first; };
+        bool ok = true;
+        std::string where;
+        for (int step = 0; step < 300 && ok; ++step, ++ops) {
+            const std::size_t op = pick(100);
+            std::string name;
+            if (op < 35) {
+                name = "add";
+                const std::uint64_t id = pick(400);
+                const auto v = vec();
+                if (model.contains(id)) {
+                    bool threw = false;
+                    try { h->add(id, v); } catch (const std::invalid_argument&) { threw = true; }
+                    try { f->add(id, v); } catch (const std::invalid_argument&) { threw = threw && true; }
+                    ok = ok && threw;
+                } else {
+                    h->add(id, v);
+                    f->add(id, v);
+                    model[id] = v;
+                    touched.push_back(id);
+                }
+            } else if (op < 47) {
+                name = "remove";
+                const std::uint64_t id = some_id();
+                const bool expected = model.erase(id) == 1;
+                ok = ok && h->remove(id) == expected && f->remove(id) == expected;
+            } else if (op < 57) {
+                name = "update";
+                const std::uint64_t id = some_id();
+                const auto v = vec();
+                const bool expected = model.contains(id);
+                ok = ok && h->update(id, v) == expected && f->update(id, v) == expected;
+                if (expected) {
+                    model[id] = v;
+                    touched.push_back(id);
+                }
+            } else if (op < 65) {
+                name = "upsert";
+                const std::uint64_t id = some_id();
+                const auto v = vec();
+                h->upsert(id, v);
+                f->upsert(id, v);
+                model[id] = v;
+                touched.push_back(id);
+            } else if (op < 73) {
+                name = "add_batch";
+                const std::size_t count = 2 + pick(15);
+                std::vector<std::uint64_t> ids;
+                std::vector<float> flat;
+                std::set<std::uint64_t> fresh;
+                while (ids.size() < count) {
+                    const std::uint64_t id = 400 + pick(2000);
+                    if (model.contains(id) || !fresh.insert(id).second) continue;
+                    ids.push_back(id);
+                    const auto v = vec();
+                    flat.insert(flat.end(), v.begin(), v.end());
+                }
+                if (pick(5) == 0) ids.back() = ids.front();  // a repeated ID: the whole batch is refused
+                const bool bad = ids.back() == ids.front();
+                bool threw_h = false, threw_f = false;
+                try { h->add_batch(ids, flat, 1 + pick(3)); } catch (const std::invalid_argument&) { threw_h = true; }
+                try { f->add_batch(ids, flat); } catch (const std::invalid_argument&) { threw_f = true; }
+                ok = ok && threw_h == bad && threw_f == bad;
+                if (!bad)
+                    for (std::size_t i = 0; i < ids.size(); ++i) {
+                        model[ids[i]] = std::vector<float>(flat.begin() + std::ptrdiff_t(i * dim), flat.begin() + std::ptrdiff_t((i + 1) * dim));
+                        touched.push_back(ids[i]);
+                    }
+            } else if (op < 78) {
+                name = "remove_batch";
+                std::vector<std::uint64_t> ids;
+                for (int i = 0; i < 5; ++i) ids.push_back(some_id());
+                std::set<std::uint64_t> removed;
+                for (auto id : ids) if (model.contains(id)) removed.insert(id);
+                for (auto id : removed) model.erase(id);
+                ok = ok && h->remove_batch(ids) == removed.size() && f->remove_batch(ids) == removed.size();
+            } else if (op < 82) {
+                name = "compact";
+                h->compact();
+                f->compact();
+            } else if (op < 86) {
+                name = "train_codec";
+                if (q.codec != CodecKind::None && !model.empty()) {
+                    // Codes only: training again is refused (it could only lose
+                    // precision). Otherwise train on a sample of at least 20.
+                    for (int which = 0; which < 2; ++which) {
+                        const bool codes_only = which == 0 ? !h->has_vector_values() : !f->has_vector_values();
+                        bool refused = false;
+                        try {
+                            if (codes_only || model.size() >= 20) {
+                                if (which == 0) h->train_codec();
+                                else f->train_codec();
+                            }
+                        } catch (const std::logic_error&) {
+                            refused = true;
+                        }
+                        ok = ok && refused == codes_only;
+                    }
+                }
+            } else if (op < 92) {
+                name = "search_by_id";
+                if (!model.empty()) {
+                    const std::uint64_t id = some_id();
+                    const auto r = h->search_by_id(id, 5, 32);
+                    const auto fr = f->search_by_id(id, 5);
+                    ok = ok && bool(r) == model.contains(id) && bool(fr) == model.contains(id);
+                    if (r) for (const auto& x : *r) ok = ok && x.id != id && model.contains(x.id);
+                    if (fr) for (const auto& x : *fr) ok = ok && x.id != id && model.contains(x.id);
+                }
+            } else {
+                name = "save and load";
+                h = load_hnsw(save_bytes(*h));
+                f = load_flat(save_bytes(*f));
+            }
+            follow(sim_h, !h->has_vector_values(), h->codec());
+            follow(sim_f, !f->has_vector_values(), f->codec());
+            touched.clear();
+            // Check against the model after every operation.
+            std::string failed;
+            if (!ok) failed = "the operation's own result";
+            if (ok && !(h->size() == model.size() && f->size() == model.size())) { ok = false; failed = "size"; }
+            // Codes only: within one step of the simulation (a rounding boundary may
+            // fall differently by a float ulp); otherwise exact or the stored form.
+            auto read_ok = [&](const std::optional<std::vector<float>>& got, const CodesOnly& sim, const VectorCodec* c,
+                               std::uint64_t id, const std::vector<float>& v) {
+                if (!got) return false;
+                if (!sim.active) return read.matches(*got, v);
+                const auto& e = sim.expected.at(id);
+                const double tol = 4 * half_step(*c) * 1.01 + 1e-5;  // a value on a boundary may round either way (binary: two spreads)
+                if (got->size() != e.size()) return false;
+                for (std::size_t d = 0; d < e.size(); ++d)
+                    if (std::abs(double((*got)[d]) - e[d]) > tol) return false;
+                return true;
+            };
+            for (const auto& [id, v] : model) {
+                if (ok && !(read_ok(h->get_vector(id), sim_h, h->codec(), id, v) && read_ok(f->get_vector(id), sim_f, f->codec(), id, v))) {
+                    ok = false;
+                    failed = "get_vector of " + std::to_string(id);
+                }
+            }
+            if (ok && !(!h->contains(5000) && !f->get_vector(5000))) { ok = false; failed = "unknown ID"; }
+            if (!model.empty()) {  // exact HNSW search equals Flat (no codec: the same distances)
+                const auto qv = vec();
+                SearchOptions exact;
+                exact.strategy = Strategy::ForceExact;
+                const auto hr = h->search(qv, 7, 32, exact), fr = f->search(qv, 7);
+                if (ok && !(hr.size() == std::min<std::size_t>(7, model.size()) && fr.size() == hr.size())) { ok = false; failed = "result count"; }
+                if (ok && q.codec == CodecKind::None && !same_up_to_ties(hr, fr)) {
+                    ok = false;
+                    failed = "exact HNSW vs Flat:";
+                    for (std::size_t i = 0; i < hr.size(); ++i)
+                        if (hr[i].id != fr[i].id || hr[i].distance != fr[i].distance) {
+                            char buf[160];
+                            std::snprintf(buf, sizeof buf, " [%llu %.9g | %llu %.9g]", (unsigned long long)hr[i].id, double(hr[i].distance), (unsigned long long)fr[i].id, double(fr[i].distance));
+                            failed += buf;
+                        }
+                }
+            }
+            if (ok && h->codec_trained() && !codes_match(*h)) { ok = false; failed = "codes"; }
+            if (ok && step % 40 == 39) {
+                const std::string hb = save_bytes(*h), fb = save_bytes(*f);
+                if (!(save_bytes(*load_hnsw(hb)) == hb && save_bytes(*load_flat(fb)) == fb)) { ok = false; failed = "save and load"; }
+            }
+            ++checks_done;
+            if (!ok) where = "seed " + std::to_string(seed) + ", step " + std::to_string(step) + ", after " + name + ": " + failed;
+        }
+        if (!ok) std::printf("    first failure: %s (metric %d, dim %zu, truncate %zu, codec %d, train_after %zu, rerank %d, keep_full %d)\n",
+                             where.c_str(), int(metric), dim, q.truncate_to, int(q.codec), q.train_after, int(q.rerank), int(q.keep_full_vectors));
+        CHECK(ok);
+        h->compact();
+        // Inner product with vector lengths 1,000 times apart leaves some vectors hard
+        // to reach (the long ones dominate every neighborhood): a known limitation of
+        // HNSW with inner product, confirmed absent without such vectors.
+        // Binary codes only, at 6 or 12 dimensions: at most 64 or 4,096 distinct codes,
+        // so many vectors share one and a graph built from codes cannot separate
+        // them (measured: about 200 vectors on 22 to 61 codes). Inherent, documented.
+        const bool binary_codes_only = q.codec == CodecKind::Binary && !h->has_vector_values();
+        if (metric != Metric::InnerProduct && !binary_codes_only) check_graph(*h, 0.9);
+        ++configs;
+    }
+    std::printf("    %ld configurations, %ld random operations, each followed by a full check (%ld)\n", configs, ops, checks_done);
+}
+
+TEST(review, v04_compact_never_changes_stored_vectors) {
+    // Without vectors as given, compact() rebuilds from the stored vectors: they
+    // must come out bit for bit the same (not normalized a second time).
+    auto data = random_vectors(300, 16, 1203);
+    for (std::size_t truncate : {std::size_t(0), std::size_t(6)}) {
+        for (Metric m : {Metric::Cosine, Metric::L2}) {
+            HnswParams p;
+            p.quantization.keep_full_vectors = false;
+            p.quantization.truncate_to = truncate;
+            HnswIndex h(16, m, p);
+            for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+            for (std::uint64_t i = 0; i < 300; i += 3) h.remove(i);
+            std::map<std::uint64_t, std::vector<float>> before;
+            for (std::uint64_t i = 1; i < 300; i += 3) before[i] = *h.get_vector(i);
+            h.compact();
+            h.compact();  // twice: no drift either
+            bool same = h.deleted_count() == 0;
+            for (const auto& [id, v] : before) same = same && *h.get_vector(id) == v;
+            CHECK(same);
+        }
+    }
+}
+
+// ===========================================================================
+// SQ8 keeping only codes: keep_full_vectors off (C1-C8)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams codes_only_q(std::size_t train_after = 200, std::size_t truncate = 0) {
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = train_after;
+    q.keep_full_vectors = false;
+    q.truncate_to = truncate;
+    return q;
+}
+
+HnswParams hnsw_codes_only(std::size_t train_after = 200, std::size_t truncate = 0) {
+    HnswParams p;
+    p.quantization = codes_only_q(train_after, truncate);
+    return p;
+}
+
+}  // namespace
+
+TEST(codes_only, c01_floats_dropped_recall_kept) {
+    auto data = clustered(3000, 32, 12, 1300);
+    auto queries = clustered(50, 32, 12, 1301);
+    for (Metric m : kMetrics) {
+        HnswIndex h(32, m, hnsw_codes_only(500)), plain(32, m);
+        FlatIndex f(32, m, Schema::dynamic(), codes_only_q(500)), exact(32, m);
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            h.add(i, data[i]);
+            plain.add(i, data[i]);
+            f.add(i, data[i]);
+            exact.add(i, data[i]);
+            if (i == 498) CHECK(h.has_vector_values() && f.has_vector_values());  // floats until trained
+        }
+        CHECK(!h.has_vector_values() && !f.has_vector_values() && h.codec_trained());
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(h, exact, queries, 10, 64);
+        double fr = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f.search(q, 10)) fr += double(truth.count(x.id));
+        }
+        fr /= 500.0;
+        std::printf("    metric %d: hnsw floats %.3f, hnsw codes only %.3f | flat codes only %.3f\n", int(m), base, r, fr);
+        CHECK(r >= base - 0.05 && fr >= 0.85);
+        // Vectors read back decoded: within half a step of the stored vector.
+        const auto state = h.codec()->state();
+        bool close = true;
+        for (std::uint64_t i = 0; i < 3000; i += 97) {
+            const auto v = *h.get_vector(i);
+            std::vector<float> stored = data[i];
+            if (m == Metric::Cosine) {
+                double len = 0;
+                for (float x : stored) len += double(x) * x;
+                for (float& x : stored) x = float(x / std::sqrt(len));
+            }
+            for (std::size_t d = 0; d < 32; ++d)
+                close = close && std::abs(v[d] - std::clamp(stored[d], state[d], state[d] + 255 * state[32 + d])) <= state[32 + d] * 0.5f + 1e-5f;
+        }
+        CHECK(close);
+    }
+}
+
+TEST(codes_only, c02_every_path) {
+    auto data = clustered(1600, 16, 8, 1302);
+    HnswIndex h(16, Metric::L2, hnsw_codes_only(200));
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), codes_only_q(200));
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (std::uint64_t i = 0; i < 400; i += 5) {  // HNSW: free slots; Flat: swap with last
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 1000; i < 1050; ++i) {  // reused slots
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 1; i < 400; i += 7) {
+        h.update(i, data[i + 1000]);
+        f.update(i, data[i + 1000]);
+    }
+    for (std::uint64_t i = 3; i < 400; i += 11) {
+        h.upsert(i, data[i + 1100]);
+        f.upsert(i, data[i + 1100]);
+    }
+    h.add_batch(id_range(5000, 50), flatten(Vectors(data.begin() + 1500, data.begin() + 1550)), 1);
+    h.add_batch(id_range(6000, 50), flatten(Vectors(data.begin() + 1550, data.begin() + 1600)), 4);
+    f.add_batch(id_range(5000, 50), flatten(Vectors(data.begin() + 1500, data.begin() + 1550)));
+    std::atomic<bool> flag{false};
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 10) flag = true; };
+    CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(7000, 60), flatten(Vectors(data.begin() + 1300, data.begin() + 1360)), 4, o));
+    CHECK(codes_match(h) && codes_match(f) && !h.has_vector_values() && !f.has_vector_values());
+    // Every kind of search works from codes.
+    CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && f.search_by_id(5001, 5)->size() == 5);
+    CHECK(!h.search_range(data[1501], 4.0f).empty() && !f.search_range(data[1501], 4.0f).empty());
+    const auto batch = h.search_batch(flatten(Vectors(data.begin() + 1500, data.begin() + 1505)), 5, 64, 3);
+    bool same = true;
+    for (std::size_t q = 0; q < 5; ++q) same = same && same_results(batch[q], h.search(data[1500 + q], 5, 64));
+    CHECK(same && h.search(data[1520], 1, 64)[0].id == 5020 && f.search(data[1520], 1)[0].id == 5020);
+    const std::size_t live = h.size();
+    h.compact();
+    CHECK(h.size() == live && h.deleted_count() == 0 && !h.has_vector_values() && codes_match(h));
+    check_graph(h, 0.95);
+}
+
+TEST(codes_only, c03_save_and_load) {
+    auto data = clustered(800, 64, 6, 1303);
+    HnswIndex h(64, Metric::Cosine, hnsw_codes_only(100)), floats(64, Metric::Cosine);
+    FlatIndex f(64, Metric::L2, Schema::dynamic(), codes_only_q(100));
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        h.add(i, data[i]);
+        floats.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    auto h2 = load_hnsw(hb);
+    auto f2 = load_flat(fb);
+    CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && !h2->has_vector_values() && !f2->has_vector_values());
+    CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && *h2->get_vector(9) == *h.get_vector(9));
+    // No floats saved: 64 bytes of code per vector instead of 2 x 256 bytes (floats and originals).
+    CHECK(hb.size() + 800 * 400 < save_bytes(floats).size());
+    std::printf("    file sizes: codes only %zu bytes, full precision %zu bytes\n", hb.size(), save_bytes(floats).size());
+}
+
+TEST(codes_only, c04_training_is_final) {
+    auto data = clustered(300, 8, 4, 1304);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(0));  // explicit training only
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), codes_only_q(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(h.has_vector_values() && !h.codec_trained());  // until trained: floats, full precision
+    h.train_codec();
+    f.train_codec();
+    CHECK(!h.has_vector_values() && !f.has_vector_values());
+    const std::string hb = save_bytes(h);
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());  // could only lose precision
+    CHECK_THROWS_AS(std::logic_error, f.train_codec());
+    CHECK(save_bytes(h) == hb);
+}
+
+TEST(codes_only, c05_damaged_and_inconsistent_files) {
+    auto data = random_vectors(30, 4, 1305);
+    HnswIndex h(4, Metric::L2, hnsw_codes_only(10));
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), codes_only_q(10));
+    for (std::uint64_t i = 0; i < 30; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+        // Valid checksums, inconsistent content: a values flag of 2; "no values"
+        // with keep_full_vectors on; "no values" without a trained codec.
+        ParsedFile p2 = ParsedFile::parse(bytes);
+        poke<std::uint8_t>(p2.payload("CONF"), p2.payload("CONF").size() - 1, 2);
+        ParsedFile keep = ParsedFile::parse(bytes);
+        poke<std::uint8_t>(keep.payload("CONF"), keep.payload("CONF").size() - 2, 1);
+        ParsedFile untrained = ParsedFile::parse(bytes);
+        std::string& codc = untrained.payload("CODC");
+        codc.resize(18);  // up to the training flag
+        codc.push_back('\0');  // "not trained"
+        for (ParsedFile* e : {&p2, &keep, &untrained}) CHECK_THROWS_AS(FormatError, load(e->assemble()));
+    }
+}
+
+TEST(codes_only, c06_searching_while_floats_are_dropped) {
+    auto data = clustered(1500, 8, 6, 1306);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(800));
+    for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "c06", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 500; i < 1500; ++i) h.add(i, data[i]);  // trains and drops floats at 800
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                check_results(h.search(data[q % 1500], 10, 32), 1500, p);
+                (void)h.get_vector(q % 500);
+                ++q;
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && !h.has_vector_values() && codes_match(h));
+}
+
+TEST(codes_only, c07_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 4, 1307);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(0));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), codes_only_q(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    // Training is all or nothing: on failure the floats are still there.
+    CHECK(sweep_allocation_failures([&] { h.train_codec(); }, [&] { CHECK(save_bytes(h) == hb && h.has_vector_values()); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!h.has_vector_values() && !f.has_vector_values());
+    const std::string fb2 = save_bytes(f);
+    std::uint64_t id = 900;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == fb2); }) > 0);
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[350]); }, [&] { CHECK(!h.contains(id) && h.size() == 300); }) > 0);
+    CHECK(codes_match(h) && codes_match(f));
+}
+
+TEST(codes_only, c08_with_truncation_and_cosine) {
+    auto data = clustered(1200, 48, 8, 1308);
+    HnswIndex h(48, Metric::Cosine, hnsw_codes_only(300, 16));
+    FlatIndex f(48, Metric::Cosine, Schema::dynamic(), codes_only_q(300, 16));
+    for (std::uint64_t i = 0; i < 1200; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.has_vector_values() && h.codec()->dim() == 16 && h.get_vector(5)->size() == 16 && h.storage().originals() == nullptr);
+    CHECK(h.search(data[5], 1, 64)[0].id == 5 && f.search(data[5], 1)[0].id == 5);
+    auto h2 = load_hnsw(save_bytes(h));
+    CHECK(save_bytes(*h2) == save_bytes(h) && h2->indexed_dim() == 16);
+}
+
+// ===========================================================================
+// Phase Q3: binary quantization (B1-B12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams binary_q(std::size_t train_after = 200, bool rerank = true, bool keep_full = true) {
+    QuantizationParams q;
+    q.codec = CodecKind::Binary;
+    q.train_after = train_after;
+    q.rerank = rerank;
+    q.keep_full_vectors = keep_full;
+    return q;
+}
+
+HnswParams hnsw_binary(std::size_t train_after = 200, bool rerank = true, bool keep_full = true) {
+    HnswParams p;
+    p.quantization = binary_q(train_after, rerank, keep_full);
+    return p;
+}
+
+}  // namespace
+
+TEST(binary, b01_code_size_and_bits) {
+    for (std::size_t d : {std::size_t(1), std::size_t(7), std::size_t(8), std::size_t(9), std::size_t(64), std::size_t(100)})
+        CHECK(BinaryCodec(d, Metric::L2).code_size() == (d + 7) / 8);
+    BinaryCodec c(10, Metric::L2);
+    std::vector<float> sample;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 10; ++j) sample.push_back(float((i % 2 ? 1 : -1) * (j + 1)));  // mean 0 in every dimension
+    c.train(sample);
+    std::uint8_t code[2];
+    c.encode(std::vector<float>{1, -1, 1, -1, 1, -1, 1, -1, 1, 1}, code);
+    CHECK(code[0] == 0x55 && code[1] == 0x03);  // bit j set when above the threshold (0)
+}
+
+TEST(binary, b02_fixed_answer) {
+    // Every CPU must produce exactly these codes (comparisons only) and state.
+    // Expected values computed independently with NumPy float32: thresholds
+    // (2, 2, 4/3), spreads (4/3, 4/3, 20/9).
+    const std::vector<float> sample = {0, 4, -2, 2, 0, 2, 4, 2, 4};  // three vectors of 3
+    BinaryCodec c(3, Metric::L2);
+    c.train(sample);
+    CHECK(c.state() == (std::vector<float>{2, 2, 4.0f / 3.0f, 4.0f / 3.0f, 4.0f / 3.0f, 2.2222223281860352f}));
+    std::uint8_t code[1];
+    c.encode(std::vector<float>{2.5f, 1.0f, 1.5f}, code);
+    CHECK(code[0] == 0x05);
+    float back[3];
+    c.decode(code, back);
+    CHECK(back[0] == 3.3333334922790527f && back[1] == 0.6666666269302368f && back[2] == 3.555555820465088f);
+}
+
+TEST(binary, b03_distances_match_decoded_vectors) {
+    std::mt19937 rng(40);
+    std::normal_distribution<float> nd(0.5f, 1);
+    for (Metric m : kMetrics) {
+        std::vector<float> sample(300 * 20);
+        for (float& x : sample) x = nd(rng);
+        BinaryCodec c(20, m);
+        c.train(sample);
+        std::vector<float> table, back(20);
+        std::vector<std::uint8_t> code(c.code_size());
+        const std::span<const float> q(&sample[0], 20);
+        c.prepare(q, table);
+        bool close = true;
+        for (std::size_t i = 1; i < 300; ++i) {
+            c.encode(std::span<const float>(&sample[i * 20], 20), code.data());
+            c.decode(code.data(), back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 20; ++j)
+                expected += m == Metric::L2 ? double(q[j] - back[j]) * (q[j] - back[j]) : double(q[j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code.data()) - expected) < 1e-4 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(binary, b04_decode_then_encode_is_exact) {
+    // Including a dimension constant in training (spread 0) and a value above it.
+    const std::vector<float> sample = {5, 1, -3, 5, 2, 3, 5, 0, 1};  // dimension 0 is always 5
+    BinaryCodec c(3, Metric::L2);
+    c.train(sample);
+    bool exact = true;
+    for (unsigned bits = 0; bits < 8; ++bits) {
+        const std::uint8_t code = static_cast<std::uint8_t>(bits);
+        std::uint8_t again;
+        float v[3];
+        c.decode(&code, v);
+        c.encode(v, &again);
+        exact = exact && again == code;
+    }
+    std::uint8_t code;
+    c.encode(std::vector<float>{6, 0, 0}, &code);  // above a constant dimension: bit set
+    CHECK(exact && (code & 1u) == 1u);
+}
+
+TEST(binary, b05_rejects_misuse) {
+    BinaryCodec c(4, Metric::L2);
+    std::uint8_t code[1];
+    std::vector<float> table;
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(4, 1.0f), code));
+    CHECK_THROWS_AS(std::logic_error, c.prepare(std::vector<float>(4, 1.0f), table));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{1, 2, kNaN, 4}));
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>(7, 0.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>{0, 0, 0, 0, 1, 1, -1, 1}));  // a negative spread
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>{3e38f, 0, 0, 0, 3e38f, 1, 1, 1}));  // overflows
+    c.train(std::vector<float>(8, 1.0f));
+    CHECK_THROWS_AS(std::invalid_argument, c.encode(std::vector<float>(3, 1.0f), code));
+    CHECK(make_codec(CodecKind::Binary, 4, Metric::L2)->kind() == CodecKind::Binary);
+}
+
+TEST(binary, b06_recall) {
+    auto data = clustered(3000, 64, 12, 1400);
+    auto queries = clustered(50, 64, 12, 1401);
+    for (Metric m : kMetrics) {
+        // Binary codes are coarse: re-ranking needs many candidates. Flat re-ranks
+        // k * rerank_factor (16 to 32 recommended for binary, default 4); HNSW
+        // re-ranks its whole beam (ef).
+        QuantizationParams wide = binary_q(500);
+        wide.rerank_factor = 32;
+        HnswIndex plain(64, m), reranked(64, m, hnsw_binary(500)), bits(64, m, hnsw_binary(500, false)), lean(64, m, hnsw_binary(500, true, false));
+        FlatIndex exact(64, m), fr(64, m, Schema::dynamic(), binary_q(500)), fwide(64, m, Schema::dynamic(), wide);
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            bits.add(i, data[i]);
+            lean.add(i, data[i]);
+            exact.add(i, data[i]);
+            fr.add(i, data[i]);
+            fwide.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(reranked, exact, queries, 10, 64);
+        const double r_wide = recall(reranked, exact, queries, 10, 400);
+        const double b = recall(bits, exact, queries, 10, 64), l = recall(lean, exact, queries, 10, 64);
+        double f = 0, fw = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : fr.search(q, 10)) f += double(truth.count(x.id));
+            for (const auto& x : fwide.search(q, 10)) fw += double(truth.count(x.id));
+        }
+        f /= 500.0;
+        fw /= 500.0;
+        std::printf("    metric %d: hnsw %.3f | binary + re-rank: ef 64 %.3f, ef 400 %.3f; bits only %.3f, codes only %.3f | flat: re-rank x4 %.3f, x32 %.3f\n",
+                    int(m), base, r, r_wide, b, l, f, fw);
+        CHECK(!lean.has_vector_values() && lean.get_code(1)->size() == 8);
+        CHECK(fw >= 0.95 && r_wide > r && r >= 0.65 && f >= 0.35 && b >= 0.30 && l >= 0.30);
+    }
+}
+
+TEST(binary, b07_every_path) {
+    auto data = clustered(1500, 24, 6, 1402);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::L2, hnsw_binary(200, true, keep_full));
+        FlatIndex f(24, Metric::L2, Schema::dynamic(), binary_q(200, true, keep_full));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 0; i < 400; i += 5) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 400; i += 7) {
+            h.update(i, data[i + 1000]);
+            f.update(i, data[i + 1000]);
+        }
+        h.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)), 4);
+        f.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)));
+        CHECK(codes_match(h) && codes_match(f) && h.has_vector_values() == keep_full);
+        h.compact();
+        CHECK(codes_match(h) && h.deleted_count() == 0);
+        check_graph(h, 0.9);
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && !f.search_range(data[1401], 50.0f).empty());
+    }
+}
+
+TEST(binary, b08_save_and_load) {
+    auto data = clustered(500, 32, 6, 1403);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(32, Metric::Cosine, hnsw_binary(100, true, keep_full));
+        FlatIndex f(32, Metric::InnerProduct, Schema::dynamic(), binary_q(100, true, keep_full));
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && h2->codec()->kind() == CodecKind::Binary);
+        CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && same_results(f2->search(data[3], 10), f.search(data[3], 10)));
+    }
+}
+
+TEST(binary, b09_damaged_files) {
+    auto data = random_vectors(16, 5, 1404);
+    HnswIndex h(5, Metric::L2, hnsw_binary(5, true, false));
+    for (std::uint64_t i = 0; i < 16; ++i) h.add(i, data[i]);
+    const std::string bytes = save_bytes(h);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_hnsw(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_hnsw(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // A negative spread behind a valid checksum. CODC: codec (1), train_after (8),
+    // rerank (1), factor (8), trained (1), state size (8), thresholds (5 x 4), spreads.
+    ParsedFile p = ParsedFile::parse(bytes);
+    poke<float>(p.payload("CODC"), 27 + 20, -1.0f);
+    CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+}
+
+TEST(binary, b10_with_truncation) {
+    auto data = clustered(1000, 64, 8, 1405);
+    HnswParams p = hnsw_binary(200);
+    p.quantization.truncate_to = 32;
+    HnswIndex h(64, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    CHECK(h.codec()->dim() == 32 && h.get_code(1)->size() == 4 && h.search(data[9], 1, 64)[0].id == 9 && *h.get_vector(9) == data[9]);
+}
+
+TEST(binary, b11_training_is_final_with_codes_only) {
+    auto data = clustered(300, 16, 4, 1406);
+    HnswIndex h(16, Metric::L2, hnsw_binary(0, true, false));
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    h.train_codec();
+    CHECK(!h.has_vector_values());
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());
+}
+
+TEST(binary, b12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 16, 4, 1407);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), binary_q(0, true, false));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!f.has_vector_values() && codes_match(f));
 }
 
 // ===========================================================================
@@ -11245,7 +12344,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -11280,6 +12379,7 @@ int main(int argc, char** argv) {
             golden_hnsw()->save(golden_path("golden_hnsw_v3.bin"));
             golden_flat()->save(golden_path("golden_flat_v3.bin"));
             golden_sq8()->save(golden_path("golden_hnsw_sq8_v3.bin"));
+            golden_binary()->save(golden_path("golden_hnsw_binary_v3.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
         } else if (arg == "--group" || arg == "--exclude") {

@@ -171,12 +171,21 @@ public:
     /// Trains the codec (HnswParams::quantization) on the stored vectors now, and
     /// encodes every vector; vectors added later are encoded as they arrive.
     /// Training again replaces the previous training. All or nothing. Throws
-    /// std::logic_error if no codec is configured, std::invalid_argument if the
+    /// std::logic_error if no codec is configured, or once only codes are kept
+    /// (keep_full_vectors off: training again from decoded vectors could only lose
+    /// precision, so the first training is final), std::invalid_argument if the
     /// index is empty. (Training also happens automatically: see train_after.)
     void train_codec();
 
     /// Whether searches use codes (a codec is configured and trained).
     bool codec_trained() const;
+
+    /// Whether full-precision vector values are stored: false once an index that
+    /// keeps only codes (a codec, keep_full_vectors off) has been trained.
+    bool has_vector_values() const {
+        const auto guard = lock_.read();
+        return storage_.vectors().has_values();
+    }
 
     /// The codec, for inspection while no other thread changes the index (like
     /// storage()); null without quantization.
@@ -390,6 +399,23 @@ public:
     const Storage& storage() const { return storage_; }
 
 private:
+    /// A stored vector as input again (for compact and search_by_id): the vector as
+    /// given if kept, otherwise the stored one, padded with zeros to dim() when
+    /// truncating (truncation ignores those values).
+    std::vector<float> as_input(NodeId slot) const;
+
+    /// Whether only codes are kept (no stored floats): after training, when
+    /// keep_full_vectors is false and a codec is configured.
+    bool codes_only() const { return !storage_.vectors().has_values(); }
+    /// The stored vector of `slot`, padded to the stride: the floats, or decoded
+    /// from its code into `buffer` (codes only).
+    std::span<const float> stored_padded(NodeId slot, std::vector<float>& buffer) const;
+    /// The stored vector of `slot` (indexed_dim() values), as a copy.
+    std::vector<float> stored_copy(NodeId slot) const;
+    /// A vector to read back for `slot`: the vector as given if kept, otherwise
+    /// the stored one (decoded, with codes only).
+    std::vector<float> read_back(NodeId slot) const;
+
     /// Draws a random top level: floor(-ln(u) / ln(M)), u uniform in (0, 1].
     int random_level();
 
@@ -491,7 +517,10 @@ private:
 
     /// update() and upsert(): `metadata` null keeps the old metadata.
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
-    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
+    /// The caller holds the write lock. `prepared`: `vector` is a stored vector of
+    /// this index (indexed_dim() values, already normalized), copied exactly; for
+    /// compact() without originals, so rebuilding never changes a stored vector.
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared = false);
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.

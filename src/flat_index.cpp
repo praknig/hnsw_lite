@@ -19,7 +19,7 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, Quantization
       scratch_(vecdb::indexed_dim(quantization, dim)) {
     validate(quantization);
     quant_ = quantization;
-    if (metric == Metric::Cosine || vectors_.dim() < dim) originals_.emplace(dim);  // keep the vectors as given
+    if (keeps_originals(quant_, metric, dim)) originals_.emplace(dim);  // keep the vectors as given
     codec_ = make_codec(quant_.codec, vectors_.dim(), metric);
 }
 
@@ -83,8 +83,7 @@ Record FlatIndex::record(NodeId slot, bool with_vector, bool with_metadata) cons
     Record r;
     r.id = ids_.external(slot);
     if (with_vector) {
-        const auto v = original(slot);
-        r.vector.assign(v.begin(), v.end());
+        r.vector = read_back(slot);
     }
     if (with_metadata) r.metadata = metadata_.read(slot);
     return r;
@@ -95,7 +94,7 @@ std::optional<std::vector<SearchResult>> FlatIndex::search_by_id(std::uint64_t i
     const auto guard = lock_.read();  // the search below nests inside this read: the vector cannot change
     const auto node = ids_.find(id);
     if (!node) return std::nullopt;
-    const std::span<const float> v = original(*node);  // normalized again by search, exactly as when stored
+    const std::vector<float> v = as_input(*node);  // prepared again by search, as when stored
     if (include_self || k == 0) return search(v, k, options);
     auto results = search(v, k == SIZE_MAX ? k : k + 1, options);  // one more, in case the record itself is among them
     std::erase_if(results, [&](const SearchResult& r) { return r.id == id; });
@@ -121,18 +120,20 @@ void FlatIndex::maybe_train() noexcept {
 void FlatIndex::train_codec_unlocked() {
     if (!codec_) throw std::logic_error("train_codec: this index has no codec (see QuantizationParams)");
     if (live_ == 0) throw std::invalid_argument("train_codec: the index is empty");
+    if (codes_only()) throw std::logic_error("train_codec: this index keeps only codes; training again from decoded vectors could only lose precision");  // see HnswIndex
     const std::size_t n = vectors_.size(), take = std::min<std::size_t>(n, 100000), d = indexed_dim();
     std::vector<float> sample(take * d);  // a deterministic sample, evenly spaced
     for (std::size_t i = 0; i < take; ++i) {
-        const auto v = vectors_.get(static_cast<NodeId>(i * n / take));
+        const auto v = stored_copy(static_cast<NodeId>(i * n / take));  // decoded, with codes only
         std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
     }
     auto trained = make_codec(codec_->kind(), d, metric_);
     trained->train(sample);
     std::vector<std::uint8_t> codes(n * trained->code_size());
-    for (NodeId r = 0; r < n; ++r) trained->encode(vectors_.get(r), codes.data() + std::size_t(r) * trained->code_size());
-    codec_ = std::move(trained);  // commit: moves only
+    for (NodeId r = 0; r < n; ++r) trained->encode(stored_copy(r), codes.data() + std::size_t(r) * trained->code_size());
+    codec_ = std::move(trained);  // commit: moves only, and freeing memory
     codes_ = std::move(codes);
+    if (!quant_.keep_full_vectors) vectors_.drop_values();  // keep only codes from now on
 }
 
 void FlatIndex::train_codec() {
@@ -153,12 +154,35 @@ std::optional<std::vector<std::uint8_t>> FlatIndex::get_code(std::uint64_t id) c
     return std::vector<std::uint8_t>(c, c + codec_->code_size());
 }
 
+std::vector<float> FlatIndex::stored_copy(NodeId slot) const {
+    if (!codes_only()) {
+        const auto v = vectors_.get(slot);
+        return std::vector<float>(v.begin(), v.end());
+    }
+    std::vector<float> v(indexed_dim());
+    codec_->decode(codes_.data() + std::size_t(slot) * codec_->code_size(), v);
+    return v;
+}
+
+std::vector<float> FlatIndex::read_back(NodeId slot) const {
+    if (originals_) {
+        const auto v = originals_->get(slot);
+        return std::vector<float>(v.begin(), v.end());
+    }
+    return stored_copy(slot);
+}
+
+std::vector<float> FlatIndex::as_input(NodeId slot) const {
+    std::vector<float> input = read_back(slot);
+    input.resize(dim(), 0.0f);  // only when truncating without full vectors
+    return input;
+}
+
 std::optional<std::vector<float>> FlatIndex::get_vector(std::uint64_t id) const {
     const auto guard = lock_.read();
     const auto node = ids_.find(id);
     if (!node) return std::nullopt;
-    const auto v = original(*node);
-    return std::vector<float>(v.begin(), v.end());
+    return read_back(*node);
 }
 
 std::optional<Record> FlatIndex::get(std::uint64_t id) const {
@@ -404,8 +428,8 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
     if (k > 0 && live_ > 0) {
         k = std::min(k, live_);  // asking for more than exists returns everything
         const bool coded = codec_ && codec_->trained();
-        const bool rerank = coded && quant_.rerank;
-        TopK top(rerank ? std::min(live_, k * quant_.rerank_factor) : k);
+        const bool rerank = coded && quant_.rerank && !codes_only();  // nothing to re-rank with otherwise
+        TopK top(rerank ? std::min(live_, saturating_mul(k, quant_.rerank_factor)) : k);
         std::vector<float> table;
         if (coded) codec_->prepare(std::span<const float>(query, indexed_dim()), table);
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
@@ -536,6 +560,8 @@ std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, 
     const detail::SearchStopScope stop(options, options.stats);
     PreparedVector q(indexed_dim());
     prepare_truncated(q, query, dim(), metric_);
+    std::vector<float> table;  // codes only: distances from codes
+    if (codes_only()) codec_->prepare(std::span<const float>(q.data(), indexed_dim()), table);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -549,7 +575,8 @@ std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, 
             if ((node & 255) == 255 && detail::search_should_stop()) break;
             if (eligible.filtered() && !eligible(node)) continue;
             ++st.distance_computations;
-            const float d = index_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
+            const float d = codes_only() ? codec_->distance(table, codes_.data() + std::size_t(node) * codec_->code_size())
+                                         : index_distance(distance_(q.data(), vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
             if (d <= radius) hits.push_back({d, node});
         }
         st.nodes_visited = count;

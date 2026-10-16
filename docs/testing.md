@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 633 individually named tests** in 27 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 665 individually named tests** in 31 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -34,6 +34,10 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `codec` | 14 | Phase Q0: k-means finding separated clusters; bit-identical results across runs and thread counts; a fixed answer every platform must reproduce; k equal to the number of points, k of 1, identical points, duplicates with many centroids; invalid input; out of memory. SQ8: round-trip error at most half a level; constant dimensions stored exactly and values outside the range clamped; distances matching the decoded vectors for every metric; ranking close to full precision; fixed-answer codes (expected values computed independently with NumPy float32); misuse rejected; restoring a trained range; the codec factory |
 | `sq8` | 12 | Phase Q1: untrained means full precision (identical results); automatic training at the threshold (single adds and batches) and explicit training (with its errors); recall for every metric with and without re-ranking, HNSW and Flat; codes following every path (removals, reuse, updates, upserts, batches, a cancelled batch, compaction); saving and loading byte for byte, trained or not; every truncation and flipped bit of SQ8 files, and seven invalid values behind valid checksums (each confirmed to be rejected by its own rule); batch, filtered and exact searches with codes, range searches at full precision; out of memory in training and adding; searching while another thread trains; older files without a codec; invalid settings |
 | `matryoshka` | 11 | Phase Q2: identical results (IDs and distances) to an ordinary index of the first N values, for every metric, HNSW and Flat (confirmed to fail if the wrong dimensions are kept); vectors read back in full by `get_vector`, `get`, `scan` and `search_by_id`; inputs checked in full (wrong sizes, NaN in the part cut off); settings (the full dimension means off, a larger truncation is rejected, a single dimension works); with SQ8; saving and loading byte for byte; every slot path keeping full vectors; every truncation and flipped bit of a file, and a truncation larger than the dimension; batch and range searches; truncation without a codec; out of memory |
+| `lean` | 8 | `keep_full_vectors = false`: truncating indexes give identical results to keeping full vectors and return the stored first N values (every metric, HNSW and Flat); cosine indexes return normalized vectors; every slot path, with `search_by_id` and `compact` rebuilding inputs from stored vectors; saving and loading byte for byte, with smaller files; damaged files and an invalid flag; a flipped flag detected; with SQ8; the default keeps everything |
+| `review` | 4 | A review of phases Q0 to Q2 and `keep_full_vectors`: a range search inside a coded search's predicate (checked on every call); a huge `rerank_factor`; a **model-based test**: 24 random configurations (metric, dimension, truncation, SQ8 trained automatically or explicitly, re-ranking, keeping full vectors), 300 random operations each (adds with duplicate and very large vectors, removals, updates, upserts, batches including refused ones, `remove_batch`, `compact`, training, `search_by_id`, saving and reloading), every one followed by a full check against a simple model (sizes, every vector read back, exact HNSW against Flat up to the order of ties, codes, byte-identical saving); and compaction never changing stored vectors |
+| `codes_only` | 8 | SQ8 keeping only codes: floats kept until training and dropped after it, with recall for every metric (HNSW and Flat) and vectors read back within half a step; every slot path (removals, reuse, updates, upserts, batches, a cancelled batch, `compact`) and every kind of search from codes; saving and loading byte for byte, with a much smaller file; training again refused; every truncation and flipped bit of a file, and three inconsistent files behind valid checksums (each confirmed rejected by its own rule); searching while another thread trains and drops the floats; out of memory (training all or nothing, floats kept on failure); with truncation and cosine |
+| `binary` | 12 | Phase Q3: code sizes and bit order; a fixed answer every CPU must reproduce (expected values computed independently with NumPy float32); distances matching decoded vectors for every metric; decode then encode exact (constant dimensions included); misuse rejected; recall with and without re-ranking, by `rerank_factor` and `ef`, and with codes only; every slot path, keeping full vectors or not; saving and loading byte for byte; every truncation and flipped bit of a file, and a negative spread; with truncation; training final with codes only; out of memory. A golden file with binary codes (`golden_hnsw_binary_v3.bin`) must be reproduced on every platform |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -44,7 +48,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 633 test names
+test_comprehensive --list               # list all 665 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -58,13 +62,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 633 of 633 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 665 of 665 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-633 passed, 0 failed, 0 skipped, 0 not run, 31074 checks, 52.02 s
+665 passed, 0 failed, 0 skipped, 0 not run, 34712 checks, 68.12 s
 All selected tests passed.
 ```
 
@@ -112,37 +116,41 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 27 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 31 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/27 Test # 1: comprehensive.layer1 ................   Passed
- 2/27 Test # 2: comprehensive.layer2 ................   Passed
- 3/27 Test # 3: comprehensive.helpers ...............   Passed
- 4/27 Test # 4: comprehensive.flat ..................   Passed
- 5/27 Test # 5: comprehensive.hnsw ..................   Passed
- 6/27 Test # 6: comprehensive.robustness ............   Passed
- 7/27 Test # 7: comprehensive.deletion ..............   Passed
- 8/27 Test # 8: comprehensive.concurrency ...........   Passed
- 9/27 Test # 9: comprehensive.metadata ..............   Passed
-10/27 Test #10: comprehensive.filter ................   Passed
-11/27 Test #11: comprehensive.planner ...............   Passed
-12/27 Test #12: comprehensive.payload ...............   Passed
-13/27 Test #13: comprehensive.batch .................   Passed
-14/27 Test #14: comprehensive.range .................   Passed
-15/27 Test #15: comprehensive.search_e2e ............   Passed
-16/27 Test #16: comprehensive.update ................   Passed
-17/27 Test #17: comprehensive.hardening .............   Passed
-18/27 Test #18: comprehensive.persistence ...........   Passed
-19/27 Test #19: comprehensive.add_batch .............   Passed
-20/27 Test #20: comprehensive.bulk ..................   Passed
-21/27 Test #21: comprehensive.records ...............   Passed
-22/27 Test #22: comprehensive.control ...............   Passed
-23/27 Test #23: comprehensive.codec .................   Passed
-24/27 Test #24: comprehensive.sq8 ...................   Passed
-25/27 Test #25: comprehensive.matryoshka ............   Passed
-26/27 Test #26: comprehensive.stress ................   Passed
-27/27 Test #27: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 27
+ 1/31 Test # 1: comprehensive.layer1 ................   Passed
+ 2/31 Test # 2: comprehensive.layer2 ................   Passed
+ 3/31 Test # 3: comprehensive.helpers ...............   Passed
+ 4/31 Test # 4: comprehensive.flat ..................   Passed
+ 5/31 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/31 Test # 6: comprehensive.robustness ............   Passed
+ 7/31 Test # 7: comprehensive.deletion ..............   Passed
+ 8/31 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/31 Test # 9: comprehensive.metadata ..............   Passed
+10/31 Test #10: comprehensive.filter ................   Passed
+11/31 Test #11: comprehensive.planner ...............   Passed
+12/31 Test #12: comprehensive.payload ...............   Passed
+13/31 Test #13: comprehensive.batch .................   Passed
+14/31 Test #14: comprehensive.range .................   Passed
+15/31 Test #15: comprehensive.search_e2e ............   Passed
+16/31 Test #16: comprehensive.update ................   Passed
+17/31 Test #17: comprehensive.hardening .............   Passed
+18/31 Test #18: comprehensive.persistence ...........   Passed
+19/31 Test #19: comprehensive.add_batch .............   Passed
+20/31 Test #20: comprehensive.bulk ..................   Passed
+21/31 Test #21: comprehensive.records ...............   Passed
+22/31 Test #22: comprehensive.control ...............   Passed
+23/31 Test #23: comprehensive.codec .................   Passed
+24/31 Test #24: comprehensive.sq8 ...................   Passed
+25/31 Test #25: comprehensive.matryoshka ............   Passed
+26/31 Test #26: comprehensive.lean ..................   Passed
+27/31 Test #27: comprehensive.review ................   Passed
+28/31 Test #28: comprehensive.codes_only ............   Passed
+29/31 Test #29: comprehensive.binary ................   Passed
+30/31 Test #30: comprehensive.stress ................   Passed
+31/31 Test #31: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 31
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -230,6 +238,23 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 
 35. **Floating-point contraction would have made ARM builds differ.** GCC fuses `a * b + c` into one instruction by default on ARM, changing rounding: built for ARM64 without `-ffp-contract=off`, SQ8 distances differed in their last bits from x86. Found by fingerprinting exact results on x86, emulated ARM64 with the flag, and without it. `kmeans.cpp` and `codec.cpp` are built with the flag, and fixed-answer tests run on every CI platform.
 
+**Found while building `keep_full_vectors`:**
+
+36. **A saved setting was lost on loading.** `CONF` restores `keep_full_vectors`, but reading the later `CODC` section replaced all quantization settings with its own, resetting the flag to its default: a lean index would have reloaded keeping full vectors (the same had been handled for `truncate_to`, but not for the new flag). Found by tests `l04` and `l07` (save, load, compare) before release; loading now keeps both settings from `CONF`.
+
+**Found by reviewing phases Q0 to Q2 and `keep_full_vectors`:**
+
+37. **A range search nested in a coded search used the wrong query.** While a search compares codes, a per-thread marker tells `distance_to` which query table to use; range searches installed none, so one started from a coded search's predicate compared codes with the outer search's query. Found by reading the code; the first test missed it (it ran the nested search only on the predicate's first call, which comes from the planner's sampling, before the search), the corrected test (`v01`, every call) failed. Range searches now install a full-precision marker.
+38. **`k * rerank_factor` could wrap around.** With `rerank_factor = 2^63`, an exact search for 10 results asked for 0 candidates and returned nothing. Found by reading the code, proven by `v02`; the product now saturates.
+39. **`compact()` slightly changed stored vectors without originals.** It rebuilt from the stored vectors, normalizing already normalized cosine vectors again, which can change their last bits (a distance differed in its 7th digit). Found by the model-based test `v03` (exact HNSW against Flat); compaction now copies stored vectors exactly, and `v04` (shown to fail with the old code) checks they stay bit for bit the same over two compactions.
+
+**Found while building SQ8 with codes only:**
+
+40. **A float read hidden behind a local alias.** `same_vector` (duplicate detection during graph building) read floats through a local `VectorStore&`, which a search for `vectors().get` missed. Caught at once by the safety net (reading a dropped value throws), located with a debugger; it now compares codes.
+41. **Retraining a codes-only index could collapse it for good.** The model-based test found indexes whose 210 and 249 vectors all shared a single code: retraining on a few live vectors gave a range of zero width, and every later training, learning only from decoded vectors, kept it. Training again is now refused once only codes are kept; the test expects the refusal.
+
+The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
+
 A test also looped over `*f.search_by_id(...)` directly and read freed memory, failing at random (about 60% of runs): a range-based `for` destroys the temporary optional before the loop body. The test stores the result first now, and the [user guide](user-guide.md#searching-by-stored-id) warns about this trap.
 
 Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
@@ -264,7 +289,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
 | Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
 | Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
-| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8 and matryoshka groups |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only and binary groups |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.

@@ -14,6 +14,7 @@ These are deliberate for the current stage:
 
 - **Changes run one at a time.** Indexes are thread-safe, and adds, updates and removes take the lock alone. `add_batch` links its vectors on several threads, but searches wait while it runs; letting searches run during inserts would need the lowest storage layer redesigned for concurrent readers.
 - **Heavy update churn gradually weakens the graph.** Each update links a new version and repairs around the old one, and these small losses add up: after 320 updates per vector on a 20-vector index, one or two vectors were unreachable from the entry point in 27 of 200 random update orders (worst 90% reachable), single-threaded as well as with threads. `compact()` rebuilds the graph and restores it fully, so call it after heavy update workloads. (hnswlib has the same weakness with repeated updates.)
+- **Inner product with vectors of very different lengths:** vectors whose lengths differ by orders of magnitude leave some vectors hard to reach in an HNSW graph (the long ones dominate every neighborhood), a known property of HNSW with inner product. Normalize the vectors (or use cosine) when their lengths vary widely.
 - **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
 - **Many exact copies of the same vector weaken the graph,** especially combined with heavy removal and update churn: graph reachability drops noticeably (hnswlib shares this limitation).
 - **HNSW build speed.** One-by-one adds are single-threaded (use `add_batch` to build on several threads), and every access is bounds-checked for safety. Unchecked accessors in the hot loops are future optimizations.
@@ -50,11 +51,15 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Bulk changes by filter: `remove_where`, `set_metadata_where`, `count_where`
 - [x] Reading records back: `get_vector`, `get`, `scan` (file format version 2)
 - [x] `remove_batch`, `search_by_id`, and deadlines, cancellation and progress
+- [x] Compression: k-means and the codec interface; SQ8 and binary codes with re-ranking; Matryoshka truncation; keeping only codes (file format version 3)
+- [ ] SIMD kernels for code distances (SQ8, binary)
+- [ ] Product quantization, an IVF index, and a disk-based index (see the [plan](compression-and-index-types-plan.md))
+- [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe
 
-The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) are planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
+The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) were planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 
 ## Comparison with existing implementations
 
@@ -66,9 +71,9 @@ The core capabilities (real deletion, updating vectors, saving and loading, thre
 | Upper-level links | One arena allocation per node | One `malloc` per node | One shared array with offsets | Own implementation | Via Knowhere |
 | SIMD selection | Runtime CPU detection | Compile-time flags with runtime checks | Separate builds per instruction set | Runtime CPU detection | Via Knowhere |
 | Deletion | Real deletion: slot reuse and graph repair | Tombstones (optional slot reuse) | Depends on index type; not for HNSW | Yes | Yes |
-| Quantization | No | No | Yes (PQ, SQ, IVF) | Yes | Yes |
+| Quantization | SQ8 and binary codes, Matryoshka truncation (PQ and IVF planned) | No | Yes (PQ, SQ, IVF) | Yes | Yes |
 | Metadata filtering | Yes, with a query planner | Limited (a filter function) | Limited (ID selectors) | Yes | Yes |
-| Persistence | Not yet | Yes | Yes | Yes | Yes |
+| Persistence | Yes (versioned file format, checksums, older versions still read) | Yes | Yes | Yes | Yes |
 | Distribution across machines | No | No | No | Yes | Yes |
 
 hnsw-lite focuses on the in-memory core that these systems share, and leaves out the database features built around it.

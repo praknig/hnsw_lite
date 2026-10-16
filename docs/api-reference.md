@@ -181,6 +181,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `FieldType` | `Int`, `Float`, `Bool`, `Keyword`, `Tags` |
 | `Value::from(x)` | Builds a value; the type comes from the C++ type of `x` |
+| `Value::of_int`, `of_float`, `of_bool`, `of_keyword`, `of_tags` | A metadata value of one exact type (`Value::from` picks the type from a C++ value) |
 | `Metadata().set(name, value)`, `set_tags(name, tags)`, `unset(name)` | Builds the fields of one vector; `unset` clears a field in `set_metadata` |
 | `Schema::strict(fields)`, `Schema::dynamic(fields = {})` | Schema modes; empty or duplicate names throw |
 | `MetadataStore` | Column storage: `validate`, `write`, `update`, `clear`, `move_row`, `read`, `index_field`, `value_count`, `present_count`, `compact_dictionary`, `unused_string_count`, fast column accessors |
@@ -190,6 +191,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | Name | Description |
 |---|---|
 | `Filter::eq/ne/lt/le/gt/ge(field, value)`, `between`, `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, `all()` | Conditions; combine with `&&`, `\|\|`, `!` |
+| `filter.is_all()`, `filter.root()` | Whether a filter matches everything (`Filter::all()`), and its condition tree, for inspection |
 | `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
 | `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |
 | `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
@@ -209,7 +211,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `search_range(query, radius, max_results = kNoLimit, options)` | Range search |
 | `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings; `planner_params()` returns a copy, safe while other threads change them |
 
-`thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
+`filter.h` also holds two helpers the indexes use internally: `plan_search` (the planner's choice between graph and exact search) and `validate_batch` (checks a batch of queries). `thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
 
 ## Hardening additions
 
@@ -252,9 +254,10 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `nearest_centroid(centroids, dim, point, distance)` | Index of the nearest centroid (squared L2; ties to the lower index) |
 | `VectorCodec` | Interface: `kind()`, `code_size()`, `trained()`, `train(sample)`, `encode`, `decode`, `prepare(query, table)`, `distance(table, code)` |
 | `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
-| `CodecKind`, `make_codec(kind, dim, metric)` | Codec kinds (`None`, `SQ8`) and a factory |
-| `QuantizationParams` | `codec` (`None`, `SQ8`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
-| `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()` | On both indexes: train now (all or nothing), whether searches use codes, one stored code, and the codec itself (for inspection) |
+| `BinaryCodec` | Binary quantization: one bit per dimension, with a learned threshold and spread per dimension |
+| `CodecKind`, `make_codec(kind, dim, metric)` | Codec kinds (`None`, `SQ8`, `Binary`) and a factory |
+| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
+| `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()`, `has_vector_values()` | On both indexes: train now (all or nothing; refused once only codes are kept), whether searches use codes, one stored code, the codec itself (for inspection), and whether full-precision vectors are still kept |
 | `VectorCodec::state()`, `restore(state)`, `clone()` | The trained state as numbers (saved in files), restoring it, and a copy |
 | `dim()`, `indexed_dim()` | On both indexes: the dimension of vectors and queries as given, and the dimensions stored and searched (fewer with truncation) |
 | `indexed_dim(params, dim)`, `prepare_truncated(out, v, input_dim, metric)` | The dimensions an index with these settings stores (throws if the truncation exceeds `dim`); preparing a full input vector for a truncating index |
