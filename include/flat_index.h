@@ -17,6 +17,7 @@
 #include "metadata.h"
 #include "prepared_vector.h"
 #include "search_result.h"
+#include "codec.h"
 #include "thread_pool.h"
 #include "vector_store.h"
 
@@ -48,7 +49,9 @@ class FlatIndex {
 public:
     /// Creates an empty index for vectors of `dim` floats. `schema` defines the
     /// metadata fields (dynamic by default: fields are created on first use).
-    FlatIndex(std::size_t dim, Metric metric, Schema schema = Schema::dynamic());
+    /// `quantization`: compact storage of vectors (see QuantizationParams); exact
+    /// searches then compare codes and re-rank the best at full precision.
+    FlatIndex(std::size_t dim, Metric metric, Schema schema = Schema::dynamic(), QuantizationParams quantization = {});
 
     /// Stores a vector, with optional metadata, under the user's `id`. Throws
     /// std::invalid_argument on a wrong dimension, NaN or infinity, an ID that is
@@ -83,6 +86,13 @@ public:
                                                          bool include_self = false) const;
 
     std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// Codec functions: as on HnswIndex (train now, whether trained, a stored code).
+    void train_codec();
+    bool codec_trained() const;
+    const VectorCodec* codec() const { return codec_.get(); }  // for inspection, like HnswIndex::codec()
+    std::optional<std::vector<std::uint8_t>> get_code(std::uint64_t id) const;
+    const QuantizationParams& quantization() const { return quant_; }
 
     /// Removes every listed ID that is stored and returns how many it removed;
     /// unknown and repeated IDs are skipped. Always completes, like remove_where.
@@ -232,7 +242,10 @@ public:
         const auto guard = lock_.read();
         return vectors_.size();
     }
-    std::size_t dim() const { return vectors_.dim(); }
+    /// The dimension of vectors and queries as given.
+    std::size_t dim() const { return input_dim_; }
+    /// The dimensions stored and searched: dim(), or fewer with Matryoshka truncation.
+    std::size_t indexed_dim() const { return vectors_.dim(); }
     Metric metric() const { return metric_; }
     const MetadataStore& metadata() const { return metadata_; }
 
@@ -242,6 +255,8 @@ private:
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
     bool remove_unlocked(std::uint64_t id);  // caller holds the write lock; never allocates
     void add_vector(std::span<const float> original);  // scratch_ (prepared) and its original; all-or-nothing
+    void maybe_train() noexcept;
+    void train_codec_unlocked();
     std::span<const float> original(NodeId slot) const { return originals_ ? originals_->get(slot) : vectors_.get(slot); }
     std::vector<NodeId> matching_slots(const Filter& filter) const;  // caller holds a lock
     Record record(NodeId slot, bool with_vector, bool with_metadata) const;
@@ -255,10 +270,14 @@ private:
     std::vector<SearchResult> scan(const float* query, std::size_t k, const Eligibility& eligible,
                                    SearchStats* stats) const;
 
+    std::size_t input_dim_;  // as given; the stored vectors may be truncated (see indexed_dim)
     Metric metric_;
     DistanceFn distance_;     // fastest kernel for this CPU, chosen once
     VectorStore vectors_;
     std::optional<VectorStore> originals_;  // cosine: the vectors as given, slot by slot
+    QuantizationParams quant_;
+    std::unique_ptr<VectorCodec> codec_;  // null without quantization
+    std::vector<std::uint8_t> codes_;     // trained: code_size() bytes per row (at least as many rows as stored)
     IdMap ids_;
     MetadataStore metadata_;
     PreparedVector scratch_;  // reused by add(); searches use their own copy

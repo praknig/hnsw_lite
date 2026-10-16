@@ -127,7 +127,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 610 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 633 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -330,7 +330,7 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 
 ### Saving and loading
 
-**File format (version 2; version 1 is still read).** All numbers are little-endian. A 24-byte header (the magic text `HNSWLITE`, the format version, a byte-order mark, the index kind and a reserved field) is followed by sections, each a 4-letter tag, a 64-bit length, the payload and a CRC-32 of the payload, and finally an empty `END ` section; nothing may follow it.
+**File format (version 3; versions 1 and 2 are still read).** All numbers are little-endian. A 24-byte header (the magic text `HNSWLITE`, the format version, a byte-order mark, the index kind and a reserved field) is followed by sections, each a 4-letter tag, a 64-bit length, the payload and a CRC-32 of the payload, and finally an empty `END ` section; nothing may follow it.
 
 | Section | Flat | HNSW |
 |---|---|---|
@@ -393,6 +393,16 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Codecs** (`codec.h`) store vectors compactly. A codec is trained once, encodes each vector into `code_size()` bytes, and computes distances between a full-precision query and a code (asymmetric distance): `prepare()` turns the query into a small table once, then `distance()` compares the table with each code in a single pass. Distances follow the library's conventions (squared L2, negative dot product, 1 minus dot product), so they are directly comparable with full-precision ones. **SQ8** maps each dimension onto 256 even levels between its smallest and largest trained value: one byte per dimension, with a rounding error of at most half a level.
 
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
+
+### Compressed indexes
+
+An index with a codec keeps, besides its full-precision vectors, one code per slot in a plain byte array, `code_size()` bytes each. Codes follow every slot path: space for a code is reserved before anything else changes (so a failure leaves nothing behind), and the vector is encoded right after it is stored. Training builds a new codec and a complete new code array, then swaps both in, so it is all or nothing; compaction copies the trained codec into the rebuilt index, which encodes as it fills.
+
+**Searching with codes** reuses the existing search code unchanged. Every distance in an HNSW search goes through `distance_to()`; while a search runs with codes, a per-thread `CodeQuery` (installed by `search_impl` for its duration, like the deadline scope) makes `distance_to()` compare the prepared query table with codes instead. Building the graph never installs it, so the graph is always built from full precision (decision D7), and range searches, which do not go through `search_impl`, stay at full precision. Afterwards the candidates (the whole beam, or `k * rerank_factor` for exact scans) are re-scored at full precision and re-sorted. Flat compares codes in its scan, then re-ranks the same way; its batch search scans each query separately with codes, since its tiling is for full precision.
+
+**Matryoshka truncation** separates an index's input dimension (`dim()`, the size of vectors and queries as given) from its indexed dimension (`indexed_dim()`, what `VectorStore`, the scratch vectors and the codec use). Every insert and query goes through `prepare_truncated`, which checks the whole input and prepares its first `indexed_dim()` values. The full vectors are kept as originals (`Storage` now allows originals of a larger dimension, and refuses an insert without one when they differ), so `get_vector` returns them, and `compact` rebuilds from them. A truncating index stores exactly what an ordinary index of the prefixes would, so the two give identical results.
+
+**File format version 3** adds the truncation setting at the end of `CONF` (the vector records that follow need it to know their size) and a `CODC` section after the vectors: the quantization settings, a flag for whether the codec is trained, and if so the codec's state (for SQ8, each dimension's minimum and step) and every slot's code. Versions 1 and 2 load without a codec. A golden file with an SQ8-trained index (`golden_hnsw_sq8_v3.bin`) must be reproduced byte for byte on every platform, which checks that every CPU encodes identically.
 
 ## Search features design
 

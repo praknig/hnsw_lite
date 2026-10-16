@@ -10,9 +10,17 @@
 
 namespace vecdb {
 
-FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema)
-    : metric_(metric), distance_(get_distance(metric)), vectors_(dim), metadata_(std::move(schema)), scratch_(dim) {
-    if (metric == Metric::Cosine) originals_.emplace(dim);  // keep the vectors as given
+FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, QuantizationParams quantization)
+    : input_dim_(dim),
+      metric_(metric),
+      distance_(get_distance(metric)),
+      vectors_(vecdb::indexed_dim(quantization, dim)),  // checks the truncation
+      metadata_(std::move(schema)),
+      scratch_(vecdb::indexed_dim(quantization, dim)) {
+    validate(quantization);
+    quant_ = quantization;
+    if (metric == Metric::Cosine || vectors_.dim() < dim) originals_.emplace(dim);  // keep the vectors as given
+    codec_ = make_codec(quant_.codec, vectors_.dim(), metric);
 }
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
@@ -22,7 +30,7 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 
 void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     // 1. Validate everything before changing anything.
-    scratch_.prepare(vector, metric_);
+    prepare_truncated(scratch_, vector, dim(), metric_);
     metadata_.validate(metadata);
     if (ids_.find(id)) throw std::invalid_argument("external id already exists");
 
@@ -43,17 +51,27 @@ void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
         throw;
     }
     ++live_;
+    maybe_train();
 }
 
 void FlatIndex::add_vector(std::span<const float> original) {
+    const bool coded = codec_ && codec_->trained();
+    if (coded) {  // room for the code first: may throw, before any change
+        const std::size_t needed = (vectors_.size() + 1) * codec_->code_size();
+        if (codes_.size() < needed) codes_.resize(std::max(needed, codes_.size() + codes_.size() / 2));
+    }
     vectors_.add(scratch_.values());
-    if (!originals_) return;
+    if (!originals_) {
+        if (coded) codec_->encode(scratch_.values(), codes_.data() + (vectors_.size() - 1) * codec_->code_size());
+        return;
+    }
     try {
         originals_->add(original);
     } catch (...) {
         vectors_.undo_last_add();
         throw;
     }
+    if (coded) codec_->encode(scratch_.values(), codes_.data() + (vectors_.size() - 1) * codec_->code_size());
 }
 
 bool FlatIndex::remove(std::uint64_t id) {
@@ -90,6 +108,49 @@ std::size_t FlatIndex::remove_batch(std::span<const std::uint64_t> ids) {
     std::size_t removed = 0;
     for (std::uint64_t id : ids) removed += remove_unlocked(id) ? 1 : 0;  // unknown or already removed: skipped
     return removed;
+}
+
+void FlatIndex::maybe_train() noexcept {
+    if (!codec_ || codec_->trained() || quant_.train_after == 0 || live_ < quant_.train_after) return;
+    try {
+        train_codec_unlocked();
+    } catch (...) {  // out of memory: stay untrained (searches use full precision) and try again on a later add
+    }
+}
+
+void FlatIndex::train_codec_unlocked() {
+    if (!codec_) throw std::logic_error("train_codec: this index has no codec (see QuantizationParams)");
+    if (live_ == 0) throw std::invalid_argument("train_codec: the index is empty");
+    const std::size_t n = vectors_.size(), take = std::min<std::size_t>(n, 100000), d = indexed_dim();
+    std::vector<float> sample(take * d);  // a deterministic sample, evenly spaced
+    for (std::size_t i = 0; i < take; ++i) {
+        const auto v = vectors_.get(static_cast<NodeId>(i * n / take));
+        std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
+    }
+    auto trained = make_codec(codec_->kind(), d, metric_);
+    trained->train(sample);
+    std::vector<std::uint8_t> codes(n * trained->code_size());
+    for (NodeId r = 0; r < n; ++r) trained->encode(vectors_.get(r), codes.data() + std::size_t(r) * trained->code_size());
+    codec_ = std::move(trained);  // commit: moves only
+    codes_ = std::move(codes);
+}
+
+void FlatIndex::train_codec() {
+    const auto guard = lock_.write("train_codec");
+    train_codec_unlocked();
+}
+
+bool FlatIndex::codec_trained() const {
+    const auto guard = lock_.read();
+    return codec_ && codec_->trained();
+}
+
+std::optional<std::vector<std::uint8_t>> FlatIndex::get_code(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = ids_.find(id);
+    if (!node || !codec_ || !codec_->trained()) return std::nullopt;
+    const std::uint8_t* c = codes_.data() + std::size_t(*node) * codec_->code_size();
+    return std::vector<std::uint8_t>(c, c + codec_->code_size());
 }
 
 std::optional<std::vector<float>> FlatIndex::get_vector(std::uint64_t id) const {
@@ -179,6 +240,9 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     if (*node != last) {
         vectors_.move_row(last, *node);
         if (originals_) originals_->move_row(last, *node);
+        if (codec_ && codec_->trained())
+            std::copy_n(codes_.data() + std::size_t(last) * codec_->code_size(), codec_->code_size(),
+                        codes_.data() + std::size_t(*node) * codec_->code_size());
         ids_.move_slot(last, *node);
         metadata_.move_row(last, *node);
     } else {
@@ -219,7 +283,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         std::unordered_set<std::uint64_t> seen;
         seen.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            scratch_.prepare(vectors.subspan(i * d, d), metric_);
+            prepare_truncated(scratch_, vectors.subspan(i * d, d), dim(), metric_);
             if (ids_.find(ids[i]) || !seen.insert(ids[i]).second)
                 throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
         }
@@ -233,7 +297,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     detail::OperationControl control(options, n);  // may throw Cancelled before any change
     try {
         for (std::size_t i = 0; i < n; ++i) {
-            scratch_.prepare(vectors.subspan(i * d, d), metric_);
+            prepare_truncated(scratch_, vectors.subspan(i * d, d), dim(), metric_);
             const auto slot = static_cast<NodeId>(vectors_.size());
             undo.push_back(metadata_.write(slot, row(i)));
             try {
@@ -266,6 +330,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         }
         throw;
     }
+    maybe_train();
 }
 
 bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) {
@@ -293,13 +358,14 @@ bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 }
 
 bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
-    scratch_.prepare(vector, metric_);  // validates; may throw before any change
+    prepare_truncated(scratch_, vector, dim(), metric_);  // validates; may throw before any change
     if (metadata) metadata_.validate(*metadata);
     const auto node = ids_.find(id);
     if (!node) return false;
     if (metadata) metadata_.write(*node, *metadata);  // all-or-nothing
     vectors_.overwrite(*node, scratch_.values());     // cannot fail: already validated
     if (originals_) originals_->overwrite(*node, vector);
+    if (codec_ && codec_->trained()) codec_->encode(scratch_.values(), codes_.data() + std::size_t(*node) * codec_->code_size());
     return true;
 }
 
@@ -337,14 +403,20 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
     std::vector<SearchResult> results;
     if (k > 0 && live_ > 0) {
         k = std::min(k, live_);  // asking for more than exists returns everything
-        TopK top(k);
+        const bool coded = codec_ && codec_->trained();
+        const bool rerank = coded && quant_.rerank;
+        TopK top(rerank ? std::min(live_, k * quant_.rerank_factor) : k);
+        std::vector<float> table;
+        if (coded) codec_->prepare(std::span<const float>(query, indexed_dim()), table);
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
         std::size_t matches = 0;
         for (NodeId node = 0; node < count; ++node) {
             if ((node & 255) == 255 && detail::search_should_stop()) break;  // deadline or cancel: best so far
             if (eligible.filtered() && !eligible(node)) continue;
             ++matches;
-            top.push({index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine), node});
+            const float d = coded ? codec_->distance(table, codes_.data() + std::size_t(node) * codec_->code_size())
+                                  : index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
+            top.push({d, node});
         }
         st.nodes_visited = count;
         st.distance_computations = matches;
@@ -352,7 +424,14 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         st.exact_count = true;
         st.selectivity = double(matches) / double(live_);
         results.reserve(k);
-        for (const Candidate& c : top.take_sorted()) results.push_back({ids_.external(c.id), c.distance});
+        std::vector<Candidate> found = top.take_sorted();
+        if (rerank) {  // the best by code, re-ranked at full precision
+            for (Candidate& c : found)
+                c.distance = index_distance(distance_(query, vectors_.get_padded(c.id).data(), stride), metric_ == Metric::Cosine);
+            std::sort(found.begin(), found.end());
+            if (found.size() > k) found.resize(k);
+        }
+        for (const Candidate& c : found) results.push_back({ids_.external(c.id), c.distance});
     }
     if (stats) *stats = st;
     return results;
@@ -366,8 +445,8 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
                                             const SearchOptions& options) const {
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);  // records stopped_early last
-    PreparedVector q(dim());
-    q.prepare(query, metric_);  // validates even when the index is empty
+    PreparedVector q(indexed_dim());
+    prepare_truncated(q, query, dim(), metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
     return scan(q.data(), k, eligible, options.stats);
@@ -383,6 +462,24 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
     std::vector<std::vector<SearchResult>> results(nq);
     if (nq == 0 || k == 0 || live_ == 0) return results;
     k = std::min(k, live_);
+    if (codec_ && codec_->trained()) {  // codes: each query scans the codes (the tiles below are for full precision)
+        std::atomic<bool> stopped{false};
+        auto one = [&](std::size_t q) {
+            const detail::SearchStopScope stop(options, nullptr);
+            PreparedVector pq(indexed_dim());
+            prepare_truncated(pq, queries.subspan(q * dim(), dim()), dim(), metric_);
+            results[q] = scan(pq.data(), k, eligible, nullptr);
+            if (stop.stopped()) stopped = true;
+        };
+        const std::size_t workers = std::min(effective_threads(threads), nq);
+        if (workers <= 1) {
+            for (std::size_t q = 0; q < nq; ++q) one(q);
+        } else {
+            pool_.get(workers)->parallel_for(nq, one);
+        }
+        if (options.stats) options.stats->stopped_early = stopped.load();
+        return results;
+    }
 
     // Tiling: a block of stored vectors is compared with a chunk of queries, so
     // each vector loaded into the cache serves every query in the chunk. Rows are
@@ -405,8 +502,8 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
         std::vector<TopK> tops;
         tops.reserve(q1 - q0);
         for (std::size_t q = q0; q < q1; ++q) {
-            prepared.emplace_back(dim());
-            prepared.back().prepare(queries.subspan(q * dim(), dim()), metric_);
+            prepared.emplace_back(indexed_dim());
+            prepare_truncated(prepared.back(), queries.subspan(q * dim(), dim()), dim(), metric_);
             tops.emplace_back(k);
         }
         std::vector<std::uint8_t> ok(kRowBlock);
@@ -437,8 +534,8 @@ std::vector<SearchResult> FlatIndex::search_range(std::span<const float> query, 
                                                   std::size_t max_results, const SearchOptions& options) const {
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);
-    PreparedVector q(dim());
-    q.prepare(query, metric_);
+    PreparedVector q(indexed_dim());
+    prepare_truncated(q, query, dim(), metric_);
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);

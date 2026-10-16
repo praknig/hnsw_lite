@@ -21,6 +21,8 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Searching by stored ID](#searching-by-stored-id)
 - [Deadlines, cancellation and progress](#deadlines-cancellation-and-progress)
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
+- [Compressing vectors (SQ8)](#compressing-vectors-sq8)
+- [Shorter vectors (Matryoshka truncation)](#shorter-vectors-matryoshka-truncation)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
 - [Errors and guarantees](#errors-and-guarantees)
@@ -359,6 +361,41 @@ The three `_where` functions take the same filters as searches; all four return 
 - **`set_metadata_where` is all or nothing:** invalid changes throw `std::invalid_argument`, even when nothing matches, and if memory runs out no vector has changed. It works on a copy of the metadata and swaps it in when complete, so it briefly needs extra memory about the size of the index's metadata.
 - **Searches see the index before or after a change, never in between**, and like all changes these cannot be made from inside a search (`std::logic_error`); `count_where` is a read and can.
 
+## Compressing vectors (SQ8)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::SQ8;   // one byte per dimension
+p.quantization.train_after = 1000;       // train automatically at 1,000 vectors
+HnswIndex index(768, Metric::Cosine, p);
+
+FlatIndex flat(768, Metric::L2, Schema::dynamic(), p.quantization);
+flat.train_codec();                      // or train now, on the stored vectors
+```
+
+- **SQ8** stores each dimension as one of 256 levels between its smallest and largest trained value. Searches compare the query with these codes, then **re-rank** the best candidates at full precision (`rerank`, on by default). In tests, recall with re-ranking matched full precision exactly; with codes alone (`rerank = false`) it was about 1% lower.
+- **Training** happens automatically once `train_after` vectors are stored (0: only by `train_codec()`), and again whenever you call `train_codec()`. Until then, searches use full precision exactly as without a codec. Training is all or nothing; if memory runs out during automatic training, the add still completes and training is retried on a later add.
+- **Memory:** full-precision vectors are kept too (for re-ranking and `get_vector`), so for now SQ8 adds 25% to vector memory rather than saving it. The saving comes with full-precision vectors kept on disk; see the [plan](compression-and-index-types-plan.md).
+- Range searches use full precision. Batch, filtered and exact searches use codes. Saved files keep the codec, its training and the codes (file format version 3).
+- **Setting `HnswParams` positionally** (`HnswParams{16, 200, 42}`) leaves out `quantization`, and compilers warn about that with `-Wextra`. Set fields by name instead, as above.
+
+## Shorter vectors (Matryoshka truncation)
+
+```cpp
+HnswParams p;
+p.quantization.truncate_to = 256;        // index only the first 256 of 768 dimensions
+HnswIndex index(768, Metric::Cosine, p);
+index.add(id, full_vector);              // vectors and queries are still given in full (768 values)
+auto results = index.search(full_query, 10);
+auto v = index.get_vector(id);           // all 768 values, exactly as given
+```
+
+- **Only for embeddings trained for it**, such as OpenAI's `text-embedding-3` models or Nomic Embed: these put the most important information first, so a prefix of the vector is still a good, slightly less precise embedding. With other embeddings, truncation damages results.
+- The index stores and searches only the first `truncate_to` values (re-normalized for cosine), so each distance costs proportionally less and building is faster. `dim()` stays the full dimension; `indexed_dim()` reports the truncated one.
+- Inputs are checked in full: a vector of the wrong size, or with NaN or infinity anywhere (even in the part that is cut off), is rejected.
+- **Memory:** the full vectors are kept too, so that `get_vector` returns them, so for now truncation uses more memory, not less.
+- It combines with SQ8 (the codes then cover the first `truncate_to` dimensions), and is saved with the index (file format version 3). `0`, or the full dimension, means no truncation.
+
 ## Saving and loading
 
 ```cpp
@@ -372,7 +409,7 @@ auto flat = FlatIndex::load("exact.flat");           // the same for FlatIndex
 - **Loaded files are checked thoroughly.** Each section carries a checksum, every count is checked before memory is allocated, and every link, level and value is validated. A damaged, truncated or foreign file throws `vecdb::FormatError`; a failed load never produces a half-built index.
 - **Streams work too:** `save(std::ostream&)` and `load(std::istream&)`, for example with `std::stringstream`. A stream given to `load` must be seekable (files and string streams are).
 - A save reads the index, so searches and other saves run alongside it, and changes wait until it finishes. Several threads may save to the **same path** at once: each writes its own temporary file and the last to finish wins, so the file is always complete. (On Windows, two renames over one file at the very same moment can be refused; that save then throws `std::runtime_error` and the file stays complete.)
-- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned; this version writes format 2 and reads 1 and 2). A cosine index saved in format 1, before originals were kept, still loads; `get_vector` then returns its normalized vectors.
+- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned; this version writes format 3 and reads 1 to 3). A cosine index saved in format 1, before originals were kept, still loads; `get_vector` then returns its normalized vectors.
 
 ## Threads
 

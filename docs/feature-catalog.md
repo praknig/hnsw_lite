@@ -54,10 +54,10 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 4.1 | **Quantization:** 8-bit (SQ8), binary and product quantization (PQ), each optional per index and with optional re-ranking at full precision. Needs file format version 2 | roadmap + new | SQ8 (roadmap, decision D4: an option); binary quantization; PQ | 3–4 days for SQ8; 2–3 more for binary; 1 week more for PQ |
-| 4.2 | **Shorter vectors (Matryoshka truncation):** keep only the first N dimensions of embeddings trained for it | new | | 1 day |
-| 4.3 | **An IVF index:** a second index type, for very large datasets and fast builds | new | | 1 week |
-| 4.4 | **A disk-based index (DiskANN-style):** indexes larger than memory | new | | 3+ weeks |
+| 4.1 | **Quantization:** 8-bit (SQ8), binary and product quantization (PQ), each optional per index and with optional re-ranking at full precision. Needs file format version 3 (version 2 added cosine originals). **In progress:** SQ8 done (SIMD kernels to follow); see the [compression and index types plan](compression-and-index-types-plan.md) | roadmap + new | SQ8 (roadmap, decision D4: an option); binary quantization; PQ | 3–4 days for SQ8; 2–3 more for binary; 1 week more for PQ |
+| 4.2 | **Shorter vectors (Matryoshka truncation):** keep only the first N dimensions of embeddings trained for it | **done** ([plan](compression-and-index-types-plan.md)) | | 1 day |
+| 4.3 | **An IVF index:** a second index type, for very large datasets and fast builds. **Planned** ([plan](compression-and-index-types-plan.md)) | new | | 1 week |
+| 4.4 | **A disk-based index (DiskANN-style):** indexes larger than memory. **Planned** ([plan](compression-and-index-types-plan.md)), read-only at first | new | | 4–6 weeks (re-estimated) |
 
 ## 5. Storage and durability
 

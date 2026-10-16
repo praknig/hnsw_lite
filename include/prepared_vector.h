@@ -71,4 +71,20 @@ private:
     AlignedBlock block_;
 };
 
+/// Prepares an input vector of `input_dim` values for an index that may use
+/// only its first out.dim() values (Matryoshka truncation): checks the whole
+/// vector (its size, and that every value is finite, including the part that is
+/// cut off), then prepares the first out.dim() values (normalizing those for
+/// cosine). Without truncation it is exactly out.prepare(v, metric).
+inline void prepare_truncated(PreparedVector& out, std::span<const float> v, std::size_t input_dim, Metric metric) {
+    if (out.dim() == input_dim) {
+        out.prepare(v, metric);
+        return;
+    }
+    if (v.size() != input_dim) throw std::invalid_argument("vector has wrong dimension");
+    for (float x : v)
+        if (!std::isfinite(x)) throw std::invalid_argument("vector contains NaN or infinity");
+    out.prepare(v.first(out.dim()), metric);
+}
+
 }  // namespace vecdb

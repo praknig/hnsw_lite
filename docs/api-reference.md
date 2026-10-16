@@ -243,7 +243,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 ## Training and codecs
 
-These are building blocks for the quantized indexes planned in the [compression and index types plan](compression-and-index-types-plan.md); the indexes do not use them yet.
+These are the building blocks of compressed indexes (see the [compression and index types plan](compression-and-index-types-plan.md)).
 
 | Name | Description |
 |---|---|
@@ -253,3 +253,8 @@ These are building blocks for the quantized indexes planned in the [compression 
 | `VectorCodec` | Interface: `kind()`, `code_size()`, `trained()`, `train(sample)`, `encode`, `decode`, `prepare(query, table)`, `distance(table, code)` |
 | `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
 | `CodecKind`, `make_codec(kind, dim, metric)` | Codec kinds (`None`, `SQ8`) and a factory |
+| `QuantizationParams` | `codec` (`None`, `SQ8`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
+| `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()` | On both indexes: train now (all or nothing), whether searches use codes, one stored code, and the codec itself (for inspection) |
+| `VectorCodec::state()`, `restore(state)`, `clone()` | The trained state as numbers (saved in files), restoring it, and a copy |
+| `dim()`, `indexed_dim()` | On both indexes: the dimension of vectors and queries as given, and the dimensions stored and searched (fewer with truncation) |
+| `indexed_dim(params, dim)`, `prepare_truncated(out, v, input_dim, metric)` | The dimensions an index with these settings stores (throws if the truncation exceeds `dim`); preparing a full input vector for a truncating index |

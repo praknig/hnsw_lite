@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -1847,14 +1847,14 @@ TEST(flat, many_vectors) {
 
 TEST(hnsw, rejects_invalid_params) {
     CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(0, Metric::L2));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{0, 200, 1}));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{1, 200, 1}));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{16, 0, 1}));
-    CHECK_NOTHROW(HnswIndex ok(4, Metric::L2, HnswParams{2, 1, 1}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{0, 200, 1, true, {}}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{1, 200, 1, true, {}}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{16, 0, 1, true, {}}));
+    CHECK_NOTHROW(HnswIndex ok(4, Metric::L2, HnswParams{2, 1, 1, true, {}}));
 }
 
 TEST(hnsw, accessors) {
-    HnswIndex h(7, Metric::InnerProduct, HnswParams{12, 50, 9});
+    HnswIndex h(7, Metric::InnerProduct, HnswParams{12, 50, 9, true, {}});
     CHECK(h.dim() == 7 && h.metric() == Metric::InnerProduct && h.size() == 0);
     CHECK(h.params().M == 12 && h.params().ef_construction == 50 && h.params().seed == 9);
 }
@@ -2103,7 +2103,7 @@ TEST(hnsw, recall_at_k1_and_k50) {
 }
 
 TEST(hnsw, level_distribution) {
-    HnswIndex h(16, Metric::L2, HnswParams{16, 32, 7});
+    HnswIndex h(16, Metric::L2, HnswParams{16, 32, 7, true, {}});
     auto data = clustered(4000, 16, 4, 8);
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     std::size_t upper = 0;
@@ -2124,7 +2124,7 @@ TEST(hnsw, param_minimal_M) {
     // M = 2 builds a valid but sparse graph (measured: ~90% reachable, recall ~0.74).
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{2, 200, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{2, 200, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.80);
@@ -2135,7 +2135,7 @@ TEST(hnsw, param_minimal_ef_construction) {
     // ef_construction = 1 builds greedily (measured recall ~0.66).
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{16, 1, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{16, 1, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.99);
@@ -2145,7 +2145,7 @@ TEST(hnsw, param_minimal_ef_construction) {
 TEST(hnsw, param_large_M) {
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{64, 200, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{64, 200, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.999);
@@ -2158,7 +2158,7 @@ TEST(hnsw, param_other_seeds) {
     FlatIndex f(16, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
     for (std::uint64_t seed : {0ull, 777ull, 123456789ull}) {
-        HnswIndex h(16, Metric::L2, HnswParams{16, 200, seed});
+        HnswIndex h(16, Metric::L2, HnswParams{16, 200, seed, true, {}});
         for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
         check_graph(h, 0.99);
         CHECK(recall(h, f, queries, 10, 100) >= 0.95);
@@ -2419,7 +2419,7 @@ TEST(robustness, ordered_distance_helper) {
 }
 
 TEST(robustness, max_level_stays_reasonable) {
-    HnswIndex h(8, Metric::L2, HnswParams{16, 16, 11});
+    HnswIndex h(8, Metric::L2, HnswParams{16, 16, 11, true, {}});
     auto data = random_vectors(5000, 8, 82);
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     CHECK(h.max_level() >= 1 && h.max_level() <= 8);  // expected about log16(5000) = 3
@@ -3040,7 +3040,7 @@ TEST(deletion, d41_hnsw_insert_reuses_slot) {
 
 TEST(deletion, d42_hnsw_reused_slot_higher_level) {
     auto data = clustered(300, 8, 4, 212);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 3});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 3, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 213));
     CHECK(seen.higher && seen.same_slot);
@@ -3050,7 +3050,7 @@ TEST(deletion, d42_hnsw_reused_slot_higher_level) {
 
 TEST(deletion, d43_hnsw_reused_slot_lower_level) {
     auto data = clustered(300, 8, 4, 215);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 5});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 5, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 216));
     CHECK(seen.lower && seen.same_slot);
@@ -3255,7 +3255,7 @@ TEST(deletion, d53_hnsw_remove_some_identical_copies) {
 
 TEST(deletion, d54_hnsw_remove_with_minimal_M) {
     auto data = clustered(400, 8, 4, 232);
-    HnswIndex h(8, Metric::L2, HnswParams{2, 100, 1});
+    HnswIndex h(8, Metric::L2, HnswParams{2, 100, 1, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     for (std::uint64_t i = 0; i < 400; i += 4) h.remove(i);
     check_graph(h, 0.70);
@@ -3512,7 +3512,7 @@ TEST(deletion, repair_skips_already_removed_links) {
     // Removing Y does not unlink X -> Y when Y does not link back to X. Removing
     // X afterwards must repair around it while ignoring the dead link to Y.
     auto data = clustered(1000, 8, 4, 247);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});  // small lists fill up and get pruned
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1, true, {}});  // small lists fill up and get pruned
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const Storage& st = h.storage();
     NodeId x = kEmpty, y = kEmpty;
@@ -3580,7 +3580,7 @@ TEST(deletion, repair_skips_stale_links) {
     // upper-level link A -> S, reuse S until its level drops, then remove A.
     auto data = clustered(1000, 8, 4, 252);
     auto extra = clustered(200, 8, 4, 253);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const Storage& st = h.storage();
     NodeId a = kEmpty, s = kEmpty;
@@ -5428,7 +5428,7 @@ TEST(search_e2e, ix05_reproducible) {
 TEST(search_e2e, ix06_large_scale_random_filters) {
     auto data = clustered(20000, 16, 25, 377);
     auto queries = clustered(30, 16, 25, 378);
-    HnswIndex h(16, Metric::L2, HnswParams{16, 100, 9}, Schema::strict(search_fields()));
+    HnswIndex h(16, Metric::L2, HnswParams{16, 100, 9, true, {}}, Schema::strict(search_fields()));
     FlatIndex f(16, Metric::L2, Schema::strict(search_fields()));
     h.create_payload_index("category");
     for (std::size_t i = 0; i < data.size(); ++i) {
@@ -6702,6 +6702,22 @@ std::unique_ptr<FlatIndex> golden_flat() {
 
 std::string golden_path(const char* name) { return std::string(HNSW_TEST_DATA_DIR) + "/" + name; }
 
+/// The index stored in tests/data/golden_hnsw_sq8_v3.bin: SQ8-trained, from whole
+/// numbers, so its codes are identical on every CPU.
+std::unique_ptr<HnswIndex> golden_sq8() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 9;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 100;
+    auto h = std::make_unique<HnswIndex>(8, Metric::L2, p);
+    std::mt19937 rng(2028);
+    for (std::uint64_t i = 0; i < 250; ++i) h->add(i, integer_vector(rng, 8));
+    for (std::uint64_t i = 0; i < 250; i += 13) h->remove(i);
+    return h;
+}
+
 /// A small HNSW index used by the corruption tests (small, so every byte can be tried).
 std::unique_ptr<HnswIndex> tiny_hnsw() {
     HnswParams p;
@@ -6927,7 +6943,7 @@ TEST(persistence, p22_wrong_magic_version_or_byte_order) {
     const std::string bytes = save_bytes(*tiny_hnsw());
     std::string magic = bytes, version = bytes, zero = bytes, order = bytes, reserved = bytes;
     magic[0] = 'X';
-    poke<std::uint32_t>(version, 8, 3);  // a future version
+    poke<std::uint32_t>(version, 8, persist::kVersion + 1);  // a future version
     poke<std::uint32_t>(zero, 8, 0);
     poke<std::uint32_t>(order, 12, 0x04030201u);
     poke<std::uint32_t>(reserved, 20, 1);
@@ -6935,7 +6951,7 @@ TEST(persistence, p22_wrong_magic_version_or_byte_order) {
     try {
         load_hnsw(version);
     } catch (const FormatError& e) {
-        CHECK(std::string(e.what()).find("version 3") != std::string::npos);  // a clear message
+        CHECK(std::string(e.what()).find("version " + std::to_string(persist::kVersion + 1)) != std::string::npos);  // a clear message
     }
 }
 
@@ -7077,7 +7093,7 @@ TEST(persistence, p30_oom_save_keeps_the_old_file) {
 TEST(persistence, p40_golden_files_load) {
   // Every format version this library reads: the version 1 files are frozen, to
   // prove that files saved by older versions of the library keep loading.
-  for (const char* version : {"v1", "v2"}) {
+  for (const char* version : {"v1", "v2", "v3"}) {
     auto h = HnswIndex::load(golden_path((std::string("golden_hnsw_") + version + ".bin").c_str()));
     auto f = FlatIndex::load(golden_path((std::string("golden_flat_") + version + ".bin").c_str()));
     auto h_ref = golden_hnsw();
@@ -7103,13 +7119,17 @@ TEST(persistence, p40_golden_files_load) {
 TEST(persistence, p41_identical_bytes_on_every_platform) {
     // Built from whole numbers, which every distance kernel sums exactly, so every
     // CI platform must reproduce the committed version 1 files byte for byte.
-    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v2.bin")));
-    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v2.bin")));
+    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v3.bin")));
+    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v3.bin")));
+    // SQ8 codes are part of the file: every CPU's encoding must match byte for byte.
+    CHECK(save_bytes(*golden_sq8()) == read_file(golden_path("golden_hnsw_sq8_v3.bin")));
+    auto loaded = HnswIndex::load(golden_path("golden_hnsw_sq8_v3.bin"));
+    CHECK(loaded->codec_trained() && *loaded->get_code(5) == *golden_sq8()->get_code(5));
 }
 
 TEST(persistence, p42_large_round_trip) {
     auto data = clustered(20000, 16, 20, 509);
-    HnswIndex h(16, Metric::L2, HnswParams{12, 60, 3});
+    HnswIndex h(16, Metric::L2, HnswParams{12, 60, 3, true, {}});
     FlatIndex f(16, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) {
         h.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
@@ -8045,7 +8065,7 @@ TEST(concurrency, c20_simultaneous_saves_to_one_file) {
     // another save has moved the file away. The index is large enough that each
     // save spans many thread time slices, and all saves start together.
     auto data = clustered(20000, 32, 10, 617);
-    HnswIndex h(32, Metric::L2, HnswParams{8, 40, 1}, Schema::dynamic({}));
+    HnswIndex h(32, Metric::L2, HnswParams{8, 40, 1, true, {}}, Schema::dynamic({}));
     FlatIndex f(32, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) {
         h.add(i, data[i], Metadata().set("g", std::int64_t(i % 7)));
@@ -8348,7 +8368,7 @@ TEST(add_batch, b08_entry_point_with_many_high_levels) {
     // vectors reachable even one by one), so quality is compared with one-by-one adds.
     auto data = clustered(4000, 8, 10, 708);
     for (int round = 0; round < 3; ++round) {
-        const HnswParams params{2, 32, std::uint64_t(round)};
+        const HnswParams params{2, 32, std::uint64_t(round), true, {}};
         HnswIndex h(8, Metric::L2, params), one_by_one(8, Metric::L2, params);
         h.add_batch(id_range(0, 4000), flatten(data), 8);
         for (std::size_t i = 0; i < data.size(); ++i) one_by_one.add(i, data[i]);
@@ -9014,11 +9034,15 @@ std::vector<std::uint64_t> ids_of(const std::vector<Record>& records) {
     return ids;
 }
 
-/// A version 1 file made from a version 2 file of a cosine index, by removing the
-/// originals stored after each vector (version 1 did not store them).
+/// A version 1 file made from a current file of a cosine index, by removing the
+/// originals stored after each vector (version 2), the CODC section and the
+/// truncation setting at the end of CONF (version 3).
 std::string as_version_1(const std::string& v2, bool hnsw, std::size_t dim) {
     ParsedFile f = ParsedFile::parse(v2);
     poke<std::uint32_t>(f.header, 8, 1);
+    std::erase_if(f.sections, [](const auto& sec) { return sec.first == persist::tag("CODC"); });  // version 3 only
+    std::string& conf = f.payload("CONF");
+    conf.resize(conf.size() - 8);  // version 3 ends CONF with the truncation setting
     std::string& node = f.payload("NODE");
     std::string out = node.substr(0, 8);
     const auto n = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(&node[0]));
@@ -9365,7 +9389,7 @@ TEST(records, r15_version_1_cosine_files) {
     CHECK(normalized);
     CHECK(same_results(h1->search(data[9], 5, 64), h.search(data[9], 5, 64)));
     // Saved again, they become version 2 files.
-    CHECK(persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(save_bytes(*h1).data() + 8)) == 2);
+    CHECK(persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(save_bytes(*h1).data() + 8)) == persist::kVersion);
 }
 
 TEST(records, r16_originals_follow_every_path) {
@@ -9417,7 +9441,7 @@ TEST(records, r17_damaged_cosine_files) {
     // The cosine-only part of the format (originals after each vector) read from
     // damaged files: truncated at every byte, a bit flipped in every byte.
     auto data = random_vectors(12, 3, 910);
-    HnswIndex h(3, Metric::Cosine, HnswParams{4, 16, 1});
+    HnswIndex h(3, Metric::Cosine, HnswParams{4, 16, 1, true, {}});
     FlatIndex f(3, Metric::Cosine);
     for (std::uint64_t i = 0; i < 12; ++i) {
         h.add(i, data[i], Metadata().set("k", std::int64_t(i)));
@@ -10276,6 +10300,606 @@ TEST(codec, q0_14_make_codec) {
 }
 
 // ===========================================================================
+// Phase Q1: SQ8 in the indexes (S8-01 to S8-12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams sq8(std::size_t train_after = 1000, bool rerank = true) {
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = train_after;
+    q.rerank = rerank;
+    return q;
+}
+
+HnswParams hnsw_sq8(std::size_t train_after = 1000, bool rerank = true) {
+    HnswParams p;
+    p.quantization = sq8(train_after, rerank);
+    return p;
+}
+
+/// Every live vector's code equals a fresh encoding of its stored vector.
+bool codes_match(const HnswIndex& h) {
+    const VectorCodec* c = h.codec();
+    if (!c || !c->trained()) return false;
+    std::vector<std::uint8_t> expected(c->code_size());
+    for (NodeId n = 0; n < h.storage().size(); ++n) {
+        if (h.storage().ids().is_deleted(n)) continue;
+        c->encode(h.storage().vectors().get(n), expected.data());
+        if (*h.get_code(h.storage().ids().external(n)) != expected) return false;
+    }
+    return true;
+}
+
+bool codes_match(const FlatIndex& f) {  // L2: the stored vector is the vector as given
+    const VectorCodec* c = f.codec();
+    if (!c || !c->trained()) return false;
+    std::vector<std::uint8_t> expected(c->code_size());
+    ScanOptions all;
+    all.limit = 1000000;
+    for (const Record& r : f.scan(all).records) {
+        c->encode(r.vector, expected.data());
+        if (*f.get_code(r.id) != expected) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(sq8, s8_01_untrained_means_full_precision) {
+    auto data = clustered(500, 16, 6, 970);
+    HnswIndex plain(16, Metric::L2), coded(16, Metric::L2, hnsw_sq8(1000));
+    FlatIndex fplain(16, Metric::L2), fcoded(16, Metric::L2, Schema::dynamic(), sq8(1000));
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        plain.add(i, data[i]);
+        coded.add(i, data[i]);
+        fplain.add(i, data[i]);
+        fcoded.add(i, data[i]);
+    }
+    CHECK(!coded.codec_trained() && !fcoded.codec_trained() && !coded.get_code(1));
+    bool same = true;
+    for (std::size_t q = 0; q < 20; ++q)
+        same = same && same_results(coded.search(data[q], 10, 64), plain.search(data[q], 10, 64)) &&
+               same_results(fcoded.search(data[q], 10), fplain.search(data[q], 10));
+    CHECK(same);
+}
+
+TEST(sq8, s8_02_automatic_training) {
+    auto data = clustered(400, 8, 4, 971);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(300));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(300));
+    for (std::uint64_t i = 0; i < 299; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.codec_trained() && !f.codec_trained());
+    h.add(299, data[299]);  // the 300th vector: trains, and encodes everything stored
+    f.add(299, data[299]);
+    CHECK(h.codec_trained() && f.codec_trained() && codes_match(h) && codes_match(f));
+    for (std::uint64_t i = 300; i < 400; ++i) {  // later vectors are encoded as they arrive
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(codes_match(h) && codes_match(f));
+    HnswIndex batch(8, Metric::L2, hnsw_sq8(300));
+    batch.add_batch(id_range(0, 400), flatten(data), 4);  // a batch crossing the threshold trains at its end
+    CHECK(batch.codec_trained() && codes_match(batch));
+}
+
+TEST(sq8, s8_03_explicit_training) {
+    auto data = clustered(200, 8, 4, 972);
+    HnswIndex none(8, Metric::L2);
+    FlatIndex fnone(8, Metric::L2);
+    CHECK_THROWS_AS(std::logic_error, none.train_codec());
+    CHECK_THROWS_AS(std::logic_error, fnone.train_codec());
+    HnswIndex h(8, Metric::L2, hnsw_sq8(0));  // 0: only explicit training
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(0));
+    CHECK_THROWS_AS(std::invalid_argument, h.train_codec());  // empty
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.codec_trained());
+    h.train_codec();
+    f.train_codec();
+    CHECK(codes_match(h) && codes_match(f));
+    h.add(500, std::vector<float>(8, 100.0f));  // far outside the trained range: clamped
+    h.train_codec();                             // training again includes it
+    CHECK(codes_match(h) && h.codec()->state()[0] <= data[0][0]);
+}
+
+TEST(sq8, s8_04_recall_every_metric) {
+    auto data = clustered(3000, 32, 12, 973);
+    auto queries = clustered(60, 32, 12, 974);
+    for (Metric m : kMetrics) {
+        HnswIndex plain(32, m), reranked(32, m, hnsw_sq8(500)), codes_only(32, m, hnsw_sq8(500, false));
+        FlatIndex exact(32, m), fcoded(32, m, Schema::dynamic(), sq8(500)), fcodes_only(32, m, Schema::dynamic(), sq8(500, false));
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            codes_only.add(i, data[i]);
+            exact.add(i, data[i]);
+            fcoded.add(i, data[i]);
+            fcodes_only.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64);
+        const double r = recall(reranked, exact, queries, 10, 64), c = recall(codes_only, exact, queries, 10, 64);
+        double fr = 0, fc = 0;  // Flat against exact results
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : fcoded.search(q, 10)) fr += double(truth.count(x.id));
+            for (const auto& x : fcodes_only.search(q, 10)) fc += double(truth.count(x.id));
+        }
+        fr /= 600.0;
+        fc /= 600.0;
+        std::printf("    metric %d: hnsw %.3f, sq8+rerank %.3f, sq8 only %.3f | flat sq8+rerank %.3f, sq8 only %.3f\n", int(m), base, r, c, fr, fc);
+        CHECK(r >= base - 0.02 && c >= 0.8 && fr >= 0.98 && fc >= 0.85);
+    }
+}
+
+TEST(sq8, s8_05_codes_follow_every_path) {
+    auto data = clustered(1500, 8, 6, 975);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(200));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(200));
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 0; i < 400; i += 5) {  // HNSW: free slots; Flat: swap with last
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 1000; i < 1050; ++i) {  // HNSW: reused slots
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 1; i < 400; i += 7) {
+        h.update(i, data[i + 1000]);
+        f.update(i, data[i + 1000]);
+    }
+    for (std::uint64_t i = 3; i < 400; i += 11) {
+        h.upsert(i, data[i + 1050]);
+        f.upsert(i, data[i + 1050]);
+    }
+    CHECK(codes_match(h) && codes_match(f));
+    for (std::uint64_t i = 2; i < 400; i += 13) h.remove(i);
+    h.add_batch(id_range(2000, 40), flatten(Vectors(data.begin() + 1100, data.begin() + 1140)), 1);  // reuse, then append
+    h.add_batch(id_range(3000, 60), flatten(Vectors(data.begin() + 1140, data.begin() + 1200)), 4);
+    f.add_batch(id_range(2000, 100), flatten(Vectors(data.begin() + 1100, data.begin() + 1200)));
+    CHECK(codes_match(h) && codes_match(f));
+    std::atomic<bool> flag{false};  // a cancelled batch leaves codes consistent
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 20) flag = true; };
+    CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(4000, 100), flatten(Vectors(data.begin() + 1200, data.begin() + 1300)), 4, o));
+    CHECK(codes_match(h));
+    h.compact();  // the codec keeps its training; codes follow the new slots
+    CHECK(h.codec_trained() && codes_match(h) && h.deleted_count() == 0);
+}
+
+TEST(sq8, s8_06_save_and_load) {
+    auto data = clustered(600, 8, 4, 976);
+    for (int trained = 0; trained < 2; ++trained) {
+        HnswIndex h(8, Metric::Cosine, hnsw_sq8(trained ? 100 : 10000, false));
+        FlatIndex f(8, Metric::InnerProduct, Schema::dynamic(), sq8(trained ? 100 : 10000));
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        h.remove(7);
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb);  // byte for byte, codes included
+        CHECK(h2->codec_trained() == bool(trained) && f2->codec_trained() == bool(trained));
+        CHECK(h2->params().quantization.codec == CodecKind::SQ8 && !h2->params().quantization.rerank && f2->quantization().rerank);
+        bool same = true;
+        for (std::size_t q = 0; q < 10; ++q)
+            same = same && same_results(h2->search(data[q], 10, 64), h.search(data[q], 10, 64)) &&
+                   same_results(f2->search(data[q], 10), f.search(data[q], 10));
+        CHECK(same);
+    }
+}
+
+TEST(sq8, s8_07_damaged_codec_sections) {
+    auto data = random_vectors(12, 3, 977);
+    HnswIndex h(3, Metric::L2, hnsw_sq8(5));
+    FlatIndex f(3, Metric::L2, Schema::dynamic(), sq8(5));
+    for (std::uint64_t i = 0; i < 12; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {  // every truncation and every flipped bit
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+    }
+    // Invalid content behind valid checksums. CODC: codec (1), train_after (8),
+    // rerank (1), factor (8), trained (1), state size (8), state (6 x 4), count (8), codes.
+    const ParsedFile base = ParsedFile::parse(save_bytes(f));
+    const std::vector<std::function<void(std::string&)>> edits = {
+        [](std::string& p) { poke<std::uint8_t>(p, 0, 7); },               // unknown codec
+        [](std::string& p) { poke<std::uint8_t>(p, 9, 2); },               // re-rank flag 2
+        [](std::string& p) { poke<std::uint64_t>(p, 10, 0); },             // factor 0
+        [](std::string& p) { poke<std::uint8_t>(p, 18, 2); },              // training flag 2
+        [](std::string& p) { poke<float>(p, 27 + 12, -1.0f); },            // a negative step
+        [](std::string& p) { poke<std::uint64_t>(p, 19, 5); },             // wrong state size
+        [](std::string& p) { poke<std::uint64_t>(p, 51, 11); },            // codes for 11 vectors, 12 stored
+    };
+    for (const auto& edit : edits) {
+        ParsedFile e = base;
+        edit(e.payload("CODC"));
+        CHECK_THROWS_AS(FormatError, load_flat(e.assemble()));
+    }
+    ParsedFile none = ParsedFile::parse(save_bytes(FlatIndex(3, Metric::L2)));  // no codec, but "trained"
+    poke<std::uint8_t>(none.payload("CODC"), 18, 1);
+    CHECK_THROWS_AS(FormatError, load_flat(none.assemble()));
+    CHECK(load_flat(base.assemble())->codec_trained());
+}
+
+TEST(sq8, s8_08_every_kind_of_search) {
+    auto data = clustered(2000, 16, 8, 978);
+    HnswIndex h(16, Metric::L2, hnsw_sq8(500)), plain(16, Metric::L2);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), sq8(500));
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        h.add(i, data[i], meta_for(i));
+        plain.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 12));
+    const auto hb = h.search_batch(queries, 10, 64, 4), fb = f.search_batch(queries, 10, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 12; ++q) same = same && same_results(hb[q], h.search(data[q], 10, 64)) && same_results(fb[q], f.search(data[q], 10));
+    CHECK(same);
+    SearchOptions exact = with_filter(Filter::eq("category", "tech"));
+    exact.strategy = Strategy::ForceExact;
+    for (const auto& r : {h.search(data[0], 10, 64, exact), f.search(data[0], 10, with_filter(Filter::eq("category", "tech")))}) {
+        bool ok = r.size() == 10;
+        for (const auto& x : r) ok = ok && x.id % 5 == 2;
+        CHECK(ok);
+    }
+    // Range searches use full precision: identical to an index without a codec.
+    CHECK(same_results(h.search_range(data[3], 2.0f), plain.search_range(data[3], 2.0f)));
+}
+
+TEST(sq8, s8_09_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 4, 979);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(0));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { h.train_codec(); }, [&] { CHECK(save_bytes(h) == hb && !h.codec_trained()); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && !f.codec_trained()); }) > 0);
+    const std::string fb2 = save_bytes(f);
+    std::uint64_t id = 900;  // adding to a trained Flat index: code room first, all or nothing
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == fb2); }) > 0);
+    CHECK(codes_match(h) && codes_match(f));
+    // Automatic training that runs out of memory: the add completes, training waits.
+    HnswIndex a(8, Metric::L2, hnsw_sq8(50));
+    for (std::uint64_t i = 0; i < 49; ++i) a.add(i, data[i]);
+    bool consistent = true, done = false;
+    for (long n = 0; n < 5000 && !done; ++n) {
+        alloc_hook::fail_after(n);
+        bool failed = false;
+        try {
+            a.add(49, data[49]);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        alloc_hook::disarm();
+        if (failed) consistent = consistent && !a.contains(49) && !a.codec_trained();
+        else done = true;
+    }
+    CHECK(consistent && done && a.contains(49));
+    if (!a.codec_trained()) a.add(50, data[50]);  // training was cut short: the next add retries
+    CHECK(a.codec_trained() && codes_match(a));
+}
+
+TEST(sq8, s8_10_searching_while_training) {
+    auto data = clustered(1500, 8, 6, 980);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(700));
+    for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "s8_10", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 500; i < 1500; ++i) h.add(i, data[i]);  // trains at 700
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) check_results(h.search(data[q++ % 1500], 10, 32), 1500, p);
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && h.codec_trained() && codes_match(h));
+}
+
+TEST(sq8, s8_11_older_files_have_no_codec) {
+    // Version 1 and 2 files load without a codec (see p40 for the golden files).
+    auto h = HnswIndex::load(golden_path("golden_hnsw_v2.bin"));
+    CHECK(!h->codec_trained() && h->codec() == nullptr && h->params().quantization.codec == CodecKind::None);
+}
+
+TEST(sq8, s8_12_invalid_settings) {
+    QuantizationParams q = sq8();
+    q.rerank_factor = 0;
+    HnswParams p;
+    p.quantization = q;
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(4, Metric::L2, p));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(4, Metric::L2, Schema::dynamic(), q));
+}
+
+// ===========================================================================
+// Phase Q2: Matryoshka truncation (M1-M11)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams truncate_to(std::size_t n) {
+    QuantizationParams q;
+    q.truncate_to = n;
+    return q;
+}
+
+HnswParams hnsw_truncate(std::size_t n) {
+    HnswParams p;
+    p.quantization.truncate_to = n;
+    return p;
+}
+
+/// The first `n` values of each vector.
+Vectors prefixes(const Vectors& data, std::size_t n) {
+    Vectors out;
+    for (const auto& v : data) out.emplace_back(v.begin(), v.begin() + std::ptrdiff_t(n));
+    return out;
+}
+
+}  // namespace
+
+TEST(matryoshka, m01_identical_to_an_index_of_the_prefixes) {
+    auto data = clustered(1500, 64, 8, 990);
+    auto queries = clustered(30, 64, 8, 991);
+    const auto short_data = prefixes(data, 24), short_queries = prefixes(queries, 24);
+    for (Metric m : kMetrics) {
+        HnswIndex truncated(64, m, hnsw_truncate(24)), reference(24, m);
+        FlatIndex ftruncated(64, m, Schema::dynamic(), truncate_to(24)), freference(24, m);
+        for (std::uint64_t i = 0; i < 1500; ++i) {
+            truncated.add(i, data[i]);
+            reference.add(i, short_data[i]);
+            ftruncated.add(i, data[i]);
+            freference.add(i, short_data[i]);
+        }
+        bool same = true;  // same IDs and the same distances
+        for (std::size_t q = 0; q < 30; ++q)
+            same = same && same_results(truncated.search(queries[q], 10, 64), reference.search(short_queries[q], 10, 64)) &&
+                   same_results(ftruncated.search(queries[q], 10), freference.search(short_queries[q], 10));
+        CHECK(same && truncated.dim() == 64 && truncated.indexed_dim() == 24 && ftruncated.indexed_dim() == 24);
+    }
+}
+
+TEST(matryoshka, m02_vectors_read_back_in_full) {
+    auto data = random_vectors(200, 32, 992);
+    for (Metric m : kMetrics) {
+        HnswIndex h(32, m, hnsw_truncate(8));
+        FlatIndex f(32, m, Schema::dynamic(), truncate_to(8));
+        for (std::uint64_t i = 0; i < 200; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        bool full = true;
+        for (std::uint64_t i = 0; i < 200; i += 7) full = full && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i] && h.get(i)->vector == data[i];
+        ScanOptions o;
+        o.limit = 50;
+        for (const Record& r : h.scan(o).records) full = full && r.vector.size() == 32 && r.vector == data[r.id];
+        CHECK(full);
+        // search_by_id uses the vector as given, truncated like any query.
+        auto expected = h.search(data[5], 6, 64);
+        std::erase_if(expected, [](const SearchResult& r) { return r.id == 5; });
+        expected.resize(std::min<std::size_t>(expected.size(), 5));
+        CHECK(same_results(*h.search_by_id(5, 5, 64), expected));
+    }
+}
+
+TEST(matryoshka, m03_inputs_are_checked_in_full) {
+    HnswIndex h(16, Metric::Cosine, hnsw_truncate(4));
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), truncate_to(4));
+    std::vector<float> v(16, 1.0f), short_v(4, 1.0f), nan_in_cut_part(16, 1.0f);
+    nan_in_cut_part[10] = kNaN;  // in the part that is cut off: still rejected
+    h.add(1, v);
+    f.add(1, v);
+    CHECK_THROWS_AS(std::invalid_argument, h.add(2, short_v));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(2, short_v));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(3, nan_in_cut_part));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(3, nan_in_cut_part));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.search(short_v, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search(nan_in_cut_part, 1));
+    CHECK_THROWS_AS(std::invalid_argument, h.add_batch(id_range(10, 2), std::vector<float>(2 * 4, 1.0f)));  // short vectors
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search_batch(std::vector<float>(8, 1.0f), 1));
+    CHECK(h.size() == 1 && f.size() == 1);
+}
+
+TEST(matryoshka, m04_settings) {
+    auto data = clustered(300, 12, 4, 993);
+    HnswIndex whole(12, Metric::L2, hnsw_truncate(12)), plain(12, Metric::L2);  // the full dimension: off
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        whole.add(i, data[i]);
+        plain.add(i, data[i]);
+    }
+    CHECK(whole.indexed_dim() == 12 && same_results(whole.search(data[0], 10, 64), plain.search(data[0], 10, 64)));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(12, Metric::L2, hnsw_truncate(13)));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(12, Metric::L2, Schema::dynamic(), truncate_to(13)));
+    HnswIndex one(12, Metric::Cosine, hnsw_truncate(1));  // a single dimension
+    for (std::uint64_t i = 0; i < 50; ++i) one.add(i, data[i]);
+    CHECK(one.indexed_dim() == 1 && one.search(data[0], 5, 64).size() == 5 && *one.get_vector(3) == data[3]);
+}
+
+TEST(matryoshka, m05_with_sq8) {
+    auto data = clustered(2000, 48, 10, 994);
+    auto queries = clustered(40, 48, 10, 995);
+    HnswParams p = hnsw_truncate(16);
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 500;
+    HnswIndex coded(48, Metric::Cosine, p), plain(48, Metric::Cosine, hnsw_truncate(16));
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        coded.add(i, data[i]);
+        plain.add(i, data[i]);
+    }
+    CHECK(coded.codec_trained() && coded.codec()->dim() == 16 && coded.get_code(3)->size() == 16);
+    double overlap = 0;  // against the same truncation at full precision
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : plain.search(q, 10, 128)) truth.insert(r.id);
+        for (const auto& r : coded.search(q, 10, 128)) overlap += double(truth.count(r.id));
+    }
+    CHECK(overlap / 400.0 >= 0.95);
+}
+
+TEST(matryoshka, m06_save_and_load) {
+    auto data = random_vectors(400, 24, 996);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        HnswParams p = hnsw_truncate(10);
+        p.quantization.codec = CodecKind::SQ8;
+        p.quantization.train_after = 100;
+        HnswIndex h(24, m, p);
+        FlatIndex f(24, m, Schema::dynamic(), truncate_to(10));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        h.remove(4);
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb);
+        CHECK(h2->indexed_dim() == 10 && f2->indexed_dim() == 10 && h2->dim() == 24 && h2->params().quantization.truncate_to == 10);
+        CHECK(*h2->get_vector(5) == data[5] && *f2->get_vector(5) == data[5] && h2->codec_trained());
+        CHECK(same_results(h2->search(data[9], 10, 64), h.search(data[9], 10, 64)) && same_results(f2->search(data[9], 10), f.search(data[9], 10)));
+    }
+}
+
+TEST(matryoshka, m07_every_path_keeps_vectors_in_full) {
+    auto data = random_vectors(900, 20, 997);
+    std::map<std::uint64_t, std::vector<float>> want;
+    HnswIndex h(20, Metric::Cosine, hnsw_truncate(6));
+    FlatIndex f(20, Metric::L2, Schema::dynamic(), truncate_to(6));
+    auto add = [&](std::uint64_t id, const std::vector<float>& v) { h.add(id, v); f.add(id, v); want[id] = v; };
+    for (std::uint64_t i = 0; i < 300; ++i) add(i, data[i]);
+    for (std::uint64_t i = 0; i < 300; i += 4) { h.remove(i); f.remove(i); want.erase(i); }  // Flat: swap with last
+    for (std::uint64_t i = 1000; i < 1040; ++i) add(i, data[i - 700]);                       // HNSW: reused slots
+    for (std::uint64_t i = 1; i < 300; i += 5)
+        if (want.contains(i)) { h.update(i, data[i + 340]); f.update(i, data[i + 340]); want[i] = data[i + 340]; }
+    for (std::uint64_t i = 2; i < 300; i += 9) { h.upsert(i, data[i + 600]); f.upsert(i, data[i + 600]); want[i] = data[i + 600]; }
+    for (std::uint64_t i = 3; i < 300; i += 11) { h.remove(i); f.remove(i); want.erase(i); }
+    std::vector<float> batch;
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        batch.insert(batch.end(), data[800 + i].begin(), data[800 + i].end());
+        want[5000 + i] = data[800 + i];
+    }
+    h.add_batch(id_range(5000, 50), std::span<const float>(batch.data(), 50 * 20), 1);
+    h.add_batch(id_range(5050, 50), std::span<const float>(batch.data() + 50 * 20, 50 * 20), 4);
+    f.add_batch(id_range(5000, 100), batch);
+    auto exact = [&] {
+        bool ok = h.size() == want.size() && f.size() == want.size();
+        for (const auto& [id, v] : want) ok = ok && h.get_vector(id) == v && f.get_vector(id) == v;
+        return ok;
+    };
+    CHECK(exact());
+    h.compact();
+    CHECK(exact() && h.search(want.begin()->second, 1, 64)[0].id == want.begin()->first);
+}
+
+TEST(matryoshka, m08_damaged_files) {
+    auto data = random_vectors(10, 6, 998);
+    HnswIndex h(6, Metric::Cosine, hnsw_truncate(2));
+    FlatIndex f(6, Metric::L2, Schema::dynamic(), truncate_to(2));
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+    }
+    // A truncation larger than the dimension, behind a valid checksum (the last 8 bytes of CONF).
+    for (int kind = 0; kind < 2; ++kind) {
+        ParsedFile p = ParsedFile::parse(kind == 0 ? save_bytes(h) : save_bytes(f));
+        std::string& conf = p.payload("CONF");
+        poke<std::uint64_t>(conf, conf.size() - 8, 7);
+        if (kind == 0) CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+        else CHECK_THROWS_AS(FormatError, load_flat(p.assemble()));
+    }
+}
+
+TEST(matryoshka, m09_batch_and_range_searches) {
+    auto data = clustered(1200, 32, 8, 999);
+    const auto short_data = prefixes(data, 12);
+    HnswIndex h(32, Metric::L2, hnsw_truncate(12)), reference(12, Metric::L2);
+    FlatIndex f(32, Metric::L2, Schema::dynamic(), truncate_to(12));
+    for (std::uint64_t i = 0; i < 1200; ++i) {
+        h.add(i, data[i]);
+        reference.add(i, short_data[i]);
+        f.add(i, data[i]);
+    }
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 10));
+    const auto hb = h.search_batch(queries, 8, 64, 4), fb = f.search_batch(queries, 8, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) same = same && same_results(hb[q], h.search(data[q], 8, 64)) && same_results(fb[q], f.search(data[q], 8));
+    CHECK(same);
+    CHECK(same_results(h.search_range(data[2], 1.0f), reference.search_range(short_data[2], 1.0f)));
+}
+
+TEST(matryoshka, m10_truncating_alone_needs_no_codec) {
+    // Truncation works without a codec, and leaves the codec settings untouched.
+    HnswIndex h(8, Metric::InnerProduct, hnsw_truncate(3));
+    CHECK(h.codec() == nullptr && !h.codec_trained() && h.params().quantization.codec == CodecKind::None);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{float(i), 1, 2, 3, 4, 5, 6, 7});
+    CHECK(h.search(std::vector<float>{19, 1, 2, 0, 0, 0, 0, 0}, 1)[0].id == 19);
+}
+
+TEST(matryoshka, m11_out_of_memory) {
+    // Adding stores the truncated vector and the full original: all or nothing.
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(60, 10, 1000);
+    HnswIndex h(10, Metric::Cosine, hnsw_truncate(4));
+    FlatIndex f(10, Metric::Cosine, Schema::dynamic(), truncate_to(4));
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string fb = save_bytes(f);
+    std::uint64_t id = 500;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[55]); }, [&] { CHECK(save_bytes(f) == fb); }) > 0);
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[55]); }, [&] { CHECK(!h.contains(id) && h.size() == 50); }) > 0);
+    CHECK(*h.get_vector(500) == data[55] && *f.get_vector(500) == data[55]);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -10367,7 +10991,7 @@ TEST(stress, st06_upper_blocks_recycled_under_churn) {
     // Reusing a slot at a higher level used to abandon its old link block.
     auto data = clustered(500, 4, 4, 380);
     auto pool = clustered(30000, 4, 4, 381);
-    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5});  // M = 4: levels vary a lot
+    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5, true, {}});  // M = 4: levels vary a lot
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     std::vector<std::uint64_t> live(500);
     std::iota(live.begin(), live.end(), 0);
@@ -10425,7 +11049,7 @@ TEST(stress, st10_long_churn_memory_bounded) {
     // dictionary and link blocks all stay bounded, and results stay correct.
     auto pool = clustered(40000, 8, 8, 384);
     auto queries = clustered(10, 8, 8, 385);
-    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3});
+    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3, true, {}});
     FlatIndex f(8, Metric::L2);
     std::vector<std::uint64_t> live;
     std::mt19937 rng(386);
@@ -10538,7 +11162,7 @@ TEST(e2e, lifecycle_cosine) { lifecycle(Metric::Cosine); }
 TEST(e2e, larger_index_recall) {
     auto data = clustered(6000, 48, 30, 92);
     auto queries = clustered(100, 48, 30, 93);
-    HnswIndex h(48, Metric::L2, HnswParams{16, 100, 3});
+    HnswIndex h(48, Metric::L2, HnswParams{16, 100, 3, true, {}});
     FlatIndex f(48, Metric::L2);
     fill(h, f, data);
     CHECK(recall(h, f, queries, 10, 128) >= 0.95);
@@ -10621,7 +11245,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -10653,8 +11277,9 @@ int main(int argc, char** argv) {
             // deliberate format change: the files guard compatibility.
             // Writes the current format version's files; older versions' files are
             // frozen and must never be rewritten.
-            golden_hnsw()->save(golden_path("golden_hnsw_v2.bin"));
-            golden_flat()->save(golden_path("golden_flat_v2.bin"));
+            golden_hnsw()->save(golden_path("golden_hnsw_v3.bin"));
+            golden_flat()->save(golden_path("golden_flat_v3.bin"));
+            golden_sq8()->save(golden_path("golden_hnsw_sq8_v3.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
         } else if (arg == "--group" || arg == "--exclude") {

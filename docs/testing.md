@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 610 individually named tests** in 25 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 633 individually named tests** in 27 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -32,6 +32,8 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `records` | 17 | Scenarios R1 to R17 for `get_vector`, `get` and `scan`: vectors read back bit for bit for every metric (cosine originals included); paging through everything with several page sizes, each ID once and ascending; filtered paging for eight kinds of filter; edge cases (empty, exact fit, limit 0, cursors beyond the end or on removed IDs, extreme IDs); records without vectors or metadata; changes between pages; paging while another thread changes the index; unknown filter fields; out of memory; reads inside a search; save and load; version 1 cosine files; originals following every path (confirmed to catch a missing move and a compaction from normalized vectors); damaged cosine files |
 | `control` | 25 | `remove_batch` (K1 to K6): exactly the listed IDs, unknown and repeated IDs, empty lists, everything, out of memory, refusal inside a search. `search_by_id` (S1 to S6): the same as searching with the stored vector (every metric), including or excluding the record, filters and predicates, unknown IDs, the largest k, duplicates of the record, atomic while another thread updates it. Deadlines, cancellation and progress (T1 to T13): searches of every kind stop early with valid results (checked by work done, not timing), a cancel from another thread, no change without a deadline, a nested search's own deadline; `add_batch`, `compact` and `save` cancelled at the start, middle and end, by flag, deadline or a throwing progress callback, always undone; progress in order; cancelling 8 linking threads |
 | `codec` | 14 | Phase Q0: k-means finding separated clusters; bit-identical results across runs and thread counts; a fixed answer every platform must reproduce; k equal to the number of points, k of 1, identical points, duplicates with many centroids; invalid input; out of memory. SQ8: round-trip error at most half a level; constant dimensions stored exactly and values outside the range clamped; distances matching the decoded vectors for every metric; ranking close to full precision; fixed-answer codes (expected values computed independently with NumPy float32); misuse rejected; restoring a trained range; the codec factory |
+| `sq8` | 12 | Phase Q1: untrained means full precision (identical results); automatic training at the threshold (single adds and batches) and explicit training (with its errors); recall for every metric with and without re-ranking, HNSW and Flat; codes following every path (removals, reuse, updates, upserts, batches, a cancelled batch, compaction); saving and loading byte for byte, trained or not; every truncation and flipped bit of SQ8 files, and seven invalid values behind valid checksums (each confirmed to be rejected by its own rule); batch, filtered and exact searches with codes, range searches at full precision; out of memory in training and adding; searching while another thread trains; older files without a codec; invalid settings |
+| `matryoshka` | 11 | Phase Q2: identical results (IDs and distances) to an ordinary index of the first N values, for every metric, HNSW and Flat (confirmed to fail if the wrong dimensions are kept); vectors read back in full by `get_vector`, `get`, `scan` and `search_by_id`; inputs checked in full (wrong sizes, NaN in the part cut off); settings (the full dimension means off, a larger truncation is rejected, a single dimension works); with SQ8; saving and loading byte for byte; every slot path keeping full vectors; every truncation and flipped bit of a file, and a truncation larger than the dimension; batch and range searches; truncation without a codec; out of memory |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -42,7 +44,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 610 test names
+test_comprehensive --list               # list all 633 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -56,13 +58,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 610 of 610 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 633 of 633 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-610 passed, 0 failed, 0 skipped, 0 not run, 30938 checks, 44.46 s
+633 passed, 0 failed, 0 skipped, 0 not run, 31074 checks, 52.02 s
 All selected tests passed.
 ```
 
@@ -110,35 +112,37 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, 25 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, 27 entries in total. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
- 1/25 Test # 1: comprehensive.layer1 ................   Passed
- 2/25 Test # 2: comprehensive.layer2 ................   Passed
- 3/25 Test # 3: comprehensive.helpers ...............   Passed
- 4/25 Test # 4: comprehensive.flat ..................   Passed
- 5/25 Test # 5: comprehensive.hnsw ..................   Passed
- 6/25 Test # 6: comprehensive.robustness ............   Passed
- 7/25 Test # 7: comprehensive.deletion ..............   Passed
- 8/25 Test # 8: comprehensive.concurrency ...........   Passed
- 9/25 Test # 9: comprehensive.metadata ..............   Passed
-10/25 Test #10: comprehensive.filter ................   Passed
-11/25 Test #11: comprehensive.planner ...............   Passed
-12/25 Test #12: comprehensive.payload ...............   Passed
-13/25 Test #13: comprehensive.batch .................   Passed
-14/25 Test #14: comprehensive.range .................   Passed
-15/25 Test #15: comprehensive.search_e2e ............   Passed
-16/25 Test #16: comprehensive.update ................   Passed
-17/25 Test #17: comprehensive.hardening .............   Passed
-18/25 Test #18: comprehensive.persistence ...........   Passed
-19/25 Test #19: comprehensive.add_batch .............   Passed
-20/25 Test #20: comprehensive.bulk ..................   Passed
-21/25 Test #21: comprehensive.records ...............   Passed
-22/25 Test #22: comprehensive.control ...............   Passed
-23/25 Test #23: comprehensive.codec .................   Passed
-24/25 Test #24: comprehensive.stress ................   Passed
-25/25 Test #25: comprehensive.e2e ...................   Passed
-100% tests passed, 0 tests failed out of 25
+ 1/27 Test # 1: comprehensive.layer1 ................   Passed
+ 2/27 Test # 2: comprehensive.layer2 ................   Passed
+ 3/27 Test # 3: comprehensive.helpers ...............   Passed
+ 4/27 Test # 4: comprehensive.flat ..................   Passed
+ 5/27 Test # 5: comprehensive.hnsw ..................   Passed
+ 6/27 Test # 6: comprehensive.robustness ............   Passed
+ 7/27 Test # 7: comprehensive.deletion ..............   Passed
+ 8/27 Test # 8: comprehensive.concurrency ...........   Passed
+ 9/27 Test # 9: comprehensive.metadata ..............   Passed
+10/27 Test #10: comprehensive.filter ................   Passed
+11/27 Test #11: comprehensive.planner ...............   Passed
+12/27 Test #12: comprehensive.payload ...............   Passed
+13/27 Test #13: comprehensive.batch .................   Passed
+14/27 Test #14: comprehensive.range .................   Passed
+15/27 Test #15: comprehensive.search_e2e ............   Passed
+16/27 Test #16: comprehensive.update ................   Passed
+17/27 Test #17: comprehensive.hardening .............   Passed
+18/27 Test #18: comprehensive.persistence ...........   Passed
+19/27 Test #19: comprehensive.add_batch .............   Passed
+20/27 Test #20: comprehensive.bulk ..................   Passed
+21/27 Test #21: comprehensive.records ...............   Passed
+22/27 Test #22: comprehensive.control ...............   Passed
+23/27 Test #23: comprehensive.codec .................   Passed
+24/27 Test #24: comprehensive.sq8 ...................   Passed
+25/27 Test #25: comprehensive.matryoshka ............   Passed
+26/27 Test #26: comprehensive.stress ................   Passed
+27/27 Test #27: comprehensive.e2e ...................   Passed
+100% tests passed, 0 tests failed out of 27
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -260,7 +264,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
 | Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
 | Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
-| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch and codec groups |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8 and matryoshka groups |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.

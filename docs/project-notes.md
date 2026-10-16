@@ -34,7 +34,7 @@ These are deliberate for the current stage:
 
 ## Roadmap
 
-Every feature that could come next, consolidated and in a suggested order, is in the [feature catalog](feature-catalog.md).
+Every feature that could come next, consolidated and in a suggested order, is in the [feature catalog](feature-catalog.md). Compression and new index types (quantization, Matryoshka truncation, IVF and a disk-based index) have their own [plan](compression-and-index-types-plan.md).
 
 - [x] **Layer 1:** aligned vector store, arena allocator, graph storage, ID mapping, tests
 - [x] **Layer 2:** SIMD distance kernels (scalar, AVX2, AVX-512, NEON), runtime dispatch, tests, benchmark

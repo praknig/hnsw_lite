@@ -19,6 +19,7 @@
 #include "prepared_vector.h"
 #include "search_result.h"
 #include "storage.h"
+#include "codec.h"
 #include "thread_pool.h"
 #include "visited_list.h"
 
@@ -63,6 +64,8 @@ struct HnswParams {
     /// its links from its own links plus the removed vector's links. Keeps search
     /// quality high under heavy churn; costs some time per remove.
     bool repair_on_remove = true;
+    /// Compact storage of vectors (codecs), with re-ranking at full precision.
+    QuantizationParams quantization;
 };
 
 /**
@@ -164,6 +167,24 @@ public:
                                                          const SearchOptions& options = {}, bool include_self = false) const;
 
     std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// Trains the codec (HnswParams::quantization) on the stored vectors now, and
+    /// encodes every vector; vectors added later are encoded as they arrive.
+    /// Training again replaces the previous training. All or nothing. Throws
+    /// std::logic_error if no codec is configured, std::invalid_argument if the
+    /// index is empty. (Training also happens automatically: see train_after.)
+    void train_codec();
+
+    /// Whether searches use codes (a codec is configured and trained).
+    bool codec_trained() const;
+
+    /// The codec, for inspection while no other thread changes the index (like
+    /// storage()); null without quantization.
+    const VectorCodec* codec() const { return codec_.get(); }
+
+    /// The code stored for `id`, or nothing if `id` is not stored or no codec
+    /// is trained. For inspection and tests.
+    std::optional<std::vector<std::uint8_t>> get_code(std::uint64_t id) const;
 
     /// Removes every listed ID that is stored and returns how many it removed;
     /// unknown and repeated IDs are skipped. Always completes, like remove_where.
@@ -348,7 +369,10 @@ public:
         return storage_.size();
     }
 
-    std::size_t dim() const { return storage_.vectors().dim(); }
+    /// The dimension of vectors and queries as given.
+    std::size_t dim() const { return input_dim_; }
+    /// The dimensions stored and searched: dim(), or fewer with Matryoshka truncation.
+    std::size_t indexed_dim() const { return storage_.vectors().dim(); }
     Metric metric() const { return metric_; }
     const HnswParams& params() const { return params_; }
 
@@ -371,6 +395,13 @@ private:
 
     /// Distance from a prepared vector (padded row) to stored node `node`.
     float distance_to(const float* query, NodeId node) const;
+
+    /// Codes: make room for `slot`'s code (may throw: called before any change),
+    /// encode the vector stored in `slot` (cannot fail), train when due.
+    void reserve_code(NodeId slot);
+    void encode_slot(NodeId slot);
+    void maybe_train() noexcept;
+    void train_codec_unlocked();
 
     /// Distance between two stored nodes.
     float distance_between(NodeId a, NodeId b) const;
@@ -479,6 +510,7 @@ private:
     /// entry point to kEmpty and the top level to -1 if no node is live.
     void choose_new_entry();
 
+    std::size_t input_dim_;  // as given; the stored vectors may be truncated (see indexed_dim)
     Metric metric_;
     DistanceFn distance_;  // fastest kernel for this CPU, chosen once
     HnswParams params_;
@@ -487,6 +519,8 @@ private:
     std::size_t stride_;
     PreparedVector scratch_;  // reused by add(); search() uses its own copy
     SplitMix64 rng_;  // random levels
+    std::unique_ptr<VectorCodec> codec_;  // null without quantization
+    std::vector<std::uint8_t> codes_;     // trained: code_size() bytes per slot (at least as many slots as stored)
     NodeId entry_ = kEmpty;
     int max_level_ = -1;
     std::size_t live_ = 0;

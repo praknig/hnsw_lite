@@ -29,8 +29,11 @@ class Storage {
 public:
     /// With `keep_originals` (cosine indexes), each slot also keeps the vector
     /// exactly as given, before normalization, so get_vector() can return it.
-    explicit Storage(std::size_t dim, std::size_t M = 16, bool keep_originals = false) : vectors_(dim), graph_(M) {
-        if (keep_originals) originals_.emplace(dim);
+    /// `original_dim` (0: `dim`) is the size of the vectors as given, larger than
+    /// `dim` when the index truncates them (Matryoshka).
+    explicit Storage(std::size_t dim, std::size_t M = 16, bool keep_originals = false, std::size_t original_dim = 0)
+        : vectors_(dim), graph_(M) {
+        if (keep_originals) originals_.emplace(original_dim == 0 ? dim : original_dim);
     }
 
     // `level` will be chosen randomly by the HNSW layer later.
@@ -122,7 +125,10 @@ public:
 private:
     void check_insert(std::span<const float> v, int level, std::span<const float> original) const {
         if (v.size() != vectors_.dim()) throw std::invalid_argument("vector has wrong dimension");
-        if (!original.empty() && original.size() != vectors_.dim()) throw std::invalid_argument("original has wrong dimension");
+        if (!original.empty() && original.size() != (originals_ ? originals_->dim() : vectors_.dim()))
+            throw std::invalid_argument("original has wrong dimension");
+        if (original.empty() && originals_ && originals_->dim() != vectors_.dim())
+            throw std::logic_error("a truncating index needs the vector as given");
         if (level < 0 || level > 255) throw std::invalid_argument("level must be in 0..255");
     }
     void add_vector(std::span<const float> v, std::span<const float> original) {
