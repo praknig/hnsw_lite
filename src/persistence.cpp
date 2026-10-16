@@ -4,7 +4,8 @@
  *
  * Sections, in order:
  *   Flat: CONF (dimension, metric; version 3: truncation, keep-full-vectors and
- *         vector-values flags), NODE (each vector with its user ID, and for
+ *         vector-values flags), NODE ... and in version 3, after CODC, IVFL (inverted
+ *         file: settings, centroids, each row's list); then (each vector with its user ID, and for
  *         cosine in version 2 the vector as given), META, END
  *   (Version 3 adds CODC after NODE for both kinds: quantization settings, and
  *   when trained the codec state and every slot's code.)
@@ -26,6 +27,7 @@
  * on load rather than trusted from the file.
  */
 #include <atomic>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -51,6 +53,7 @@ constexpr std::uint32_t kNode = persist::tag("NODE");
 constexpr std::uint32_t kStat = persist::tag("STAT");
 constexpr std::uint32_t kMeta = persist::tag("META");
 constexpr std::uint32_t kCodec = persist::tag("CODC");  // version 3
+constexpr std::uint32_t kIvf = persist::tag("IVFL");    // version 3, Flat: inverted file
 
 /// CODC: quantization settings, then (if trained) the codec's state and every
 /// slot's code. Written for every index in version 3, even without a codec.
@@ -62,12 +65,14 @@ void write_codec(Writer& w, const QuantizationParams& q, const VectorCodec* code
     w.put<std::uint64_t>(q.rerank_factor);
     const bool trained = codec && codec->trained();
     w.put<std::uint8_t>(trained ? 1 : 0);
-    if (!trained) return;
-    const std::vector<float> state = codec->state();
-    w.put<std::uint64_t>(state.size());
-    w.put_floats(state.data(), state.size());
-    w.put<std::uint64_t>(slots);
-    w.bytes(codes.data(), slots * codec->code_size());
+    if (trained) {
+        const std::vector<float> state = codec->state();
+        w.put<std::uint64_t>(state.size());
+        w.put_floats(state.data(), state.size());
+        w.put<std::uint64_t>(slots);
+        w.bytes(codes.data(), slots * codec->code_size());
+    }
+    w.put<std::uint64_t>(q.pq_subspaces);  // last: added for PQ, keeping earlier offsets
 }
 
 /// A 0 or 1 byte; anything else is damage.
@@ -86,7 +91,7 @@ struct LoadedCodec {
 LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t slots) {
     LoadedCodec c;
     const auto kind = r.get<std::uint8_t>();
-    if (kind > static_cast<std::uint8_t>(CodecKind::Binary)) throw FormatError("unknown codec");
+    if (kind > static_cast<std::uint8_t>(CodecKind::PQ)) throw FormatError("unknown codec");
     c.params.codec = static_cast<CodecKind>(kind);
     c.params.train_after = static_cast<std::size_t>(r.get<std::uint64_t>());
     const auto rerank = r.get<std::uint8_t>();
@@ -94,18 +99,32 @@ LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t sl
     c.params.rerank = rerank == 1;
     c.params.rerank_factor = static_cast<std::size_t>(r.get<std::uint64_t>());
     validate(c.params);  // invalid settings become a FormatError (see guarded_load)
-    c.codec = make_codec(c.params.codec, dim, metric);
     const auto trained = r.get<std::uint8_t>();
-    if (trained > 1 || (trained == 1 && !c.codec)) throw FormatError("invalid codec training flag");
-    if (trained == 0) return c;
-    const auto state_size = r.get_count(4, "codec state values");
-    std::vector<float> state(static_cast<std::size_t>(state_size));
-    r.get_floats(state.data(), state.size());
-    c.codec->restore(state);  // checks the state
-    const auto count = r.get_count(c.codec->code_size(), "codes");
-    if (count != slots) throw FormatError("the number of codes does not match the vectors");
-    c.codes.resize(static_cast<std::size_t>(count) * c.codec->code_size());
-    r.bytes(c.codes.data(), c.codes.size());
+    if (trained > 1 || (trained == 1 && c.params.codec == CodecKind::None)) throw FormatError("invalid codec training flag");
+    std::vector<float> state;
+    std::uint64_t count = 0;
+    std::size_t code_bytes = 0;
+    if (trained == 1) {
+        const auto state_size = r.get_count(4, "codec state values");
+        state.resize(static_cast<std::size_t>(state_size));
+        r.get_floats(state.data(), state.size());
+        count = r.get_count(1, "codes");
+        if (count != slots) throw FormatError("the number of codes does not match the vectors");
+        code_bytes = r.section_left() >= 8 ? static_cast<std::size_t>(r.section_left() - 8) : 0;  // before the last field
+        c.codes.resize(code_bytes);
+        r.bytes(c.codes.data(), c.codes.size());
+    }
+    c.params.pq_subspaces = static_cast<std::size_t>(r.get<std::uint64_t>());
+    c.codec = make_codec(c.params.codec, dim, metric, c.params.pq_subspaces);  // checks the number of parts
+    if (trained == 1) {
+        c.codec->restore(state);  // checks the state
+        if (code_bytes != slots * c.codec->code_size()) throw FormatError("codes have the wrong size");
+        if (c.params.codec == CodecKind::PQ) {  // every code must name an existing centroid
+            const std::size_t k = static_cast<PQCodec&>(*c.codec).centroids();
+            for (std::uint8_t b : c.codes)
+                if (b >= k) throw FormatError("a code refers to a centroid that does not exist");
+        }
+    }
     return c;
 }
 constexpr std::uint32_t kEnd = persist::tag("END ");
@@ -349,6 +368,18 @@ void FlatIndex::save(std::ostream& out, const OperationOptions& options) const {
         }
     });
     persist::write_section(out, kCodec, [&](Writer& w) { write_codec(w, quant_, codec_.get(), codes_, vectors_.size()); });
+    persist::write_section(out, kIvf, [&](Writer& w) {
+        // Settings; when trained, the centroids (unpadded) and each row's list.
+        w.put<std::uint64_t>(ivf_.lists);
+        w.put<std::uint64_t>(ivf_.probes);
+        w.put<std::uint64_t>(ivf_.train_after);
+        w.put<std::uint8_t>(ivf_trained() ? 1 : 0);
+        if (!ivf_trained()) return;
+        const std::size_t stride = vectors_.stride();
+        w.put<std::uint64_t>(lists_.size());
+        for (std::size_t l = 0; l < lists_.size(); ++l) w.put_floats(centroids_.data() + l * stride, indexed_dim());
+        for (std::uint32_t l : list_of_) w.put<std::uint32_t>(l);
+    });
     persist::write_section(out, kMeta, [&](Writer& w) { metadata_.save(w); });
     write_end(out);
     control.finish();
@@ -412,6 +443,45 @@ std::unique_ptr<FlatIndex> FlatIndex::load(std::istream& in) {
         // Codes only: there must be codes, and only when full vectors are not kept.
         if (!values && (!index->codec_ || !index->codec_->trained() || index->quant_.keep_full_vectors))
             throw FormatError("an index without vector values needs a trained codec and keep_full_vectors off");
+        if (r.version() >= 3) {
+            r.begin_section(kIvf, "IVFL");
+            IvfParams ivf;
+            ivf.lists = static_cast<std::size_t>(r.get<std::uint64_t>());
+            ivf.probes = static_cast<std::size_t>(r.get<std::uint64_t>());
+            ivf.train_after = static_cast<std::size_t>(r.get<std::uint64_t>());
+            validate(ivf);  // invalid settings become a FormatError (see guarded_load)
+            index->ivf_ = ivf;
+            const auto trained = r.get<std::uint8_t>();
+            if (trained > 1 || (trained == 1 && ivf.lists == 0)) throw FormatError("invalid inverted-file training flag");
+            if (trained == 1) {
+                const std::size_t stride = index->vectors_.stride(), rows = index->vectors_.size();
+                const auto lists = r.get_count(4 * std::uint64_t(stored), "lists");
+                if (lists == 0 || lists > ivf.lists) throw FormatError("invalid number of trained lists");
+                std::vector<float> centroids(static_cast<std::size_t>(lists) * stride, 0.0f);
+                for (std::size_t l = 0; l < lists; ++l) {
+                    r.get_floats(centroids.data() + l * stride, stored);
+                    for (std::size_t j = 0; j < stored; ++j)
+                        // GCOVR_EXCL_BR_LINE: unreachable today, the reader rejects every non-finite float;
+                        // kept in case that ever changes (a centroid must be finite)
+                        if (!std::isfinite(centroids[l * stride + j])) throw FormatError("a list centroid is not finite");  // GCOVR_EXCL_BR_LINE
+                }
+                if (r.section_left() != 4 * std::uint64_t(rows)) throw FormatError("list numbers do not match the vectors");
+                std::vector<std::vector<NodeId>> members(static_cast<std::size_t>(lists));
+                std::vector<std::uint32_t> list_of(rows), pos(rows);
+                for (std::size_t row = 0; row < rows; ++row) {
+                    const auto l = r.get<std::uint32_t>();
+                    if (l >= lists) throw FormatError("a vector is in a list that does not exist");
+                    list_of[row] = l;
+                    pos[row] = static_cast<std::uint32_t>(members[l].size());
+                    members[l].push_back(static_cast<NodeId>(row));
+                }
+                index->centroids_ = std::move(centroids);  // derived data (members, positions) rebuilt, not read
+                index->lists_ = std::move(members);
+                index->list_of_ = std::move(list_of);
+                index->pos_ = std::move(pos);
+            }
+            r.end_section();
+        }
         r.begin_section(kMeta, "META");
         index->metadata_ = MetadataStore::load(r, index->vectors_.size(), [](NodeId) { return true; });
         r.end_section();

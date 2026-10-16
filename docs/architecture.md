@@ -107,7 +107,7 @@ hnsw-lite/
 │   ├── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
 │   ├── serialize.h             # Saving: checksums, writer, untrusted-file reader, FormatError
 │   ├── kmeans.h                # k-means training (for PQ and IVF)
-│   ├── codec.h                 # Vector codecs: SQ8
+│   ├── codec.h                 # Vector codecs: SQ8, binary, PQ
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -127,7 +127,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 665 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 702 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -336,7 +336,8 @@ A failure in steps 1 to 3 abandons the new version like a failed insert, restori
 |---|---|---|
 | `CONF` | Dimension, metric; version 3: truncation, keep-full-vectors and vector-values flags | Dimension, metric, `M`, `ef_construction`, seed, graph repair, planner settings; version 3: the same three |
 | `NODE` | Each vector with its user ID; the vector as given when kept (cosine since version 2, truncation in version 3); no vector values with codes only (version 3) | Each slot, live or removed: user ID, removed flag, level, vector (none with codes only), the vector as given when kept, then the links on each level |
-| `CODC` (version 3) | Quantization settings; when trained, the codec's state and every slot's code | The same |
+| `CODC` (version 3) | Quantization settings; when trained, the codec's state and every slot's code; the number of PQ parts last | The same |
+| `IVFL` (version 3) | Inverted-file settings; when trained, the centroids and each row's list | |
 | `STAT` | | Entry point, top level, free slots in reuse order, the random generator's state |
 | `META` | Metadata | Metadata: schema mode, fields (name, type, indexed), string dictionary, then each field's rows in slot order |
 
@@ -391,11 +392,17 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 
 **k-means** (`kmeans.h`) trains centroids for product quantization and the IVF index: k-means++ seeding (each new centroid drawn with probability proportional to its squared distance from the nearest so far), then Lloyd's refinement until no assignment changes. A cluster that becomes empty takes the point farthest from its own centroid. Points are assigned in fixed-size chunks, possibly on several threads; since each point's assignment is independent, the thread count never changes the result.
 
-**Codecs** (`codec.h`) store vectors compactly. A codec is trained once, encodes each vector into `code_size()` bytes, and computes distances between a full-precision query and a code (asymmetric distance): `prepare()` turns the query into a small table once, then `distance()` compares the table with each code in a single pass. Distances follow the library's conventions (squared L2, negative dot product, 1 minus dot product), so they are directly comparable with full-precision ones. **SQ8** maps each dimension onto 256 even levels between its smallest and largest trained value: one byte per dimension, with a rounding error of at most half a level.
+**Codecs** (`codec.h`) store vectors compactly. A codec is trained once, encodes each vector into `code_size()` bytes, and computes distances between a full-precision query and a code (asymmetric distance): `prepare()` turns the query into a small table once, then `distance()` compares the table with each code in a single pass. Distances follow the library's conventions (squared L2, negative dot product, 1 minus dot product), so they are directly comparable with full-precision ones. **SQ8** maps each dimension onto 256 even levels between its smallest and largest trained value: one byte per dimension, with a rounding error of at most half a level. Training, encoding and decoding compute in double, so values spanning more than the float range (where `max - min` would overflow a float) work too; ordinary codes are the same as with float arithmetic.
 
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Inverted file (IVF).** An option of `FlatIndex`: `train_lists` runs `kmeans` on the stored vectors (decoded, with codes only) and assigns every row to its nearest centroid, building everything in local variables and swapping it in at the end. Every row is in one list at a known position (`list_of_`, `pos_`), so each slot path is O(1): an add reserves room in its list before changing anything; a removal takes the row out of its list and, since Flat swaps the last row into the gap, renames the last row in its own list; an update that changes a vector's nearest list moves it; a batch rollback takes popped rows out. The scan orders the lists by centroid distance and visits at least `probes`, then more until `k` matching vectors were seen. Saved as `IVFL` (version 3): settings, centroids and each row's list; the lists and positions are rebuilt and checked on load.
+
+**Product quantization** (`PQCodec`) splits a vector into parts (uneven sizes allowed: the first parts take the extra dimensions) and stores each as the index of its nearest centroid, one byte. Training runs `kmeans` on each part (256 centroids, fewer with fewer vectors); its state is the number of centroids followed by every part's centroids. The query table holds 256 entries per part (squared distance or negative dot product to each centroid), so a distance is one lookup per part. `nearest_centroid` breaks ties toward the lower index, so stored codes always name the lowest of duplicate centroids and decoding then encoding reproduces them. Loading checks that every code names an existing centroid; the number of parts is saved last in `CODC`, so earlier offsets did not move when it was added.
+
+**Code kernels.** SQ8 and binary distances reduce to three kernels (`sq8_l2`, `sq8_dot`, `bits_sum`), with the same four versions as the float kernels (plain C++, AVX2, AVX-512, NEON), chosen once by the same CPU detection; each codec keeps the chosen set. SQ8 widens 8 or 16 code bytes to floats per step; binary spreads a code byte into a lane mask (AVX-512: two bytes are exactly its 16-lane mask). Encoding stays in `codec.cpp`, so codes and files do not depend on the CPU; only distances may differ in their last bits, as for float kernels.
 
 **Binary codes** (`BinaryCodec`) store one bit per dimension: a value above its dimension's threshold (the training mean) sets the bit, which decodes to threshold plus or minus the dimension's spread (mean absolute deviation). The per-query table holds, for each dimension, the contribution of a 0 bit and the difference a 1 bit makes, so a distance is a sum over set bits. Encoding is a comparison, identical on every CPU. A set bit in a dimension constant in training (spread 0) decodes to the smallest float above the threshold, so decoding then encoding always reproduces a code (needed by `compact` with codes only).
 

@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -6703,6 +6703,39 @@ std::unique_ptr<FlatIndex> golden_flat() {
 
 std::string golden_path(const char* name) { return std::string(HNSW_TEST_DATA_DIR) + "/" + name; }
 
+/// The index stored in tests/data/golden_flat_ivf_v3.bin: a Flat index with a
+/// trained inverted file (8 lists), from whole numbers, so every distance is exact
+/// and every CPU assigns the same lists.
+std::unique_ptr<FlatIndex> golden_ivf() {
+    IvfParams ivf;
+    ivf.lists = 8;
+    ivf.probes = 3;
+    ivf.train_after = 200;
+    auto f = std::make_unique<FlatIndex>(12, Metric::L2, Schema::dynamic(), QuantizationParams{}, ivf);
+    std::mt19937 rng(2031);
+    for (std::uint64_t i = 0; i < 260; ++i) f->add(i, integer_vector(rng, 12));
+    for (std::uint64_t i = 0; i < 260; i += 23) f->remove(i);
+    return f;
+}
+
+/// The index stored in tests/data/golden_hnsw_pq_v3.bin: PQ codes only (4 parts),
+/// trained by k-means on whole numbers; identical on every CPU.
+std::unique_ptr<HnswIndex> golden_pq() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 13;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 300;
+    p.quantization.pq_subspaces = 4;
+    p.quantization.keep_full_vectors = false;
+    auto h = std::make_unique<HnswIndex>(16, Metric::L2, p);
+    std::mt19937 rng(2030);
+    for (std::uint64_t i = 0; i < 350; ++i) h->add(i, integer_vector(rng, 16));
+    for (std::uint64_t i = 0; i < 350; i += 19) h->remove(i);
+    return h;
+}
+
 /// The index stored in tests/data/golden_hnsw_binary_v3.bin: binary codes only,
 /// from whole numbers (thresholds are means: exact here), identical on every CPU.
 std::unique_ptr<HnswIndex> golden_binary() {
@@ -7142,6 +7175,8 @@ TEST(persistence, p41_identical_bytes_on_every_platform) {
     // SQ8 codes are part of the file: every CPU's encoding must match byte for byte.
     CHECK(save_bytes(*golden_sq8()) == read_file(golden_path("golden_hnsw_sq8_v3.bin")));
     CHECK(save_bytes(*golden_binary()) == read_file(golden_path("golden_hnsw_binary_v3.bin")));
+    CHECK(save_bytes(*golden_pq()) == read_file(golden_path("golden_hnsw_pq_v3.bin")));
+    CHECK(save_bytes(*golden_ivf()) == read_file(golden_path("golden_flat_ivf_v3.bin")));
     auto loaded = HnswIndex::load(golden_path("golden_hnsw_sq8_v3.bin"));
     CHECK(loaded->codec_trained() && *loaded->get_code(5) == *golden_sq8()->get_code(5));
 }
@@ -9059,7 +9094,7 @@ std::vector<std::uint64_t> ids_of(const std::vector<Record>& records) {
 std::string as_version_1(const std::string& v2, bool hnsw, std::size_t dim) {
     ParsedFile f = ParsedFile::parse(v2);
     poke<std::uint32_t>(f.header, 8, 1);
-    std::erase_if(f.sections, [](const auto& sec) { return sec.first == persist::tag("CODC"); });  // version 3 only
+    std::erase_if(f.sections, [](const auto& sec) { return sec.first == persist::tag("CODC") || sec.first == persist::tag("IVFL"); });  // version 3 only
     std::string& conf = f.payload("CONF");
     conf.resize(conf.size() - 10);  // version 3 ends CONF with the truncation setting and two flags
     std::string& node = f.payload("NODE");
@@ -10318,6 +10353,70 @@ TEST(codec, q0_14_make_codec) {
     CHECK(c && c->kind() == CodecKind::SQ8 && c->dim() == 4 && c->metric() == Metric::Cosine && c->code_size() == 4);
 }
 
+TEST(codec, q0_15_code_kernels_match_plain_cpp) {
+    // Every instruction set this CPU supports, every length 0 to 130 (all
+    // remainders), at unaligned addresses: within rounding of the plain version.
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<float> u(-2, 2);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::vector<float> t(140), s(140), w(140);
+    std::vector<std::uint8_t> c(150);
+    const CodeKernels plain = get_code_kernels(Isa::Scalar);
+    long compared = 0, wrong = 0;
+    for (Isa isa : {Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        if (!isa_supported(isa)) continue;
+        const CodeKernels k = get_code_kernels(isa);
+        for (std::size_t n = 0; n <= 130; ++n) {
+            for (int round = 0; round < 3; ++round) {
+                for (float& x : t) x = u(rng);
+                for (float& x : s) x = std::abs(u(rng)) / 255;
+                for (float& x : w) x = u(rng);
+                for (auto& b : c) b = std::uint8_t(byte(rng));
+                const std::size_t off = std::size_t(round);  // 0, 1, 2: unaligned floats and bytes
+                const float* tt = t.data() + off;
+                const float* ss = s.data() + off;
+                const float* ww = w.data() + off;
+                const std::uint8_t* cc = c.data() + off;
+                auto close = [](float a, float b, float scale) { return std::abs(a - b) <= 1e-4f * (1 + scale); };
+                float mag = 0;
+                for (std::size_t j = 0; j < n; ++j) mag += std::abs(ww[j]) * 255;
+                wrong += long(!close(k.sq8_l2(tt, ss, cc, n), plain.sq8_l2(tt, ss, cc, n), plain.sq8_l2(tt, ss, cc, n)));
+                wrong += long(!close(k.sq8_dot(ww, cc, n), plain.sq8_dot(ww, cc, n), mag));
+                wrong += long(!close(k.bits_sum(ww, cc, n), plain.bits_sum(ww, cc, n), mag / 255));
+                compared += 3;
+            }
+        }
+        std::printf("    %s: compared with plain C++ for lengths 0 to 130\n", isa_name(isa));
+    }
+    CHECK(wrong == 0 && (compared > 0 || !isa_supported(Isa::Avx2)));
+    CHECK(plain.sq8_l2(nullptr, nullptr, nullptr, 0) == 0.0f && plain.bits_sum(nullptr, nullptr, 0) == 0.0f);
+    const auto best = get_code_kernels();
+    const auto active = get_code_kernels(active_isa());
+    CHECK(best.sq8_l2 == active.sq8_l2 && best.bits_sum == active.bits_sum);  // the same choice as the float kernels
+    if (!isa_supported(Isa::Avx512)) CHECK_THROWS_AS(std::invalid_argument, (void)get_code_kernels(Isa::Avx512));
+    if (!isa_supported(Isa::Neon)) CHECK_THROWS_AS(std::invalid_argument, (void)get_code_kernels(Isa::Neon));
+}
+
+TEST(codec, q0_16_binary_kernel_bit_order) {
+    // Exactly the set bits count, bit j being c[j / 8] >> (j % 8): one bit at a time.
+    std::vector<float> w(64);
+    for (std::size_t j = 0; j < 64; ++j) w[j] = float(j + 1);
+    for (Isa isa : {Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        if (!isa_supported(isa)) continue;
+        const CodeKernels k = get_code_kernels(isa);
+        bool exact = true;
+        for (std::size_t j = 0; j < 64; ++j) {
+            std::uint8_t c[8] = {};
+            c[j / 8] = std::uint8_t(1u << (j % 8));
+            exact = exact && k.bits_sum(w.data(), c, 64) == float(j + 1);
+        }
+        std::uint8_t all[8];
+        std::fill(all, all + 8, std::uint8_t(0xFF));
+        CHECK(exact && k.bits_sum(w.data(), all, 64) == 64.0f * 65.0f / 2.0f);
+    }
+}
+
+
 // ===========================================================================
 // Phase Q1: SQ8 in the indexes (S8-01 to S8-12)
 // ===========================================================================
@@ -11249,7 +11348,13 @@ TEST(review, v03_model_based_random_operations) {
         hp.seed = seed;
         hp.quantization = q;
         auto h = std::make_unique<HnswIndex>(dim, metric, hp);
-        auto f = std::make_unique<FlatIndex>(dim, metric, Schema::dynamic(), q);
+        IvfParams ivf;  // Flat sometimes has an inverted file (trained automatically or explicitly)
+        if (pick(3) == 0) {
+            ivf.lists = 2 + pick(6);
+            ivf.probes = 1 + pick(3);
+            ivf.train_after = pick(2) ? 40 : 0;
+        }
+        auto f = std::make_unique<FlatIndex>(dim, metric, Schema::dynamic(), q, ivf);
         const std::size_t n = vecdb::indexed_dim(q, dim);
         std::map<std::uint64_t, std::vector<float>> model;
         const ReadModel read{metric, n, q.keep_full_vectors || (metric != Metric::Cosine && n == dim)};
@@ -11381,6 +11486,7 @@ TEST(review, v03_model_based_random_operations) {
                 f->compact();
             } else if (op < 86) {
                 name = "train_codec";
+                if (ivf.lists > 0 && model.size() >= ivf.lists && pick(2)) f->train_lists();
                 if (q.codec != CodecKind::None && !model.empty()) {
                     // Codes only: training again is refused (it could only lose
                     // precision). Otherwise train on a sample of at least 20.
@@ -11446,7 +11552,7 @@ TEST(review, v03_model_based_random_operations) {
                 exact.strategy = Strategy::ForceExact;
                 const auto hr = h->search(qv, 7, 32, exact), fr = f->search(qv, 7);
                 if (ok && !(hr.size() == std::min<std::size_t>(7, model.size()) && fr.size() == hr.size())) { ok = false; failed = "result count"; }
-                if (ok && q.codec == CodecKind::None && !same_up_to_ties(hr, fr)) {
+                if (ok && q.codec == CodecKind::None && !f->lists_trained() && !same_up_to_ties(hr, fr)) {
                     ok = false;
                     failed = "exact HNSW vs Flat:";
                     for (std::size_t i = 0; i < hr.size(); ++i)
@@ -11458,6 +11564,13 @@ TEST(review, v03_model_based_random_operations) {
                 }
             }
             if (ok && h->codec_trained() && !codes_match(*h)) { ok = false; failed = "codes"; }
+            if (ok && f->lists_trained()) {  // every vector in exactly one list
+                std::size_t total = 0;
+                for (std::size_t sz : f->list_sizes()) total += sz;
+                bool listed = total == model.size();
+                for (const auto& [id, v] : model) listed = listed && f->list_of(id).has_value();
+                if (!listed) { ok = false; failed = "inverted lists"; }
+            }
             if (ok && step % 40 == 39) {
                 const std::string hb = save_bytes(*h), fb = save_bytes(*f);
                 if (!(save_bytes(*load_hnsw(hb)) == hb && save_bytes(*load_flat(fb)) == fb)) { ok = false; failed = "save and load"; }
@@ -11684,6 +11797,7 @@ TEST(codes_only, c05_damaged_and_inconsistent_files) {
         std::string& codc = untrained.payload("CODC");
         codc.resize(18);  // up to the training flag
         codc.push_back('\0');  // "not trained"
+        codc.append(8, '\0');  // then the number of PQ parts, which ends the section
         for (ParsedFile* e : {&p2, &keep, &untrained}) CHECK_THROWS_AS(FormatError, load(e->assemble()));
     }
 }
@@ -11996,6 +12110,730 @@ TEST(binary, b12_out_of_memory) {
     const std::string fb = save_bytes(f);
     CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
     CHECK(!f.has_vector_values() && codes_match(f));
+}
+
+// ===========================================================================
+// Phase Q4: product quantization (PQ1-PQ12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams pq_q(std::size_t train_after = 300, std::size_t parts = 0, bool keep_full = true, std::size_t factor = 4) {
+    QuantizationParams q;
+    q.codec = CodecKind::PQ;
+    q.train_after = train_after;
+    q.pq_subspaces = parts;
+    q.keep_full_vectors = keep_full;
+    q.rerank_factor = factor;
+    return q;
+}
+
+HnswParams hnsw_pq(std::size_t train_after = 300, std::size_t parts = 0, bool keep_full = true) {
+    HnswParams p;
+    p.quantization = pq_q(train_after, parts, keep_full);
+    return p;
+}
+
+}  // namespace
+
+TEST(pq, pq01_parts_and_code_size) {
+    CHECK(PQCodec(64, Metric::L2).parts() == 8 && PQCodec(64, Metric::L2).code_size() == 8);  // one per 8 dimensions
+    CHECK(PQCodec(5, Metric::L2).parts() == 1 && PQCodec(24, Metric::L2, 5).code_size() == 5);  // uneven: 5, 5, 5, 5, 4
+    CHECK_THROWS_AS(std::invalid_argument, PQCodec(4, Metric::L2, 5));
+    CHECK(make_codec(CodecKind::PQ, 16, Metric::L2, 4)->code_size() == 4);
+    HnswParams too_many = hnsw_pq(10, 9);
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(8, Metric::L2, too_many));
+}
+
+TEST(pq, pq02_few_vectors_are_stored_exactly) {
+    // Fewer training vectors than 256: one centroid per vector, so each decodes exactly.
+    std::vector<float> sample = {1, 2, 3, 4, 5, 6, -1, 0, 7, 7, 7, 7, 0, 0, 0, 0, 9, -9, 2, 3};  // 5 vectors of 4
+    PQCodec c(4, Metric::L2, 2);
+    c.train(sample);
+    CHECK(c.centroids() == 5 && c.state().size() == 1 + 5 * 4);
+    bool exact = true;
+    for (std::size_t i = 0; i < 5; ++i) {
+        std::uint8_t code[2];
+        float back[4];
+        c.encode(std::span<const float>(&sample[i * 4], 4), code);
+        c.decode(code, back);
+        exact = exact && std::equal(back, back + 4, &sample[i * 4]);
+    }
+    CHECK(exact);
+}
+
+TEST(pq, pq03_distances_match_decoded_vectors) {
+    auto data = clustered(600, 24, 6, 1500);
+    for (Metric m : kMetrics) {
+        PQCodec c(24, m, 6);
+        c.train(flatten(data));
+        std::vector<float> table, back(24);
+        std::uint8_t code[6];
+        c.prepare(data[0], table);
+        bool close = true;
+        for (std::size_t i = 1; i < 600; i += 7) {
+            c.encode(data[i], code);
+            c.decode(code, back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 24; ++j)
+                expected += m == Metric::L2 ? double(data[0][j] - back[j]) * (data[0][j] - back[j]) : double(data[0][j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code) - expected) < 1e-3 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(pq, pq04_decode_then_encode_is_exact) {
+    // Including duplicate centroids (many identical training vectors).
+    std::vector<float> sample;
+    for (int i = 0; i < 300; ++i)
+        for (int j = 0; j < 8; ++j) sample.push_back(float((i % 3) * 10 + j % 2));  // 3 distinct vectors only
+    PQCodec c(8, Metric::L2, 4);
+    c.train(sample);
+    bool exact = true;
+    std::vector<float> back(8);
+    for (std::size_t i = 0; i < 300; ++i) {
+        std::uint8_t code[4], again[4];
+        c.encode(std::span<const float>(&sample[i * 8], 8), code);
+        c.decode(code, back);
+        c.encode(back, again);
+        exact = exact && std::equal(code, code + 4, again) && std::equal(back.begin(), back.end(), &sample[i * 8]);
+    }
+    CHECK(exact);
+}
+
+TEST(pq, pq05_rejects_misuse) {
+    PQCodec c(8, Metric::L2, 2);
+    std::uint8_t code[2] = {0, 0};
+    std::vector<float> table, out(8);
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(8, 1.0f), code));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>(7, 1.0f)));
+    for (const std::vector<float>& bad : {std::vector<float>{0}, std::vector<float>{257}, std::vector<float>{1.5f},
+                                          std::vector<float>{2, 1, 1, 1, 1, 1, 1, 1, 1}, std::vector<float>{1, 0, 0, 0, kNaN, 0, 0, 0, 0}})
+        CHECK_THROWS_AS(std::invalid_argument, c.restore(bad));
+    c.restore(std::vector<float>{1, 0, 0, 0, 0, 1, 1, 1, 1});  // one centroid per part
+    code[1] = 3;  // no centroid 3
+    CHECK_THROWS_AS(std::invalid_argument, c.decode(code, out));
+}
+
+TEST(pq, pq06_recall) {
+    auto data = clustered(4000, 64, 16, 1501);
+    auto queries = clustered(50, 64, 16, 1502);
+    for (Metric m : kMetrics) {
+        HnswIndex plain(64, m), reranked(64, m, hnsw_pq(1000)), lean(64, m, hnsw_pq(1000, 0, false));
+        FlatIndex exact(64, m), f4(64, m, Schema::dynamic(), pq_q(1000)), f16(64, m, Schema::dynamic(), pq_q(1000, 0, true, 16));
+        for (std::uint64_t i = 0; i < 4000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            lean.add(i, data[i]);
+            exact.add(i, data[i]);
+            f4.add(i, data[i]);
+            f16.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(reranked, exact, queries, 10, 64);
+        const double r_wide = recall(reranked, exact, queries, 10, 200), l = recall(lean, exact, queries, 10, 64);
+        double a = 0, b = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f4.search(q, 10)) a += double(truth.count(x.id));
+            for (const auto& x : f16.search(q, 10)) b += double(truth.count(x.id));
+        }
+        a /= 500.0;
+        b /= 500.0;
+        std::printf("    metric %d: hnsw %.3f | pq + re-rank: ef 64 %.3f, ef 200 %.3f; codes only %.3f | flat: re-rank x4 %.3f, x16 %.3f\n",
+                    int(m), base, r, r_wide, l, a, b);
+        CHECK(!lean.has_vector_values() && lean.get_code(1)->size() == 8);
+        // Measured on this synthetic data (8 dimensions per part): like binary codes,
+        // PQ needs a generous re-ranking budget; on its own it is coarse.
+        CHECK(r_wide >= 0.88 && r_wide > r && r >= 0.60 && b >= 0.85 && a >= 0.55 && l >= 0.25);
+    }
+}
+
+TEST(pq, pq07_every_path) {
+    auto data = clustered(1500, 24, 6, 1503);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::L2, hnsw_pq(300, 6, keep_full));
+        FlatIndex f(24, Metric::L2, Schema::dynamic(), pq_q(300, 6, keep_full));
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 0; i < 500; i += 5) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 500; i += 7) {
+            h.update(i, data[i + 900]);
+            f.update(i, data[i + 900]);
+        }
+        h.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)), 4);
+        f.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)));
+        CHECK(codes_match(h) && codes_match(f) && h.has_vector_values() == keep_full);
+        h.compact();
+        CHECK(codes_match(h) && h.deleted_count() == 0);
+        if (keep_full) check_graph(h, 0.9);
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && !f.search_range(data[1401], 50.0f).empty());
+    }
+}
+
+TEST(pq, pq08_save_and_load) {
+    auto data = clustered(600, 24, 6, 1504);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::Cosine, hnsw_pq(300, 5, keep_full));  // 5 uneven parts
+        FlatIndex f(24, Metric::InnerProduct, Schema::dynamic(), pq_q(300, 5, keep_full));
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && h2->params().quantization.pq_subspaces == 5 && h2->codec()->code_size() == 5);
+        CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && same_results(f2->search(data[3], 10), f.search(data[3], 10)));
+    }
+    HnswIndex untrained(24, Metric::L2, hnsw_pq(10000, 3));  // the number of parts is kept even before training
+    untrained.add(1, data[1]);
+    CHECK(load_hnsw(save_bytes(untrained))->params().quantization.pq_subspaces == 3);
+}
+
+TEST(pq, pq09_damaged_and_invalid_files) {
+    auto data = random_vectors(30, 6, 1505);
+    HnswIndex h(6, Metric::L2, hnsw_pq(10, 3, false));
+    for (std::uint64_t i = 0; i < 30; ++i) h.add(i, data[i]);
+    const std::string bytes = save_bytes(h);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_hnsw(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_hnsw(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // Valid checksums, invalid content: more parts than dimensions (the last 8
+    // bytes of CODC), and a code naming a centroid that does not exist (10 here).
+    ParsedFile parts = ParsedFile::parse(bytes);
+    poke<std::uint64_t>(parts.payload("CODC"), parts.payload("CODC").size() - 8, 7);
+    ParsedFile code = ParsedFile::parse(bytes);
+    std::string& codc = code.payload("CODC");
+    codc[codc.size() - 9] = char(200);  // the last code byte, just before the number of parts
+    for (ParsedFile* e : {&parts, &code}) CHECK_THROWS_AS(FormatError, load_hnsw(e->assemble()));
+}
+
+TEST(pq, pq10_with_truncation) {
+    auto data = clustered(1000, 64, 8, 1506);
+    HnswParams p = hnsw_pq(300, 4);
+    p.quantization.truncate_to = 32;
+    HnswIndex h(64, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    CHECK(h.codec()->dim() == 32 && h.get_code(1)->size() == 4 && h.search(data[9], 1, 64)[0].id == 9 && *h.get_vector(9) == data[9]);
+}
+
+TEST(pq, pq11_training_is_final_with_codes_only) {
+    auto data = clustered(400, 16, 4, 1507);
+    HnswIndex h(16, Metric::L2, hnsw_pq(0, 4, false));
+    for (std::uint64_t i = 0; i < 400; ++i) h.add(i, data[i]);
+    h.train_codec();
+    CHECK(!h.has_vector_values());
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());
+}
+
+TEST(pq, pq12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 16, 4, 1508);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), pq_q(0, 4, false));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!f.has_vector_values() && codes_match(f));
+}
+
+// ===========================================================================
+// Phase Q5: IVF, an inverted file for FlatIndex (I1-I12)
+// ===========================================================================
+
+namespace {
+
+IvfParams ivf_p(std::size_t lists, std::size_t probes = 4, std::size_t train_after = 0) {
+    IvfParams p;
+    p.lists = lists;
+    p.probes = probes;
+    p.train_after = train_after;
+    return p;
+}
+
+/// The lists hold every vector exactly once; and, when full vectors are kept,
+/// every vector searched with a single probe finds itself (or an identical copy)
+/// first: it sits in the list nearest to it. With codes only, a vector added after
+/// training is placed by its true vector, whose nearest list can differ from its
+/// decoded one's, so only the bookkeeping is checked.
+bool lists_consistent(const FlatIndex& f) {
+    if (!f.lists_trained()) return false;
+    std::size_t total = 0;
+    for (std::size_t s : f.list_sizes()) total += s;
+    if (total != f.size()) return false;
+    ScanOptions ids;
+    ids.limit = 1000000;
+    ids.with_vectors = false;
+    ids.with_metadata = false;
+    std::vector<std::size_t> counted(f.list_sizes().size(), 0);
+    for (const Record& r : f.scan(ids).records) {
+        const auto l = f.list_of(r.id);
+        if (!l || *l >= counted.size()) return false;
+        ++counted[*l];
+    }
+    if (counted != f.list_sizes()) return false;
+    if (!f.has_vector_values()) return true;
+    SearchOptions one;
+    one.probes = 1;
+    ScanOptions all;
+    all.limit = 1000000;
+    for (const Record& r : f.scan(all).records) {
+        auto in = r.vector;
+        in.resize(f.dim(), 0.0f);  // truncating indexes read back the indexed values only
+        const auto top = f.search(in, 1, one);
+        if (top.empty() || (top[0].id != r.id && top[0].distance > 1e-5f)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(ivf, i01_untrained_scans_everything) {
+    auto data = clustered(800, 16, 8, 1600);
+    FlatIndex plain(16, Metric::L2), f(16, Metric::L2, Schema::dynamic(), {}, ivf_p(16));
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        plain.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!f.lists_trained() && !f.list_of(1) && f.list_sizes().empty());
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) same = same && same_results(f.search(data[q], 10), plain.search(data[q], 10));
+    CHECK(same);
+}
+
+TEST(ivf, i02_training) {
+    auto data = clustered(600, 8, 6, 1601);
+    FlatIndex none(8, Metric::L2), autof(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 2, 300)), f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 2, 0));
+    CHECK_THROWS_AS(std::logic_error, none.train_lists());
+    for (std::uint64_t i = 0; i < 5; ++i) f.add(i, data[i]);
+    CHECK_THROWS_AS(std::invalid_argument, f.train_lists());  // fewer vectors than lists
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        autof.add(i, data[i]);
+        if (i == 298) CHECK(!autof.lists_trained());
+    }
+    CHECK(autof.lists_trained() && autof.list_sizes().size() == 10 && lists_consistent(autof));  // trained at 300
+    for (std::uint64_t i = 5; i < 600; ++i) f.add(i, data[i]);
+    CHECK(!f.lists_trained());  // 0: only explicitly
+    f.train_lists();
+    CHECK(lists_consistent(f));
+    f.train_lists();  // again: replaces the lists
+    CHECK(lists_consistent(f));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 0)));
+}
+
+TEST(ivf, i03_probing_every_list_is_exact) {
+    auto data = clustered(1500, 24, 10, 1602);
+    for (Metric m : kMetrics) {
+        FlatIndex exact(24, m), f(24, m, Schema::dynamic(), {}, ivf_p(20, 20, 0));
+        for (std::uint64_t i = 0; i < 1500; ++i) {
+            exact.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        f.train_lists();
+        bool same = true;
+        for (std::size_t q = 0; q < 20; ++q) same = same && same_up_to_ties(f.search(data[q * 7], 10), exact.search(data[q * 7], 10));
+        CHECK(same);
+    }
+}
+
+TEST(ivf, i04_recall_rises_with_probes) {
+    auto data = clustered(5000, 32, 40, 1603);
+    auto queries = clustered(60, 32, 40, 1604);
+    FlatIndex exact(32, Metric::L2), f(32, Metric::L2, Schema::dynamic(), {}, ivf_p(64, 1, 0));
+    for (std::uint64_t i = 0; i < 5000; ++i) {
+        exact.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    f.train_lists();
+    std::vector<double> r;
+    for (std::size_t probes : {std::size_t(1), std::size_t(4), std::size_t(16), std::size_t(64)}) {
+        SearchOptions o;
+        o.probes = probes;
+        SearchStats st;
+        o.stats = &st;
+        double hit = 0, visited = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f.search(q, 10, o)) hit += double(truth.count(x.id));
+            visited += double(st.nodes_visited);
+        }
+        r.push_back(hit / 600.0);
+        std::printf("    probes %2zu: recall %.3f, vectors scanned %.0f of 5000\n", probes, hit / 600.0, visited / 60.0);
+    }
+    // Measured on this noisy synthetic data: recall rises with probes, and probing
+    // every list is exact.
+    CHECK(r[0] < r[1] && r[1] < r[2] && r[2] < r[3] && r[3] == 1.0 && r[2] >= 0.75);
+}
+
+TEST(ivf, i05_every_path_keeps_the_lists) {
+    auto data = clustered(1500, 12, 8, 1605);
+    FlatIndex f(12, Metric::L2, Schema::dynamic(), {}, ivf_p(12, 2, 200));
+    for (std::uint64_t i = 0; i < 500; ++i) f.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 500; i += 4) f.remove(i);  // swap with last
+    for (std::uint64_t i = 1; i < 500; i += 5) f.update(i, data[1499 - i]);  // possibly another list
+    for (std::uint64_t i = 2; i < 500; i += 9) f.upsert(i, data[1000 + i]);
+    f.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1300, data.begin() + 1400)));
+    CHECK(lists_consistent(f));
+    std::vector<Metadata> meta(50);
+    std::atomic<bool> flag{false};
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 20) flag = true; };
+    CHECK_THROWS_AS(Cancelled, f.add_batch(id_range(7000, 50), flatten(Vectors(data.begin() + 1200, data.begin() + 1250)), meta, 0, o));
+    CHECK(lists_consistent(f));
+    CHECK(f.remove_where(Filter::eq("category", "tech")) > 0 && lists_consistent(f));
+    f.compact();
+    CHECK(lists_consistent(f));
+}
+
+TEST(ivf, i06_ivf_pq) {
+    auto data = clustered(4000, 64, 32, 1606);
+    auto queries = clustered(50, 64, 32, 1607);
+    QuantizationParams pq;
+    pq.codec = CodecKind::PQ;
+    pq.train_after = 1000;
+    pq.rerank_factor = 16;
+    FlatIndex exact(64, Metric::L2), f(64, Metric::L2, Schema::dynamic(), pq, ivf_p(32, 8, 1000));
+    QuantizationParams lean_q = pq;
+    lean_q.keep_full_vectors = false;
+    FlatIndex lean(64, Metric::L2, Schema::dynamic(), lean_q, ivf_p(32, 8, 1000));
+    for (std::uint64_t i = 0; i < 4000; ++i) {
+        exact.add(i, data[i]);
+        f.add(i, data[i]);
+        lean.add(i, data[i]);
+    }
+    CHECK(f.lists_trained() && f.codec_trained() && lean.lists_trained() && !lean.has_vector_values() && lists_consistent(lean));
+    double a = 0, all = 0, b = 0;
+    SearchOptions every;
+    every.probes = 32;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+        for (const auto& x : f.search(q, 10)) a += double(truth.count(x.id));
+        for (const auto& x : f.search(q, 10, every)) all += double(truth.count(x.id));
+        for (const auto& x : lean.search(q, 10)) b += double(truth.count(x.id));
+    }
+    std::printf("    IVF-PQ (32 lists): re-ranked, 8 probes %.3f, all 32 probes %.3f; codes only, 8 probes %.3f\n", a / 500.0, all / 500.0, b / 500.0);
+    // Two approximations stack: the probed lists, then the codes (re-ranked).
+    CHECK(all / 500.0 >= 0.85 && all >= a && a / 500.0 >= 0.45 && b / 500.0 >= 0.20);
+}
+
+TEST(ivf, i07_filters_predicates_and_k) {
+    auto data = clustered(2000, 16, 20, 1608);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), {}, ivf_p(32, 1, 0));
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(i, data[i], meta_for(i));
+    f.train_lists();
+    // A selective filter: one probe holds too few matches, so more lists are probed: never fewer than k results.
+    const auto r = f.search(data[0], 10, with_filter(Filter::eq("category", "tech")));
+    bool ok = r.size() == 10;
+    for (const auto& x : r) ok = ok && x.id % 5 == 2;
+    SearchOptions odd;
+    odd.predicate = [](std::uint64_t id) { return id % 97 == 3; };  // about 20 vectors in total
+    const auto p = f.search(data[0], 15, odd);
+    ok = ok && p.size() == 15;
+    for (const auto& x : p) ok = ok && x.id % 97 == 3;
+    CHECK(ok && f.search(data[0], 5000).size() == 2000);  // more than exists: everything
+    SearchStats st;
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.probes = 32;
+    late.stats = &st;
+    (void)f.search(data[0], 10, late);
+    CHECK(st.stopped_early && st.nodes_visited < 2000);
+}
+
+TEST(ivf, i08_batch_and_range) {
+    auto data = clustered(1000, 16, 10, 1609);
+    FlatIndex f(16, Metric::Cosine, Schema::dynamic(), {}, ivf_p(10, 3, 0)), exact(16, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        f.add(i, data[i]);
+        exact.add(i, data[i]);
+    }
+    f.train_lists();
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 12));
+    const auto batch = f.search_batch(queries, 8, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 12; ++q) same = same && same_results(batch[q], f.search(data[q], 8));
+    CHECK(same && same_results(f.search_range(data[3], 0.05f), exact.search_range(data[3], 0.05f)));  // range: exact
+}
+
+TEST(ivf, i09_save_and_load) {
+    auto data = clustered(700, 12, 8, 1610);
+    for (bool trained : {false, true}) {
+        FlatIndex f(12, Metric::InnerProduct, Schema::dynamic(), {}, ivf_p(9, 3, trained ? 100 : 0));
+        for (std::uint64_t i = 0; i < 700; ++i) f.add(i, data[i]);
+        f.remove(5);
+        const std::string bytes = save_bytes(f);
+        auto f2 = load_flat(bytes);
+        CHECK(save_bytes(*f2) == bytes && f2->lists_trained() == trained && f2->ivf().lists == 9 && f2->ivf().probes == 3);
+        CHECK(same_results(f2->search(data[1], 10), f.search(data[1], 10)));
+        if (trained) CHECK(f2->list_sizes() == f.list_sizes() && lists_consistent(*f2));
+    }
+}
+
+TEST(ivf, i10_damaged_and_invalid_files) {
+    auto data = random_vectors(40, 4, 1611);
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_p(3, 2, 0));
+    for (std::uint64_t i = 0; i < 40; ++i) f.add(i, data[i]);
+    f.train_lists();
+    const std::string bytes = save_bytes(f);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_flat(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_flat(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // IVFL: lists (8), probes (8), train_after (8), trained (1), trained lists (8), centroids (3 x 4 x 4), list numbers.
+    const ParsedFile base = ParsedFile::parse(bytes);
+    const std::vector<std::function<void(std::string&)>> edits = {
+        [](std::string& p) { poke<std::uint64_t>(p, 8, 0); },                // probes 0
+        [](std::string& p) { poke<std::uint8_t>(p, 24, 2); },                // training flag 2
+        [](std::string& p) { poke<std::uint64_t>(p, 25, 0); },               // no trained lists
+        [](std::string& p) { poke<std::uint64_t>(p, 25, 4); },               // more trained lists than configured
+        [](std::string& p) { poke<float>(p, 33 + 4, kNaN); },                // a centroid that is not finite
+        [](std::string& p) { poke<std::uint32_t>(p, p.size() - 4, 3); },     // a vector in list 3 of 3
+        [](std::string& p) { p.resize(p.size() - 4); },                      // one list number missing
+    };
+    for (const auto& edit : edits) {
+        ParsedFile e = base;
+        edit(e.payload("IVFL"));
+        CHECK_THROWS_AS(FormatError, load_flat(e.assemble()));
+    }
+}
+
+TEST(ivf, i11_searching_while_lists_are_trained) {
+    auto data = clustered(1500, 8, 10, 1612);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(16, 4, 800));
+    for (std::uint64_t i = 0; i < 400; ++i) f.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "i11", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 400; i < 1500; ++i) f.add(i, data[i]);  // trains the lists at 800
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) check_results(f.search(data[q++ % 1500], 10), 1500, p);
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && lists_consistent(f));
+}
+
+TEST(ivf, i12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 6, 1613);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(8, 2, 0));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string untrained = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_lists(); }, [&] { CHECK(save_bytes(f) == untrained && !f.lists_trained()); }) > 0);
+    const std::string trained = save_bytes(f);
+    std::uint64_t id = 900;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == trained); }) > 0);
+    CHECK(sweep_allocation_failures([&] { (void)f.update(3, data[360]); }, [&] { CHECK(lists_consistent(f)); }) >= 0);
+    CHECK(lists_consistent(f) && f.contains(900));
+}
+
+// ===========================================================================
+// Edge cases across SIMD kernels, PQ and IVF (E1-E8)
+// ===========================================================================
+
+namespace {
+IvfParams ivf_e(std::size_t lists, std::size_t probes) {
+    IvfParams p;
+    p.lists = lists;
+    p.probes = probes;
+    p.train_after = 0;
+    return p;
+}
+std::size_t total_listed(const FlatIndex& f) {
+    std::size_t t = 0;
+    for (std::size_t s : f.list_sizes()) t += s;
+    return t;
+}
+}  // namespace
+
+TEST(edges, e01_ivf_list_counts) {
+    auto data = random_vectors(60, 4, 1700);
+    FlatIndex one(4, Metric::L2, Schema::dynamic(), {}, ivf_e(1, 1)), exact(4, Metric::L2), many(4, Metric::L2, Schema::dynamic(), {}, ivf_e(4, 100));
+    for (std::uint64_t i = 0; i < 60; ++i) {
+        one.add(i, data[i]);
+        exact.add(i, data[i]);
+        many.add(i, data[i]);
+    }
+    one.train_lists();
+    many.train_lists();
+    CHECK(same_up_to_ties(one.search(data[7], 5), exact.search(data[7], 5)));  // one list: an exact scan
+    CHECK(many.search(data[7], 5).size() == 5 && one.search(data[7], 0).empty());  // probes beyond lists; k = 0
+}
+
+TEST(edges, e02_ivf_emptied_and_refilled) {
+    auto data = random_vectors(40, 4, 1701);
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_e(4, 2));
+    for (std::uint64_t i = 0; i < 20; ++i) f.add(i, data[i]);
+    f.train_lists();
+    for (std::uint64_t i = 0; i < 20; ++i) f.remove(i);
+    CHECK(f.search(data[0], 5).empty() && total_listed(f) == 0 && f.lists_trained());
+    for (std::uint64_t i = 20; i < 40; ++i) f.add(i, data[i]);
+    CHECK(total_listed(f) == 20 && f.search(data[25], 30).size() == 20 && f.search(data[25], 1)[0].id == 25);
+}
+
+TEST(edges, e03_ivf_unmatched_filter_and_duplicates) {
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_e(5, 1));
+    for (std::uint64_t i = 0; i < 30; ++i) f.add(i, std::vector<float>(4, 2.0f), Metadata().set("c", "a"));  // identical vectors
+    f.train_lists();
+    CHECK(f.search(std::vector<float>(4, 2.0f), 30).size() == 30);
+    CHECK(f.search(std::vector<float>(4, 2.0f), 5, with_filter(Filter::eq("c", "zzz"))).empty());  // every list probed, none match
+}
+
+TEST(edges, e04_ivf_with_other_features) {
+    auto data = random_vectors(60, 6, 1702);
+    QuantizationParams q;
+    q.truncate_to = 2;
+    FlatIndex f(6, Metric::Cosine, Schema::dynamic(), q, ivf_e(3, 1));
+    for (std::uint64_t i = 0; i < 30; ++i) f.add(i, data[i], Metadata().set("c", i % 2 ? "a" : "b"));
+    f.add(99, std::vector<float>(6, 0.0f));  // a zero vector, before and after training
+    f.train_lists();
+    f.add(98, std::vector<float>(6, 0.0f));
+    CHECK(f.search(data[3], 40).size() == 32);
+    CHECK(f.remove_batch(std::vector<std::uint64_t>{1, 2, 3, 4}) == 4 && f.set_metadata_where(Filter::eq("c", "a"), Metadata().set("x", 1)) > 0);
+    CHECK(total_listed(f) == 28);
+    auto g = load_flat(save_bytes(f));  // and keep adding after loading
+    for (std::uint64_t i = 30; i < 60; ++i) g->add(i, data[i]);
+    CHECK(total_listed(*g) == 58);
+}
+
+TEST(edges, e05_pq_extremes) {
+    auto data = random_vectors(50, 6, 1703);
+    PQCodec per_dim(6, Metric::L2, 6);  // one dimension per part
+    per_dim.train(flatten(data));
+    std::uint8_t code[6];
+    per_dim.encode(data[0], code);
+    PQCodec single(8, Metric::L2, 2);  // trained on one vector: one centroid per part
+    single.train(random_vectors(1, 8, 1704)[0]);
+    std::uint8_t c2[2];
+    single.encode(data[1].size() == 6 ? std::vector<float>(8, 1.0f) : data[1], c2);
+    CHECK(per_dim.code_size() == 6 && single.centroids() == 1 && c2[0] == 0 && c2[1] == 0 && PQCodec(3, Metric::L2).parts() == 1);
+}
+
+TEST(edges, e06_codecs_with_huge_ranges) {
+    // Values spanning more than the float range: max - min overflows a float.
+    const std::vector<float> sample = {-3e38f, 0, 3e38f, 1};
+    SQ8Codec sq8(2, Metric::L2);
+    sq8.train(sample);
+    std::uint8_t code[2];
+    sq8.encode(std::vector<float>{1e38f, 0.5f}, code);  // 1e38 - (-3e38) also overflows a float
+    float back[2];
+    sq8.decode(code, back);
+    CHECK(std::isfinite(back[0]) && std::abs(back[0] - 1e38f) <= sq8.step()[0] * 0.5f + 1e33f && code[0] > 100 && code[0] < 255);
+    BinaryCodec bin(2, Metric::L2);
+    bin.train(sample);
+    PQCodec pq(2, Metric::L2, 1);
+    pq.train(std::vector<float>{-3e38f, 0, 3e38f, 1, 0, 0});
+    CHECK(bin.trained() && pq.trained());
+    // Automatic training must not fail silently on such data.
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 10;
+    HnswIndex h(2, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{i % 2 ? 3e38f : -3e38f, float(i)});
+    CHECK(h.codec_trained());
+}
+
+TEST(edges, e07_kernel_tails) {
+    const auto k = get_code_kernels();
+    std::vector<float> w(13, 1.0f), t(13, 1.0f), s(13, 0.0f);
+    std::uint8_t bits[2] = {0xFF, 0x1F}, bytes[13] = {};
+    CHECK(k.bits_sum(w.data(), bits, 13) == 13.0f && k.sq8_l2(t.data(), s.data(), bytes, 13) == 13.0f && k.sq8_dot(w.data(), bytes, 13) == 0.0f);
+}
+
+TEST(edges, e08_sq8_fixed_answers_unchanged) {
+    // Computing SQ8 in double (for huge ranges) must not change ordinary codes:
+    // the same values as q0_11, computed independently with NumPy float32.
+    const std::vector<float> sample = {0, -1, 2.5f, 255, 1, 0.5f, 127.5f, 0, -0.25f};
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    c.encode(std::vector<float>{63.75f, 0.3f, 1.0f}, code);
+    CHECK(code[0] == 64 && code[1] == 166 && code[2] == 116);
+}
+
+TEST(edges, e09_codec_misuse_branches) {
+    BinaryCodec b(4, Metric::L2);
+    CHECK_THROWS_AS(std::invalid_argument, b.train(std::vector<float>(6, 1.0f)));  // not whole vectors
+    CHECK_THROWS_AS(std::invalid_argument, b.restore(std::vector<float>{kNaN, 0, 0, 0, 1, 1, 1, 1}));  // a threshold that is not finite
+    CHECK_THROWS_AS(std::invalid_argument, b.restore(std::vector<float>{-3e38f, 0, 0, 0, 3e38f, 1, 1, 1}));  // threshold - spread overflows
+    PQCodec q(8, Metric::L2, 2);
+    CHECK(q.state().empty() && !q.trained());  // untrained: no state
+    CHECK_THROWS_AS(std::invalid_argument, q.train(std::vector<float>{1, 2, 3, 4, 5, 6, 7, kInf}));
+    CHECK_THROWS_AS(std::invalid_argument, q.restore(std::vector<float>{}));
+}
+
+TEST(edges, e10_list_of_unknown_and_untrained) {
+    IvfParams ivf;
+    ivf.lists = 2;
+    ivf.train_after = 0;
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 10; ++i) f.add(i, random_vectors(1, 4, unsigned(1710 + i))[0]);
+    CHECK(!f.list_of(3));  // untrained
+    f.train_lists();
+    CHECK(f.list_of(3) && !f.list_of(999));  // unknown ID
+}
+
+TEST(edges, e11_inconsistent_codec_and_list_sections) {
+    // A trained CODC section with fewer than 8 bytes left for its last field
+    // (the number of PQ parts), and "trained" lists while no lists are configured.
+    auto data = random_vectors(20, 4, 1711);
+    HnswParams p;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 5;
+    p.quantization.pq_subspaces = 2;
+    HnswIndex h(4, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, data[i]);
+    ParsedFile short_codc = ParsedFile::parse(save_bytes(h));
+    std::string& codc = short_codc.payload("CODC");
+    codc.resize(codc.size() - 8 - 40 + 4);  // drop the field and the codes, keep 4 stray bytes
+    CHECK_THROWS_AS(FormatError, load_hnsw(short_codc.assemble()));
+    IvfParams ivf;
+    ivf.lists = 2;
+    ivf.train_after = 0;
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 20; ++i) f.add(i, data[i]);
+    f.train_lists();
+    ParsedFile no_lists = ParsedFile::parse(save_bytes(f));
+    poke<std::uint64_t>(no_lists.payload("IVFL"), 0, 0);  // lists = 0, yet trained
+    try {
+        (void)load_flat(no_lists.assemble());
+        CHECK(false);
+    } catch (const FormatError& e) {
+        CHECK(std::string(e.what()).find("training flag") != std::string::npos);  // rejected by its own rule
+    }
 }
 
 // ===========================================================================
@@ -12344,7 +13182,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -12380,6 +13218,8 @@ int main(int argc, char** argv) {
             golden_flat()->save(golden_path("golden_flat_v3.bin"));
             golden_sq8()->save(golden_path("golden_hnsw_sq8_v3.bin"));
             golden_binary()->save(golden_path("golden_hnsw_binary_v3.bin"));
+            golden_pq()->save(golden_path("golden_hnsw_pq_v3.bin"));
+            golden_ivf()->save(golden_path("golden_flat_ivf_v3.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
         } else if (arg == "--group" || arg == "--exclude") {

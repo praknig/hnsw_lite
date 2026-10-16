@@ -118,7 +118,15 @@ Removed HNSW slots are reused by later inserts, so memory stays bounded by the p
 
 ### Compression
 
-Measured recall@10 (3,000 clustered vectors; see the `sq8`, `binary` and `codes_only` test groups). Speed has not been measured yet: the code distances still use plain C++ (SIMD kernels are planned), so measure before relying on any speed-up.
+Measured recall@10 on synthetic clustered data (see the `sq8`, `binary`, `pq` and `codes_only` test groups). Code distances use SIMD kernels (AVX2, AVX-512, NEON). `bench_codecs [dimension]` times them against full-precision distances; a first run on a shared cloud machine (AVX-512, 768 dimensions, so indicative only) gave, in nanoseconds per distance:
+
+| Kernels | Float L2 | SQ8 L2 | SQ8 dot | Binary |
+|---|---|---|---|---|
+| Plain C++ | 630 | 618 | 588 | 4,866 |
+| AVX2 | 123 | 104 | 93 | 105 |
+| AVX-512 | 115 | 70 | 57 | 51 |
+
+So with SIMD, SQ8 and binary distances are faster than full-precision ones (less memory to read); binary codes without SIMD were about 8 times slower. Measure on your own hardware before relying on these numbers; whole-search speed has not been measured yet.
 
 | Setting | Recall@10 | Memory for vectors |
 |---|---|---|
@@ -128,11 +136,27 @@ Measured recall@10 (3,000 clustered vectors; see the `sq8`, `binary` and `codes_
 | Binary, re-ranked, Flat `rerank_factor` 32 or HNSW `ef` 400 | 0.96 to 0.99 | 4 bytes and 1 bit per dimension |
 | Binary, re-ranked with the defaults (`rerank_factor` 4, `ef` 64) | 0.63 to 0.79 | the same |
 | Binary, codes only | 0.34 to 0.39: not recommended | 1 bit per dimension |
+| PQ (8 dimensions per part), re-ranked: Flat `rerank_factor` 16, HNSW `ef` 200 | 0.89 to 0.97 | 4 bytes per dimension plus 1 byte per part |
+| PQ, codes only | 0.31 to 0.40 on this test data | 1 byte per part (32 times smaller by default) |
 
 - **SQ8** is the safe choice: re-ranked, it matches full precision; with codes only it saves three quarters of the vector memory for about 1.5% recall.
 - **Binary codes** need a large re-ranking budget: a `rerank_factor` of 16 to 32 for Flat, a larger `ef` for HNSW. Keep the full vectors with them.
+- **PQ** gives the smallest codes for a given recall once re-ranked with a generous budget; choose more parts (`pq_subspaces`) for better recall. Its training (k-means) is slower than SQ8's.
 - **Matryoshka truncation** (`truncate_to`) cuts the cost of every distance in proportion, for embeddings trained for it; add `keep_full_vectors = false` to save the memory too.
 - With codes only, training is final: train on a representative sample (`train_after`).
+
+### Inverted file (IVF)
+
+Measured on noisy synthetic data (5,000 vectors of 32 dimensions in 40 clusters, 64 lists; test `i04`):
+
+| Probes | Vectors scanned | Recall@10 |
+|---|---|---|
+| 1 | 1.5% | 0.16 |
+| 4 | 6% | 0.40 |
+| 16 | 25% | 0.81 |
+| 64 (all) | 100% | 1.00 (exact) |
+
+Scan time grows with the share scanned, so probes trade speed for recall; real embeddings cluster better than this data and usually need fewer. IVF-PQ (32 lists, PQ re-ranked with `rerank_factor` 16) reached 0.56 at 8 probes and 0.87 with all lists probed, the same as PQ alone. Measure on your data: start with `lists` near the square root of the number of vectors and raise `probes` until recall suffices.
 
 ### Build type
 

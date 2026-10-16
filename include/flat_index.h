@@ -51,7 +51,9 @@ public:
     /// metadata fields (dynamic by default: fields are created on first use).
     /// `quantization`: compact storage of vectors (see QuantizationParams); exact
     /// searches then compare codes and re-rank the best at full precision.
-    FlatIndex(std::size_t dim, Metric metric, Schema schema = Schema::dynamic(), QuantizationParams quantization = {});
+    /// `ivf`: an inverted file (see IvfParams), for example with a PQ codec (IVF-PQ).
+    FlatIndex(std::size_t dim, Metric metric, Schema schema = Schema::dynamic(), QuantizationParams quantization = {},
+              IvfParams ivf = {});
 
     /// Stores a vector, with optional metadata, under the user's `id`. Throws
     /// std::invalid_argument on a wrong dimension, NaN or infinity, an ID that is
@@ -99,6 +101,19 @@ public:
     const VectorCodec* codec() const { return codec_.get(); }  // for inspection, like HnswIndex::codec()
     std::optional<std::vector<std::uint8_t>> get_code(std::uint64_t id) const;
     const QuantizationParams& quantization() const { return quant_; }
+
+    /// IVF: trains the lists on the stored vectors now (k-means) and assigns every
+    /// vector to its nearest list; later vectors are assigned as they arrive.
+    /// Training again replaces the lists. All or nothing. Throws std::logic_error
+    /// without IvfParams::lists, std::invalid_argument with fewer vectors than lists.
+    void train_lists();
+    /// Whether searches use the lists (trained).
+    bool lists_trained() const;
+    /// The list holding `id`, or nothing if it is not stored or the lists are untrained.
+    std::optional<std::uint32_t> list_of(std::uint64_t id) const;
+    /// The number of vectors in each list (empty if untrained).
+    std::vector<std::size_t> list_sizes() const;
+    const IvfParams& ivf() const { return ivf_; }
 
     /// Removes every listed ID that is stored and returns how many it removed;
     /// unknown and repeated IDs are skipped. Always completes, like remove_where.
@@ -268,6 +283,16 @@ private:
     void add_vector(std::span<const float> original);  // scratch_ (prepared) and its original; all-or-nothing
     void maybe_train() noexcept;
     void train_codec_unlocked();
+    // IVF bookkeeping: every row is in one list, at a known position (O(1) moves).
+    bool ivf_trained() const { return !lists_.empty(); }
+    std::uint32_t nearest_list(const float* padded) const;  // a prepared vector, padded to the stride
+    std::uint32_t nearest_of(const std::vector<float>& centroids, const float* padded) const;  // among given centroids
+    void ivf_reserve(std::uint32_t list);                  // may throw: before any change
+    void ivf_append(NodeId row, std::uint32_t list) noexcept;
+    void ivf_detach(NodeId row) noexcept;                  // takes `row` out of its list
+    void ivf_pop_row(NodeId row) noexcept;                 // the last row was removed
+    void maybe_train_lists() noexcept;
+    void train_lists_unlocked();
     /// Whether only codes are kept (see HnswIndex::codes_only).
     bool codes_only() const { return !vectors_.has_values(); }
     /// The stored vector of row `slot` (indexed_dim() values), as a copy: the
@@ -284,7 +309,7 @@ private:
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;
 
     /// Exact top-k over eligible vectors for one prepared query.
-    std::vector<SearchResult> scan(const float* query, std::size_t k, const Eligibility& eligible,
+    std::vector<SearchResult> scan(const float* query, std::size_t k, const Eligibility& eligible, std::size_t probes,
                                    SearchStats* stats) const;
 
     std::size_t input_dim_;  // as given; the stored vectors may be truncated (see indexed_dim)
@@ -295,6 +320,10 @@ private:
     QuantizationParams quant_;
     std::unique_ptr<VectorCodec> codec_;  // null without quantization
     std::vector<std::uint8_t> codes_;     // trained: code_size() bytes per row (at least as many rows as stored)
+    IvfParams ivf_;
+    std::vector<float> centroids_;               // trained: lists x stride, padded with zeros
+    std::vector<std::vector<NodeId>> lists_;     // trained: the rows of each list
+    std::vector<std::uint32_t> list_of_, pos_;   // per row: its list, and its position there
     IdMap ids_;
     MetadataStore metadata_;
     PreparedVector scratch_;  // reused by add(); searches use their own copy

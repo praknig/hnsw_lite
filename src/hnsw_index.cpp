@@ -52,7 +52,7 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params, Schema s
       stride_(storage_.vectors().stride()),
       scratch_(vecdb::indexed_dim(params.quantization, dim)),
       rng_(params.seed),
-      codec_(make_codec(params.quantization.codec, vecdb::indexed_dim(params.quantization, dim), metric)),
+      codec_(make_codec(params.quantization.codec, vecdb::indexed_dim(params.quantization, dim), metric, params.quantization.pq_subspaces)),
       metadata_(std::move(schema)) {}
 
 int HnswIndex::random_level() {
@@ -792,7 +792,7 @@ void HnswIndex::train_codec_unlocked() {
         const auto v = stored_copy(live[i * live.size() / take]);  // decoded, with codes only
         std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
     }
-    auto trained = make_codec(codec_->kind(), d, metric_);
+    auto trained = make_codec(codec_->kind(), d, metric_, params_.quantization.pq_subspaces);
     trained->train(sample);
     std::vector<std::uint8_t> codes(storage_.size() * trained->code_size());
     for (NodeId n = 0; n < storage_.size(); ++n) trained->encode(stored_copy(n), codes.data() + std::size_t(n) * trained->code_size());

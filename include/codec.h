@@ -33,6 +33,7 @@ enum class CodecKind : std::uint8_t {
     None = 0,  ///< full-precision floats (no codec)
     SQ8 = 1,   ///< 8-bit scalar quantization: one byte per dimension
     Binary = 2,  ///< binary quantization: one bit per dimension
+    PQ = 3,      ///< product quantization: one byte per part of the vector
 };
 
 /// How an index stores its vectors in compact form (see the compression and
@@ -62,6 +63,10 @@ struct QuantizationParams {
     /// vectors once the codec is trained, keeping only codes: re-ranking is then
     /// off, vectors read back decoded, and that first training is final.
     bool keep_full_vectors = true;
+    /// Product quantization: the number of parts each vector is split into (one
+    /// byte of code each). 0: one part per 8 dimensions. At most the (indexed)
+    /// dimension; dimensions that do not divide evenly go to the first parts.
+    std::size_t pq_subspaces = 0;
 };
 
 /// Whether an index keeps each vector as given besides the stored one: when it
@@ -79,6 +84,24 @@ inline std::size_t indexed_dim(const QuantizationParams& q, std::size_t dim) {
     return q.truncate_to == 0 ? dim : q.truncate_to;
 }
 
+/// An inverted file (IVF) for FlatIndex: k-means divides the vectors into
+/// `lists`, and a search scans only the `probes` lists nearest to the query
+/// (more if they hold fewer than k matching vectors), instead of everything.
+/// With a codec this is, for example, IVF-PQ. Range searches stay exact.
+struct IvfParams {
+    std::size_t lists = 0;          ///< 0: no inverted file (every search scans everything)
+    std::size_t probes = 8;         ///< lists searched per query (SearchOptions::probes overrides)
+    /// Train the lists automatically once this many vectors (and at least
+    /// `lists`) are stored; 0: only when train_lists() is called.
+    std::size_t train_after = 10000;
+};
+
+/// Throws std::invalid_argument for IVF settings that cannot work.
+inline void validate(const IvfParams& p) {
+    if (p.lists > 0 && p.probes < 1) throw std::invalid_argument("IvfParams::probes must be at least 1");
+    if (p.lists > (std::size_t(1) << 31)) throw std::invalid_argument("IvfParams::lists is too large");
+}
+
 /// a * b, or SIZE_MAX if that would overflow (k * rerank_factor must never wrap).
 inline std::size_t saturating_mul(std::size_t a, std::size_t b) {
     return (b != 0 && a > SIZE_MAX / b) ? SIZE_MAX : a * b;
@@ -86,7 +109,7 @@ inline std::size_t saturating_mul(std::size_t a, std::size_t b) {
 
 /// Throws std::invalid_argument for settings that cannot work.
 inline void validate(const QuantizationParams& q) {
-    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::Binary)) throw std::invalid_argument("QuantizationParams: unknown codec");
+    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::PQ)) throw std::invalid_argument("QuantizationParams: unknown codec");
     if (q.rerank_factor < 1) throw std::invalid_argument("QuantizationParams::rerank_factor must be at least 1");
 }
 
@@ -132,6 +155,9 @@ public:
     virtual float distance(const std::vector<float>& table, const std::uint8_t* code) const = 0;
 
 protected:
+    /// The fastest code kernels for this CPU, chosen once (see distance.h).
+    CodeKernels kernels_ = get_code_kernels();
+
     void check_trained() const {
         if (!trained()) throw std::logic_error("codec: not trained yet");
     }
@@ -229,7 +255,46 @@ private:
     std::vector<float> threshold_, spread_;
 };
 
-/// Creates an untrained codec of the given kind (nullptr for CodecKind::None).
-std::unique_ptr<VectorCodec> make_codec(CodecKind kind, std::size_t dim, Metric metric);
+/**
+ * @brief Product quantization (PQ): each vector is split into parts, each part
+ *        stored as the index of its nearest centroid, one byte.
+ *
+ * Training runs k-means (kmeans.h) on each part: 256 centroids, or as many as
+ * there are training vectors if fewer. A query prepares a table of its
+ * distance to every centroid of every part, so a distance is one lookup per
+ * part. Encoding is deterministic on every CPU, and breaks ties toward the
+ * lower centroid, so decoding then encoding reproduces a code exactly.
+ */
+class PQCodec final : public VectorCodec {
+public:
+    /// `parts`: the number of parts, 0 for one per 8 dimensions. Throws
+    /// std::invalid_argument if it exceeds the dimension.
+    PQCodec(std::size_t dim, Metric metric, std::size_t parts = 0);
+
+    CodecKind kind() const override { return CodecKind::PQ; }
+    std::unique_ptr<VectorCodec> clone() const override { return std::make_unique<PQCodec>(*this); }
+    /// The number of centroids per part, then every part's centroids in order.
+    std::vector<float> state() const override;
+    void restore(std::span<const float> state) override;
+    std::size_t code_size() const override { return parts_; }
+    bool trained() const override { return centroids_count_ > 0; }
+    void train(std::span<const float> sample) override;
+    void encode(std::span<const float> v, std::uint8_t* code) const override;
+    void decode(const std::uint8_t* code, std::span<float> out) const override;
+    void prepare(std::span<const float> query, std::vector<float>& table) const override;
+    float distance(const std::vector<float>& table, const std::uint8_t* code) const override;
+
+    std::size_t parts() const { return parts_; }
+    std::size_t centroids() const { return centroids_count_; }
+
+private:
+    std::size_t part_begin(std::size_t p) const;  // first dimension of part p
+    std::size_t parts_, centroids_count_ = 0;
+    std::vector<float> centroids_;  // part by part: centroids_count_ x part dimension
+};
+
+/// Creates an untrained codec of the given kind (nullptr for CodecKind::None);
+/// `pq_subspaces` is used by PQ only.
+std::unique_ptr<VectorCodec> make_codec(CodecKind kind, std::size_t dim, Metric metric, std::size_t pq_subspaces = 0);
 
 }  // namespace vecdb

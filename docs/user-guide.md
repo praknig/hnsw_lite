@@ -23,6 +23,8 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
 - [Binary quantization](#binary-quantization)
+- [Inverted file (IVF)](#inverted-file-ivf)
+- [Product quantization (PQ)](#product-quantization-pq)
 - [Shorter vectors (Matryoshka truncation)](#shorter-vectors-matryoshka-truncation)
 - [Keeping only the stored vectors](#keeping-only-the-stored-vectors)
 - [Keeping only codes (SQ8 without full precision)](#keeping-only-codes-sq8-without-full-precision)
@@ -398,6 +400,43 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - **Binary codes are coarse, so re-ranking at full precision is essential, with many candidates.** Measured recall@10 on 3,000 clustered vectors: Flat with `rerank_factor` 4 (the default, suited to SQ8) reached 0.63 to 0.73, with 16 about 0.86, and with 32 0.96 to 0.99; HNSW re-ranks its whole beam, and reached 0.74 to 0.79 at `ef` 64 and 0.98 to 0.99 at `ef` 400.
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
 - Training, saving, truncation and everything else work as for SQ8.
+- Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Inverted file (IVF)
+
+```cpp
+IvfParams ivf;
+ivf.lists = 1024;         // about the square root of the number of vectors is a common start
+ivf.probes = 32;          // lists searched per query: the speed and recall trade-off
+ivf.train_after = 50000;  // train automatically (or call train_lists())
+FlatIndex index(768, Metric::Cosine, Schema::dynamic(), QuantizationParams{}, ivf);
+
+SearchOptions o;
+o.probes = 64;            // more lists for this search only
+auto results = index.search(query, 10, o);
+```
+
+- **k-means divides the vectors into lists**, and a search scans only the lists nearest to the query instead of everything. It is an option of `FlatIndex`, so filters, metadata, deadlines, codecs, saving and everything else work as before.
+- **Probes trade speed for recall.** Measured on noisy synthetic data with 64 lists: 1 probe scanned 1.5% of the vectors for recall@10 of 0.16, 16 probes 25% for 0.81, all 64 probes everything for exact results. Real embeddings, which cluster better, usually need fewer probes.
+- **Never fewer than k results:** if the probed lists hold fewer than `k` matching vectors (with a selective filter, say), more lists are probed.
+- **IVF-PQ:** combine with `QuantizationParams{.codec = CodecKind::PQ}` for small codes and fast scans; re-ranking works as for PQ.
+- **Until trained**, searches scan everything. Training (`train_lists()`, or automatically at `train_after` vectors and at least `lists`) is all or nothing, and can be repeated. **Training costs** about lists × sampled vectors × dimensions × iterations (up to 25; at most 100,000 vectors are sampled): 1,024 lists over 50,000 vectors of 768 dimensions is around 10^12 operations, minutes on a few cores. k-means uses every core; train once on a representative sample. Vectors added later go to their nearest list. Range searches always scan everything.
+
+## Product quantization (PQ)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::PQ;
+p.quantization.pq_subspaces = 96;           // 768 dimensions in 96 parts of 8: 96 bytes per vector
+p.quantization.train_after = 10000;         // k-means needs a representative sample
+HnswIndex index(768, Metric::Cosine, p);
+auto results = index.search(query, 10, 200);  // re-ranked: give the search a generous beam
+```
+
+- **Each vector is split into parts**, and each part is stored as the index of its nearest of 256 centroids, learned by k-means: one byte per part. With the default (`pq_subspaces = 0`: one part per 8 dimensions) that is 32 times smaller than floats. Dimensions that do not divide evenly go to the first parts.
+- **Distances are table lookups:** a query computes its distance to every centroid once, then each code costs one lookup per part.
+- **Re-ranking is essential, as with binary codes.** Measured recall@10 on synthetic clustered data (64 dimensions, 8 per part): HNSW 0.70 to 0.79 at `ef` 64 and 0.92 to 0.97 at `ef` 200; Flat 0.62 to 0.74 with `rerank_factor` 4 and 0.89 to 0.95 with 16; codes only 0.31 to 0.40. More parts (fewer dimensions each) give better recall for more bytes; real embeddings usually suit PQ better than this noisy test data.
+- **Training** runs k-means on each part (up to 100,000 sample vectors), so it takes longer than for SQ8 or binary codes; with fewer than 256 training vectors there are fewer centroids. Training, saving, truncation and codes only work as for SQ8.
 
 ## Shorter vectors (Matryoshka truncation)
 

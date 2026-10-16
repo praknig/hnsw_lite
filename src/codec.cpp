@@ -4,6 +4,7 @@
  *        (see CMakeLists.txt), so codes are identical on every CPU.
  */
 #include "codec.h"
+#include "kmeans.h"
 
 #include <algorithm>
 #include <cmath>
@@ -22,7 +23,8 @@ void SQ8Codec::train(std::span<const float> sample) {
         hi[i % d] = std::max(hi[i % d], x);
     }
     std::vector<float> step(d);
-    for (std::size_t j = 0; j < d; ++j) step[j] = (hi[j] - lo[j]) / 255.0f;
+    // In double: hi - lo overflows a float when the values span more than its range.
+    for (std::size_t j = 0; j < d; ++j) step[j] = static_cast<float>((double(hi[j]) - double(lo[j])) / 255.0);
     set_range(lo, step);
 }
 
@@ -40,7 +42,8 @@ void SQ8Codec::encode(std::span<const float> v, std::uint8_t* code) const {
     check_size(v);
     for (std::size_t j = 0; j < dim(); ++j) {
         float level = 0;  // a constant dimension (step 0) is stored exactly as its minimum
-        if (step_[j] > 0) level = std::floor((v[j] - min_[j]) / step_[j] + 0.5f);  // round half up: same everywhere
+        // In double (deterministic everywhere): v - min overflows a float for huge ranges.
+        if (step_[j] > 0) level = static_cast<float>(std::floor((double(v[j]) - double(min_[j])) / double(step_[j]) + 0.5));
         code[j] = static_cast<std::uint8_t>(std::clamp(level, 0.0f, 255.0f));     // outside the range: clamped
     }
 }
@@ -48,7 +51,10 @@ void SQ8Codec::encode(std::span<const float> v, std::uint8_t* code) const {
 void SQ8Codec::decode(const std::uint8_t* code, std::span<float> out) const {
     check_trained();
     check_size(out);
-    for (std::size_t j = 0; j < dim(); ++j) out[j] = min_[j] + float(code[j]) * step_[j];
+    for (std::size_t j = 0; j < dim(); ++j) {  // in double, kept within the float range
+        const double x = double(min_[j]) + double(code[j]) * double(step_[j]);
+        out[j] = static_cast<float>(std::clamp(x, -double(std::numeric_limits<float>::max()), double(std::numeric_limits<float>::max())));
+    }
 }
 
 void SQ8Codec::prepare(std::span<const float> query, std::vector<float>& table) const {
@@ -73,16 +79,8 @@ void SQ8Codec::prepare(std::span<const float> query, std::vector<float>& table) 
 
 float SQ8Codec::distance(const std::vector<float>& table, const std::uint8_t* code) const {
     const std::size_t d = dim();
-    if (metric() == Metric::L2) {
-        float sum = 0;
-        for (std::size_t j = 0; j < d; ++j) {
-            const float diff = table[j] - float(code[j]) * step_[j];
-            sum += diff * diff;
-        }
-        return sum;
-    }
-    float dot = table[d];
-    for (std::size_t j = 0; j < d; ++j) dot += table[j] * float(code[j]);
+    if (metric() == Metric::L2) return kernels_.sq8_l2(table.data(), step_.data(), code, d);  // SIMD where available
+    const float dot = table[d] + kernels_.sq8_dot(table.data(), code, d);
     return metric() == Metric::Cosine ? 1.0f - dot : -dot;
 }
 
@@ -161,17 +159,106 @@ void BinaryCodec::prepare(std::span<const float> query, std::vector<float>& tabl
 
 float BinaryCodec::distance(const std::vector<float>& table, const std::uint8_t* code) const {
     const std::size_t d = dim();
-    float sum = table[2 * d];
-    for (std::size_t j = 0; j < d; ++j)
-        if ((code[j / 8] >> (j % 8)) & 1u) sum += table[d + j];
+    const float sum = table[2 * d] + kernels_.bits_sum(table.data() + d, code, d);  // SIMD where available
     return metric() == Metric::Cosine ? 1.0f + sum : sum;  // cosine: 1 - dot, and sum is -dot
 }
 
-std::unique_ptr<VectorCodec> make_codec(CodecKind kind, std::size_t dim, Metric metric) {
+PQCodec::PQCodec(std::size_t dim, Metric metric, std::size_t parts)
+    : VectorCodec(dim, metric), parts_(parts == 0 ? std::max<std::size_t>(1, dim / 8) : parts) {
+    if (parts_ > dim) throw std::invalid_argument("PQ: more parts than dimensions");
+}
+
+std::size_t PQCodec::part_begin(std::size_t p) const {
+    const std::size_t base = dim() / parts_, extra = dim() % parts_;  // the first `extra` parts get one more
+    return p * base + std::min(p, extra);
+}
+
+void PQCodec::train(std::span<const float> sample) {
+    const std::size_t d = dim();
+    if (sample.empty() || sample.size() % d != 0) throw std::invalid_argument("PQ: sample must hold whole vectors, at least one");
+    for (float x : sample)
+        if (!std::isfinite(x)) throw std::invalid_argument("PQ: sample contains NaN or infinity");
+    const std::size_t n = sample.size() / d, k = std::min<std::size_t>(256, n);
+    std::vector<float> state{float(k)};
+    std::vector<float> part;
+    for (std::size_t p = 0; p < parts_; ++p) {
+        const std::size_t b = part_begin(p), e = part_begin(p + 1), pd = e - b;
+        part.resize(n * pd);
+        for (std::size_t i = 0; i < n; ++i) std::copy_n(sample.begin() + std::ptrdiff_t(i * d + b), pd, part.begin() + std::ptrdiff_t(i * pd));
+        const KMeansResult r = kmeans(part, pd, KMeansParams{k, 25, 0x5051 + p, 0});  // the thread count never changes the result
+        state.insert(state.end(), r.centroids.begin(), r.centroids.end());
+    }
+    restore(state);
+}
+
+std::vector<float> PQCodec::state() const {
+    if (!trained()) return {};
+    std::vector<float> s{float(centroids_count_)};
+    s.insert(s.end(), centroids_.begin(), centroids_.end());
+    return s;
+}
+
+void PQCodec::restore(std::span<const float> state) {
+    if (state.empty() || !(state[0] >= 1 && state[0] <= 256) || state[0] != std::floor(state[0]))
+        throw std::invalid_argument("PQ: saved state must start with 1 to 256 centroids per part");
+    const std::size_t k = std::size_t(state[0]);
+    if (state.size() != 1 + k * dim()) throw std::invalid_argument("PQ: saved state has wrong size");
+    for (std::size_t i = 1; i < state.size(); ++i)
+        if (!std::isfinite(state[i])) throw std::invalid_argument("PQ: centroids must be finite");
+    centroids_.assign(state.begin() + 1, state.end());
+    centroids_count_ = k;
+}
+
+void PQCodec::encode(std::span<const float> v, std::uint8_t* code) const {
+    check_trained();
+    check_size(v);
+    for (std::size_t p = 0; p < parts_; ++p) {
+        const std::size_t b = part_begin(p), pd = part_begin(p + 1) - b;
+        const std::span<const float> cs(centroids_.data() + b * centroids_count_, centroids_count_ * pd);
+        code[p] = static_cast<std::uint8_t>(nearest_centroid(cs, pd, v.data() + b));  // ties: the lower centroid
+    }
+}
+
+void PQCodec::decode(const std::uint8_t* code, std::span<float> out) const {
+    check_trained();
+    check_size(out);
+    for (std::size_t p = 0; p < parts_; ++p) {
+        const std::size_t b = part_begin(p), pd = part_begin(p + 1) - b;
+        if (code[p] >= centroids_count_) throw std::invalid_argument("PQ: code refers to a centroid that does not exist");
+        std::copy_n(centroids_.data() + b * centroids_count_ + std::size_t(code[p]) * pd, pd, out.begin() + std::ptrdiff_t(b));
+    }
+}
+
+void PQCodec::prepare(std::span<const float> query, std::vector<float>& table) const {
+    check_trained();
+    check_size(query);
+    // For every part and centroid: its share of the distance (squared distance,
+    // or negative dot product). 256 entries per part, unused ones never read.
+    table.assign(parts_ * 256, 0.0f);
+    for (std::size_t p = 0; p < parts_; ++p) {
+        const std::size_t b = part_begin(p), pd = part_begin(p + 1) - b;
+        for (std::size_t c = 0; c < centroids_count_; ++c) {
+            const float* x = centroids_.data() + b * centroids_count_ + c * pd;
+            float share = 0;
+            for (std::size_t j = 0; j < pd; ++j)
+                share += metric() == Metric::L2 ? (query[b + j] - x[j]) * (query[b + j] - x[j]) : -query[b + j] * x[j];
+            table[p * 256 + c] = share;
+        }
+    }
+}
+
+float PQCodec::distance(const std::vector<float>& table, const std::uint8_t* code) const {
+    float sum = 0;
+    for (std::size_t p = 0; p < parts_; ++p) sum += table[p * 256 + code[p]];  // one lookup per part
+    return metric() == Metric::Cosine ? 1.0f + sum : sum;  // cosine: 1 - dot, and sum is -dot
+}
+
+std::unique_ptr<VectorCodec> make_codec(CodecKind kind, std::size_t dim, Metric metric, std::size_t pq_subspaces) {
     switch (kind) {
         case CodecKind::None: return nullptr;
         case CodecKind::SQ8: return std::make_unique<SQ8Codec>(dim, metric);
         case CodecKind::Binary: return std::make_unique<BinaryCodec>(dim, metric);
+        case CodecKind::PQ: return std::make_unique<PQCodec>(dim, metric, pq_subspaces);
     }
     throw std::invalid_argument("unknown codec kind");  // GCOVR_EXCL_LINE: every enumerator is handled above
 }

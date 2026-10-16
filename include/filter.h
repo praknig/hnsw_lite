@@ -272,6 +272,8 @@ struct SearchStats {
  *    through vectors outside the radius to reach more of the region.
  */
 struct SearchOptions {
+    /// IVF (FlatIndex with IvfParams): lists to probe; 0: the index's default.
+    std::size_t probes = 0;
     std::optional<Filter> filter;
     std::function<bool(std::uint64_t)> predicate;
     Strategy strategy = Strategy::Auto;

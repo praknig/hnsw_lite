@@ -3,6 +3,8 @@
  * @brief Implementation of FlatIndex (see flat_index.h for the design).
  */
 #include "flat_index.h"
+#include <limits>
+#include "kmeans.h"
 
 #include <algorithm>
 #include <cmath>
@@ -10,7 +12,7 @@
 
 namespace vecdb {
 
-FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, QuantizationParams quantization)
+FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, QuantizationParams quantization, IvfParams ivf)
     : input_dim_(dim),
       metric_(metric),
       distance_(get_distance(metric)),
@@ -18,9 +20,11 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, Quantization
       metadata_(std::move(schema)),
       scratch_(vecdb::indexed_dim(quantization, dim)) {
     validate(quantization);
+    validate(ivf);
     quant_ = quantization;
+    ivf_ = ivf;
     if (keeps_originals(quant_, metric, dim)) originals_.emplace(dim);  // keep the vectors as given
-    codec_ = make_codec(quant_.codec, vectors_.dim(), metric);
+    codec_ = make_codec(quant_.codec, vectors_.dim(), metric, quant_.pq_subspaces);
 }
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
@@ -52,10 +56,16 @@ void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     }
     ++live_;
     maybe_train();
+    maybe_train_lists();
 }
 
 void FlatIndex::add_vector(std::span<const float> original) {
     const bool coded = codec_ && codec_->trained();
+    std::uint32_t list = 0;
+    if (ivf_trained()) {  // its list first, with room: may throw, before any change
+        list = nearest_list(scratch_.data());
+        ivf_reserve(list);
+    }
     if (coded) {  // room for the code first: may throw, before any change
         const std::size_t needed = (vectors_.size() + 1) * codec_->code_size();
         if (codes_.size() < needed) codes_.resize(std::max(needed, codes_.size() + codes_.size() / 2));
@@ -63,6 +73,7 @@ void FlatIndex::add_vector(std::span<const float> original) {
     vectors_.add(scratch_.values());
     if (!originals_) {
         if (coded) codec_->encode(scratch_.values(), codes_.data() + (vectors_.size() - 1) * codec_->code_size());
+        if (ivf_trained()) ivf_append(static_cast<NodeId>(vectors_.size() - 1), list);
         return;
     }
     try {
@@ -72,6 +83,7 @@ void FlatIndex::add_vector(std::span<const float> original) {
         throw;
     }
     if (coded) codec_->encode(scratch_.values(), codes_.data() + (vectors_.size() - 1) * codec_->code_size());
+    if (ivf_trained()) ivf_append(static_cast<NodeId>(vectors_.size() - 1), list);
 }
 
 bool FlatIndex::remove(std::uint64_t id) {
@@ -127,7 +139,7 @@ void FlatIndex::train_codec_unlocked() {
         const auto v = stored_copy(static_cast<NodeId>(i * n / take));  // decoded, with codes only
         std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
     }
-    auto trained = make_codec(codec_->kind(), d, metric_);
+    auto trained = make_codec(codec_->kind(), d, metric_, quant_.pq_subspaces);
     trained->train(sample);
     std::vector<std::uint8_t> codes(n * trained->code_size());
     for (NodeId r = 0; r < n; ++r) trained->encode(stored_copy(r), codes.data() + std::size_t(r) * trained->code_size());
@@ -176,6 +188,113 @@ std::vector<float> FlatIndex::as_input(NodeId slot) const {
     std::vector<float> input = read_back(slot);
     input.resize(dim(), 0.0f);  // only when truncating without full vectors
     return input;
+}
+
+std::uint32_t FlatIndex::nearest_list(const float* padded) const { return nearest_of(centroids_, padded); }
+
+std::uint32_t FlatIndex::nearest_of(const std::vector<float>& centroids, const float* padded) const {
+    const std::size_t stride = vectors_.stride(), lists = centroids.size() / stride;
+    std::uint32_t best = 0;
+    float best_d = std::numeric_limits<float>::infinity();
+    for (std::uint32_t l = 0; l < lists; ++l) {
+        const float d = index_distance(distance_(padded, centroids.data() + std::size_t(l) * stride, stride), metric_ == Metric::Cosine);
+        if (d < best_d) {  // strict: ties keep the lower list
+            best_d = d;
+            best = l;
+        }
+    }
+    return best;
+}
+
+void FlatIndex::ivf_reserve(std::uint32_t list) {
+    auto grow = [](auto& v) { if (v.size() == v.capacity()) v.reserve(std::max<std::size_t>(8, v.size() * 2)); };
+    grow(lists_[list]);
+    grow(list_of_);
+    grow(pos_);
+}
+
+void FlatIndex::ivf_append(NodeId row, std::uint32_t list) noexcept {
+    lists_[list].push_back(row);  // reserved by ivf_reserve
+    list_of_.push_back(list);
+    pos_.push_back(static_cast<std::uint32_t>(lists_[list].size() - 1));
+}
+
+void FlatIndex::ivf_detach(NodeId row) noexcept {
+    auto& members = lists_[list_of_[row]];
+    const NodeId moved = members.back();  // the list's last member fills the gap
+    members[pos_[row]] = moved;
+    pos_[moved] = pos_[row];
+    members.pop_back();
+}
+
+void FlatIndex::ivf_pop_row(NodeId row) noexcept {
+    ivf_detach(row);
+    list_of_.pop_back();
+    pos_.pop_back();
+}
+
+void FlatIndex::maybe_train_lists() noexcept {
+    if (ivf_.lists == 0 || ivf_trained() || ivf_.train_after == 0 || live_ < std::max(ivf_.train_after, ivf_.lists)) return;
+    try {
+        train_lists_unlocked();
+    } catch (...) {  // out of memory: stay untrained (searches scan everything) and try again on a later add
+    }
+}
+
+void FlatIndex::train_lists_unlocked() {
+    if (ivf_.lists == 0) throw std::logic_error("train_lists: this index has no inverted file (see IvfParams)");
+    if (live_ < ivf_.lists) throw std::invalid_argument("train_lists: fewer vectors than lists");
+    const std::size_t n = vectors_.size(), take = std::min<std::size_t>(n, 100000), d = indexed_dim(), stride = vectors_.stride();
+    std::vector<float> sample(take * d);  // a deterministic sample, evenly spaced (decoded, with codes only)
+    for (std::size_t i = 0; i < take; ++i) {
+        const auto v = stored_copy(static_cast<NodeId>(i * n / take));
+        std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * d));
+    }
+    const KMeansResult r = kmeans(sample, d, KMeansParams{std::min(ivf_.lists, take), 25, 0x1F5EED, 0});
+    const std::size_t lists = r.centroids.size() / d;
+    // Everything is built in local variables; the index changes only by the
+    // swaps at the end, which cannot fail (all or nothing).
+    std::vector<float> centroids(lists * stride, 0.0f);
+    for (std::size_t l = 0; l < lists; ++l) std::copy_n(r.centroids.begin() + std::ptrdiff_t(l * d), d, centroids.begin() + std::ptrdiff_t(l * stride));
+    std::vector<std::vector<NodeId>> members(lists);
+    std::vector<std::uint32_t> list_of(n), pos(n);
+    std::vector<float> buffer(stride, 0.0f);
+    for (NodeId row = 0; row < n; ++row) {
+        const auto v = stored_copy(row);
+        std::copy(v.begin(), v.end(), buffer.begin());
+        const std::uint32_t l = nearest_of(centroids, buffer.data());
+        list_of[row] = l;
+        pos[row] = static_cast<std::uint32_t>(members[l].size());
+        members[l].push_back(row);
+    }
+    centroids_.swap(centroids);  // commit: moves only
+    lists_.swap(members);
+    list_of_.swap(list_of);
+    pos_.swap(pos);
+}
+
+void FlatIndex::train_lists() {
+    const auto guard = lock_.write("train_lists");
+    train_lists_unlocked();
+}
+
+bool FlatIndex::lists_trained() const {
+    const auto guard = lock_.read();
+    return ivf_trained();
+}
+
+std::optional<std::uint32_t> FlatIndex::list_of(std::uint64_t id) const {
+    const auto guard = lock_.read();
+    const auto node = ids_.find(id);
+    if (!node || !ivf_trained()) return std::nullopt;
+    return list_of_[*node];
+}
+
+std::vector<std::size_t> FlatIndex::list_sizes() const {
+    const auto guard = lock_.read();
+    std::vector<std::size_t> sizes;
+    for (const auto& l : lists_) sizes.push_back(l.size());
+    return sizes;
 }
 
 std::optional<std::vector<float>> FlatIndex::get_vector(std::uint64_t id) const {
@@ -262,6 +381,13 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     const auto last = static_cast<NodeId>(vectors_.size() - 1);
     ids_.release(id);
     if (*node != last) {
+        if (ivf_trained()) {  // the removed row leaves its list; the last row takes its number
+            ivf_detach(*node);
+            const std::uint32_t l = list_of_[last];
+            lists_[l][pos_[last]] = *node;
+            list_of_[*node] = l;
+            pos_[*node] = pos_[last];
+        }
         vectors_.move_row(last, *node);
         if (originals_) originals_->move_row(last, *node);
         if (codec_ && codec_->trained())
@@ -271,6 +397,11 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
         metadata_.move_row(last, *node);
     } else {
         metadata_.clear(last);
+    }
+    if (ivf_trained()) {
+        if (last == *node) ivf_detach(*node);
+        list_of_.pop_back();
+        pos_.pop_back();
     }
     ids_.pop_back_slot();
     vectors_.pop_back();
@@ -346,6 +477,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     } catch (...) {
         for (std::size_t k = undo.size(); k-- > 0;) {
             const auto slot = static_cast<NodeId>(vectors_.size() - 1);
+            if (ivf_trained()) ivf_pop_row(slot);
             vectors_.pop_back();
             if (originals_) originals_->pop_back();
             ids_.undo_last_add(ids[k]);
@@ -355,6 +487,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         throw;
     }
     maybe_train();
+    maybe_train_lists();
 }
 
 bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) {
@@ -387,7 +520,18 @@ bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     const auto node = ids_.find(id);
     if (!node) return false;
     if (metadata) metadata_.write(*node, *metadata);  // all-or-nothing
+    std::uint32_t new_list = 0;
+    if (ivf_trained()) {  // the new vector may belong to another list: room first
+        new_list = nearest_list(scratch_.data());
+        if (new_list != list_of_[*node]) ivf_reserve(new_list);
+    }
     vectors_.overwrite(*node, scratch_.values());     // cannot fail: already validated
+    if (ivf_trained() && new_list != list_of_[*node]) {
+        ivf_detach(*node);
+        lists_[new_list].push_back(*node);  // reserved
+        list_of_[*node] = new_list;
+        pos_[*node] = static_cast<std::uint32_t>(lists_[new_list].size() - 1);
+    }
     if (originals_) originals_->overwrite(*node, vector);
     if (codec_ && codec_->trained()) codec_->encode(scratch_.values(), codes_.data() + std::size_t(*node) * codec_->code_size());
     return true;
@@ -419,7 +563,7 @@ Eligibility FlatIndex::eligibility(const SearchOptions& options, std::optional<C
     return Eligibility{&ids_, holder ? &*holder : nullptr, options.predicate ? &options.predicate : nullptr};
 }
 
-std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, const Eligibility& eligible,
+std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, const Eligibility& eligible, std::size_t probes,
                                           SearchStats* stats) const {
     SearchStats st;
     st.strategy = Strategy::ForceExact;
@@ -433,16 +577,33 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         std::vector<float> table;
         if (coded) codec_->prepare(std::span<const float>(query, indexed_dim()), table);
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
-        std::size_t matches = 0;
-        for (NodeId node = 0; node < count; ++node) {
-            if ((node & 255) == 255 && detail::search_should_stop()) break;  // deadline or cancel: best so far
-            if (eligible.filtered() && !eligible(node)) continue;
+        std::size_t matches = 0, visited = 0;
+        bool stop = false;
+        auto visit = [&](NodeId node) {
+            if ((++visited & 255) == 0 && detail::search_should_stop()) stop = true;  // deadline or cancel: best so far
+            if (eligible.filtered() && !eligible(node)) return;
             ++matches;
             const float d = coded ? codec_->distance(table, codes_.data() + std::size_t(node) * codec_->code_size())
                                   : index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
             top.push({d, node});
+        };
+        if (!ivf_trained()) {
+            for (NodeId node = 0; node < count && !stop; ++node) visit(node);
+        } else {
+            // The nearest lists first: at least `probes`, and more until k matching
+            // vectors were seen (a selective filter may need more), or all of them.
+            std::vector<std::pair<float, std::uint32_t>> order(lists_.size());
+            for (std::uint32_t l = 0; l < lists_.size(); ++l)
+                order[l] = {index_distance(distance_(query, centroids_.data() + std::size_t(l) * stride, stride), metric_ == Metric::Cosine), l};
+            std::sort(order.begin(), order.end());
+            const std::size_t want = probes == 0 ? ivf_.probes : probes;
+            for (std::size_t p = 0; p < order.size() && !stop && (p < want || matches < k); ++p)
+                for (NodeId node : lists_[order[p].second]) {
+                    visit(node);
+                    if (stop) break;
+                }
         }
-        st.nodes_visited = count;
+        st.nodes_visited = visited;
         st.distance_computations = matches;
         st.estimated_matches = matches;
         st.exact_count = true;
@@ -473,7 +634,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
     prepare_truncated(q, query, dim(), metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
-    return scan(q.data(), k, eligible, options.stats);
+    return scan(q.data(), k, eligible, options.probes, options.stats);
 }
 
 std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const float> queries, std::size_t k,
@@ -486,13 +647,13 @@ std::vector<std::vector<SearchResult>> FlatIndex::search_batch(std::span<const f
     std::vector<std::vector<SearchResult>> results(nq);
     if (nq == 0 || k == 0 || live_ == 0) return results;
     k = std::min(k, live_);
-    if (codec_ && codec_->trained()) {  // codes: each query scans the codes (the tiles below are for full precision)
+    if ((codec_ && codec_->trained()) || ivf_trained()) {  // codes or lists: each query scans on its own (the tiles below are for full precision without lists)
         std::atomic<bool> stopped{false};
         auto one = [&](std::size_t q) {
             const detail::SearchStopScope stop(options, nullptr);
             PreparedVector pq(indexed_dim());
             prepare_truncated(pq, queries.subspan(q * dim(), dim()), dim(), metric_);
-            results[q] = scan(pq.data(), k, eligible, nullptr);
+            results[q] = scan(pq.data(), k, eligible, options.probes, nullptr);
             if (stop.stopped()) stopped = true;
         };
         const std::size_t workers = std::min(effective_threads(threads), nq);
