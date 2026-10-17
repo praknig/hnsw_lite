@@ -61,10 +61,10 @@ BlockFile::BlockFile(const std::string& path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("cannot open " + path);
     struct stat st {};
-    if (::fstat(fd, &st) != 0) {
+    if (::fstat(fd, &st) != 0) {  // GCOVR_EXCL_START: fstat of a file that just opened does not fail
         ::close(fd);
         throw std::runtime_error("cannot read the size of " + path);
-    }
+    }  // GCOVR_EXCL_STOP
     handle_ = fd;
     size_ = static_cast<std::uint64_t>(st.st_size);
 #endif
@@ -261,7 +261,7 @@ void write_atomically(const std::string& path, Fill&& fill) {
             if (!out) throw std::runtime_error("cannot create " + tmp);
             fill(out);
             out.flush();
-            if (!out) throw std::runtime_error("cannot write " + tmp);
+            if (!out) throw std::runtime_error("cannot write " + tmp);  // GCOVR_EXCL_LINE: needs a failing or full disk
         }
         replace_file(tmp, path);
     } catch (...) {
@@ -412,8 +412,9 @@ void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> id
 // ---------------------------------------------------------------- build from a file
 
 void write_vectors_file(const std::string& path, std::span<const float> vectors, std::size_t dim) {
-    if (dim == 0 || vectors.size() % dim != 0 || vectors.size() / dim > 0xFFFFFFFFull || dim > 0xFFFFFFFFull)
-        throw std::invalid_argument("write_vectors_file: whole vectors of dim values");
+    if (dim == 0 || vectors.size() % dim != 0) throw std::invalid_argument("write_vectors_file: whole vectors of dim values");
+    if (vectors.size() / dim > 0xFFFFFFFFull || dim > 0xFFFFFFFFull)  // GCOVR_EXCL_BR_LINE: needs 16 GB of floats
+        throw std::invalid_argument("write_vectors_file: at most 2^32 - 1 vectors and dimensions");  // GCOVR_EXCL_LINE
     write_atomically(path, [&](std::ofstream& out) {
         Bytes b;
         b.put<std::uint32_t>(static_cast<std::uint32_t>(vectors.size() / dim));
@@ -529,7 +530,7 @@ void DiskIndex::build_from_file(const std::string& path, const std::string& vect
     std::vector<std::size_t> sizes(partitions, 0);
     for (std::size_t p = 0; p < partitions; ++p) {
         members[p].open(tmp / ("members-" + std::to_string(p)), std::ios::binary);
-        if (!members[p]) throw std::runtime_error("cannot create a temporary file in " + tmp.string());
+        if (!members[p]) throw std::runtime_error("cannot create a temporary file in " + tmp.string());  // GCOVR_EXCL_LINE: the directory was just created
     }
     std::vector<std::pair<double, std::size_t>> nearest(partitions);  // not `near`: <windows.h> defines near and far as macros
     for (std::size_t i = 0; i < n; ++i) {
@@ -557,7 +558,7 @@ void DiskIndex::build_from_file(const std::string& path, const std::string& vect
     }
     for (auto& m : members) {
         m.close();
-        if (!m) throw std::runtime_error("cannot write a temporary file in " + tmp.string());
+        if (!m) throw std::runtime_error("cannot write a temporary file in " + tmp.string());  // GCOVR_EXCL_LINE: needs a failing or full disk
     }
 
     // 3. A Vamana graph per partition, built in memory one at a time, written in ID order.
@@ -586,7 +587,7 @@ void DiskIndex::build_from_file(const std::string& path, const std::string& vect
             for (NodeId q : nbs) rec.put<std::uint32_t>(ids_of[q]);
             out.write(rec.data.data(), std::streamsize(rec.data.size()));
         }
-        if (!out) throw std::runtime_error("cannot write a temporary file in " + tmp.string());
+        if (!out) throw std::runtime_error("cannot write a temporary file in " + tmp.string());  // GCOVR_EXCL_LINE: needs a failing or full disk
     }
     st.partitions = partitions;
 
@@ -614,44 +615,131 @@ void DiskIndex::build_from_file(const std::string& path, const std::string& vect
     std::vector<float> decoded(dim), other(dim), table;
     const float alpha = params.index.graph.alpha;
     auto code_of = [&](std::size_t i) { return codes.data() + i * pq.code_size(); };
+    auto tie = [](NodeId i, NodeId q) {  // equal distances: by a hash of the pair, not by node number
+        std::uint64_t z = (std::uint64_t(i) << 32 | q) + 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    // 4a. Merge, in ID order, into an adjacency table (R numbers per vector,
+    // held in memory like the PQ codes): each vector's lists from its partitions,
+    // joined and, beyond R, pruned again with distances from the PQ codes.
+    std::vector<std::uint32_t> adjacency(n * R, kNoNeighbor), degree(n, 0);
+    std::vector<NodeId> nbs;
+    for (NodeId i = 0; i < n; ++i) {
+        nbs.clear();
+        for (auto& r : readers) {
+            if (!r.more || r.id != i) continue;
+            std::vector<unsigned char> b(4 * std::size_t(r.degree));
+            r.in.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
+            for (std::size_t s = 0; s < r.degree; ++s) nbs.push_back(load_le<std::uint32_t>(&b[4 * s]));
+            r.advance();
+        }
+        std::sort(nbs.begin(), nbs.end());
+        nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
+        std::erase(nbs, i);
+        if (nbs.size() > R) {
+            ++st.merged_and_pruned;
+            read_raw(i, raw.data());
+            pv.prepare(raw, metric);
+            pq.prepare(pv.values(), table);
+            std::vector<std::pair<float, NodeId>> c;
+            for (NodeId q : nbs) c.emplace_back(pq.distance(table, code_of(q)), q);
+            // Ordering equal distances by node number would make every identical
+            // copy prefer the same lowest-numbered ones (found by dk37).
+            std::sort(c.begin(), c.end(), [&](const auto& x, const auto& y) {
+                if (x.first != y.first) return x.first < y.first;
+                return tie(i, x.second) < tie(i, y.second);
+            });
+            std::vector<NodeId> kept;
+            std::vector<bool> dropped(c.size(), false);
+            for (std::size_t a2 = 0; a2 < c.size() && kept.size() < R; ++a2) {
+                if (dropped[a2]) continue;
+                kept.push_back(c[a2].second);
+                pq.decode(code_of(c[a2].second), decoded);
+                for (std::size_t z = a2 + 1; z < c.size(); ++z) {
+                    if (dropped[z] || c[z].first <= 0) continue;
+                    pq.decode(code_of(c[z].second), other);
+                    float d = 0;
+                    for (std::size_t j = 0; j < dim; ++j) d += (decoded[j] - other[j]) * (decoded[j] - other[j]);
+                    if (metric == Metric::Cosine) d *= 0.5f;  // 1 - dot = |a - b|^2 / 2 for unit vectors
+                    if (alpha * d <= c[z].first) dropped[z] = true;
+                }
+            }
+            nbs = kept;
+        }
+        degree[i] = static_cast<std::uint32_t>(nbs.size());
+        std::copy(nbs.begin(), nbs.end(), adjacency.begin() + std::ptrdiff_t(std::size_t(i) * R));
+    }
+    // 4b. Connectivity repair, as for in-memory graphs: graphs built per partition
+    // need not join into one reachable whole (found by dk37: 75 of 1,200 vectors
+    // unreachable). Each unreachable vector gets an edge from a reachable vector
+    // it links to (near it by construction), preferring a free slot, then
+    // replacing a neighbor that keeps another incoming edge; repeated until all
+    // are reachable (at most 16 rounds).
+    auto out = [&](NodeId v) { return adjacency.begin() + std::ptrdiff_t(std::size_t(v) * R); };
+    for (int round = 0; round < 16; ++round) {
+        std::vector<bool> seen(n, false);
+        std::vector<NodeId> queue{medoid};
+        seen[medoid] = true;
+        for (std::size_t h = 0; h < queue.size(); ++h)
+            for (std::uint32_t s = 0; s < degree[queue[h]]; ++s) {
+                const NodeId nb = out(queue[h])[s];
+                if (!seen[nb]) {
+                    seen[nb] = true;
+                    queue.push_back(nb);
+                }
+            }
+        if (queue.size() == n) break;
+        // Incoming edges from reachable vectors only: an edge from an unreachable
+        // one does not keep its target reachable (counting those made the repair
+        // undo itself, round after round).
+        std::vector<std::uint32_t> indegree(n, 0);
+        for (NodeId v = 0; v < n; ++v)
+            if (seen[v])
+                for (std::uint32_t s = 0; s < degree[v]; ++s) ++indegree[out(v)[s]];
+        for (NodeId u = 0; u < n; ++u) {
+            if (seen[u]) continue;
+            std::vector<NodeId> hosts;  // reachable vectors u links to, then the medoid
+            for (std::uint32_t s = 0; s < degree[u]; ++s)
+                if (seen[out(u)[s]]) hosts.push_back(out(u)[s]);
+            hosts.push_back(medoid);
+            NodeId host = hosts.front();
+            std::uint32_t slot = std::uint32_t(R);  // R: append
+            bool placed = false;
+            for (NodeId h : hosts)
+                if (degree[h] < R) {
+                    host = h;
+                    placed = true;
+                    break;
+                }
+            for (std::size_t x = 0; !placed && x < hosts.size(); ++x)
+                for (std::uint32_t s = degree[hosts[x]]; s-- > 0;)
+                    if (indegree[out(hosts[x])[s]] >= 2) {
+                        host = hosts[x];
+                        slot = s;
+                        placed = true;
+                        break;
+                    }
+            if (!placed) slot = degree[host] - 1;  // GCOVR_EXCL_LINE: every slot's target has one incoming edge only
+            if (std::find(out(host), out(host) + degree[host], u) != out(host) + degree[host]) continue;  // GCOVR_EXCL_LINE: u would be reachable
+            if (slot == R) {
+                out(host)[degree[host]++] = u;
+            } else {
+                --indegree[out(host)[slot]];
+                out(host)[slot] = u;
+            }
+            ++indegree[u];
+            seen[u] = true;  // reachable through host; its own links follow next round
+        }
+    }
+    // 4c. Write, one sequential pass in ID order.
     write_index(path, dim, metric, R, medoid, n,
-                [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& nbs) {
+                [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& list) {
                     read_raw(i, raw.data());
                     pv.prepare(raw, metric);
                     v.assign(pv.values().begin(), pv.values().end());
-                    nbs.clear();
-                    for (auto& r : readers) {
-                        if (!r.more || r.id != i) continue;
-                        std::vector<unsigned char> b(4 * std::size_t(r.degree));
-                        r.in.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
-                        for (std::size_t s = 0; s < r.degree; ++s) nbs.push_back(load_le<std::uint32_t>(&b[4 * s]));
-                        r.advance();
-                    }
-                    std::sort(nbs.begin(), nbs.end());
-                    nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
-                    std::erase(nbs, i);
-                    if (nbs.size() <= R) return;
-                    ++st.merged_and_pruned;
-                    pq.prepare(v, table);
-                    std::vector<std::pair<float, NodeId>> c;
-                    for (NodeId q : nbs) c.emplace_back(pq.distance(table, code_of(q)), q);
-                    std::sort(c.begin(), c.end());
-                    std::vector<NodeId> kept;
-                    std::vector<bool> dropped(c.size(), false);
-                    for (std::size_t a = 0; a < c.size() && kept.size() < R; ++a) {
-                        if (dropped[a]) continue;
-                        kept.push_back(c[a].second);
-                        pq.decode(code_of(c[a].second), decoded);
-                        for (std::size_t z = a + 1; z < c.size(); ++z) {
-                            if (dropped[z] || c[z].first <= 0) continue;
-                            pq.decode(code_of(c[z].second), other);
-                            float d = 0;
-                            for (std::size_t j = 0; j < dim; ++j) d += (decoded[j] - other[j]) * (decoded[j] - other[j]);
-                            if (metric == Metric::Cosine) d *= 0.5f;  // 1 - dot = |a - b|^2 / 2 for unit vectors
-                            if (alpha * d <= c[z].first) dropped[z] = true;
-                        }
-                    }
-                    nbs = kept;
+                    list.assign(out(i), out(i) + degree[i]);
                 },
                 pq, codes, ids, store);
     if (stats) *stats = st;

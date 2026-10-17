@@ -289,6 +289,7 @@ jobs:
             --exclude-unreachable-branches --exclude-throw-branches \
             --gcov-ignore-parse-errors=negative_hits.warn_once_per_file --merge-lines \
             --gcov-suspicious-hits-threshold 1099511627776 \
+            -j 4 \
             --print-summary --html-details coverage/index.html \
             --fail-under-line 99 --fail-under-branch 97
 
@@ -326,7 +327,7 @@ jobs:
 
       - name: Test threaded groups
         # The threaded groups (14), four at a time.
-        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk)$'
+        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk)(\..*)?$'
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).

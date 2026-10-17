@@ -136,9 +136,12 @@ void VamanaGraph::repair_connectivity() {
     std::vector<std::pair<float, NodeId>> beam;
     for (int round = 0; round < 16; ++round) {
         const std::vector<bool> seen = reachable();
+        // Incoming edges from reachable nodes only: an edge from an unreachable
+        // node does not keep its target reachable.
         std::vector<std::uint32_t> indegree(size(), 0);
-        for (const auto& out : adjacency_)
-            for (NodeId x : out) ++indegree[x];
+        for (NodeId v = 0; v < size(); ++v)
+            if (seen[v])
+                for (NodeId x : adjacency_[v]) ++indegree[x];
         bool changed = false;
         for (NodeId u = 0; u < size(); ++u) {
             if (seen[u]) continue;
@@ -189,10 +192,10 @@ void VamanaGraph::repair_connectivity() {
 
 std::vector<std::pair<float, NodeId>> VamanaGraph::greedy(const float* query, std::size_t beam_width,
                                                            std::vector<std::pair<float, NodeId>>& best) const {
-    if (++generation_ == 0) {  // wrapped: start the marks again
+    if (++generation_ == 0) {  // GCOVR_EXCL_START: wraps after 4 billion searches; then start the marks again
         std::fill(mark_.begin(), mark_.end(), 0u);
         generation_ = 1;
-    }
+    }  // GCOVR_EXCL_STOP
     std::vector<std::pair<float, NodeId>> expanded;
     std::vector<bool> done;  // per entry of `best`: expanded already
     best.clear();

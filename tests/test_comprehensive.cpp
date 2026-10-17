@@ -13908,6 +13908,125 @@ TEST(disk, dk35_replaced_or_deleted_while_open) {
     CHECK(old_index->search(old_data[3], 1)[0].id == 3 && new_index->search(new_data[250], 1)[0].id == 250);
 }
 
+TEST(vamana, va10_remaining_settings_and_counts) {
+    const std::vector<float> v = {1, 2, 3, 4, 5, 6};
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 8, kInf}));  // infinite alpha
+    const auto g = VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 8});
+    std::size_t expanded = 99;
+    CHECK(g.search(std::vector<float>{1, 2}, 0, 8, &expanded).empty() && expanded == 0);  // k = 0 reports no reads
+}
+
+TEST(disk, dk36_build_settings_not_yet_covered) {
+    const std::string vec = temp_path("dk36_vectors"), path = temp_path("dk36"), bad = temp_path("dk36_bad");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1}, std::vector<float>{}, 0, Metric::L2));
+    auto data = clustered(1200, 8, 6, 1970);
+    write_vectors_file(vec, flatten(data), 8);
+    LargeBuildParams zero;
+    zero.replicas = 0;
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, zero));
+    auto header = [&](std::uint32_t n, std::uint32_t dim) { write_file(bad, le<std::uint32_t>(n) + le<std::uint32_t>(dim)); };
+    header(0, 8);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));  // no vectors
+    header(1, 0);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));  // dimension 0
+    // Fits the budget, without statistics: one in-memory build.
+    DiskIndex::build_from_file(path, vec, Metric::L2);
+    CHECK(DiskIndex::open(path)->size() == 1200);
+    // An explicit partition count, although everything would fit; without statistics.
+    LargeBuildParams forced;
+    forced.index.graph = VamanaParams{8, 16, 1.2f, 1};
+    forced.partitions = 6;
+    DiskIndex::build_from_file(path, vec, Metric::L2, forced);
+    CHECK(disk_reachable(*DiskIndex::open(path)) == 1200);
+    for (const auto& f : {vec, path, bad}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk37_partitioned_cosine_and_identical_vectors) {
+    // Cosine merges whose joined lists exceed R (a small R); and mostly identical
+    // vectors, whose partitions share copies (k-means centroids coincide).
+    auto data = clustered(1500, 8, 6, 1971);
+    const std::string vec = temp_path("dk37_vectors"), path = temp_path("dk37");
+    write_vectors_file(vec, flatten(data), 8);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{4, 8, 1.2f, 3};
+    lp.memory_budget = std::size_t(96) << 10;
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::Cosine, lp, {}, {}, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    CHECK(st.partitions > 1 && st.merged_and_pruned > 0 && d->search(data[9], 1, DiskSearchParams{60, 4})[0].id == 9);
+    Vectors same(1200, std::vector<float>(8, 0.5f));
+    for (std::size_t i = 0; i < 1200; i += 100) same[i][0] = float(i);  // a few distinct among identical ones
+    write_vectors_file(vec, flatten(same), 8);
+    LargeBuildParams many = lp;
+    many.index.graph = VamanaParams{8, 16, 1.2f, 3};
+    many.partitions = 12;
+    many.memory_budget = std::size_t(2) << 20;
+    DiskIndex::build_from_file(path, vec, Metric::L2, many, {}, {}, Schema::dynamic(), &st);
+    // Found here: merged graphs left 386 of 1,200 vectors unreachable (merge pruning
+    // broke ties by node number), then 75 (no connectivity repair after merging),
+    // then 4 (the repair counted incoming edges from unreachable vectors).
+    const auto d2 = DiskIndex::open(path);
+    CHECK(st.partitions == 12 && disk_reachable(*d2) == 1200 && d2->search(same[1], 1)[0].distance == 0.0f);
+    CHECK(d2->search(same[300], 1, DiskSearchParams{1200, 8})[0].id == 300);  // a lone vector among copies, reachable
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk38_invalid_headers_behind_valid_checksums) {
+    auto data = random_vectors(60, 8, 1972);
+    const std::string good = temp_path("dk38_good"), path = temp_path("dk38");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    p.pq_subspaces = 2;
+    DiskIndex::build(good, id_range(0, 60), flatten(data), 8, Metric::L2, p);
+    const std::string bytes = read_file(good);
+    // Header fields: only the header is re-signed (its checks come before any
+    // section is read; resign_disk would follow the edited sizes past the file).
+    // Inside a section: everything is re-signed, the header being intact.
+    auto rejected = [&](std::size_t at, const std::string& value) {
+        std::string f = bytes;
+        f.replace(at, value.size(), value);
+        if (at >= 168) {
+            resign_disk(f);
+        } else {
+            unsigned char b[4];
+            persist::to_little_endian(persist::crc32(0, f.data(), 168), b);
+            f.replace(168, 4, reinterpret_cast<const char*>(b), 4);
+        }
+        write_file(path, f);
+        try {
+            (void)DiskIndex::open(path);
+            return false;
+        } catch (const FormatError&) {
+            return true;
+        }
+    };
+    CHECK(rejected(16, le<std::uint64_t>(0)) && rejected(16, le<std::uint64_t>(std::uint64_t(1) << 21)));  // dimension
+    CHECK(rejected(40, le<std::uint64_t>(std::uint64_t(1) << 17)) && rejected(32, le<std::uint64_t>(0)));    // R, n
+    CHECK(rejected(32, le<std::uint64_t>(0xFFFFFFFFull)));                                                 // n beyond node ids
+    for (std::size_t at : {56, 64, 72, 80}) CHECK(rejected(at, le<std::uint64_t>(12345)));               // each layout field
+    CHECK(rejected(96, le<std::uint64_t>(std::uint64_t(1) << 40)));  // a section larger than the file
+    const std::size_t pq = std::size_t(persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + 108)));
+    CHECK(rejected(pq, le<std::uint64_t>(9)));                       // more PQ parts than dimensions
+    for (const auto& f : {good, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk39_search_paths_not_yet_covered) {
+    auto data = random_vectors(400, 8, 1973);
+    const std::string path = temp_path("dk39");
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 400; ++i) meta.push_back(Metadata().set("rare", std::int64_t(i % 40 == 0)));
+    DiskIndex::build(path, id_range(0, 400), flatten(data), 8, Metric::L2, {}, meta);
+    const auto d = DiskIndex::open(path);
+    SearchOptions late = with_filter(Filter::eq("rare", std::int64_t(1)));  // 10 match: read directly
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    DiskSearchStats st;
+    CHECK(d->search(data[0], 5, {}, late, &st).empty() && st.stopped_early && st.nodes_read == 0);
+    CHECK(d->search_by_id(7, SIZE_MAX, DiskSearchParams{500, 8})->size() == 399);  // every other record
+    const auto other = *d->search_by_id(7, 3, {}, with_filter(Filter::eq("rare", std::int64_t(1))));  // 7 does not match
+    CHECK(other.size() == 3 && std::none_of(other.begin(), other.end(), [](const SearchResult& r) { return r.id == 7; }));
+    std::filesystem::remove(path);
+}
+
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
@@ -14248,6 +14367,7 @@ void print_usage() {
         "  patterns            run tests whose \"group.name\" contains any pattern\n"
         "  --group <name>      run only this group (repeatable)\n"
         "  --exclude <text>    skip tests whose \"group.name\" contains text (repeatable)\n"
+        "  --shard K/N         run every N-th selected test, from the K-th (CTest splits heavy groups)\n"
         "  --list              list the selected tests without running them\n"
         "  --fail-fast         stop after the first failing test\n"
         "  --write-golden      rewrite the saved-format golden files (format changes only)\n"
@@ -14271,6 +14391,7 @@ bool contains_text(const std::string& text, const std::string& part) {
 int main(int argc, char** argv) {
     std::vector<std::string> patterns, groups, excludes;
     bool list_only = false, fail_fast = false;
+    std::size_t shard = 0, shards = 1;  // --shard K/N: every N-th selected test, from the K-th (1-based)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -14294,6 +14415,16 @@ int main(int argc, char** argv) {
             golden_ivf()->save(golden_path("golden_flat_ivf_v3.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
+        } else if (arg == "--shard") {
+            unsigned k = 0, n = 0;
+            if (i + 1 >= argc || std::sscanf(argv[i + 1], "%u/%u", &k, &n) != 2 || n == 0 || k == 0 || k > n) {
+                std::printf("--shard needs K/N with 1 <= K <= N, for example 2/4\n\n");
+                print_usage();
+                return 2;
+            }
+            ++i;
+            shard = k - 1;
+            shards = n;
         } else if (arg == "--group" || arg == "--exclude") {
             if (i + 1 >= argc) {
                 std::printf("Missing value after %s\n\n", arg.c_str());
@@ -14322,6 +14453,11 @@ int main(int argc, char** argv) {
                         [&](const std::string& e) { return contains_text(full, e); }))
             continue;
         selected.push_back(&t);
+    }
+    if (shards > 1) {  // round-robin, so a group's heavy tests spread over its shards
+        std::vector<const TestCase*> mine;
+        for (std::size_t i = shard; i < selected.size(); i += shards) mine.push_back(selected[i]);
+        selected.swap(mine);
     }
 
     if (list_only) {
