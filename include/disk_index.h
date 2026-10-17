@@ -96,6 +96,32 @@ struct DiskIndexParams {
     std::size_t pq_subspaces = 0;
 };
 
+/// Building from a vectors file that need not fit in memory (DiskIndex::build_from_file).
+struct LargeBuildParams {
+    DiskIndexParams index;
+    /// Memory for vectors and graphs while building one partition (bytes). The
+    /// PQ codes, IDs and metadata (what a search holds in memory) come on top.
+    std::size_t memory_budget = std::size_t(1) << 30;
+    /// Partitions each vector joins: at least 2 when there are several, so that
+    /// neighboring partitions share vectors and their graphs connect.
+    std::size_t replicas = 2;
+    /// 0: automatic (1 if everything fits; otherwise enough that no partition can
+    /// exceed the budget, with two thirds of slack). Explicit values below
+    /// ceil(n * replicas / per-partition capacity) + replicas are rejected.
+    std::size_t partitions = 0;
+};
+
+struct LargeBuildStats {
+    std::size_t partitions = 0;          ///< partitions built (1: built in memory)
+    std::size_t largest_partition = 0;   ///< vectors in the largest (never beyond the budget: full partitions are skipped)
+    std::size_t merged_and_pruned = 0;   ///< vectors whose joined lists exceeded R and were pruned again
+};
+
+/// Writes vectors (n * dim values) as a vectors file for build_from_file: the
+/// .fbin layout (a 32-bit count, a 32-bit dimension, then the floats, all
+/// little-endian), as used by DiskANN and the big-ANN benchmarks.
+void write_vectors_file(const std::string& path, std::span<const float> vectors, std::size_t dim);
+
 class DiskIndex {
 public:
     static constexpr std::size_t kBlock = 4096;
@@ -107,6 +133,19 @@ public:
     static void build(const std::string& path, std::span<const std::uint64_t> ids, std::span<const float> vectors,
                       std::size_t dim, Metric metric, const DiskIndexParams& params = {},
                       std::span<const Metadata> metadata = {}, Schema schema = Schema::dynamic());
+
+    /// Builds from a vectors file (see write_vectors_file) that need not fit in
+    /// memory (as DiskANN does): if it fits the budget it is built in memory;
+    /// otherwise k-means on a sample divides it into partitions that fit, each
+    /// vector joins its `replicas` nearest, a Vamana graph is built per partition
+    /// (one at a time), and the graphs are merged in one pass, lists beyond R
+    /// pruned again using the PQ codes. Temporary files go to a directory next to
+    /// `path`, removed afterwards. IDs default to 0..n-1. Throws
+    /// std::invalid_argument for an invalid file or settings.
+    static void build_from_file(const std::string& path, const std::string& vectors_path, Metric metric,
+                                const LargeBuildParams& params = {}, std::span<const std::uint64_t> ids = {},
+                                std::span<const Metadata> metadata = {}, Schema schema = Schema::dynamic(),
+                                LargeBuildStats* stats = nullptr);
 
     /// Opens an index file, verifying everything held in memory. Throws
     /// FormatError for a damaged or invalid file.

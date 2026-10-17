@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 739 individually named tests** in 36 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 745 individually named tests** in 36 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -42,7 +42,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `ivf` | 12 | Phase Q5: untrained scans everything (identical results); automatic and explicit training, its errors, and training again; probing every list exactly the exact results (every metric); recall rising with probes; every slot path keeping every vector in its nearest list (swap with last, updates moving lists, upserts, batches, a cancelled batch, `remove_where`, `compact`); IVF-PQ, re-ranked and codes only; selective filters and predicates still returning k results, deadlines; batch searches, and exact range searches; saving and loading byte for byte; every truncation and flipped bit of a file, and seven invalid `IVFL` contents; searching while another thread trains the lists; out of memory. A golden file with a trained inverted file (`golden_flat_ivf_v3.bin`); the model-based test also draws Flat indexes with an inverted file |
 | `edges` | 11 | A review of edge cases across the SIMD kernels, PQ and IVF: one list (an exact scan), probes beyond the number of lists, k = 0; lists emptied and refilled; a filter nothing matches; identical vectors only; IVF with truncation, cosine zero vectors, `remove_batch`, `set_metadata_where`, and adding after loading; PQ with one dimension per part and trained on a single vector; all three codecs trained on values spanning more than the float range (automatic training included; shown to fail with the old float arithmetic); kernel remainders; SQ8 fixed answers unchanged; branches found untested by coverage (codec misuse, `list_of`, a trained codec section too short for its last field, trained lists with none configured) |
 | `vamana` | 9 | Phase Q6a: recall of the graph searched in memory (L2, cosine); structure (degrees at most R, no self loops or repeated edges, every node reachable from the medoid); alpha 1.0 against 1.2 (recorded); determinism; one and two vectors, fewer vectors than R, identical vectors, one dimension; invalid input; search parameters; cosine normalization; a large group of identical vectors among distinct ones |
-| `disk` | 28 | Phases Q6b to Q6d: every node read back equal to the graph built in memory; three block layouts; damaged files (header, sizes behind a valid checksum, truncation, trailing data, every section, a damaged node block met when read); invalid input; replacing a file only when complete; metadata and schemas; concurrent reads; recall against reads and rounds; exact distances; invalid searches; deadlines; concurrent searches; damage met during a search; alpha against reads; filtered searches (graph, direct, widening until k are found, shown to fail without widening), predicates, records, `search_by_id`, batches, concurrent filtered searches; files inconsistent behind valid checksums, each rejected by its own check; concurrent reads (identical results and statistics for every thread count and beam width; the overlap measured with simulated latency; an error during concurrent reads, then destroying the index; many searches sharing the readers) |
+| `disk` | 34 | Phases Q6b to Q6d: every node read back equal to the graph built in memory; three block layouts; damaged files (header, sizes behind a valid checksum, truncation, trailing data, every section, a damaged node block met when read); invalid input; replacing a file only when complete; metadata and schemas; concurrent reads; recall against reads and rounds; exact distances; invalid searches; deadlines; concurrent searches; damage met during a search; alpha against reads; filtered searches (graph, direct, widening until k are found, shown to fail without widening), predicates, records, `search_by_id`, batches, concurrent filtered searches; files inconsistent behind valid checksums, each rejected by its own check; concurrent reads (identical results and statistics for every thread count and beam width; the overlap measured with simulated latency; an error during concurrent reads, then destroying the index; many searches sharing the readers); building from files (byte-identical to `build` when it fits; partitioned builds with every vector reachable and recall checked against an exact index; IDs, metadata and cosine; invalid files and settings, leaving an existing index and no temporary files; vectors files; the budget held with 3 replicas) |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -53,7 +53,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 739 test names
+test_comprehensive --list               # list all 745 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -67,13 +67,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 739 of 739 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 745 of 745 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-739 passed, 0 failed, 0 skipped, 0 not run, 36272 checks, 102.35 s
+745 passed, 0 failed, 0 skipped, 0 not run, 36290 checks, 94.85 s
 All selected tests passed.
 ```
 
@@ -285,6 +285,13 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 50. **Vamana does not guarantee every node an incoming edge.** Even after both fixes one of 100 identical vectors was never chosen as a neighbor; a first repair pass then ping-ponged inside a large group of copies (656 of 660). A connectivity repair now prefers free slots and neighbors keeping another incoming edge: every node is reachable in every test.
 51. **Coarse navigation codes wasted reads.** Disk recall started well below the graph's own (0.735 against 0.99): with one PQ part per 8 dimensions the codes misjudged which nodes to read. Measured across resolutions, finer codes restored recall without adding reads; the disk index now defaults to one part per 2 dimensions.
 52. **Checks behind checksums were unreached.** Coverage showed that `open`'s checks of section contents (PQ, IDs, metadata) and of node records were never run: damaged-file tests are caught by the checksums first. `dk24` re-signs every checksum after its edits and confirms each check by its message.
+
+**Found while extending the disk-based index:**
+
+53. **The memory budget was exceeded by 1.6 times.** k-means makes partitions of unequal size, so a dense region's partition held 2,692 vectors against a cap of 1,706. Full partitions are now skipped for the next nearest.
+54. **With 3 replicas the budget broke again** (1,347 against 853): the automatic partition count assumed at most 2 replicas, and a fallback for "every partition full" overfilled one silently. The count is now provably sufficient (at least ceil(n * replicas / capacity) + replicas), explicit counts below it are rejected, and the fallback is gone. Test `dk34`.
+55. **Skipping full partitions cost recall** (0.952 instead of 1.000): vectors pushed out of their nearest partition lose their natural neighbors. Measured across partition counts; the automatic count now allows two thirds of slack, which restored 1.000.
+56. **`near` is a macro on Windows.** `<windows.h>` defines `near` and `far` (from 16-bit Windows), so a variable named `near` broke the MinGW build while GCC and Clang on Linux compiled it; found by the MinGW check before delivery and renamed.
 
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 

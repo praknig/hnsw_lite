@@ -13733,6 +13733,155 @@ TEST(disk, dk28_searches_share_the_pool) {
 }
 
 // ===========================================================================
+// Extension E2: building indexes larger than memory (DK29-DK34)
+// ===========================================================================
+
+namespace {
+
+std::size_t disk_reachable(const DiskIndex& d) {
+    std::vector<bool> seen(d.size(), false);
+    std::vector<NodeId> queue{d.medoid()};
+    seen[d.medoid()] = true;
+    for (std::size_t h = 0; h < queue.size(); ++h)
+        for (NodeId nb : d.read_node(queue[h]).neighbors)
+            if (!seen[nb]) {
+                seen[nb] = true;
+                queue.push_back(nb);
+            }
+    return queue.size();
+}
+
+std::size_t build_dirs_left(const std::string& path) {
+    std::size_t left = 0;
+    const std::filesystem::path dir = std::filesystem::path(path).parent_path();
+    const std::string name = std::filesystem::path(path).filename().string();
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().filename().string().rfind(name + ".build-", 0) == 0) ++left;
+    return left;
+}
+
+}  // namespace
+
+TEST(disk, dk29_fitting_in_the_budget_matches_build) {
+    auto data = clustered(800, 16, 6, 1950);
+    const std::string vec = temp_path("dk29_vectors"), a = temp_path("dk29_a"), b = temp_path("dk29_b");
+    write_vectors_file(vec, flatten(data), 16);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{16, 32, 1.2f, 4};
+    LargeBuildStats st;
+    DiskIndex::build_from_file(a, vec, Metric::Cosine, lp, {}, {}, Schema::dynamic(), &st);
+    DiskIndex::build(b, id_range(0, 800), flatten(data), 16, Metric::Cosine, lp.index);
+    CHECK(st.partitions == 1 && read_file(a) == read_file(b));  // byte for byte
+    for (const auto& f : {vec, a, b}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk30_partitioned_build) {
+    auto data = clustered(6000, 32, 30, 1951);
+    auto queries = clustered(40, 32, 30, 1952);
+    const std::string vec = temp_path("dk30_vectors"), path = temp_path("dk30");
+    write_vectors_file(vec, flatten(data), 32);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{32, 64, 1.2f, 1};
+    lp.memory_budget = std::size_t(400) << 10;
+    const std::size_t cap = lp.memory_budget / (4 * PreparedVector(32).stride() + 8 * 32 + 96);
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp, {}, {}, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    FlatIndex exact(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 6000; ++i) exact.add(i, data[i]);
+    // Built in pieces, the graph is a little weaker at a tight beam and the same at a
+    // normal one (measured: in memory 0.983 and 0.998, partitioned 0.950 and 0.998,
+    // at L 50 and 100, for the same reads).
+    const DiskRun tight = disk_run(*d, exact, queries, DiskSearchParams{50, 4});
+    const DiskRun r = disk_run(*d, exact, queries, DiskSearchParams{100, 4});
+    std::printf("    %zu partitions (largest %zu, cap %zu), %zu lists pruned at the merge; reachable %zu of 6000; recall@10 %.3f at L 50, %.3f at L 100\n",
+                st.partitions, st.largest_partition, cap, st.merged_and_pruned, disk_reachable(*d), tight.recall, r.recall);
+    CHECK(st.partitions > 1 && st.largest_partition <= cap && disk_reachable(*d) == 6000 && r.recall >= 0.97 && tight.recall >= 0.90);
+    CHECK(build_dirs_left(path) == 0);  // temporary files removed
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk31_ids_metadata_and_cosine) {
+    auto data = clustered(3000, 16, 12, 1953);
+    const std::string vec = temp_path("dk31_vectors"), path = temp_path("dk31");
+    write_vectors_file(vec, flatten(data), 16);
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 3000; ++i) meta.push_back(meta_for(i));
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{16, 32, 1.2f, 2};
+    lp.memory_budget = std::size_t(300) << 10;
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::Cosine, lp, id_range(9000, 3000), meta, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    bool ok = st.partitions > 1 && d->contains(9000) && !d->contains(0) && d->get(9007)->metadata == meta_for(7);
+    for (const auto& x : d->search(data[5], 10, {}, with_filter(Filter::eq("category", "tech")))) ok = ok && (x.id - 9000) % 5 == 2;
+    const auto v = *d->get_vector(9003);
+    double len = 0;
+    for (float x : v) len += double(x) * x;
+    CHECK(ok && std::abs(len - 1.0) < 1e-5 && d->search(data[11], 1)[0].id == 9011);
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk32_rejects_invalid_input) {
+    auto data = random_vectors(2000, 8, 1954);
+    const std::string vec = temp_path("dk32_vectors"), path = temp_path("dk32"), bad = temp_path("dk32_bad");
+    write_vectors_file(vec, flatten(data), 8);
+    write_file(path, "the previous index");
+    LargeBuildParams small;
+    small.memory_budget = std::size_t(64) << 10;
+    LargeBuildParams one = small;
+    one.replicas = 1;
+    LargeBuildParams few = small;
+    few.partitions = 3;
+    CHECK_THROWS_AS(std::runtime_error, DiskIndex::build_from_file(path, temp_path("dk32_missing"), Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, one));   // partitions could not connect
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, few));   // too few for the budget
+    LargeBuildParams tiny;
+    tiny.memory_budget = 1000;
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, tiny));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, {}, id_range(0, 5)));
+    std::string f = read_file(vec);
+    write_file(bad, f.substr(0, f.size() - 4));  // its size no longer matches
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));
+    write_file(bad, "abc");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));
+    const float nan = kNaN;
+    f.replace(8 + 4 * 100, 4, reinterpret_cast<const char*>(&nan), 4);
+    write_file(bad, f);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2, small));  // found while partitioning
+    CHECK(read_file(path) == "the previous index" && build_dirs_left(path) == 0 && temporaries_left(path) == 0);
+    for (const auto& x : {vec, path, bad}) std::filesystem::remove(x);
+}
+
+TEST(disk, dk33_vectors_files) {
+    const std::string vec = temp_path("dk33");
+    write_vectors_file(vec, std::vector<float>{1, 2, 3, 4, 5, 6}, 3);
+    const std::string f = read_file(vec);
+    CHECK(f.size() == 8 + 24 && persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(f.data())) == 2);
+    CHECK_THROWS_AS(std::invalid_argument, write_vectors_file(vec, std::vector<float>{1, 2, 3}, 0));
+    CHECK_THROWS_AS(std::invalid_argument, write_vectors_file(vec, std::vector<float>{1, 2, 3}, 2));
+    std::filesystem::remove(vec);
+}
+
+TEST(disk, dk34_the_budget_holds_with_more_replicas) {
+    // Found while measuring: 3 replicas once overfilled partitions (1,347 vectors
+    // against a cap of 853). The partition count now guarantees room.
+    auto data = clustered(4000, 32, 20, 1955);
+    const std::string vec = temp_path("dk34_vectors"), path = temp_path("dk34");
+    write_vectors_file(vec, flatten(data), 32);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{32, 64, 1.2f, 1};
+    lp.memory_budget = std::size_t(400) << 10;
+    lp.replicas = 3;
+    const std::size_t cap = lp.memory_budget / (4 * PreparedVector(32).stride() + 8 * 32 + 96);
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp, {}, {}, Schema::dynamic(), &st);
+    CHECK(st.partitions > 1 && st.largest_partition <= cap && disk_reachable(*DiskIndex::open(path)) == 4000);
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 

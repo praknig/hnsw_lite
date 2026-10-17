@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <functional>
 #include <thread>
 #include <mutex>
 #include <future>
@@ -19,6 +21,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include "kmeans.h"
 #include "prepared_vector.h"
 #include "serialize.h"
 #include "thread_pool.h"
@@ -215,74 +218,52 @@ void write_atomically(const std::string& path, Fill&& fill) {
 
 // ---------------------------------------------------------------- build
 
-void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t dim,
-                      Metric metric, const DiskIndexParams& params, std::span<const Metadata> metadata, Schema schema) {
-    if (dim == 0 || vectors.size() != ids.size() * dim || ids.empty())
-        throw std::invalid_argument("DiskIndex::build: one vector of dim values per ID, at least one");
-    if (!metadata.empty() && metadata.size() != ids.size()) throw std::invalid_argument("DiskIndex::build: one metadata entry per vector");
-    {
-        std::unordered_set<std::uint64_t> seen;
-        for (std::uint64_t id : ids)
-            if (!seen.insert(id).second) throw std::invalid_argument("DiskIndex::build: repeated ID");
-    }
-    MetadataStore store(std::move(schema));
-    for (std::size_t i = 0; i < metadata.size(); ++i) store.validate(metadata[i]);
-    for (std::size_t i = 0; i < metadata.size(); ++i) (void)store.write(static_cast<NodeId>(i), metadata[i]);
-    if (metadata.empty())
-        for (std::size_t i = 0; i < ids.size(); ++i) (void)store.write(static_cast<NodeId>(i), Metadata());
+namespace {
 
-    const VamanaGraph g = VamanaGraph::build(vectors, dim, metric, params.graph);  // checks the vectors and settings
-    const std::size_t n = g.size(), R = params.graph.R;
+/// Supplies node `i` (called for 0, 1, 2, ... in order): its stored vector and neighbors.
+using NodeSource = std::function<void(NodeId, std::vector<float>&, std::vector<NodeId>&)>;
+
+/// Writes a complete index file (see the layout in disk_index.h), replacing
+/// `path` only once complete. Every builder goes through here, so every builder
+/// writes the same format.
+void write_index(const std::string& path, std::size_t dim, Metric metric, std::size_t R, NodeId medoid, std::size_t n,
+                 const NodeSource& next, const PQCodec& pq, const std::vector<std::uint8_t>& codes,
+                 std::span<const std::uint64_t> ids, const MetadataStore& store) {
     const Layout layout(dim, R, n);
-
-    // PQ codes of the stored (prepared) vectors, for the in-memory search guide.
-    PQCodec pq(dim, metric, params.pq_subspaces == 0 ? std::max<std::size_t>(1, dim / 2) : params.pq_subspaces);
-    {
-        const std::size_t take = std::min<std::size_t>(n, 100000);
-        std::vector<float> sample(take * dim);
-        for (std::size_t i = 0; i < take; ++i) {
-            const auto v = g.vector(static_cast<NodeId>(i * n / take));
-            std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * dim));
-        }
-        pq.train(sample);
-    }
-    std::vector<std::uint8_t> codes(n * pq.code_size());
-    for (NodeId i = 0; i < n; ++i) pq.encode(g.vector(i), codes.data() + std::size_t(i) * pq.code_size());
-
     write_atomically(path, [&](std::ofstream& out) {
-        // Node blocks, with a checksum for each.
         std::vector<std::uint32_t> crcs;
-        std::string block(kBlock, '\0');
+        std::vector<float> vec;
+        std::vector<NodeId> nbs;
         auto record = [&](NodeId i, char* at) {
+            next(i, vec, nbs);
             Bytes r;
-            const auto v = g.vector(i);
-            r.put_floats(v.data(), dim);
-            const auto nbs = g.neighbors(i);
+            r.put_floats(vec.data(), dim);
             r.put<std::uint32_t>(static_cast<std::uint32_t>(nbs.size()));
             for (std::size_t s = 0; s < R; ++s) r.put<std::uint32_t>(s < nbs.size() ? nbs[s] : kNoNeighbor);
             std::memcpy(at, r.data.data(), r.data.size());
         };
-        out.write(std::string(kBlock, '\0').data(), kBlock);  // the header, written last
+        out.write(std::string(DiskIndex::kBlock, '\0').data(), DiskIndex::kBlock);  // the header, written last
         if (layout.nodes_per_block > 0) {
+            std::string block(DiskIndex::kBlock, '\0');
             for (std::uint64_t b = 0; b < layout.node_blocks; ++b) {
                 std::fill(block.begin(), block.end(), '\0');
                 for (std::size_t s = 0; s < layout.nodes_per_block; ++s) {
                     const std::uint64_t i = b * layout.nodes_per_block + s;
                     if (i < n) record(static_cast<NodeId>(i), block.data() + s * layout.node_bytes);
                 }
-                crcs.push_back(persist::crc32(0, block.data(), kBlock));
-                out.write(block.data(), kBlock);
+                crcs.push_back(persist::crc32(0, block.data(), DiskIndex::kBlock));
+                out.write(block.data(), DiskIndex::kBlock);
             }
         } else {
-            std::string big(layout.blocks_per_node * kBlock, '\0');
+            std::string big(layout.blocks_per_node * DiskIndex::kBlock, '\0');
             for (NodeId i = 0; i < n; ++i) {
                 std::fill(big.begin(), big.end(), '\0');
                 record(i, big.data());
-                for (std::size_t b = 0; b < layout.blocks_per_node; ++b) crcs.push_back(persist::crc32(0, big.data() + b * kBlock, kBlock));
+                for (std::size_t b = 0; b < layout.blocks_per_node; ++b)
+                    crcs.push_back(persist::crc32(0, big.data() + b * DiskIndex::kBlock, DiskIndex::kBlock));
                 out.write(big.data(), std::streamsize(big.size()));
             }
         }
-        // The sections held in memory.
         Bytes sections[kSections];
         for (std::uint32_t c : crcs) sections[kBlockCrc].put(c);
         const auto state = pq.state();
@@ -296,7 +277,7 @@ void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> id
             persist::write_section(meta, persist::tag("META"), [&](persist::Writer& w) { store.save(w); });
             sections[kMeta].data = meta.str();
         }
-        std::uint64_t offset = kBlock * (1 + layout.node_blocks);
+        std::uint64_t offset = DiskIndex::kBlock * (1 + layout.node_blocks);
         Bytes header;
         header.data.append(kMagic, 8);
         header.put<std::uint32_t>(kDiskVersion);
@@ -306,7 +287,7 @@ void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> id
         header.put<std::uint32_t>(0);
         header.put<std::uint64_t>(n);
         header.put<std::uint64_t>(R);
-        header.put<std::uint64_t>(g.medoid());
+        header.put<std::uint64_t>(medoid);
         header.put<std::uint64_t>(layout.node_bytes);
         header.put<std::uint64_t>(layout.nodes_per_block);
         header.put<std::uint64_t>(layout.blocks_per_node);
@@ -322,6 +303,301 @@ void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> id
         out.seekp(0);
         out.write(header.data.data(), std::streamsize(header.data.size()));
     });
+}
+
+/// Checks IDs (unique) and metadata (validated) and fills a metadata store.
+MetadataStore checked_metadata(std::span<const std::uint64_t> ids, std::span<const Metadata> metadata, Schema schema) {
+    if (!metadata.empty() && metadata.size() != ids.size()) throw std::invalid_argument("DiskIndex: one metadata entry per vector");
+    std::unordered_set<std::uint64_t> seen;
+    for (std::uint64_t id : ids)
+        if (!seen.insert(id).second) throw std::invalid_argument("DiskIndex: repeated ID");
+    MetadataStore store(std::move(schema));
+    for (const Metadata& m : metadata) store.validate(m);
+    for (std::size_t i = 0; i < ids.size(); ++i) (void)store.write(static_cast<NodeId>(i), metadata.empty() ? Metadata() : metadata[i]);
+    return store;
+}
+
+std::size_t pq_parts(const DiskIndexParams& params, std::size_t dim) {
+    return params.pq_subspaces == 0 ? std::max<std::size_t>(1, dim / 2) : params.pq_subspaces;
+}
+
+}  // namespace
+
+void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t dim,
+                      Metric metric, const DiskIndexParams& params, std::span<const Metadata> metadata, Schema schema) {
+    if (dim == 0 || vectors.size() != ids.size() * dim || ids.empty())
+        throw std::invalid_argument("DiskIndex::build: one vector of dim values per ID, at least one");
+    const MetadataStore store = checked_metadata(ids, metadata, std::move(schema));
+    const VamanaGraph g = VamanaGraph::build(vectors, dim, metric, params.graph);  // checks the vectors and settings
+    const std::size_t n = g.size();
+    PQCodec pq(dim, metric, pq_parts(params, dim));
+    {
+        const std::size_t take = std::min<std::size_t>(n, 100000);
+        std::vector<float> sample(take * dim);
+        for (std::size_t i = 0; i < take; ++i) {
+            const auto v = g.vector(static_cast<NodeId>(i * n / take));
+            std::copy(v.begin(), v.end(), sample.begin() + std::ptrdiff_t(i * dim));
+        }
+        pq.train(sample);
+    }
+    std::vector<std::uint8_t> codes(n * pq.code_size());
+    for (NodeId i = 0; i < n; ++i) pq.encode(g.vector(i), codes.data() + std::size_t(i) * pq.code_size());
+    write_index(path, dim, metric, params.graph.R, g.medoid(), n,
+                [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& nbs) {
+                    const auto x = g.vector(i);
+                    v.assign(x.begin(), x.end());
+                    const auto ns = g.neighbors(i);
+                    nbs.assign(ns.begin(), ns.end());
+                },
+                pq, codes, ids, store);
+}
+
+// ---------------------------------------------------------------- build from a file
+
+void write_vectors_file(const std::string& path, std::span<const float> vectors, std::size_t dim) {
+    if (dim == 0 || vectors.size() % dim != 0 || vectors.size() / dim > 0xFFFFFFFFull || dim > 0xFFFFFFFFull)
+        throw std::invalid_argument("write_vectors_file: whole vectors of dim values");
+    write_atomically(path, [&](std::ofstream& out) {
+        Bytes b;
+        b.put<std::uint32_t>(static_cast<std::uint32_t>(vectors.size() / dim));
+        b.put<std::uint32_t>(static_cast<std::uint32_t>(dim));
+        b.put_floats(vectors.data(), vectors.size());
+        out.write(b.data.data(), std::streamsize(b.data.size()));
+    });
+}
+
+void DiskIndex::build_from_file(const std::string& path, const std::string& vectors_path, Metric metric, const LargeBuildParams& params,
+                                std::span<const std::uint64_t> ids_in, std::span<const Metadata> metadata, Schema schema,
+                                LargeBuildStats* stats) {
+    validate(params.index.graph);
+    if (metric != Metric::L2 && metric != Metric::Cosine) throw std::invalid_argument("DiskIndex: L2 and cosine only");
+    if (params.replicas < 1) throw std::invalid_argument("LargeBuildParams::replicas must be at least 1");
+    BlockFile src(vectors_path);
+    unsigned char head[8];
+    if (src.size() < 8) throw std::invalid_argument("not a vectors file (too short)");
+    src.read(0, head, 8);
+    const std::size_t n = load_le<std::uint32_t>(head), dim = load_le<std::uint32_t>(head + 4);
+    if (n == 0 || dim == 0 || src.size() != 8 + std::uint64_t(n) * dim * 4)
+        throw std::invalid_argument("not a vectors file (its size does not match its count and dimension)");
+    std::vector<std::uint64_t> own_ids;
+    if (ids_in.empty()) {
+        own_ids.resize(n);
+        for (std::size_t i = 0; i < n; ++i) own_ids[i] = i;
+    } else if (ids_in.size() != n) {
+        throw std::invalid_argument("DiskIndex::build_from_file: one ID per vector");
+    }
+    const std::span<const std::uint64_t> ids = ids_in.empty() ? std::span<const std::uint64_t>(own_ids) : ids_in;
+    auto read_raw = [&](std::size_t i, float* out) {  // one vector as stored in the file
+        std::vector<unsigned char> buf(dim * 4);
+        src.read(8 + std::uint64_t(i) * dim * 4, buf.data(), buf.size());
+        for (std::size_t j = 0; j < dim; ++j) out[j] = load_le<float>(&buf[4 * j]);
+    };
+    const std::size_t R = params.index.graph.R;
+    const std::size_t stride = PreparedVector(dim).stride();
+    const std::size_t per_vector = 4 * stride + 8 * R + 96;  // vectors, graph and bookkeeping while building a partition
+    const std::size_t cap = params.memory_budget / per_vector;
+    if (cap < std::max<std::size_t>(R + 2, 64)) throw std::invalid_argument("LargeBuildParams::memory_budget is too small for this dimension and R");
+
+    LargeBuildStats st;
+    if (n <= cap && params.partitions <= 1) {  // fits: one in-memory build
+        std::vector<float> all(n * dim);
+        for (std::size_t i = 0; i < n; ++i) read_raw(i, all.data() + i * dim);
+        build(path, ids, all, dim, metric, params.index, metadata, std::move(schema));
+        st.partitions = 1;
+        st.largest_partition = n;
+        if (stats) *stats = st;
+        return;
+    }
+    const MetadataStore store = checked_metadata(ids, metadata, std::move(schema));
+
+    // Temporary files, all in one directory, removed whatever happens.
+    const std::filesystem::path tmp = path + ".build-" + std::to_string(std::random_device{}());
+    std::filesystem::create_directories(tmp);
+    struct Cleanup {
+        std::filesystem::path dir;
+        ~Cleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(dir, ignored);
+        }
+    } cleanup{tmp};
+
+    // 1. A sample: partition centroids (k-means), the PQ codebooks, the medoid.
+    // Every vector needs `replicas` different partitions with room. Fewer than
+    // n * replicas / cap partitions can ever be full, so P >= that + replicas
+    // guarantees it: no partition ever exceeds the budget. Automatically, also
+    // two thirds of slack: fewer vectors pushed out of their nearest partitions
+    // (measured: recall@10 0.952 with 25% slack, 1.000 with two thirds).
+    const std::size_t replicas = params.replicas;
+    if (replicas < 2) throw std::invalid_argument("LargeBuildParams::replicas must be at least 2 with several partitions (partitions that share no vectors cannot connect)");
+    const std::size_t needed = (n * replicas + cap - 1) / cap + replicas;
+    if (params.partitions > 0 && params.partitions < needed)
+        throw std::invalid_argument("LargeBuildParams::partitions is too few for the memory budget (at least " + std::to_string(needed) + ")");
+    const std::size_t P = params.partitions > 0 ? params.partitions : std::max(needed, (n * replicas * 5 / 3 + cap - 1) / cap);
+    const std::size_t take = std::min(n, std::min(cap, std::max<std::size_t>(P * 64, 20000)));
+    PreparedVector pv(dim);
+    std::vector<float> raw(dim), sample(take * dim);
+    std::vector<std::size_t> sample_index(take);
+    for (std::size_t s = 0; s < take; ++s) {
+        sample_index[s] = s * n / take;
+        read_raw(sample_index[s], raw.data());
+        pv.prepare(raw, metric);  // checks the values; normalizes for cosine
+        std::copy_n(pv.values().begin(), dim, sample.begin() + std::ptrdiff_t(s * dim));
+    }
+    if (take < P) throw std::invalid_argument("LargeBuildParams: more partitions than the sample can train");  // GCOVR_EXCL_LINE: P <= n / (cap / replicas) is far below the sample
+    const KMeansResult parts = kmeans(sample, dim, KMeansParams{P, 20, params.index.graph.seed, 0});
+    const std::size_t partitions = parts.centroids.size() / dim;
+    PQCodec pq(dim, metric, pq_parts(params.index, dim));
+    pq.train(sample);
+    NodeId medoid = 0;
+    {
+        std::vector<double> mean(dim, 0.0);
+        for (std::size_t s = 0; s < take; ++s)
+            for (std::size_t j = 0; j < dim; ++j) mean[j] += sample[s * dim + j];
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t s = 0; s < take; ++s) {
+            double d = 0;
+            for (std::size_t j = 0; j < dim; ++j) d += (sample[s * dim + j] - mean[j] / double(take)) * (sample[s * dim + j] - mean[j] / double(take));
+            if (d < best) {
+                best = d;
+                medoid = static_cast<NodeId>(sample_index[s]);
+            }
+        }
+    }
+
+    // 2. One pass: each vector joins its `replicas` nearest partitions that are not
+    // full (k-means does not balance partitions; a full one would exceed the
+    // budget), and gets its PQ code. P allows 25% slack, so there is room.
+    std::vector<std::uint8_t> codes(n * pq.code_size());
+    std::vector<std::ofstream> members(partitions);
+    std::vector<std::size_t> sizes(partitions, 0);
+    for (std::size_t p = 0; p < partitions; ++p) {
+        members[p].open(tmp / ("members-" + std::to_string(p)), std::ios::binary);
+        if (!members[p]) throw std::runtime_error("cannot create a temporary file in " + tmp.string());
+    }
+    std::vector<std::pair<double, std::size_t>> nearest(partitions);  // not `near`: <windows.h> defines near and far as macros
+    for (std::size_t i = 0; i < n; ++i) {
+        read_raw(i, raw.data());
+        pv.prepare(raw, metric);
+        const auto v = pv.values();
+        pq.encode(v, codes.data() + i * pq.code_size());
+        for (std::size_t p = 0; p < partitions; ++p) {
+            double d = 0;
+            for (std::size_t j = 0; j < dim; ++j) d += (double(v[j]) - parts.centroids[p * dim + j]) * (double(v[j]) - parts.centroids[p * dim + j]);
+            nearest[p] = {d, p};
+        }
+        std::sort(nearest.begin(), nearest.end());
+        std::size_t joined = 0;
+        for (std::size_t r = 0; r < partitions && joined < replicas; ++r) {
+            const std::size_t p = nearest[r].second;
+            if (sizes[p] >= cap) continue;  // full: the next nearest
+            unsigned char b[4];
+            persist::to_little_endian(static_cast<std::uint32_t>(i), b);
+            members[p].write(reinterpret_cast<const char*>(b), 4);
+            ++sizes[p];
+            ++joined;
+        }
+        if (joined < replicas) throw std::logic_error("build_from_file: no partition with room");  // GCOVR_EXCL_LINE: impossible, see P
+    }
+    for (auto& m : members) {
+        m.close();
+        if (!m) throw std::runtime_error("cannot write a temporary file in " + tmp.string());
+    }
+
+    // 3. A Vamana graph per partition, built in memory one at a time, written in ID order.
+    for (std::size_t p = 0; p < partitions; ++p) {
+        st.largest_partition = std::max(st.largest_partition, sizes[p]);
+        if (sizes[p] == 0) continue;
+        std::vector<std::uint32_t> ids_of(sizes[p]);
+        {
+            std::ifstream in(tmp / ("members-" + std::to_string(p)), std::ios::binary);
+            std::vector<unsigned char> buf(4 * sizes[p]);
+            in.read(reinterpret_cast<char*>(buf.data()), std::streamsize(buf.size()));
+            for (std::size_t j = 0; j < sizes[p]; ++j) ids_of[j] = load_le<std::uint32_t>(&buf[4 * j]);
+        }
+        std::vector<float> vectors(sizes[p] * dim);
+        for (std::size_t j = 0; j < sizes[p]; ++j) read_raw(ids_of[j], vectors.data() + j * dim);  // ascending: mostly sequential
+        VamanaParams gp = params.index.graph;
+        gp.seed += p;
+        const VamanaGraph g = VamanaGraph::build(vectors, dim, metric, gp);
+        std::ofstream out(tmp / ("graph-" + std::to_string(p)), std::ios::binary);
+        Bytes rec;
+        for (std::size_t j = 0; j < sizes[p]; ++j) {
+            rec.data.clear();
+            rec.put<std::uint32_t>(ids_of[j]);
+            const auto nbs = g.neighbors(static_cast<NodeId>(j));
+            rec.put<std::uint32_t>(static_cast<std::uint32_t>(nbs.size()));
+            for (NodeId q : nbs) rec.put<std::uint32_t>(ids_of[q]);
+            out.write(rec.data.data(), std::streamsize(rec.data.size()));
+        }
+        if (!out) throw std::runtime_error("cannot write a temporary file in " + tmp.string());
+    }
+    st.partitions = partitions;
+
+    // 4. Merge and write, one pass in ID order: each vector's lists from its
+    // partitions, joined and, beyond R, pruned again with distances from the PQ
+    // codes held in memory (no random reads).
+    struct Reader {
+        std::ifstream in;
+        std::uint32_t id = 0, degree = 0;
+        bool more = false;
+        void advance() {
+            unsigned char b[8];
+            more = bool(in.read(reinterpret_cast<char*>(b), 8));
+            if (more) {
+                id = load_le<std::uint32_t>(b);
+                degree = load_le<std::uint32_t>(b + 4);
+            }
+        }
+    };
+    std::vector<Reader> readers(partitions);
+    for (std::size_t p = 0; p < partitions; ++p) {
+        readers[p].in.open(tmp / ("graph-" + std::to_string(p)), std::ios::binary);
+        readers[p].advance();
+    }
+    std::vector<float> decoded(dim), other(dim), table;
+    const float alpha = params.index.graph.alpha;
+    auto code_of = [&](std::size_t i) { return codes.data() + i * pq.code_size(); };
+    write_index(path, dim, metric, R, medoid, n,
+                [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& nbs) {
+                    read_raw(i, raw.data());
+                    pv.prepare(raw, metric);
+                    v.assign(pv.values().begin(), pv.values().end());
+                    nbs.clear();
+                    for (auto& r : readers) {
+                        if (!r.more || r.id != i) continue;
+                        std::vector<unsigned char> b(4 * std::size_t(r.degree));
+                        r.in.read(reinterpret_cast<char*>(b.data()), std::streamsize(b.size()));
+                        for (std::size_t s = 0; s < r.degree; ++s) nbs.push_back(load_le<std::uint32_t>(&b[4 * s]));
+                        r.advance();
+                    }
+                    std::sort(nbs.begin(), nbs.end());
+                    nbs.erase(std::unique(nbs.begin(), nbs.end()), nbs.end());
+                    std::erase(nbs, i);
+                    if (nbs.size() <= R) return;
+                    ++st.merged_and_pruned;
+                    pq.prepare(v, table);
+                    std::vector<std::pair<float, NodeId>> c;
+                    for (NodeId q : nbs) c.emplace_back(pq.distance(table, code_of(q)), q);
+                    std::sort(c.begin(), c.end());
+                    std::vector<NodeId> kept;
+                    std::vector<bool> dropped(c.size(), false);
+                    for (std::size_t a = 0; a < c.size() && kept.size() < R; ++a) {
+                        if (dropped[a]) continue;
+                        kept.push_back(c[a].second);
+                        pq.decode(code_of(c[a].second), decoded);
+                        for (std::size_t z = a + 1; z < c.size(); ++z) {
+                            if (dropped[z] || c[z].first <= 0) continue;
+                            pq.decode(code_of(c[z].second), other);
+                            float d = 0;
+                            for (std::size_t j = 0; j < dim; ++j) d += (decoded[j] - other[j]) * (decoded[j] - other[j]);
+                            if (metric == Metric::Cosine) d *= 0.5f;  // 1 - dot = |a - b|^2 / 2 for unit vectors
+                            if (alpha * d <= c[z].first) dropped[z] = true;
+                        }
+                    }
+                    nbs = kept;
+                },
+                pq, codes, ids, store);
+    if (stats) *stats = st;
 }
 
 // ---------------------------------------------------------------- open

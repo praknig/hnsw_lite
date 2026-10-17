@@ -278,6 +278,9 @@ These are the building blocks of compressed indexes (see the [compression and in
 | Name | Description |
 |---|---|
 | `DiskIndex::build(path, ids, vectors, dim, metric, params, metadata, schema)` | Builds a Vamana graph and PQ codes, and writes the index file (replacing `path` only once complete). L2 and cosine |
+| `DiskIndex::build_from_file(path, vectors_path, metric, LargeBuildParams, ids, metadata, schema, &stats)` | Builds from a `.fbin` vectors file within a memory budget (partitions merged when it does not fit) |
+| `LargeBuildParams`, `LargeBuildStats` | `index`, `memory_budget`, `replicas` (at least 2 with several partitions), `partitions` (0: automatic); `partitions`, `largest_partition`, `merged_and_pruned` |
+| `write_vectors_file(path, vectors, dim)` | Writes vectors as a `.fbin` file |
 | `DiskIndex::open(path, DiskOpenOptions)` | Opens an index file, verifying everything held in memory |
 | `DiskOpenOptions` | `io_threads` (read each round's nodes concurrently; 0: one after another), `simulated_latency` (delays every read, for tests and benchmarks) |
 | `search(query, k, DiskSearchParams{L, beam_width}, options, &stats)` | Searches from disk; filters, predicates, deadlines; exact distances |

@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 739 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 745 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -20,7 +20,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
 - **Bulk changes by filter:** `remove_where`, `set_metadata_where` and `count_where`, like SQL's DELETE and UPDATE with a WHERE clause.
 - **Reading records back:** `get_vector` (exactly as given), `get`, and `scan` to page through records by ID, optionally filtered.
-- **Disk-based index (DiskANN-style):** indexes larger than memory, searched with a few disk reads per query, with filters.
+- **Disk-based index (DiskANN-style):** indexes larger than memory, built within a memory budget and searched with a few disk reads per query (concurrently), with filters.
 - **Inverted file (IVF, and IVF-PQ):** scan only the lists nearest to a query, with filters and every codec.
 - **Compression (SQ8, binary, PQ) and Matryoshka truncation:** one byte or one bit per dimension, or one byte per part of the vector (PQ), searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it; optionally keep only the codes (about a quarter of the memory) (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
 - **Search by stored ID, deadlines and cancellation:** "more like record 42"; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
@@ -168,7 +168,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 739 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 745 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
