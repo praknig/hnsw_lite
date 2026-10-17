@@ -255,9 +255,35 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `VectorCodec` | Interface: `kind()`, `code_size()`, `trained()`, `train(sample)`, `encode`, `decode`, `prepare(query, table)`, `distance(table, code)` |
 | `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
 | `BinaryCodec` | Binary quantization: one bit per dimension, with a learned threshold and spread per dimension |
-| `CodecKind`, `make_codec(kind, dim, metric)` | Codec kinds (`None`, `SQ8`, `Binary`) and a factory |
-| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
+| `PQCodec(dim, metric, parts = 0)` | Product quantization: one byte per part, 256 centroids per part learned by k-means; `parts()`, `centroids()` |
+| `CodecKind`, `make_codec(kind, dim, metric, pq_subspaces = 0)` | Codec kinds (`None`, `SQ8`, `Binary`, `PQ`) and a factory |
+| `get_code_kernels()`, `get_code_kernels(isa)`, `CodeKernels` | The SIMD kernels behind code distances (`sq8_l2`, `sq8_dot`, `bits_sum`): the fastest for this CPU, or one instruction set (for tests and benchmarks) |
+| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`, `PQ`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given), `pq_subspaces` (PQ parts; 0: one per 8 dimensions); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
 | `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()`, `has_vector_values()` | On both indexes: train now (all or nothing; refused once only codes are kept), whether searches use codes, one stored code, the codec itself (for inspection), and whether full-precision vectors are still kept |
 | `VectorCodec::state()`, `restore(state)`, `clone()` | The trained state as numbers (saved in files), restoring it, and a copy |
 | `dim()`, `indexed_dim()` | On both indexes: the dimension of vectors and queries as given, and the dimensions stored and searched (fewer with truncation) |
 | `indexed_dim(params, dim)`, `prepare_truncated(out, v, input_dim, metric)` | The dimensions an index with these settings stores (throws if the truncation exceeds `dim`); preparing a full input vector for a truncating index |
+
+## Inverted file (IVF)
+
+| Name | Description |
+|---|---|
+| `IvfParams` | `lists` (0: none), `probes` (default 8), `train_after` (default 10,000; 0: only explicit); the last `FlatIndex` constructor argument |
+| `train_lists()`, `lists_trained()` | Train the lists now (k-means; all or nothing; may be repeated), and whether searches use them |
+| `list_of(id)`, `list_sizes()`, `ivf()` | The list holding a vector, the size of each list, and the settings |
+| `SearchOptions::probes` | Lists to probe for one search (0: the index's default) |
+
+## Disk-based index
+
+| Name | Description |
+|---|---|
+| `DiskIndex::build(path, ids, vectors, dim, metric, params, metadata, schema)` | Builds a Vamana graph and PQ codes, and writes the index file (replacing `path` only once complete). L2 and cosine |
+| `DiskIndex::open(path, DiskOpenOptions)` | Opens an index file, verifying everything held in memory |
+| `DiskOpenOptions` | `io_threads` (read each round's nodes concurrently; 0: one after another), `simulated_latency` (delays every read, for tests and benchmarks) |
+| `search(query, k, DiskSearchParams{L, beam_width}, options, &stats)` | Searches from disk; filters, predicates, deadlines; exact distances |
+| `search_batch`, `search_by_id`, `contains`, `get_vector`, `get`, `scan` | As for the in-memory indexes |
+| `read_node(node)`, `blocks_read()`, `medoid()`, `codec()`, `metadata()` | Inspection: one node as stored, blocks read since opening, the entry point, the PQ codec, the metadata |
+| `DiskIndexParams` | `graph` (`VamanaParams`), `pq_subspaces` (0: one part per 2 dimensions) |
+| `DiskSearchStats` | `nodes_read`, `blocks_read`, `rounds`, `stopped_early` |
+| `VamanaGraph::build(vectors, dim, metric, VamanaParams{R, L, alpha, seed})` | The Vamana graph alone, built and searched in memory (`search`, `neighbors`, `medoid`) |
+| `BlockFile` | Positional reads from a read-only file, safe from many threads |

@@ -23,6 +23,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
 - [Binary quantization](#binary-quantization)
+- [Disk-based index](#disk-based-index)
 - [Inverted file (IVF)](#inverted-file-ivf)
 - [Product quantization (PQ)](#product-quantization-pq)
 - [Shorter vectors (Matryoshka truncation)](#shorter-vectors-matryoshka-truncation)
@@ -401,6 +402,31 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
 - Training, saving, truncation and everything else work as for SQ8.
 - Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Disk-based index
+
+```cpp
+// Build once (the vectors must fit in memory while building), then search from disk.
+DiskIndexParams params;
+params.graph.R = 64;      // neighbors per node
+params.graph.L = 100;     // beam while building
+DiskIndex::build("vectors.idx", ids, vectors, 768, Metric::Cosine, params, metadata);
+
+auto index = DiskIndex::open("vectors.idx");  // loads only PQ codes, IDs and metadata
+SearchOptions options;
+options.filter = Filter::eq("lang", "en");
+DiskSearchStats stats;
+auto results = index->search(query, 10, DiskSearchParams{100, 4}, options, &stats);
+// stats.nodes_read: disk reads for this query
+```
+
+- **For indexes larger than memory** (DiskANN-style): the graph and the full vectors stay on disk in 4 KB blocks, one read per node; memory holds only compact PQ codes (by default one byte per 2 dimensions, an eighth of the floats), the IDs and the metadata.
+- **Searching:** PQ codes rank the candidates; the best unread ones are read from disk, `beam_width` (W) per round, their exact distances computed from the vectors read, their neighbors added; the search ends when the best `L` candidates were all read. Results carry exact distances. Measured on 5,000 vectors of 32 dimensions: `L` 50 read 56 nodes (1.1%) for recall@10 0.98, `L` 100 read 105 for 1.00. Raise `L` for recall, `W` for fewer round trips (W 4 needed 3 times fewer rounds than W 1, for the same reads).
+- **The PQ codes guide which nodes are read**, so they are finer than PQ's general default: with one part per 8 dimensions, recall at `L` 50 fell to 0.71 for the same number of reads. Set `DiskIndexParams::pq_subspaces` to trade memory for fewer wasted reads.
+- **Filters and predicates:** only matching vectors are returned, never fewer than `k` if `k` match. A filter matching at most `L` vectors reads exactly those (an exact answer); a broader one searches the graph, widening `L` until it finds `k`.
+- **Records:** `contains`, `get_vector`, `get`, `scan`, `search_by_id` and `search_batch` work as for the in-memory indexes; vectors come back as stored (normalized for cosine). Deadlines and cancellation stop a search with the best results so far. Safe to search from many threads.
+- **Concurrent reads:** `DiskIndex::open(path, DiskOpenOptions{.io_threads = 8})` reads the W nodes of each round at the same time, so a round costs about one read's latency instead of W. Results are identical either way; several searches share the threads. It helps on storage with real latency (network disks, cloud volumes, hard disks); on a fast local SSD or with the file cached by the operating system, gains are small. Measured with a simulated 3 ms per read, W 4: 194 ms instead of 679 for the same 60 rounds.
+- **Read-only:** to change it, rebuild. L2 and cosine only. Building writes a temporary file and replaces `path` only once complete. Every block is checksummed and checked when read: damage is reported as `FormatError` where it is met.
 
 ## Inverted file (IVF)
 

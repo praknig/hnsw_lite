@@ -91,6 +91,10 @@ Because the branch will be long-lived, `master` is merged into it whenever `mast
 
 **Q5 (done).** IVF is an option of `FlatIndex` (`IvfParams`) rather than a separate class: an inverted file changes only which rows a scan visits, so it inherits filters, metadata, deadlines, records, bulk changes, thread safety, saving and every codec (IVF-PQ is IVF with `CodecKind::PQ`, decision D10's "full vectors first, then IVF-PQ" in one step). Lists are trained by k-means (all or nothing; repeatable), kept consistent on every slot path in O(1), probed nearest first and beyond `probes` until `k` matches were seen, and saved as `IVFL`. Probing every list gives exactly the exact results (test `i03`); on noisy synthetic data, 16 of 64 lists scanned 25% of the vectors for recall@10 of 0.81. The first version of training could leave the index half-updated if memory ran out (it reused the live list table while building); it now builds everything locally and swaps it in, before any test ran.
 
+**Q6 (done).** In five steps: the Vamana graph (Q6a), the file layout (Q6b), the disk search (Q6c), integration (Q6d: filters, records, batches) and verification (Q6e). Defaults as proposed: built in memory then written; L2 and cosine; plain positional reads, W per round; read-only. Findings: Vamana needed three changes for degenerate data (complete graphs for tiny inputs, identical vectors, and a connectivity repair, since an unreachable vector could never be found); the PQ codes guiding the search must be finer than PQ's general default (one part per 2 dimensions: recall at L 50 went from 0.71 to 0.98 for the same reads); and alpha's benefit did not show at 5,000 vectors (the literature reports it at much larger scales), so it is measured, not asserted. Later extensions: building indexes larger than memory (partition and merge), inner product, and updates in place (FreshDiskANN).
+
+**Extension E1 (done): asynchronous reads.** `DiskOpenOptions::io_threads` reads each round's W nodes concurrently through a small pool shared by all searches, with identical results; a round costs about one read's latency (measured 3.5 times faster with a simulated 3 ms per read and W 4). Threads and positional reads are portable; native asynchronous interfaces (`io_uring`, I/O completion ports) would save the hand-off per read and remain a possible optimization. **Extension E2 (next):** building indexes larger than memory.
+
 ## Risks
 
 | Risk | Mitigation |
@@ -111,4 +115,4 @@ Because the branch will be long-lived, `master` is merged into it whenever `mast
 | Q3. Binary quantization | **Done** |
 | Q4. Product quantization | **Done** |
 | Q5. IVF index | **Done**, as an option of `FlatIndex` (IVF-PQ with a PQ codec) |
-| Q6. Disk-based index | Not started |
+| Q6. Disk-based index | **Done** (read-only, as planned) |

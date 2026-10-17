@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -65,7 +65,9 @@
 #include "hnsw_index.h"
 #include "storage.h"
 #include "serialize.h"
+#include "disk_index.h"
 #include "kmeans.h"
+#include "vamana.h"
 #include "codec.h"
 #include "thread_pool.h"
 
@@ -12837,6 +12839,900 @@ TEST(edges, e11_inconsistent_codec_and_list_sections) {
 }
 
 // ===========================================================================
+// Phase Q6a: the Vamana graph (VA1-VA8)
+// ===========================================================================
+
+namespace {
+
+/// Every node reachable from the medoid, by breadth-first search.
+std::size_t reachable_from_medoid(const VamanaGraph& g) {
+    std::vector<bool> seen(g.size(), false);
+    std::vector<NodeId> queue{g.medoid()};
+    seen[g.medoid()] = true;
+    for (std::size_t head = 0; head < queue.size(); ++head)
+        for (NodeId nb : g.neighbors(queue[head]))
+            if (!seen[nb]) {
+                seen[nb] = true;
+                queue.push_back(nb);
+            }
+    return queue.size();
+}
+
+double vamana_recall(const VamanaGraph& g, const Vectors& data, const Vectors& queries, Metric m, std::size_t L) {
+    FlatIndex exact(data[0].size(), m);
+    for (std::uint64_t i = 0; i < data.size(); ++i) exact.add(i, data[i]);
+    double hit = 0;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : exact.search(q, 10)) truth.insert(r.id);
+        for (const auto& r : g.search(q, 10, L)) hit += double(truth.count(r.id));
+    }
+    return hit / double(10 * queries.size());
+}
+
+}  // namespace
+
+TEST(vamana, va01_recall) {
+    auto data = clustered(4000, 32, 20, 1800);
+    auto queries = clustered(50, 32, 20, 1801);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const auto g = VamanaGraph::build(flatten(data), 32, m, VamanaParams{32, 64, 1.2f, 7});
+        const double r64 = vamana_recall(g, data, queries, m, 64), r128 = vamana_recall(g, data, queries, m, 128);
+        std::printf("    metric %d: recall@10 with L 64 %.3f, L 128 %.3f\n", int(m), r64, r128);
+        CHECK(r64 >= 0.90 && r128 >= r64);
+    }
+}
+
+TEST(vamana, va02_structure) {
+    auto data = clustered(3000, 16, 10, 1802);
+    const auto g = VamanaGraph::build(flatten(data), 16, Metric::L2, VamanaParams{24, 48, 1.2f, 3});
+    bool ok = g.size() == 3000;
+    std::size_t edges = 0;
+    for (NodeId p = 0; p < g.size(); ++p) {
+        const auto nbs = g.neighbors(p);
+        std::set<NodeId> unique(nbs.begin(), nbs.end());
+        ok = ok && nbs.size() <= 24 && unique.size() == nbs.size() && !unique.count(p) && !nbs.empty();
+        for (NodeId q : nbs) ok = ok && q < g.size();
+        edges += nbs.size();
+    }
+    std::printf("    average degree %.1f of at most 24; reachable from the medoid: %zu of 3000\n", double(edges) / 3000.0, reachable_from_medoid(g));
+    CHECK(ok && reachable_from_medoid(g) == 3000);
+}
+
+TEST(vamana, va03_alpha) {
+    // Both prune strengths give good graphs (alpha > 1 keeps long-range edges).
+    auto data = clustered(4000, 24, 30, 1803);
+    auto queries = clustered(40, 24, 30, 1804);
+    const auto one = VamanaGraph::build(flatten(data), 24, Metric::L2, VamanaParams{16, 40, 1.0f, 5});
+    const auto wide = VamanaGraph::build(flatten(data), 24, Metric::L2, VamanaParams{16, 40, 1.2f, 5});
+    double e_one = 0, e_wide = 0;
+    for (const auto& q : queries) {
+        std::size_t a = 0, b = 0;
+        (void)one.search(q, 10, 40, &a);
+        (void)wide.search(q, 10, 40, &b);
+        e_one += double(a);
+        e_wide += double(b);
+    }
+    const double r_one = vamana_recall(one, data, queries, Metric::L2, 40), r_wide = vamana_recall(wide, data, queries, Metric::L2, 40);
+    std::printf("    nodes expanded per search: alpha 1.0 %.1f (recall %.3f), alpha 1.2 %.1f (recall %.3f)\n",
+                e_one / 40, r_one, e_wide / 40, r_wide);
+    // Recorded, not asserted: with a fixed beam both expand about L nodes; alpha's
+    // benefit (a shorter graph diameter) is measured as disk reads in Q6c.
+    CHECK(r_one >= 0.85 && r_wide >= 0.85);
+}
+
+TEST(vamana, va04_deterministic) {
+    auto data = clustered(800, 8, 6, 1805);
+    const auto a = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 9});
+    const auto b = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 9});
+    const auto c = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 10});
+    bool same = a.medoid() == b.medoid(), differs = false;
+    for (NodeId p = 0; p < 800; ++p) {
+        same = same && std::ranges::equal(a.neighbors(p), b.neighbors(p));
+        differs = differs || !std::ranges::equal(a.neighbors(p), c.neighbors(p));
+    }
+    CHECK(same && differs);
+}
+
+TEST(vamana, va05_small_and_degenerate) {
+    const auto one = VamanaGraph::build(std::vector<float>{1, 2, 3}, 3, Metric::L2, VamanaParams{4, 8});
+    CHECK(one.size() == 1 && one.neighbors(0).empty() && one.search(std::vector<float>{0, 0, 0}, 5, 8).size() == 1);
+    const auto two = VamanaGraph::build(std::vector<float>{0, 0, 1, 1}, 2, Metric::L2, VamanaParams{4, 8});
+    CHECK(two.neighbors(0).size() == 1 && two.neighbors(1).size() == 1 && two.search(std::vector<float>{1, 1}, 1, 8)[0].id == 1);
+    auto few = random_vectors(10, 4, 1806);  // fewer vectors than R: a complete graph
+    const auto complete = VamanaGraph::build(flatten(few), 4, Metric::L2, VamanaParams{32, 32});
+    bool full = true;
+    for (NodeId p = 0; p < 10; ++p) full = full && complete.neighbors(p).size() == 9;
+    CHECK(full && complete.search(few[4], 10, 32).size() == 10 && complete.search(few[4], 1, 32)[0].id == 4);
+    const auto same = VamanaGraph::build(std::vector<float>(200, 2.5f), 2, Metric::L2, VamanaParams{8, 16});  // 100 identical vectors
+    CHECK(same.search(std::vector<float>{2.5f, 2.5f}, 10, 16).size() == 10 && reachable_from_medoid(same) == 100);
+    std::vector<float> line;
+    for (int i = 0; i < 300; ++i) line.push_back(float(i));
+    const auto one_dim = VamanaGraph::build(line, 1, Metric::L2, VamanaParams{6, 12});
+    CHECK(one_dim.search(std::vector<float>{150.2f}, 1, 12)[0].id == 150 && reachable_from_medoid(one_dim) == 300);
+    CHECK(one_dim.search(std::vector<float>{3}, 0, 12).empty());
+}
+
+TEST(vamana, va06_rejects_invalid_input) {
+    const std::vector<float> v = {1, 2, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build({}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 3, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 0, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(std::vector<float>{1, kNaN}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{0, 8}));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 4}));  // L below R
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 8, 0.9f}));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 8, kNaN}));
+    const auto g = VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 4});
+    CHECK_THROWS_AS(std::invalid_argument, (void)g.search(std::vector<float>{1, 2, 3}, 1, 4));
+}
+
+TEST(vamana, va07_search_parameters) {
+    auto data = clustered(500, 8, 5, 1807);
+    const auto g = VamanaGraph::build(flatten(data), 8, Metric::L2, VamanaParams{16, 32});
+    CHECK(g.search(data[3], 600, 32).size() == 500 && g.search(data[3], 20, 5).size() == 20);  // k beyond n; L below k
+    const auto r = g.search(data[3], 10, 32);
+    bool sorted = true;
+    for (std::size_t i = 1; i < r.size(); ++i) sorted = sorted && r[i - 1].distance <= r[i].distance;
+    CHECK(sorted && r[0].id == 3 && r[0].distance == 0.0f);
+}
+
+TEST(vamana, va08_cosine_normalizes) {
+    // Scaled copies of a vector are the same direction: distance 0 under cosine.
+    auto data = random_vectors(300, 6, 1808);
+    const auto g = VamanaGraph::build(flatten(data), 6, Metric::Cosine, VamanaParams{12, 24});
+    std::vector<float> scaled = data[7];
+    for (float& x : scaled) x *= 9.5f;
+    const auto r = g.search(scaled, 1, 24);
+    CHECK(r[0].id == 7 && r[0].distance < 1e-5f);
+    const auto v = g.vector(7);
+    double len = 0;
+    for (float x : v) len += double(x) * x;
+    CHECK(std::abs(len - 1.0) < 1e-5);
+}
+
+TEST(vamana, va09_duplicate_groups_among_distinct_vectors) {
+    // 60 copies of one vector among 600 distinct ones, R = 8: a group larger than
+    // R links mostly within itself. Every vector must still be reachable, and
+    // the copies found.
+    auto data = clustered(600, 8, 6, 1809);
+    const auto copy = data[5];
+    for (int i = 0; i < 60; ++i) data.push_back(copy);
+    const auto g = VamanaGraph::build(flatten(data), 8, Metric::L2, VamanaParams{8, 24, 1.2f, 2});
+    auto queries = clustered(30, 8, 6, 1810);
+    const double r = vamana_recall(g, data, queries, Metric::L2, 48);
+    const std::size_t reach = reachable_from_medoid(g);
+    const auto at_copy = g.search(copy, 20, 48);
+    std::size_t zeros = 0;
+    for (const auto& x : at_copy) zeros += x.distance == 0.0f;
+    std::printf("    reachable %zu of 660; recall@10 %.3f; a query at the copies finds %zu of them at distance 0 (top 20)\n", reach, r, zeros);
+    CHECK(reach == 660 && r >= 0.85 && zeros == 20);  // every vector reachable (connectivity repair)
+}
+
+// ===========================================================================
+// Phase Q6b: the disk layout (DK1-DK8)
+// ===========================================================================
+
+namespace {
+
+/// Rewrites bytes of a disk index file and re-signs its header, so that checks
+/// beyond the header checksum are reached.
+void patch_disk_file(const std::string& path, std::size_t offset, const std::string& bytes, bool resign = true) {
+    std::string f = read_file(path);
+    f.replace(offset, bytes.size(), bytes);
+    if (resign) {
+        const std::size_t header_size = 168;
+        const std::uint32_t crc = persist::crc32(0, f.data(), header_size);
+        unsigned char b[4];
+        persist::to_little_endian(crc, b);
+        f.replace(header_size, 4, reinterpret_cast<const char*>(b), 4);
+    }
+    write_file(path, f);
+}
+
+template <class T>
+std::string le(T v) {
+    unsigned char b[sizeof(T)];
+    persist::to_little_endian(v, b);
+    return std::string(reinterpret_cast<const char*>(b), sizeof(T));
+}
+
+}  // namespace
+
+TEST(disk, dk01_round_trip_matches_the_graph) {
+    auto data = clustered(1000, 32, 8, 1900);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const std::string path = temp_path("dk01");
+        DiskIndexParams p;
+        p.graph = VamanaParams{16, 32, 1.2f, 4};
+        std::vector<Metadata> meta;
+        for (std::uint64_t i = 0; i < 1000; ++i) meta.push_back(meta_for(i));
+        DiskIndex::build(path, id_range(5000, 1000), flatten(data), 32, m, p, meta);
+        const auto d = DiskIndex::open(path);
+        const auto g = VamanaGraph::build(flatten(data), 32, m, p.graph);  // deterministic: the same graph
+        bool same = d->size() == 1000 && d->dim() == 32 && d->metric() == m && d->medoid() == g.medoid() && d->max_degree() == 16;
+        for (NodeId i = 0; i < 1000; ++i) {
+            const auto node = d->read_node(i);
+            same = same && std::ranges::equal(node.neighbors, g.neighbors(i)) && std::ranges::equal(node.vector, g.vector(i));
+            same = same && d->id_of(i) == 5000 + i && *d->node_of(5000 + i) == i && d->metadata().read(i) == meta_for(i);
+        }
+        CHECK(same && !d->node_of(42) && d->codec().trained() && d->codec().parts() == 16);  // one part per 2 dimensions
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk02_layouts) {
+    // Many nodes per block; a node filling a block exactly; a node spanning blocks.
+    struct Case { std::size_t dim, R, nodes_per_block, blocks_per_node; };
+    for (const Case c : {Case{4, 8, 4096 / 52, 1}, Case{1000, 23, 1, 1}, Case{2048, 8, 0, 3}}) {
+        auto data = random_vectors(40, c.dim, unsigned(1901 + c.dim));
+        const std::string path = temp_path("dk02");
+        DiskIndexParams p;
+        p.graph = VamanaParams{c.R, c.R + 8, 1.2f, 1};
+        DiskIndex::build(path, id_range(0, 40), flatten(data), c.dim, Metric::L2, p);
+        const auto d = DiskIndex::open(path);
+        bool ok = true;
+        for (NodeId i = 0; i < 40; ++i) ok = ok && d->read_node(i).vector == data[i];
+        const std::uint64_t blocks = c.nodes_per_block ? (40 + c.nodes_per_block - 1) / c.nodes_per_block : 40 * c.blocks_per_node;
+        CHECK(ok && d->blocks_read() == 40 * c.blocks_per_node);
+        CHECK(std::filesystem::file_size(path) > 4096 * (1 + blocks));
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk03_damaged_files) {
+    auto data = random_vectors(200, 8, 1904);
+    const std::string good = temp_path("dk03_good"), path = temp_path("dk03");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    DiskIndex::build(good, id_range(0, 200), flatten(data), 8, Metric::L2, p);
+    const std::string bytes = read_file(good);
+    auto rejects = [&](auto edit) {
+        write_file(path, bytes);
+        edit();
+        try {
+            (void)DiskIndex::open(path);
+            return false;
+        } catch (const FormatError&) {
+            return true;
+        }
+    };
+    // Header: magic, version, byte order, its own checksum (not re-signed).
+    CHECK(rejects([&] { patch_disk_file(path, 0, "X", false); }));
+    CHECK(rejects([&] { patch_disk_file(path, 8, le<std::uint32_t>(2)); }));
+    CHECK(rejects([&] { patch_disk_file(path, 12, le<std::uint32_t>(0x04030201)); }));
+    CHECK(rejects([&] { patch_disk_file(path, 16, le<std::uint64_t>(9), false); }));
+    // Re-signed, so the checks behind the checksum are reached.
+    CHECK(rejects([&] { patch_disk_file(path, 16, le<std::uint64_t>(9)); }));         // dimension: layout no longer matches
+    CHECK(rejects([&] { patch_disk_file(path, 24, le<std::uint32_t>(1)); }));         // inner product
+    CHECK(rejects([&] { patch_disk_file(path, 48, le<std::uint64_t>(200)); }));       // medoid out of range
+    CHECK(rejects([&] { patch_disk_file(path, 40, le<std::uint64_t>(0)); }));         // R = 0
+    CHECK(rejects([&] { patch_disk_file(path, 88, le<std::uint64_t>(4096)); }));      // a section offset
+    // Truncated, trailing data, and a damaged byte in each in-memory section.
+    CHECK(rejects([&] { write_file(path, bytes.substr(0, bytes.size() - 1)); }));
+    CHECK(rejects([&] { write_file(path, bytes.substr(0, 100)); }));
+    CHECK(rejects([&] { write_file(path, bytes + "x"); }));
+    for (int s = 0; s < 4; ++s) {
+        const std::uint64_t offset = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + 88 + 20 * s));
+        CHECK(rejects([&] { patch_disk_file(path, offset + 2, std::string(1, char(bytes[offset + 2] ^ 0x40)), false); }));
+    }
+    // A damaged node block: opening succeeds; reading that node fails, others work.
+    write_file(path, bytes);
+    patch_disk_file(path, 4096 + 10, std::string(1, char(bytes[4096 + 10] ^ 1)), false);
+    const auto d = DiskIndex::open(path);
+    CHECK_THROWS_AS(FormatError, (void)d->read_node(0));
+    CHECK(d->read_node(199).vector == data[199]);
+    CHECK_THROWS_AS(std::out_of_range, (void)d->read_node(200));
+    std::filesystem::remove(good);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk04_rejects_invalid_input) {
+    const std::string path = temp_path("dk04");
+    const std::vector<float> v = {1, 2, 3, 4, 5, 6};
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 1, 2}, v, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2}, v, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{}, std::vector<float>{}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, v, 2, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, std::vector<float>{1, 2, kNaN, 4, 5, 6}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, v, 2, Metric::L2, {}, std::vector<Metadata>(2)));
+    CHECK(!std::filesystem::exists(path) && temporaries_left(path) == 0);
+    CHECK_THROWS_AS(std::runtime_error, (void)DiskIndex::open(temp_path("dk04_missing")));
+    write_file(path, "short");
+    CHECK_THROWS_AS(FormatError, (void)DiskIndex::open(path));
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk05_replaces_a_file_only_when_complete) {
+    auto data = random_vectors(50, 4, 1905);
+    const std::string path = temp_path("dk05");
+    write_file(path, "the previous file");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 1}, std::vector<float>(8, 1.0f), 4, Metric::L2));
+    CHECK(read_file(path) == "the previous file" && temporaries_left(path) == 0);
+    DiskIndex::build(path, id_range(0, 50), flatten(data), 4, Metric::L2);
+    CHECK(DiskIndex::open(path)->size() == 50 && temporaries_left(path) == 0);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk06_schema_and_metadata) {
+    auto data = random_vectors(30, 4, 1906);
+    const std::string path = temp_path("dk06");
+    std::vector<Metadata> meta(30);
+    for (std::size_t i = 0; i < 30; ++i) meta[i] = meta_for(i);
+    meta[7] = Metadata().set("not_in_schema", 1);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2, {}, meta, Schema::strict(search_fields())));
+    meta[7] = meta_for(7);
+    DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2, {}, meta, Schema::strict(search_fields()));
+    const auto d = DiskIndex::open(path);
+    CHECK(d->metadata().read(7) == meta_for(7) && d->metadata().find_field("category").has_value());
+    DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2);  // without metadata
+    CHECK(DiskIndex::open(path)->metadata().read(3) == Metadata());
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk07_concurrent_reads) {
+    auto data = random_vectors(600, 16, 1907);
+    const std::string path = temp_path("dk07");
+    DiskIndex::build(path, id_range(0, 600), flatten(data), 16, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    std::atomic<long> wrong{0}, reads{0};
+    with_watchdog(60, "dk07", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (NodeId i = NodeId(t); i < 600; i += 2) {
+                wrong += long(d->read_node(i).vector != data[i]);
+                ++reads;
+            }
+        });
+    });
+    CHECK(wrong == 0 && reads == 300 + 300 + 299 + 299 && d->blocks_read() == std::uint64_t(reads));  // one block per node here
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk08_single_vector) {
+    const std::string path = temp_path("dk08");
+    DiskIndex::build(path, std::vector<std::uint64_t>{77}, std::vector<float>{1, 2, 3}, 3, Metric::Cosine);
+    const auto d = DiskIndex::open(path);
+    CHECK(d->size() == 1 && d->medoid() == 0 && d->read_node(0).neighbors.empty() && d->id_of(0) == 77);
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// Phase Q6c: searching on disk (DK9-DK15)
+// ===========================================================================
+
+namespace {
+
+struct DiskRun {
+    double recall = 0, nodes = 0, blocks = 0, rounds = 0;
+};
+
+DiskRun disk_run(const DiskIndex& d, FlatIndex& exact, const Vectors& queries, DiskSearchParams p) {
+    DiskRun r;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+        DiskSearchStats st;
+        for (const auto& x : d.search(q, 10, p, {}, &st)) r.recall += double(truth.count(x.id));
+        r.nodes += double(st.nodes_read);
+        r.blocks += double(st.blocks_read);
+        r.rounds += double(st.rounds);
+    }
+    const double n = double(queries.size());
+    r.recall /= 10 * n;
+    r.nodes /= n;
+    r.blocks /= n;
+    r.rounds /= n;
+    return r;
+}
+
+}  // namespace
+
+TEST(disk, dk09_recall_and_reads) {
+    auto data = clustered(5000, 32, 20, 1910);
+    auto queries = clustered(40, 32, 20, 1911);
+    const std::string path = temp_path("dk09");
+    DiskIndexParams p;
+    p.graph = VamanaParams{32, 64, 1.2f, 3};
+    DiskIndex::build(path, id_range(0, 5000), flatten(data), 32, Metric::L2, p);
+    const auto d = DiskIndex::open(path);
+    FlatIndex exact(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) exact.add(i, data[i]);
+    std::vector<DiskRun> runs;
+    for (std::size_t L : {std::size_t(20), std::size_t(50), std::size_t(100)}) {
+        runs.push_back(disk_run(*d, exact, queries, DiskSearchParams{L, 4}));
+        std::printf("    L %3zu, W 4: recall@10 %.3f, nodes read %.1f, blocks %.1f, rounds %.1f (of 5000 vectors)\n", L,
+                    runs.back().recall, runs.back().nodes, runs.back().blocks, runs.back().rounds);
+    }
+    const DiskRun w1 = disk_run(*d, exact, queries, DiskSearchParams{50, 1});
+    std::printf("    L  50, W 1: recall@10 %.3f, nodes read %.1f, rounds %.1f\n", w1.recall, w1.nodes, w1.rounds);
+    CHECK(runs[0].recall <= runs[1].recall + 0.02 && runs[1].recall <= runs[2].recall + 0.02 && runs[2].recall >= 0.95);
+    CHECK(runs[2].nodes < 400 && w1.rounds > runs[1].rounds * 2);  // a few hundred reads out of 5000; W 4: far fewer rounds
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk10_results_are_exact) {
+    auto data = clustered(1500, 16, 10, 1912);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const std::string path = temp_path("dk10");
+        DiskIndex::build(path, id_range(100, 1500), flatten(data), 16, m);
+        const auto d = DiskIndex::open(path);
+        FlatIndex exact(16, m);
+        for (std::uint64_t i = 0; i < 1500; ++i) exact.add(100 + i, data[i]);
+        bool ok = true;
+        for (std::size_t q = 0; q < 20; ++q) {
+            const auto r = d->search(data[q * 50], 10, DiskSearchParams{60, 4});
+            ok = ok && r.size() == 10 && r[0].id == 100 + q * 50 && sorted_and_unique(r);
+            for (const auto& x : r) {  // the distance an exact index computes for the same vector
+                const auto e = exact.search(data[x.id - 100], 1);
+                ok = ok && x.id >= 100 && x.id < 1600 && std::abs(x.distance - exact.search(data[q * 50], 1500)[0].distance) >= 0;
+                (void)e;
+            }
+            const auto truth = exact.search(data[q * 50], 1500);
+            std::map<std::uint64_t, float> by_id;
+            for (const auto& t : truth) by_id[t.id] = t.distance;
+            for (const auto& x : r) ok = ok && std::abs(x.distance - by_id[x.id]) <= 1e-5f * (1 + by_id[x.id]);
+        }
+        if (m == Metric::Cosine) {  // a scaled query is the same direction
+            std::vector<float> scaled = data[7];
+            for (float& x : scaled) x *= 6.0f;
+            ok = ok && d->search(scaled, 1)[0].id == 107;
+        }
+        CHECK(ok && d->search(data[0], 0).empty());
+        CHECK(d->search(data[0], 5000, DiskSearchParams{2000, 8}).size() == 1500);  // k beyond n, a beam covering everything
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk11_rejects_invalid_searches) {
+    auto data = random_vectors(50, 4, 1913);
+    const std::string path = temp_path("dk11");
+    DiskIndex::build(path, id_range(0, 50), flatten(data), 4, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(data[0], 5, DiskSearchParams{0, 4}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(data[0], 5, DiskSearchParams{10, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(std::vector<float>{1, 2, 3}, 5));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(std::vector<float>{1, 2, kNaN, 4}, 5));
+    CHECK(d->search(data[0], 5, {}, with_filter(Filter::eq("c", 1))).empty());  // an unknown field (dynamic schema): nothing matches
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk12_deadlines_and_cancellation) {
+    auto data = random_vectors(500, 8, 1914);
+    const std::string path = temp_path("dk12");
+    DiskIndex::build(path, id_range(0, 500), flatten(data), 8, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    SearchStats ss;
+    late.stats = &ss;
+    DiskSearchStats st;
+    const auto r = d->search(data[0], 10, {}, late, &st);
+    CHECK(st.stopped_early && ss.stopped_early && st.nodes_read == 0 && r.empty());  // stopped before the first read
+    std::atomic<bool> cancel{true};
+    SearchOptions cancelled;
+    cancelled.cancel = &cancel;
+    CHECK(d->search(data[0], 10, {}, cancelled, &st).empty() && st.stopped_early);
+    SearchOptions far;
+    far.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    CHECK(same_results(d->search(data[0], 10, {}, far, &st), d->search(data[0], 10)) && !st.stopped_early);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk13_concurrent_searches) {
+    auto data = clustered(2000, 16, 10, 1915);
+    const std::string path = temp_path("dk13");
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 40; ++q) expected.push_back(d->search(data[q * 37], 10));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk13", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (std::size_t round = 0; round < 3; ++round)
+                for (std::size_t q = t; q < 40; q += 2) wrong += long(!same_results(d->search(data[q * 37], 10), expected[q]));
+        });
+    });
+    CHECK(wrong == 0);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk14_damage_met_during_a_search) {
+    auto data = random_vectors(300, 8, 1916);
+    const std::string path = temp_path("dk14");
+    DiskIndex::build(path, id_range(0, 300), flatten(data), 8, Metric::L2);
+    const NodeId medoid = DiskIndex::open(path)->medoid();
+    const std::size_t per_block = 4096 / (4 * 8 + 4 + 4 * 64);
+    const std::uint64_t at = 4096 * (1 + medoid / per_block) + 5;
+    std::string bytes = read_file(path);
+    bytes[at] = char(bytes[at] ^ 0x10);
+    write_file(path, bytes);
+    const auto d = DiskIndex::open(path);  // opening does not read node blocks
+    CHECK_THROWS_AS(FormatError, (void)d->search(data[0], 5));  // every search starts at the medoid
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk15_alpha_and_reads) {
+    // Alpha's purpose, measured where it matters: disk reads for a given recall.
+    auto data = clustered(5000, 24, 30, 1917);
+    auto queries = clustered(40, 24, 30, 1918);
+    FlatIndex exact(24, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) exact.add(i, data[i]);
+    for (float alpha : {1.0f, 1.2f}) {
+        const std::string path = temp_path("dk15");
+        DiskIndexParams p;
+        p.graph = VamanaParams{24, 48, alpha, 6};
+        DiskIndex::build(path, id_range(0, 5000), flatten(data), 24, Metric::L2, p);
+        const auto d = DiskIndex::open(path);
+        for (std::size_t L : {std::size_t(30), std::size_t(60)}) {
+            const DiskRun r = disk_run(*d, exact, queries, DiskSearchParams{L, 4});
+            std::printf("    alpha %.1f, L %2zu: recall@10 %.3f, nodes read %.1f, rounds %.1f\n", double(alpha), L, r.recall, r.nodes, r.rounds);
+            CHECK(r.recall >= 0.80);
+        }
+        std::filesystem::remove(path);
+    }
+}
+
+namespace {
+/// The search fields plus "rare" (an int), for strict schemas in the disk tests.
+std::vector<FieldSpec> search_fields_with_rare() {
+    auto f = search_fields();
+    f.push_back({"rare", FieldType::Int});
+    return f;
+}
+}  // namespace
+
+// ===========================================================================
+// Phase Q6d: filters, records, batches (DK16-DK23)
+// ===========================================================================
+
+namespace {
+
+struct DiskFixture {
+    Vectors data;
+    std::string path;
+    std::unique_ptr<DiskIndex> d;
+    FlatIndex exact;
+    DiskFixture(std::size_t n, std::size_t dim, unsigned seed, Metric m = Metric::L2, Schema schema = Schema::dynamic())
+        : data(clustered(n, dim, 10, seed)), path(temp_path("dkfix")), exact(dim, m, schema) {
+        std::vector<Metadata> meta;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            meta.push_back(meta_for(i).set("rare", std::int64_t(i % 50 == 0)));
+            exact.add(i, data[i], meta.back());
+        }
+        DiskIndex::build(path, id_range(0, n), flatten(data), dim, m, {}, meta, schema);
+        d = DiskIndex::open(path);
+    }
+    ~DiskFixture() {
+        d.reset();
+        std::filesystem::remove(path);
+    }
+};
+
+}  // namespace
+
+TEST(disk, dk16_filtered_graph_search) {
+    DiskFixture f(3000, 16, 1920);
+    double hit = 0;
+    bool only_matching = true, full = true;
+    for (std::size_t q = 0; q < 20; ++q) {
+        const auto opts = with_filter(Filter::eq("category", "tech"));  // a fifth of the vectors: the graph search
+        const auto r = f.d->search(f.data[q * 101], 10, DiskSearchParams{60, 4}, opts);
+        std::set<std::uint64_t> truth;
+        for (const auto& x : f.exact.search(f.data[q * 101], 10, opts)) truth.insert(x.id);
+        for (const auto& x : r) {
+            only_matching = only_matching && x.id % 5 == 2;
+            hit += double(truth.count(x.id));
+        }
+        full = full && r.size() == 10;
+    }
+    std::printf("    filtered (a fifth match): recall@10 %.3f\n", hit / 200.0);
+    CHECK(only_matching && full && hit / 200.0 >= 0.9);
+}
+
+TEST(disk, dk17_selective_filter_is_exact) {
+    DiskFixture f(3000, 16, 1921);
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) {  // 60 vectors match: at most L (100), read directly
+        const auto opts = with_filter(Filter::eq("rare", std::int64_t(1)));
+        DiskSearchStats st;
+        const auto r = f.d->search(f.data[q * 77], 10, {}, opts, &st);
+        same = same && same_up_to_ties(r, f.exact.search(f.data[q * 77], 10, opts)) && st.nodes_read == 60;
+    }
+    CHECK(same && f.d->search(f.data[0], 10, {}, with_filter(Filter::eq("category", "none"))).empty());  // nothing matches
+}
+
+TEST(disk, dk18_never_fewer_than_k) {
+    // 60 of 3000 match, more than L (20): the graph search, which widens L until it finds 10.
+    DiskFixture f(3000, 16, 1922);
+    bool ok = true;
+    for (std::size_t q = 0; q < 10; ++q) {
+        const auto opts = with_filter(Filter::eq("rare", std::int64_t(1)));
+        const auto r = f.d->search(f.data[q * 31], 10, DiskSearchParams{20, 4}, opts);
+        ok = ok && r.size() == 10;
+        for (const auto& x : r) ok = ok && x.id % 50 == 0;
+    }
+    SearchOptions odd;
+    odd.predicate = [](std::uint64_t id) { return id % 97 == 3; };  // about 31 match
+    const auto p = f.d->search(f.data[5], 25, DiskSearchParams{10, 4}, odd);
+    ok = ok && p.size() == 25;
+    for (const auto& x : p) ok = ok && x.id % 97 == 3;
+    CHECK(ok);
+}
+
+TEST(disk, dk19_predicates_and_schemas) {
+    DiskFixture f(1000, 8, 1923, Metric::L2, Schema::strict(search_fields_with_rare()));
+    SearchOptions both = with_filter(Filter::eq("category", "tech"));
+    both.predicate = [](std::uint64_t id) { return id % 2 == 0; };
+    bool ok = true;
+    for (const auto& x : f.d->search(f.data[3], 10, {}, both)) ok = ok && x.id % 5 == 2 && x.id % 2 == 0;
+    CHECK(ok);
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->search(f.data[3], 10, {}, with_filter(Filter::eq("no_such_field", 1))));
+}
+
+TEST(disk, dk20_records) {
+    DiskFixture f(500, 8, 1924, Metric::Cosine);
+    CHECK(f.d->contains(7) && !f.d->contains(500) && !f.d->get_vector(500) && !f.d->get(500));
+    const auto v = *f.d->get_vector(7);
+    double len = 0, dot = 0, given = 0;
+    for (std::size_t j = 0; j < 8; ++j) {
+        len += double(v[j]) * v[j];
+        dot += double(v[j]) * f.data[7][j];
+        given += double(f.data[7][j]) * f.data[7][j];
+    }
+    CHECK(std::abs(len - 1.0) < 1e-5 && std::abs(dot - std::sqrt(given)) < 1e-4);  // stored normalized for cosine
+    const auto r = *f.d->get(7);
+    CHECK(r.id == 7 && r.vector == v && r.metadata.get("category").has_value());
+    // scan: ascending IDs, pages, filters; without vectors it reads nothing from disk.
+    ScanOptions o;
+    o.limit = 64;
+    o.with_vectors = false;
+    std::vector<std::uint64_t> seen;
+    const std::uint64_t before = f.d->blocks_read();
+    for (Page page = f.d->scan(o);; page = f.d->scan(o)) {
+        for (const auto& rec : page.records) seen.push_back(rec.id);
+        if (!page.next) break;
+        o.after = page.next;
+    }
+    CHECK(seen == id_range(0, 500) && f.d->blocks_read() == before);
+    ScanOptions tech;
+    tech.filter = Filter::eq("category", "tech");
+    tech.limit = 1000;
+    const auto t = f.d->scan(tech);
+    CHECK(t.records.size() == 100 && !t.next && t.records[0].vector.size() == 8);
+    o.limit = 0;
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->scan(o));
+}
+
+TEST(disk, dk21_search_by_id) {
+    DiskFixture f(1000, 16, 1925);
+    const auto without = *f.d->search_by_id(42, 5);
+    const auto with = *f.d->search_by_id(42, 5, {}, {}, true);
+    CHECK(without.size() == 5 && std::none_of(without.begin(), without.end(), [](const SearchResult& x) { return x.id == 42; }));
+    CHECK(with[0].id == 42 && with[0].distance == 0.0f && !f.d->search_by_id(5000, 5) && f.d->search_by_id(42, 0)->empty());
+}
+
+TEST(disk, dk22_batches) {
+    DiskFixture f(1500, 16, 1926);
+    const auto queries = flatten(Vectors(f.data.begin(), f.data.begin() + 12));
+    bool same = true;
+    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+        const auto b = f.d->search_batch(queries, 8, {}, threads);
+        for (std::size_t q = 0; q < 12; ++q) same = same && same_results(b[q], f.d->search(f.data[q], 8));
+    }
+    CHECK(same && f.d->search_batch({}, 5).empty());
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->search_batch(std::vector<float>(17, 1.0f), 5));
+    SearchStats st;
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.stats = &st;
+    (void)f.d->search_batch(queries, 8, {}, 4, late);
+    CHECK(st.stopped_early);
+}
+
+TEST(disk, dk23_concurrent_filtered_searches) {
+    DiskFixture f(2000, 16, 1927);
+    const auto opts = with_filter(Filter::eq("category", "news"));
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 20; ++q) expected.push_back(f.d->search(f.data[q * 53], 10, {}, opts));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk23", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (std::size_t q = t; q < 20; q += 2) wrong += long(!same_results(f.d->search(f.data[q * 53], 10, {}, opts), expected[q]));
+        });
+    });
+    CHECK(wrong == 0);
+}
+
+namespace {
+
+/// Re-signs a whole disk index file after an edit: every node block's checksum,
+/// every section's, then the header's, so that the checks behind them are reached.
+void resign_disk(std::string& f) {
+    auto u64 = [&](std::size_t at) { return persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(f.data() + at)); };
+    auto put32 = [&](std::size_t at, std::uint32_t v) {
+        unsigned char b[4];
+        persist::to_little_endian(v, b);
+        f.replace(at, 4, reinterpret_cast<const char*>(b), 4);
+    };
+    const std::uint64_t blocks = u64(80), crc_at = u64(88);
+    for (std::uint64_t b = 0; b < blocks; ++b) put32(std::size_t(crc_at + 4 * b), persist::crc32(0, f.data() + 4096 * (1 + b), 4096));
+    for (std::size_t s = 0; s < 4; ++s) {
+        const std::uint64_t offset = u64(88 + 20 * s), size = u64(96 + 20 * s);
+        put32(104 + 20 * s, persist::crc32(0, f.data() + offset, std::size_t(size)));
+    }
+    put32(168, persist::crc32(0, f.data(), 168));
+}
+
+}  // namespace
+
+TEST(disk, dk24_inconsistent_files_behind_valid_checksums) {
+    auto data = random_vectors(60, 8, 1930);
+    const std::string good = temp_path("dk24_good"), path = temp_path("dk24");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    p.pq_subspaces = 2;
+    std::vector<Metadata> meta(60, Metadata().set("k", std::int64_t(1)));
+    DiskIndex::build(good, id_range(0, 60), flatten(data), 8, Metric::L2, p, meta);
+    const std::string bytes = read_file(good);
+    auto u64 = [&](std::size_t at) { return std::size_t(persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + at))); };
+    const std::size_t pq = u64(108), ids = u64(128), metas = u64(148);  // section offsets (PQ, IDs, metadata)
+    auto message = [&](auto edit) -> std::string {
+        std::string f = bytes;
+        edit(f);
+        resign_disk(f);
+        write_file(path, f);
+        try {
+            (void)DiskIndex::open(path);
+            return "accepted";
+        } catch (const FormatError& e) {
+            return e.what();
+        }
+    };
+    auto contains = [](const std::string& m, const char* what) { return m.find(what) != std::string::npos; };
+    CHECK(contains(message([&](std::string& f) { f.replace(pq, 8, le<std::uint64_t>(0)); }), "invalid PQ section"));       // no parts
+    CHECK(contains(message([&](std::string& f) { f.replace(pq + 8, 8, le<std::uint64_t>(1u << 30)); }), "invalid PQ section"));  // a huge state
+    CHECK(contains(message([&](std::string& f) { f.replace(pq + 16, 4, le<float>(0.0f)); }), "invalid PQ codebooks"));  // 0 centroids
+    CHECK(contains(message([&](std::string& f) { f.replace(u64(116) + pq - 1, 1, std::string(1, char(250))); }), "centroid that does not exist"));
+    CHECK(contains(message([&](std::string& f) { f.replace(ids + 8, 8, le<std::uint64_t>(0)); }), "repeated ID"));
+    CHECK(contains(message([&](std::string& f) { f[metas + 20] = char(f[metas + 20] ^ 0x5A); }), ""));  // inner damage: still a FormatError
+    CHECK(message([&](std::string& f) { f[metas + 20] = char(f[metas + 20] ^ 0x5A); }) != "accepted");
+    // Node records behind valid block checksums: an impossible degree, a missing neighbor.
+    const std::size_t degree_at = 4096 + 4 * 8;
+    for (int which = 0; which < 2; ++which) {
+        std::string f = bytes;
+        if (which == 0) f.replace(degree_at, 4, le<std::uint32_t>(9));          // R is 8
+        else f.replace(degree_at + 4, 4, le<std::uint32_t>(60));                // node 60 of 60
+        resign_disk(f);
+        write_file(path, f);
+        const auto d = DiskIndex::open(path);
+        try {
+            (void)d->read_node(0);
+            CHECK(false);
+        } catch (const FormatError& e) {
+            CHECK(contains(e.what(), which == 0 ? "invalid node degree" : "a neighbor does not exist"));
+        }
+    }
+    // Building into a directory that does not exist; reads past the end.
+    CHECK_THROWS_AS(std::runtime_error, DiskIndex::build(temp_path("no_such_dir") + "/x.idx", id_range(0, 60), flatten(data), 8, Metric::L2));
+    BlockFile file(good);
+    char buf[16];
+    CHECK_THROWS_AS(FormatError, file.read(file.size() - 4, buf, 16));
+    CHECK_THROWS_AS(FormatError, file.read(file.size() + 1, buf, 1));
+    std::filesystem::remove(good);
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// Extension E1: asynchronous reads (DK25-DK28)
+// ===========================================================================
+
+TEST(disk, dk25_async_results_are_identical) {
+    auto data = clustered(2000, 16, 10, 1940);
+    const std::string path = temp_path("dk25");
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 2000; ++i) meta.push_back(meta_for(i).set("rare", std::int64_t(i % 50 == 0)));
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::Cosine, {}, meta);
+    const auto sync = DiskIndex::open(path);
+    bool same = true;
+    for (std::size_t threads : {std::size_t(1), std::size_t(4), std::size_t(8)}) {
+        DiskOpenOptions o;
+        o.io_threads = threads;
+        const auto async = DiskIndex::open(path, o);
+        for (std::size_t w : {std::size_t(1), std::size_t(4), std::size_t(8)})
+            for (std::size_t q = 0; q < 10; ++q) {
+                const DiskSearchParams p{40, w};
+                DiskSearchStats a, b;
+                same = same && same_results(async->search(data[q * 91], 10, p, {}, &a), sync->search(data[q * 91], 10, p, {}, &b));
+                same = same && a.nodes_read == b.nodes_read && a.rounds == b.rounds;  // the same reads, in the same rounds
+                for (const auto& opts : {with_filter(Filter::eq("rare", std::int64_t(1))), with_filter(Filter::eq("category", "tech"))})
+                    same = same && same_results(async->search(data[q * 91], 10, p, opts), sync->search(data[q * 91], 10, p, opts));
+            }
+    }
+    CHECK(same);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk26_reads_overlap) {
+    // With slow storage (simulated: 3 ms a read) the W reads of a round overlap:
+    // a round takes about one latency instead of W. Sleeps need no CPU, so this
+    // holds on a loaded machine too.
+    auto data = clustered(1500, 16, 10, 1941);
+    const std::string path = temp_path("dk26");
+    DiskIndex::build(path, id_range(0, 1500), flatten(data), 16, Metric::L2);
+    DiskOpenOptions slow;
+    slow.simulated_latency = std::chrono::milliseconds(3);
+    DiskOpenOptions slow_async = slow;
+    slow_async.io_threads = 4;
+    const auto sync = DiskIndex::open(path, slow);
+    const auto async = DiskIndex::open(path, slow_async);
+    auto time = [&](const DiskIndex& d, std::size_t& rounds) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t q = 0; q < 5; ++q) {
+            DiskSearchStats st;
+            (void)d.search(data[q * 7], 10, DiskSearchParams{40, 4}, {}, &st);
+            rounds += st.rounds;
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    std::size_t rs = 0, ra = 0;
+    const double ts = time(*sync, rs), ta = time(*async, ra);
+    std::printf("    5 searches, W 4, 3 ms a read: one after another %.0f ms, concurrent %.0f ms (%zu rounds each)\n", ts, ta, rs);
+    CHECK(rs == ra && ta < 0.6 * ts && ta >= double(ra) * 3.0 * 0.9);  // about one latency per round, never less
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk27_errors_during_concurrent_reads) {
+    auto data = random_vectors(300, 8, 1942);
+    const std::string path = temp_path("dk27");
+    DiskIndex::build(path, id_range(0, 300), flatten(data), 8, Metric::L2);
+    std::size_t damaged_node;
+    {
+        const auto d = DiskIndex::open(path);
+        damaged_node = d->read_node(d->medoid()).neighbors.at(0);  // read in the first round, beside others
+    }
+    const std::size_t per_block = 4096 / (4 * 8 + 4 + 4 * 64), block = damaged_node / per_block;
+    std::string bytes = read_file(path);
+    bytes[4096 * (1 + block) + 7] = char(bytes[4096 * (1 + block) + 7] ^ 0x08);
+    write_file(path, bytes);
+    DiskOpenOptions o;
+    o.io_threads = 4;
+    o.simulated_latency = std::chrono::microseconds(500);  // the other reads still running when one fails
+    bool threw = false;
+    {
+        auto d = DiskIndex::open(path, o);
+        try {
+            (void)d->search(data[0], 10, DiskSearchParams{40, 8});
+        } catch (const FormatError&) {
+            threw = true;
+        }
+        CHECK(d->read_node(NodeId(block == 0 ? 299 : 0)).vector.size() == 8);  // still usable
+    }  // destroyed right after: no read may still be running (AddressSanitizer checks)
+    CHECK(threw);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk28_searches_share_the_pool) {
+    auto data = clustered(2000, 16, 10, 1943);
+    const std::string path = temp_path("dk28");
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::L2);
+    DiskOpenOptions o;
+    o.io_threads = 3;
+    const auto d = DiskIndex::open(path, o);
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 24; ++q) expected.push_back(d->search(data[q * 41], 10));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk28", [&] {
+        run_threads(6, [&](std::size_t t) {  // more searching threads than readers
+            for (std::size_t round = 0; round < 3; ++round)
+                for (std::size_t q = t; q < 24; q += 3) wrong += long(!same_results(d->search(data[q * 41], 10), expected[q]));
+        });
+    });
+    CHECK(wrong == 0 && same_results(d->search_batch(flatten(Vectors(data.begin(), data.begin() + 6)), 5, {}, 4)[2], d->search(data[2], 5)));
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -13182,7 +14078,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

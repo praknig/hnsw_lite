@@ -157,6 +157,18 @@ Measured on noisy synthetic data (5,000 vectors of 32 dimensions in 40 clusters,
 
 Scan time grows with the share scanned, so probes trade speed for recall; real embeddings cluster better than this data and usually need fewer. IVF-PQ (32 lists, PQ re-ranked with `rerank_factor` 16) reached 0.56 at 8 probes and 0.87 with all lists probed, the same as PQ alone. Measure on your data: start with `lists` near the square root of the number of vectors and raise `probes` until recall suffices.
 
+### Disk-based index
+
+Measured on 5,000 clustered vectors of 32 dimensions (R 32; tests `dk09` and `dk15`; reads counted, not timed):
+
+| `L` (W 4) | Nodes read per query | Rounds | Recall@10 |
+|---|---|---|---|
+| 20 | 30 (0.6%) | 9 | 0.86 |
+| 50 | 56 (1.1%) | 16 | 0.98 |
+| 100 | 105 (2.1%) | 27 | 1.00 |
+
+Each node read is one 4 KB block. `W` 1 needed 52 rounds at `L` 50 for the same reads: on storage with high latency, a larger `W` cuts waiting, and with `DiskOpenOptions::io_threads` the reads of a round also overlap. With a simulated 3 ms per read and W 4, five searches (60 rounds) took 679 ms with reads one after another and 194 ms with 4 reading threads (test `dk26`): about one latency per round, 3.5 times faster. Search time is roughly reads times the storage's latency (unless cached by the operating system), so measure on your storage. The navigation codes matter: with one PQ part per 8 dimensions instead of 2, recall at `L` 50 fell from 0.98 to 0.71 for the same reads.
+
 ### Build type
 
 Always measure Release builds. Debug builds are many times slower.

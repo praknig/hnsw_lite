@@ -55,7 +55,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] SIMD kernels for code distances (SQ8, binary)
 - [x] Product quantization
 - [x] An inverted file (IVF, and IVF-PQ) for `FlatIndex`
-- [ ] A disk-based index (see the [plan](compression-and-index-types-plan.md))
+- [x] A disk-based index, read-only (see the [plan](compression-and-index-types-plan.md))
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
@@ -73,7 +73,7 @@ The core capabilities (real deletion, updating vectors, saving and loading, thre
 | Upper-level links | One arena allocation per node | One `malloc` per node | One shared array with offsets | Own implementation | Via Knowhere |
 | SIMD selection | Runtime CPU detection | Compile-time flags with runtime checks | Separate builds per instruction set | Runtime CPU detection | Via Knowhere |
 | Deletion | Real deletion: slot reuse and graph repair | Tombstones (optional slot reuse) | Depends on index type; not for HNSW | Yes | Yes |
-| Quantization | SQ8, binary and PQ codes, IVF (and IVF-PQ), Matryoshka truncation | No | Yes (PQ, SQ, IVF) | Yes | Yes |
+| Quantization | SQ8, binary and PQ codes, IVF (and IVF-PQ), Matryoshka truncation; a disk-based index (DiskANN-style) | No | Yes (PQ, SQ, IVF) | Yes | Yes |
 | Metadata filtering | Yes, with a query planner | Limited (a filter function) | Limited (ID selectors) | Yes | Yes |
 | Persistence | Yes (versioned file format, checksums, older versions still read) | Yes | Yes | Yes | Yes |
 | Distribution across machines | No | No | No | Yes | Yes |

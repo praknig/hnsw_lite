@@ -108,6 +108,8 @@ hnsw-lite/
 │   ├── serialize.h             # Saving: checksums, writer, untrusted-file reader, FormatError
 │   ├── kmeans.h                # k-means training (for PQ and IVF)
 │   ├── codec.h                 # Vector codecs: SQ8, binary, PQ
+│   ├── vamana.h                # The Vamana graph (DiskANN)
+│   ├── disk_index.h            # The disk-based index
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -124,10 +126,12 @@ hnsw-lite/
 │   ├── persistence.cpp         # Saving and loading (file format version 3; reads 1 to 3)
 │   ├── kmeans.cpp              # k-means (built without floating-point contraction)
 │   ├── codec.cpp               # Codecs (built without floating-point contraction)
+│   ├── vamana.cpp              # Building and searching Vamana graphs
+│   ├── disk_index.cpp          # The disk index: file layout, reads, search
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 702 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 739 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -397,6 +401,8 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Disk-based index.** `VamanaGraph` builds the DiskANN graph: a random graph of degree R, then two passes (alpha 1, then the given alpha) in which each node is searched for from the medoid and its neighbors replaced by the robust pruning of everything visited, with reverse edges. Three changes for degenerate data, each found by a test: with at most R + 1 vectors the complete graph is kept (pruning could only remove edges); a candidate identical to the node (distance 0) is never pruned, and equal distances are ordered by a hash of the node pair rather than by node number (otherwise identical vectors collapse onto a few hubs); and a connectivity repair at the end gives every node a path from the medoid (preferring free slots, then neighbors that keep another incoming edge), since Vamana does not guarantee it and an unreachable vector could never be found. `DiskIndex::build` writes block 0 (the header, with section offsets, sizes and checksums, and its own checksum), the node records (vector, degree, R neighbor slots; several per 4 KB block, or whole blocks each, never crossing a boundary), then the block checksums, PQ codebooks and codes, IDs and metadata, which `open` loads and verifies. A search ranks candidates by PQ distance (the codes are finer than PQ's default, one part per 2 dimensions, because they decide what is read), reads the W best unread per round through `BlockFile` (`pread`, or `ReadFile` with an offset), checks each block's checksum, and keeps the exact distances of every node read. A filter matching at most L vectors reads them directly; otherwise the candidate list is kept whole so that L can widen until k matching vectors are found. With `io_threads`, an `IoPool` (a task queue shared by all searches, returning futures) reads each round's nodes concurrently; the search waits for all of them before passing on an error, then accounts for them in order on its own thread (predicates included), so results and statistics are identical to reading one after another. The pool is declared after the file, so destroying the index first finishes any queued read.
 
 **Inverted file (IVF).** An option of `FlatIndex`: `train_lists` runs `kmeans` on the stored vectors (decoded, with codes only) and assigns every row to its nearest centroid, building everything in local variables and swapping it in at the end. Every row is in one list at a known position (`list_of_`, `pos_`), so each slot path is O(1): an add reserves room in its list before changing anything; a removal takes the row out of its list and, since Flat swaps the last row into the gap, renames the last row in its own list; an update that changes a vector's nearest list moves it; a batch rollback takes popped rows out. The scan orders the lists by centroid distance and visits at least `probes`, then more until `k` matching vectors were seen. Saved as `IVFL` (version 3): settings, centroids and each row's list; the lists and positions are rebuilt and checked on load.
 

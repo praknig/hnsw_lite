@@ -312,7 +312,7 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive
 
       - name: Test threaded groups
-        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion --group add_batch --group codec --group sq8 --group matryoshka --group lean --group review --group codes_only --group binary --group pq --group ivf
+        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion --group add_batch --group codec --group sq8 --group matryoshka --group lean --group review --group codes_only --group binary --group pq --group ivf --group disk
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).
