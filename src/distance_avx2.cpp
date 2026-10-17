@@ -16,6 +16,8 @@
  */
 #include <immintrin.h>
 
+#include <cstdint>
+
 #include "kernels.h"
 
 namespace vecdb::kernels {
@@ -76,4 +78,49 @@ float ip_avx2(const float* a, const float* b, std::size_t n) { return -dot(a, b,
 /// Cosine distance for normalized vectors: 1 - (a . b).
 float cos_avx2(const float* a, const float* b, std::size_t n) { return 1.0f - dot(a, b, n); }
 
+
+namespace {
+inline __m256 bytes8(const std::uint8_t* c) {  // 8 bytes, widened to 8 floats
+    return _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(c))));
+}
+}  // namespace
+
+float sq8_l2_avx2(const float* t, const float* s, const std::uint8_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) {
+        const __m256 diff = _mm256_fnmadd_ps(bytes8(c + j), _mm256_loadu_ps(s + j), _mm256_loadu_ps(t + j));
+        acc = _mm256_fmadd_ps(diff, diff, acc);
+    }
+    float sum = hsum(acc);
+    for (; j < n; ++j) {
+        const float diff = t[j] - float(c[j]) * s[j];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+float sq8_dot_avx2(const float* w, const std::uint8_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) acc = _mm256_fmadd_ps(bytes8(c + j), _mm256_loadu_ps(w + j), acc);
+    float sum = hsum(acc);
+    for (; j < n; ++j) sum += w[j] * float(c[j]);
+    return sum;
+}
+
+float bits_sum_avx2(const float* w, const std::uint8_t* c, std::size_t n) {
+    const __m256i bit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) {  // one code byte: 8 dimensions
+        const __m256i spread = _mm256_and_si256(_mm256_set1_epi32(c[j / 8]), bit);
+        const __m256 mask = _mm256_castsi256_ps(_mm256_cmpeq_epi32(spread, bit));
+        acc = _mm256_add_ps(acc, _mm256_and_ps(mask, _mm256_loadu_ps(w + j)));
+    }
+    float sum = hsum(acc);
+    for (; j < n; ++j)
+        if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
+    return sum;
+}
 }  // namespace vecdb::kernels

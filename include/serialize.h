@@ -5,7 +5,7 @@
  * File layout (all numbers little-endian):
  *
  *   header:   magic "HNSWLITE" (8 bytes), format version (u32: this library writes
- *             2 and reads 1 and 2), byte-order mark
+ *             3 and reads 1 to 3), byte-order mark
  *             (u32 0x01020304), index kind (u32: 1 Flat, 2 HNSW), reserved (u32, 0)
  *   sections: tag (4 ASCII bytes), payload length (u64), payload, CRC-32 of the payload (u32)
  *   last:     an "END " section with an empty payload; nothing may follow it
@@ -45,8 +45,9 @@ namespace persist {
 
 inline constexpr char kMagic[8] = {'H', 'N', 'S', 'W', 'L', 'I', 'T', 'E'};
 /// The version this library writes. Version 2 added, for cosine indexes, each
-/// vector as given (before normalization) right after the stored vector.
-inline constexpr std::uint32_t kVersion = 2;
+/// vector as given (before normalization) right after the stored vector;
+/// version 3 added the CODC section (quantization settings, codec, codes).
+inline constexpr std::uint32_t kVersion = 3;
 /// The oldest version this library still reads.
 inline constexpr std::uint32_t kOldestVersion = 1;
 inline constexpr std::uint32_t kByteOrderMark = 0x01020304u;

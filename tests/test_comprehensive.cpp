@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -33,6 +33,7 @@
  *  - The exit code is 0 only if every selected test passed.
  */
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -64,6 +65,10 @@
 #include "hnsw_index.h"
 #include "storage.h"
 #include "serialize.h"
+#include "disk_index.h"
+#include "kmeans.h"
+#include "vamana.h"
+#include "codec.h"
 #include "thread_pool.h"
 
 using namespace vecdb;
@@ -1845,14 +1850,14 @@ TEST(flat, many_vectors) {
 
 TEST(hnsw, rejects_invalid_params) {
     CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(0, Metric::L2));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{0, 200, 1}));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{1, 200, 1}));
-    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{16, 0, 1}));
-    CHECK_NOTHROW(HnswIndex ok(4, Metric::L2, HnswParams{2, 1, 1}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{0, 200, 1, true, {}}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{1, 200, 1, true, {}}));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex bad(4, Metric::L2, HnswParams{16, 0, 1, true, {}}));
+    CHECK_NOTHROW(HnswIndex ok(4, Metric::L2, HnswParams{2, 1, 1, true, {}}));
 }
 
 TEST(hnsw, accessors) {
-    HnswIndex h(7, Metric::InnerProduct, HnswParams{12, 50, 9});
+    HnswIndex h(7, Metric::InnerProduct, HnswParams{12, 50, 9, true, {}});
     CHECK(h.dim() == 7 && h.metric() == Metric::InnerProduct && h.size() == 0);
     CHECK(h.params().M == 12 && h.params().ef_construction == 50 && h.params().seed == 9);
 }
@@ -2101,7 +2106,7 @@ TEST(hnsw, recall_at_k1_and_k50) {
 }
 
 TEST(hnsw, level_distribution) {
-    HnswIndex h(16, Metric::L2, HnswParams{16, 32, 7});
+    HnswIndex h(16, Metric::L2, HnswParams{16, 32, 7, true, {}});
     auto data = clustered(4000, 16, 4, 8);
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     std::size_t upper = 0;
@@ -2122,7 +2127,7 @@ TEST(hnsw, param_minimal_M) {
     // M = 2 builds a valid but sparse graph (measured: ~90% reachable, recall ~0.74).
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{2, 200, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{2, 200, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.80);
@@ -2133,7 +2138,7 @@ TEST(hnsw, param_minimal_ef_construction) {
     // ef_construction = 1 builds greedily (measured recall ~0.66).
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{16, 1, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{16, 1, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.99);
@@ -2143,7 +2148,7 @@ TEST(hnsw, param_minimal_ef_construction) {
 TEST(hnsw, param_large_M) {
     auto data = clustered(600, 16, 6, 50);
     auto queries = clustered(40, 16, 6, 51);
-    HnswIndex h(16, Metric::L2, HnswParams{64, 200, 1});
+    HnswIndex h(16, Metric::L2, HnswParams{64, 200, 1, true, {}});
     FlatIndex f(16, Metric::L2);
     fill(h, f, data);
     check_graph(h, 0.999);
@@ -2156,7 +2161,7 @@ TEST(hnsw, param_other_seeds) {
     FlatIndex f(16, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) f.add(i, data[i]);
     for (std::uint64_t seed : {0ull, 777ull, 123456789ull}) {
-        HnswIndex h(16, Metric::L2, HnswParams{16, 200, seed});
+        HnswIndex h(16, Metric::L2, HnswParams{16, 200, seed, true, {}});
         for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
         check_graph(h, 0.99);
         CHECK(recall(h, f, queries, 10, 100) >= 0.95);
@@ -2417,7 +2422,7 @@ TEST(robustness, ordered_distance_helper) {
 }
 
 TEST(robustness, max_level_stays_reasonable) {
-    HnswIndex h(8, Metric::L2, HnswParams{16, 16, 11});
+    HnswIndex h(8, Metric::L2, HnswParams{16, 16, 11, true, {}});
     auto data = random_vectors(5000, 8, 82);
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     CHECK(h.max_level() >= 1 && h.max_level() <= 8);  // expected about log16(5000) = 3
@@ -3038,7 +3043,7 @@ TEST(deletion, d41_hnsw_insert_reuses_slot) {
 
 TEST(deletion, d42_hnsw_reused_slot_higher_level) {
     auto data = clustered(300, 8, 4, 212);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 3});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 3, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 213));
     CHECK(seen.higher && seen.same_slot);
@@ -3048,7 +3053,7 @@ TEST(deletion, d42_hnsw_reused_slot_higher_level) {
 
 TEST(deletion, d43_hnsw_reused_slot_lower_level) {
     auto data = clustered(300, 8, 4, 215);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 5});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 50, 5, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const LevelChange seen = reuse_levels(h, clustered(300, 8, 4, 216));
     CHECK(seen.lower && seen.same_slot);
@@ -3253,7 +3258,7 @@ TEST(deletion, d53_hnsw_remove_some_identical_copies) {
 
 TEST(deletion, d54_hnsw_remove_with_minimal_M) {
     auto data = clustered(400, 8, 4, 232);
-    HnswIndex h(8, Metric::L2, HnswParams{2, 100, 1});
+    HnswIndex h(8, Metric::L2, HnswParams{2, 100, 1, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     for (std::uint64_t i = 0; i < 400; i += 4) h.remove(i);
     check_graph(h, 0.70);
@@ -3510,7 +3515,7 @@ TEST(deletion, repair_skips_already_removed_links) {
     // Removing Y does not unlink X -> Y when Y does not link back to X. Removing
     // X afterwards must repair around it while ignoring the dead link to Y.
     auto data = clustered(1000, 8, 4, 247);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});  // small lists fill up and get pruned
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1, true, {}});  // small lists fill up and get pruned
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const Storage& st = h.storage();
     NodeId x = kEmpty, y = kEmpty;
@@ -3578,7 +3583,7 @@ TEST(deletion, repair_skips_stale_links) {
     // upper-level link A -> S, reuse S until its level drops, then remove A.
     auto data = clustered(1000, 8, 4, 252);
     auto extra = clustered(200, 8, 4, 253);
-    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1});
+    HnswIndex h(8, Metric::L2, HnswParams{4, 100, 1, true, {}});
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     const Storage& st = h.storage();
     NodeId a = kEmpty, s = kEmpty;
@@ -5426,7 +5431,7 @@ TEST(search_e2e, ix05_reproducible) {
 TEST(search_e2e, ix06_large_scale_random_filters) {
     auto data = clustered(20000, 16, 25, 377);
     auto queries = clustered(30, 16, 25, 378);
-    HnswIndex h(16, Metric::L2, HnswParams{16, 100, 9}, Schema::strict(search_fields()));
+    HnswIndex h(16, Metric::L2, HnswParams{16, 100, 9, true, {}}, Schema::strict(search_fields()));
     FlatIndex f(16, Metric::L2, Schema::strict(search_fields()));
     h.create_payload_index("category");
     for (std::size_t i = 0; i < data.size(); ++i) {
@@ -6579,7 +6584,10 @@ std::unique_ptr<HnswIndex> load_hnsw(const std::string& bytes) {
 
 /// A unique temporary file path for one test.
 std::string temp_path(const std::string& name) {
-    return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + name + ".bin")).string();
+    // A token per process: test groups run in parallel (ctest -j), and two runs
+    // on one machine must never share a file.
+    static const std::string token = std::to_string(std::random_device{}());
+    return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + token + "_" + name + ".bin")).string();
 }
 
 /// Temporary files a save left next to `path` ("<path>.tmp-..."): must be none.
@@ -6699,6 +6707,72 @@ std::unique_ptr<FlatIndex> golden_flat() {
 }
 
 std::string golden_path(const char* name) { return std::string(HNSW_TEST_DATA_DIR) + "/" + name; }
+
+/// The index stored in tests/data/golden_flat_ivf_v3.bin: a Flat index with a
+/// trained inverted file (8 lists), from whole numbers, so every distance is exact
+/// and every CPU assigns the same lists.
+std::unique_ptr<FlatIndex> golden_ivf() {
+    IvfParams ivf;
+    ivf.lists = 8;
+    ivf.probes = 3;
+    ivf.train_after = 200;
+    auto f = std::make_unique<FlatIndex>(12, Metric::L2, Schema::dynamic(), QuantizationParams{}, ivf);
+    std::mt19937 rng(2031);
+    for (std::uint64_t i = 0; i < 260; ++i) f->add(i, integer_vector(rng, 12));
+    for (std::uint64_t i = 0; i < 260; i += 23) f->remove(i);
+    return f;
+}
+
+/// The index stored in tests/data/golden_hnsw_pq_v3.bin: PQ codes only (4 parts),
+/// trained by k-means on whole numbers; identical on every CPU.
+std::unique_ptr<HnswIndex> golden_pq() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 13;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 300;
+    p.quantization.pq_subspaces = 4;
+    p.quantization.keep_full_vectors = false;
+    auto h = std::make_unique<HnswIndex>(16, Metric::L2, p);
+    std::mt19937 rng(2030);
+    for (std::uint64_t i = 0; i < 350; ++i) h->add(i, integer_vector(rng, 16));
+    for (std::uint64_t i = 0; i < 350; i += 19) h->remove(i);
+    return h;
+}
+
+/// The index stored in tests/data/golden_hnsw_binary_v3.bin: binary codes only,
+/// from whole numbers (thresholds are means: exact here), identical on every CPU.
+std::unique_ptr<HnswIndex> golden_binary() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 11;
+    p.quantization.codec = CodecKind::Binary;
+    p.quantization.train_after = 64;
+    p.quantization.keep_full_vectors = false;
+    auto h = std::make_unique<HnswIndex>(16, Metric::L2, p);
+    std::mt19937 rng(2029);
+    for (std::uint64_t i = 0; i < 200; ++i) h->add(i, integer_vector(rng, 16));
+    for (std::uint64_t i = 0; i < 200; i += 17) h->remove(i);
+    return h;
+}
+
+/// The index stored in tests/data/golden_hnsw_sq8_v3.bin: SQ8-trained, from whole
+/// numbers, so its codes are identical on every CPU.
+std::unique_ptr<HnswIndex> golden_sq8() {
+    HnswParams p;
+    p.M = 8;
+    p.ef_construction = 40;
+    p.seed = 9;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 100;
+    auto h = std::make_unique<HnswIndex>(8, Metric::L2, p);
+    std::mt19937 rng(2028);
+    for (std::uint64_t i = 0; i < 250; ++i) h->add(i, integer_vector(rng, 8));
+    for (std::uint64_t i = 0; i < 250; i += 13) h->remove(i);
+    return h;
+}
 
 /// A small HNSW index used by the corruption tests (small, so every byte can be tried).
 std::unique_ptr<HnswIndex> tiny_hnsw() {
@@ -6925,7 +6999,7 @@ TEST(persistence, p22_wrong_magic_version_or_byte_order) {
     const std::string bytes = save_bytes(*tiny_hnsw());
     std::string magic = bytes, version = bytes, zero = bytes, order = bytes, reserved = bytes;
     magic[0] = 'X';
-    poke<std::uint32_t>(version, 8, 3);  // a future version
+    poke<std::uint32_t>(version, 8, persist::kVersion + 1);  // a future version
     poke<std::uint32_t>(zero, 8, 0);
     poke<std::uint32_t>(order, 12, 0x04030201u);
     poke<std::uint32_t>(reserved, 20, 1);
@@ -6933,7 +7007,7 @@ TEST(persistence, p22_wrong_magic_version_or_byte_order) {
     try {
         load_hnsw(version);
     } catch (const FormatError& e) {
-        CHECK(std::string(e.what()).find("version 3") != std::string::npos);  // a clear message
+        CHECK(std::string(e.what()).find("version " + std::to_string(persist::kVersion + 1)) != std::string::npos);  // a clear message
     }
 }
 
@@ -7075,7 +7149,7 @@ TEST(persistence, p30_oom_save_keeps_the_old_file) {
 TEST(persistence, p40_golden_files_load) {
   // Every format version this library reads: the version 1 files are frozen, to
   // prove that files saved by older versions of the library keep loading.
-  for (const char* version : {"v1", "v2"}) {
+  for (const char* version : {"v1", "v2", "v3"}) {
     auto h = HnswIndex::load(golden_path((std::string("golden_hnsw_") + version + ".bin").c_str()));
     auto f = FlatIndex::load(golden_path((std::string("golden_flat_") + version + ".bin").c_str()));
     auto h_ref = golden_hnsw();
@@ -7101,13 +7175,20 @@ TEST(persistence, p40_golden_files_load) {
 TEST(persistence, p41_identical_bytes_on_every_platform) {
     // Built from whole numbers, which every distance kernel sums exactly, so every
     // CI platform must reproduce the committed version 1 files byte for byte.
-    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v2.bin")));
-    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v2.bin")));
+    CHECK(save_bytes(*golden_hnsw()) == read_file(golden_path("golden_hnsw_v3.bin")));
+    CHECK(save_bytes(*golden_flat()) == read_file(golden_path("golden_flat_v3.bin")));
+    // SQ8 codes are part of the file: every CPU's encoding must match byte for byte.
+    CHECK(save_bytes(*golden_sq8()) == read_file(golden_path("golden_hnsw_sq8_v3.bin")));
+    CHECK(save_bytes(*golden_binary()) == read_file(golden_path("golden_hnsw_binary_v3.bin")));
+    CHECK(save_bytes(*golden_pq()) == read_file(golden_path("golden_hnsw_pq_v3.bin")));
+    CHECK(save_bytes(*golden_ivf()) == read_file(golden_path("golden_flat_ivf_v3.bin")));
+    auto loaded = HnswIndex::load(golden_path("golden_hnsw_sq8_v3.bin"));
+    CHECK(loaded->codec_trained() && *loaded->get_code(5) == *golden_sq8()->get_code(5));
 }
 
 TEST(persistence, p42_large_round_trip) {
     auto data = clustered(20000, 16, 20, 509);
-    HnswIndex h(16, Metric::L2, HnswParams{12, 60, 3});
+    HnswIndex h(16, Metric::L2, HnswParams{12, 60, 3, true, {}});
     FlatIndex f(16, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) {
         h.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
@@ -8043,7 +8124,7 @@ TEST(concurrency, c20_simultaneous_saves_to_one_file) {
     // another save has moved the file away. The index is large enough that each
     // save spans many thread time slices, and all saves start together.
     auto data = clustered(20000, 32, 10, 617);
-    HnswIndex h(32, Metric::L2, HnswParams{8, 40, 1}, Schema::dynamic({}));
+    HnswIndex h(32, Metric::L2, HnswParams{8, 40, 1, true, {}}, Schema::dynamic({}));
     FlatIndex f(32, Metric::L2);
     for (std::size_t i = 0; i < data.size(); ++i) {
         h.add(i, data[i], Metadata().set("g", std::int64_t(i % 7)));
@@ -8346,7 +8427,7 @@ TEST(add_batch, b08_entry_point_with_many_high_levels) {
     // vectors reachable even one by one), so quality is compared with one-by-one adds.
     auto data = clustered(4000, 8, 10, 708);
     for (int round = 0; round < 3; ++round) {
-        const HnswParams params{2, 32, std::uint64_t(round)};
+        const HnswParams params{2, 32, std::uint64_t(round), true, {}};
         HnswIndex h(8, Metric::L2, params), one_by_one(8, Metric::L2, params);
         h.add_batch(id_range(0, 4000), flatten(data), 8);
         for (std::size_t i = 0; i < data.size(); ++i) one_by_one.add(i, data[i]);
@@ -9012,11 +9093,15 @@ std::vector<std::uint64_t> ids_of(const std::vector<Record>& records) {
     return ids;
 }
 
-/// A version 1 file made from a version 2 file of a cosine index, by removing the
-/// originals stored after each vector (version 1 did not store them).
+/// A version 1 file made from a current file of a cosine index, by removing the
+/// originals stored after each vector (version 2), the CODC section and the
+/// truncation setting at the end of CONF (version 3).
 std::string as_version_1(const std::string& v2, bool hnsw, std::size_t dim) {
     ParsedFile f = ParsedFile::parse(v2);
     poke<std::uint32_t>(f.header, 8, 1);
+    std::erase_if(f.sections, [](const auto& sec) { return sec.first == persist::tag("CODC") || sec.first == persist::tag("IVFL"); });  // version 3 only
+    std::string& conf = f.payload("CONF");
+    conf.resize(conf.size() - 10);  // version 3 ends CONF with the truncation setting and two flags
     std::string& node = f.payload("NODE");
     std::string out = node.substr(0, 8);
     const auto n = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(&node[0]));
@@ -9363,7 +9448,7 @@ TEST(records, r15_version_1_cosine_files) {
     CHECK(normalized);
     CHECK(same_results(h1->search(data[9], 5, 64), h.search(data[9], 5, 64)));
     // Saved again, they become version 2 files.
-    CHECK(persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(save_bytes(*h1).data() + 8)) == 2);
+    CHECK(persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(save_bytes(*h1).data() + 8)) == persist::kVersion);
 }
 
 TEST(records, r16_originals_follow_every_path) {
@@ -9415,7 +9500,7 @@ TEST(records, r17_damaged_cosine_files) {
     // The cosine-only part of the format (originals after each vector) read from
     // damaged files: truncated at every byte, a bit flipped in every byte.
     auto data = random_vectors(12, 3, 910);
-    HnswIndex h(3, Metric::Cosine, HnswParams{4, 16, 1});
+    HnswIndex h(3, Metric::Cosine, HnswParams{4, 16, 1, true, {}});
     FlatIndex f(3, Metric::Cosine);
     for (std::uint64_t i = 0; i < 12; ++i) {
         h.add(i, data[i], Metadata().set("k", std::int64_t(i)));
@@ -9733,9 +9818,13 @@ TEST(control, t02_cancel_from_another_thread) {
     SearchOptions o;
     o.cancel = &cancel;
     o.stats = &stats;
+    // At its 100th call the predicate waits until the other thread has set the
+    // flag: the cancel always lands mid-search. (Sleeping instead made this
+    // depend on timing: MinGW rounds sub-millisecond sleeps down to nothing, and
+    // the search finished before the cancel arrived.)
     o.predicate = [&](std::uint64_t) {
-        ++calls;
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        if (++calls == 100)
+            while (!cancel) std::this_thread::yield();
         return true;
     };
     with_watchdog(60, "t02", [&] {
@@ -10017,6 +10106,3928 @@ TEST(control, t13_cancelling_a_parallel_batch) {
 }
 
 // ===========================================================================
+// Phase Q0: k-means and codecs (Q0-1 to Q0-14)
+// ===========================================================================
+
+namespace {
+
+/// Points around `centers` (each `dim` values), `per` points each, small spread.
+std::vector<float> blobs(const std::vector<std::vector<float>>& centers, std::size_t per, float spread, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-spread, spread);
+    std::vector<float> out;
+    for (std::size_t i = 0; i < per; ++i)
+        for (const auto& c : centers)
+            for (float x : c) out.push_back(x + u(rng));
+    return out;
+}
+
+}  // namespace
+
+TEST(codec, q0_01_kmeans_finds_separated_clusters) {
+    const std::vector<std::vector<float>> centers = {{0, 0, 0}, {10, 0, 0}, {0, 10, 0}, {0, 0, 10}, {10, 10, 10}};
+    const auto data = blobs(centers, 200, 0.5f, 1);
+    const auto r = kmeans(data, 3, KMeansParams{5, 50, 7, 1});
+    bool found = true;
+    for (const auto& c : centers) {
+        float d = 0;
+        (void)nearest_centroid(r.centroids, 3, c.data(), &d);
+        found = found && d < 0.05f;  // each true center has a centroid within about 0.2
+    }
+    CHECK(found && r.centroids.size() == 15 && r.assignment.size() == 1000);
+    bool consistent = true;  // points of one blob share a centroid
+    for (std::size_t i = 0; i < 1000; ++i) consistent = consistent && r.assignment[i] == r.assignment[i % 5];
+    CHECK(consistent && r.inertia < 1000 * 3 * 0.25);
+}
+
+TEST(codec, q0_02_kmeans_is_deterministic_and_independent_of_threads) {
+    std::mt19937 rng(2);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<float> data(20000 * 8);
+    for (float& x : data) x = nd(rng);
+    const KMeansParams one{64, 15, 42, 1};
+    KMeansParams many = one;
+    many.threads = 4;
+    const auto a = kmeans(data, 8, one), b = kmeans(data, 8, one), c = kmeans(data, 8, many);
+    CHECK(a.centroids == b.centroids && a.assignment == b.assignment);  // bit for bit
+    CHECK(a.centroids == c.centroids && a.assignment == c.assignment && a.inertia == c.inertia);
+    KMeansParams other = one;
+    other.seed = 43;
+    const auto d = kmeans(data, 8, other);
+    CHECK(d.centroids != a.centroids && d.centroids.size() == a.centroids.size());  // another seed: another valid result
+}
+
+TEST(codec, q0_03_kmeans_fixed_answer) {
+    // Whole numbers average exactly, so every CPU and compiler must give exactly these.
+    const std::vector<float> data = {0, 0, 1, 0, 0, 1, 1, 1, 10, 10, 11, 10, 10, 11, 11, 11, 20, 0, 21, 0, 20, 2, 21, 2};
+    const auto r = kmeans(data, 2, KMeansParams{3, 20, 5, 1});
+    std::vector<std::vector<float>> got;
+    for (std::size_t c = 0; c < 3; ++c) got.push_back({r.centroids[c * 2], r.centroids[c * 2 + 1]});
+    std::sort(got.begin(), got.end());
+    CHECK(got == (std::vector<std::vector<float>>{{0.5f, 0.5f}, {10.5f, 10.5f}, {20.5f, 1.0f}}));
+    CHECK(r.inertia == 9.0);  // 4 x 0.5 for each of the first two clusters, 4 x 1.25 for the third
+}
+
+TEST(codec, q0_04_kmeans_edge_cases) {
+    // k = n: every point is its own centroid. k = 1: the mean.
+    const std::vector<float> data = {1, 2, 3, 4, 5, 6, 7, 8};
+    const auto all = kmeans(data, 2, KMeansParams{4, 10, 1, 1});
+    CHECK(all.inertia == 0.0);
+    const auto one = kmeans(data, 2, KMeansParams{1, 10, 1, 1});
+    CHECK(one.centroids == (std::vector<float>{4, 5}));
+    // Identical points: no NaN, every centroid equal to the point.
+    const std::vector<float> same(50 * 4, 3.25f);
+    const auto s = kmeans(same, 4, KMeansParams{8, 10, 1, 1});
+    CHECK(std::all_of(s.centroids.begin(), s.centroids.end(), [](float x) { return x == 3.25f; }) && s.inertia == 0.0);
+    // Only 3 distinct values but 25 centroids: identical centroids tie, ties go to
+    // the lower index, so most stay empty. Every centroid is still a valid value
+    // (empty clusters are refilled before averaging: never NaN).
+    std::vector<float> dup;
+    for (int i = 0; i < 30; ++i) dup.push_back(float(i % 3));
+    const auto e = kmeans(dup, 1, KMeansParams{25, 10, 3, 1});
+    CHECK(e.inertia == 0.0 && std::all_of(e.centroids.begin(), e.centroids.end(), [](float x) { return x == 0 || x == 1 || x == 2; }));
+}
+
+TEST(codec, q0_05_kmeans_rejects_invalid_input) {
+    const std::vector<float> data = {1, 2, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 0, KMeansParams{1}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 3, KMeansParams{1}));  // not a multiple
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans({}, 2, KMeansParams{1}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{3}));  // more centroids than points
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(data, 2, KMeansParams{1, 0}));
+    const std::vector<float> bad = {1, kNaN, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, (void)kmeans(bad, 2, KMeansParams{1}));
+}
+
+TEST(codec, q0_06_kmeans_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    std::vector<float> data(3000 * 4);
+    for (std::size_t i = 0; i < data.size(); ++i) data[i] = float((i * 7919) % 101);
+    KMeansResult r;
+    CHECK(sweep_allocation_failures([&] { r = kmeans(data, 4, KMeansParams{16, 5, 1, 2}); }, [] {}) > 0);
+    CHECK(r.centroids.size() == 64);
+}
+
+TEST(codec, q0_07_sq8_round_trip_error_is_bounded) {
+    std::mt19937 rng(3);
+    std::uniform_real_distribution<float> u(-4, 9);
+    std::vector<float> sample(500 * 16);
+    for (float& x : sample) x = u(rng);
+    SQ8Codec c(16, Metric::L2);
+    c.train(sample);
+    std::vector<std::uint8_t> code(c.code_size());
+    std::vector<float> back(16);
+    float worst = 0;
+    for (std::size_t i = 0; i < 500; ++i) {
+        c.encode(std::span<const float>(&sample[i * 16], 16), code.data());
+        c.decode(code.data(), back);
+        for (std::size_t j = 0; j < 16; ++j) worst = std::max(worst, std::abs(back[j] - sample[i * 16 + j]) / c.step()[j]);
+    }
+    CHECK(c.code_size() == 16 && worst <= 0.5f + 1e-3f);  // at most half a level, plus float rounding
+}
+
+TEST(codec, q0_08_sq8_constant_dimensions_and_clamping) {
+    const std::vector<float> sample = {1, 5, 0, 1, 7, 10, 1, 6, 5};  // dimension 0 is constant
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    float back[3];
+    c.encode(std::vector<float>{1, 5, 0}, code);
+    c.decode(code, back);
+    CHECK(back[0] == 1.0f && code[0] == 0);  // a constant dimension is stored exactly
+    c.encode(std::vector<float>{-100, 100, 5.2f}, code);  // outside the range: clamped to its ends
+    CHECK(code[0] == 0 && code[1] == 255 && code[2] == 133);  // 5.2 / (10 / 255) = 132.6
+    c.decode(code, back);
+    CHECK(back[1] == 7.0f);
+}
+
+TEST(codec, q0_09_sq8_distances_match_decoded_vectors) {
+    std::mt19937 rng(4);
+    std::normal_distribution<float> nd(0, 1);
+    for (Metric m : kMetrics) {
+        std::vector<float> sample(400 * 24);
+        for (float& x : sample) x = nd(rng);
+        if (m == Metric::Cosine)  // cosine codecs receive normalized vectors
+            for (std::size_t i = 0; i < 400; ++i) {
+                float n2 = 0;
+                for (std::size_t j = 0; j < 24; ++j) n2 += sample[i * 24 + j] * sample[i * 24 + j];
+                for (std::size_t j = 0; j < 24; ++j) sample[i * 24 + j] /= std::sqrt(n2);
+            }
+        SQ8Codec c(24, m);
+        c.train(sample);
+        std::vector<std::uint8_t> code(24);
+        std::vector<float> table, back(24);
+        const std::span<const float> q(&sample[0], 24);
+        c.prepare(q, table);
+        bool close = true;
+        for (std::size_t i = 1; i < 400; ++i) {
+            const std::span<const float> v(&sample[i * 24], 24);
+            c.encode(v, code.data());
+            c.decode(code.data(), back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 24; ++j)
+                expected += m == Metric::L2 ? double(q[j] - back[j]) * (q[j] - back[j]) : double(q[j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code.data()) - expected) < 1e-4 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(codec, q0_10_sq8_ranks_like_full_precision) {
+    // Codes keep the ordering: the 10 nearest by code overlap the true 10 nearest.
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<float> data(2000 * 32);
+    for (float& x : data) x = nd(rng);
+    SQ8Codec c(32, Metric::L2);
+    c.train(data);
+    std::vector<std::uint8_t> codes(2000 * 32);
+    for (std::size_t i = 0; i < 2000; ++i) c.encode(std::span<const float>(&data[i * 32], 32), &codes[i * 32]);
+    double overlap = 0;
+    for (std::size_t q = 0; q < 20; ++q) {
+        std::vector<float> query(32);
+        for (float& x : query) x = nd(rng);
+        std::vector<float> table;
+        c.prepare(query, table);
+        std::vector<std::pair<float, std::size_t>> exact, coded;
+        for (std::size_t i = 0; i < 2000; ++i) {
+            float d = 0;
+            for (std::size_t j = 0; j < 32; ++j) d += (query[j] - data[i * 32 + j]) * (query[j] - data[i * 32 + j]);
+            exact.emplace_back(d, i);
+            coded.emplace_back(c.distance(table, &codes[i * 32]), i);
+        }
+        std::partial_sort(exact.begin(), exact.begin() + 10, exact.end());
+        std::partial_sort(coded.begin(), coded.begin() + 10, coded.end());
+        std::set<std::size_t> truth;
+        for (std::size_t i = 0; i < 10; ++i) truth.insert(exact[i].second);
+        for (std::size_t i = 0; i < 10; ++i) overlap += double(truth.count(coded[i].second));
+    }
+    CHECK(overlap / 200.0 > 0.9);
+}
+
+TEST(codec, q0_11_sq8_fixed_answer_codes) {
+    // Every CPU and compiler must produce exactly these codes (they are saved in files).
+    // Expected values computed independently with NumPy float32, with inputs away
+    // from exact halves between levels (where float rounding decides).
+    const std::vector<float> sample = {0, -1, 2.5f, 255, 1, 0.5f, 127.5f, 0, -0.25f};
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    c.encode(std::vector<float>{63.75f, 0.3f, 1.0f}, code);
+    CHECK(code[0] == 64 && code[1] == 166 && code[2] == 116);
+    c.encode(std::vector<float>{127.5f, 1.0f, -0.25f}, code);
+    CHECK(code[0] == 128 && code[1] == 255 && code[2] == 0);
+}
+
+TEST(codec, q0_12_sq8_rejects_misuse) {
+    SQ8Codec c(4, Metric::L2);
+    std::uint8_t code[4];
+    std::vector<float> table, out(4);
+    CHECK(!c.trained());
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(4, 1.0f), code));
+    CHECK_THROWS_AS(std::logic_error, c.prepare(std::vector<float>(4, 1.0f), table));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>(6, 1.0f)));  // not whole vectors
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{1, 2, kInf, 4}));
+    c.train(std::vector<float>{0, 0, 0, 0, 1, 1, 1, 1});
+    CHECK_THROWS_AS(std::invalid_argument, c.encode(std::vector<float>(3, 1.0f), code));
+    CHECK_THROWS_AS(std::invalid_argument, c.decode(code, std::span<float>(out.data(), 3)));
+    CHECK_THROWS_AS(std::invalid_argument, c.set_range(std::vector<float>(4, 0.0f), std::vector<float>(4, -1.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, c.set_range(std::vector<float>(3, 0.0f), std::vector<float>(4, 1.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, SQ8Codec(0, Metric::L2));
+}
+
+TEST(codec, q0_13_sq8_set_range_matches_training) {
+    std::vector<float> sample(100 * 6);
+    for (std::size_t i = 0; i < sample.size(); ++i) sample[i] = float((i * 37) % 23) - 5.0f;
+    SQ8Codec trained(6, Metric::InnerProduct), restored(6, Metric::InnerProduct);
+    trained.train(sample);
+    restored.set_range(trained.minimum(), trained.step());  // as when loading a saved index
+    std::uint8_t a[6], b[6];
+    bool same = true;
+    for (std::size_t i = 0; i < 100; ++i) {
+        trained.encode(std::span<const float>(&sample[i * 6], 6), a);
+        restored.encode(std::span<const float>(&sample[i * 6], 6), b);
+        same = same && std::equal(a, a + 6, b);
+    }
+    CHECK(same);
+}
+
+TEST(codec, q0_14_make_codec) {
+    CHECK(make_codec(CodecKind::None, 4, Metric::L2) == nullptr);
+    const auto c = make_codec(CodecKind::SQ8, 4, Metric::Cosine);
+    CHECK(c && c->kind() == CodecKind::SQ8 && c->dim() == 4 && c->metric() == Metric::Cosine && c->code_size() == 4);
+}
+
+TEST(codec, q0_15_code_kernels_match_plain_cpp) {
+    // Every instruction set this CPU supports, every length 0 to 130 (all
+    // remainders), at unaligned addresses: within rounding of the plain version.
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<float> u(-2, 2);
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::vector<float> t(140), s(140), w(140);
+    std::vector<std::uint8_t> c(150);
+    const CodeKernels plain = get_code_kernels(Isa::Scalar);
+    long compared = 0, wrong = 0;
+    for (Isa isa : {Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        if (!isa_supported(isa)) continue;
+        const CodeKernels k = get_code_kernels(isa);
+        for (std::size_t n = 0; n <= 130; ++n) {
+            for (int round = 0; round < 3; ++round) {
+                for (float& x : t) x = u(rng);
+                for (float& x : s) x = std::abs(u(rng)) / 255;
+                for (float& x : w) x = u(rng);
+                for (auto& b : c) b = std::uint8_t(byte(rng));
+                const std::size_t off = std::size_t(round);  // 0, 1, 2: unaligned floats and bytes
+                const float* tt = t.data() + off;
+                const float* ss = s.data() + off;
+                const float* ww = w.data() + off;
+                const std::uint8_t* cc = c.data() + off;
+                auto close = [](float a, float b, float scale) { return std::abs(a - b) <= 1e-4f * (1 + scale); };
+                float mag = 0;
+                for (std::size_t j = 0; j < n; ++j) mag += std::abs(ww[j]) * 255;
+                wrong += long(!close(k.sq8_l2(tt, ss, cc, n), plain.sq8_l2(tt, ss, cc, n), plain.sq8_l2(tt, ss, cc, n)));
+                wrong += long(!close(k.sq8_dot(ww, cc, n), plain.sq8_dot(ww, cc, n), mag));
+                wrong += long(!close(k.bits_sum(ww, cc, n), plain.bits_sum(ww, cc, n), mag / 255));
+                compared += 3;
+            }
+        }
+        std::printf("    %s: compared with plain C++ for lengths 0 to 130\n", isa_name(isa));
+    }
+    CHECK(wrong == 0 && (compared > 0 || !isa_supported(Isa::Avx2)));
+    CHECK(plain.sq8_l2(nullptr, nullptr, nullptr, 0) == 0.0f && plain.bits_sum(nullptr, nullptr, 0) == 0.0f);
+    const auto best = get_code_kernels();
+    const auto active = get_code_kernels(active_isa());
+    CHECK(best.sq8_l2 == active.sq8_l2 && best.bits_sum == active.bits_sum);  // the same choice as the float kernels
+    if (!isa_supported(Isa::Avx512)) CHECK_THROWS_AS(std::invalid_argument, (void)get_code_kernels(Isa::Avx512));
+    if (!isa_supported(Isa::Neon)) CHECK_THROWS_AS(std::invalid_argument, (void)get_code_kernels(Isa::Neon));
+}
+
+TEST(codec, q0_16_binary_kernel_bit_order) {
+    // Exactly the set bits count, bit j being c[j / 8] >> (j % 8): one bit at a time.
+    std::vector<float> w(64);
+    for (std::size_t j = 0; j < 64; ++j) w[j] = float(j + 1);
+    for (Isa isa : {Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        if (!isa_supported(isa)) continue;
+        const CodeKernels k = get_code_kernels(isa);
+        bool exact = true;
+        for (std::size_t j = 0; j < 64; ++j) {
+            std::uint8_t c[8] = {};
+            c[j / 8] = std::uint8_t(1u << (j % 8));
+            exact = exact && k.bits_sum(w.data(), c, 64) == float(j + 1);
+        }
+        std::uint8_t all[8];
+        std::fill(all, all + 8, std::uint8_t(0xFF));
+        CHECK(exact && k.bits_sum(w.data(), all, 64) == 64.0f * 65.0f / 2.0f);
+    }
+}
+
+
+// ===========================================================================
+// Phase Q1: SQ8 in the indexes (S8-01 to S8-12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams sq8(std::size_t train_after = 1000, bool rerank = true) {
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = train_after;
+    q.rerank = rerank;
+    return q;
+}
+
+HnswParams hnsw_sq8(std::size_t train_after = 1000, bool rerank = true) {
+    HnswParams p;
+    p.quantization = sq8(train_after, rerank);
+    return p;
+}
+
+/// Every live vector's code equals a fresh encoding of its stored vector (with
+/// codes only, of its decoded vector: decoding then encoding must be lossless).
+bool codes_match(const HnswIndex& h) {
+    const VectorCodec* c = h.codec();
+    if (!c || !c->trained()) return false;
+    std::vector<std::uint8_t> expected(c->code_size());
+    const bool codes_only = !h.storage().vectors().has_values();
+    std::vector<float> decoded(c->dim());
+    for (NodeId n = 0; n < h.storage().size(); ++n) {
+        if (h.storage().ids().is_deleted(n)) continue;
+        if (codes_only) {
+            c->decode(h.get_code(h.storage().ids().external(n))->data(), decoded);
+            c->encode(decoded, expected.data());
+        } else {
+            c->encode(h.storage().vectors().get(n), expected.data());
+        }
+        if (*h.get_code(h.storage().ids().external(n)) != expected) return false;
+    }
+    return true;
+}
+
+bool codes_match(const FlatIndex& f) {  // L2: the stored vector is the vector as given
+    const VectorCodec* c = f.codec();
+    if (!c || !c->trained()) return false;
+    std::vector<std::uint8_t> expected(c->code_size());
+    ScanOptions all;
+    all.limit = 1000000;
+    for (const Record& r : f.scan(all).records) {
+        c->encode(r.vector, expected.data());
+        if (*f.get_code(r.id) != expected) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(sq8, s8_01_untrained_means_full_precision) {
+    auto data = clustered(500, 16, 6, 970);
+    HnswIndex plain(16, Metric::L2), coded(16, Metric::L2, hnsw_sq8(1000));
+    FlatIndex fplain(16, Metric::L2), fcoded(16, Metric::L2, Schema::dynamic(), sq8(1000));
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        plain.add(i, data[i]);
+        coded.add(i, data[i]);
+        fplain.add(i, data[i]);
+        fcoded.add(i, data[i]);
+    }
+    CHECK(!coded.codec_trained() && !fcoded.codec_trained() && !coded.get_code(1));
+    bool same = true;
+    for (std::size_t q = 0; q < 20; ++q)
+        same = same && same_results(coded.search(data[q], 10, 64), plain.search(data[q], 10, 64)) &&
+               same_results(fcoded.search(data[q], 10), fplain.search(data[q], 10));
+    CHECK(same);
+}
+
+TEST(sq8, s8_02_automatic_training) {
+    auto data = clustered(400, 8, 4, 971);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(300));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(300));
+    for (std::uint64_t i = 0; i < 299; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.codec_trained() && !f.codec_trained());
+    h.add(299, data[299]);  // the 300th vector: trains, and encodes everything stored
+    f.add(299, data[299]);
+    CHECK(h.codec_trained() && f.codec_trained() && codes_match(h) && codes_match(f));
+    for (std::uint64_t i = 300; i < 400; ++i) {  // later vectors are encoded as they arrive
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(codes_match(h) && codes_match(f));
+    HnswIndex batch(8, Metric::L2, hnsw_sq8(300));
+    batch.add_batch(id_range(0, 400), flatten(data), 4);  // a batch crossing the threshold trains at its end
+    CHECK(batch.codec_trained() && codes_match(batch));
+}
+
+TEST(sq8, s8_03_explicit_training) {
+    auto data = clustered(200, 8, 4, 972);
+    HnswIndex none(8, Metric::L2);
+    FlatIndex fnone(8, Metric::L2);
+    CHECK_THROWS_AS(std::logic_error, none.train_codec());
+    CHECK_THROWS_AS(std::logic_error, fnone.train_codec());
+    HnswIndex h(8, Metric::L2, hnsw_sq8(0));  // 0: only explicit training
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(0));
+    CHECK_THROWS_AS(std::invalid_argument, h.train_codec());  // empty
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.codec_trained());
+    h.train_codec();
+    f.train_codec();
+    CHECK(codes_match(h) && codes_match(f));
+    h.add(500, std::vector<float>(8, 100.0f));  // far outside the trained range: clamped
+    h.train_codec();                             // training again includes it
+    CHECK(codes_match(h) && h.codec()->state()[0] <= data[0][0]);
+}
+
+TEST(sq8, s8_04_recall_every_metric) {
+    auto data = clustered(3000, 32, 12, 973);
+    auto queries = clustered(60, 32, 12, 974);
+    for (Metric m : kMetrics) {
+        HnswIndex plain(32, m), reranked(32, m, hnsw_sq8(500)), codes_only(32, m, hnsw_sq8(500, false));
+        FlatIndex exact(32, m), fcoded(32, m, Schema::dynamic(), sq8(500)), fcodes_only(32, m, Schema::dynamic(), sq8(500, false));
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            codes_only.add(i, data[i]);
+            exact.add(i, data[i]);
+            fcoded.add(i, data[i]);
+            fcodes_only.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64);
+        const double r = recall(reranked, exact, queries, 10, 64), c = recall(codes_only, exact, queries, 10, 64);
+        double fr = 0, fc = 0;  // Flat against exact results
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : fcoded.search(q, 10)) fr += double(truth.count(x.id));
+            for (const auto& x : fcodes_only.search(q, 10)) fc += double(truth.count(x.id));
+        }
+        fr /= 600.0;
+        fc /= 600.0;
+        std::printf("    metric %d: hnsw %.3f, sq8+rerank %.3f, sq8 only %.3f | flat sq8+rerank %.3f, sq8 only %.3f\n", int(m), base, r, c, fr, fc);
+        CHECK(r >= base - 0.02 && c >= 0.8 && fr >= 0.98 && fc >= 0.85);
+    }
+}
+
+TEST(sq8, s8_05_codes_follow_every_path) {
+    auto data = clustered(1500, 8, 6, 975);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(200));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(200));
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 0; i < 400; i += 5) {  // HNSW: free slots; Flat: swap with last
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 1000; i < 1050; ++i) {  // HNSW: reused slots
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 1; i < 400; i += 7) {
+        h.update(i, data[i + 1000]);
+        f.update(i, data[i + 1000]);
+    }
+    for (std::uint64_t i = 3; i < 400; i += 11) {
+        h.upsert(i, data[i + 1050]);
+        f.upsert(i, data[i + 1050]);
+    }
+    CHECK(codes_match(h) && codes_match(f));
+    for (std::uint64_t i = 2; i < 400; i += 13) h.remove(i);
+    h.add_batch(id_range(2000, 40), flatten(Vectors(data.begin() + 1100, data.begin() + 1140)), 1);  // reuse, then append
+    h.add_batch(id_range(3000, 60), flatten(Vectors(data.begin() + 1140, data.begin() + 1200)), 4);
+    f.add_batch(id_range(2000, 100), flatten(Vectors(data.begin() + 1100, data.begin() + 1200)));
+    CHECK(codes_match(h) && codes_match(f));
+    std::atomic<bool> flag{false};  // a cancelled batch leaves codes consistent
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 20) flag = true; };
+    CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(4000, 100), flatten(Vectors(data.begin() + 1200, data.begin() + 1300)), 4, o));
+    CHECK(codes_match(h));
+    h.compact();  // the codec keeps its training; codes follow the new slots
+    CHECK(h.codec_trained() && codes_match(h) && h.deleted_count() == 0);
+}
+
+TEST(sq8, s8_06_save_and_load) {
+    auto data = clustered(600, 8, 4, 976);
+    for (int trained = 0; trained < 2; ++trained) {
+        HnswIndex h(8, Metric::Cosine, hnsw_sq8(trained ? 100 : 10000, false));
+        FlatIndex f(8, Metric::InnerProduct, Schema::dynamic(), sq8(trained ? 100 : 10000));
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        h.remove(7);
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb);  // byte for byte, codes included
+        CHECK(h2->codec_trained() == bool(trained) && f2->codec_trained() == bool(trained));
+        CHECK(h2->params().quantization.codec == CodecKind::SQ8 && !h2->params().quantization.rerank && f2->quantization().rerank);
+        bool same = true;
+        for (std::size_t q = 0; q < 10; ++q)
+            same = same && same_results(h2->search(data[q], 10, 64), h.search(data[q], 10, 64)) &&
+                   same_results(f2->search(data[q], 10), f.search(data[q], 10));
+        CHECK(same);
+    }
+}
+
+TEST(sq8, s8_07_damaged_codec_sections) {
+    auto data = random_vectors(12, 3, 977);
+    HnswIndex h(3, Metric::L2, hnsw_sq8(5));
+    FlatIndex f(3, Metric::L2, Schema::dynamic(), sq8(5));
+    for (std::uint64_t i = 0; i < 12; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {  // every truncation and every flipped bit
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+    }
+    // Invalid content behind valid checksums. CODC: codec (1), train_after (8),
+    // rerank (1), factor (8), trained (1), state size (8), state (6 x 4), count (8), codes.
+    const ParsedFile base = ParsedFile::parse(save_bytes(f));
+    const std::vector<std::function<void(std::string&)>> edits = {
+        [](std::string& p) { poke<std::uint8_t>(p, 0, 7); },               // unknown codec
+        [](std::string& p) { poke<std::uint8_t>(p, 9, 2); },               // re-rank flag 2
+        [](std::string& p) { poke<std::uint64_t>(p, 10, 0); },             // factor 0
+        [](std::string& p) { poke<std::uint8_t>(p, 18, 2); },              // training flag 2
+        [](std::string& p) { poke<float>(p, 27 + 12, -1.0f); },            // a negative step
+        [](std::string& p) { poke<std::uint64_t>(p, 19, 5); },             // wrong state size
+        [](std::string& p) { poke<std::uint64_t>(p, 51, 11); },            // codes for 11 vectors, 12 stored
+    };
+    for (const auto& edit : edits) {
+        ParsedFile e = base;
+        edit(e.payload("CODC"));
+        CHECK_THROWS_AS(FormatError, load_flat(e.assemble()));
+    }
+    ParsedFile none = ParsedFile::parse(save_bytes(FlatIndex(3, Metric::L2)));  // no codec, but "trained"
+    poke<std::uint8_t>(none.payload("CODC"), 18, 1);
+    CHECK_THROWS_AS(FormatError, load_flat(none.assemble()));
+    CHECK(load_flat(base.assemble())->codec_trained());
+}
+
+TEST(sq8, s8_08_every_kind_of_search) {
+    auto data = clustered(2000, 16, 8, 978);
+    HnswIndex h(16, Metric::L2, hnsw_sq8(500)), plain(16, Metric::L2);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), sq8(500));
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        h.add(i, data[i], meta_for(i));
+        plain.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 12));
+    const auto hb = h.search_batch(queries, 10, 64, 4), fb = f.search_batch(queries, 10, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 12; ++q) same = same && same_results(hb[q], h.search(data[q], 10, 64)) && same_results(fb[q], f.search(data[q], 10));
+    CHECK(same);
+    SearchOptions exact = with_filter(Filter::eq("category", "tech"));
+    exact.strategy = Strategy::ForceExact;
+    for (const auto& r : {h.search(data[0], 10, 64, exact), f.search(data[0], 10, with_filter(Filter::eq("category", "tech")))}) {
+        bool ok = r.size() == 10;
+        for (const auto& x : r) ok = ok && x.id % 5 == 2;
+        CHECK(ok);
+    }
+    // Range searches use full precision: identical to an index without a codec.
+    CHECK(same_results(h.search_range(data[3], 2.0f), plain.search_range(data[3], 2.0f)));
+}
+
+TEST(sq8, s8_09_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 4, 979);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(0));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), sq8(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { h.train_codec(); }, [&] { CHECK(save_bytes(h) == hb && !h.codec_trained()); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && !f.codec_trained()); }) > 0);
+    const std::string fb2 = save_bytes(f);
+    std::uint64_t id = 900;  // adding to a trained Flat index: code room first, all or nothing
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == fb2); }) > 0);
+    CHECK(codes_match(h) && codes_match(f));
+    // Automatic training that runs out of memory: the add completes, training waits.
+    HnswIndex a(8, Metric::L2, hnsw_sq8(50));
+    for (std::uint64_t i = 0; i < 49; ++i) a.add(i, data[i]);
+    bool consistent = true, done = false;
+    for (long n = 0; n < 5000 && !done; ++n) {
+        alloc_hook::fail_after(n);
+        bool failed = false;
+        try {
+            a.add(49, data[49]);
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        alloc_hook::disarm();
+        if (failed) consistent = consistent && !a.contains(49) && !a.codec_trained();
+        else done = true;
+    }
+    CHECK(consistent && done && a.contains(49));
+    if (!a.codec_trained()) a.add(50, data[50]);  // training was cut short: the next add retries
+    CHECK(a.codec_trained() && codes_match(a));
+}
+
+TEST(sq8, s8_10_searching_while_training) {
+    auto data = clustered(1500, 8, 6, 980);
+    HnswIndex h(8, Metric::L2, hnsw_sq8(700));
+    for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "s8_10", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 500; i < 1500; ++i) h.add(i, data[i]);  // trains at 700
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) check_results(h.search(data[q++ % 1500], 10, 32), 1500, p);
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && h.codec_trained() && codes_match(h));
+}
+
+TEST(sq8, s8_11_older_files_have_no_codec) {
+    // Version 1 and 2 files load without a codec (see p40 for the golden files).
+    auto h = HnswIndex::load(golden_path("golden_hnsw_v2.bin"));
+    CHECK(!h->codec_trained() && h->codec() == nullptr && h->params().quantization.codec == CodecKind::None);
+}
+
+TEST(sq8, s8_12_invalid_settings) {
+    QuantizationParams q = sq8();
+    q.rerank_factor = 0;
+    HnswParams p;
+    p.quantization = q;
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(4, Metric::L2, p));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(4, Metric::L2, Schema::dynamic(), q));
+}
+
+// ===========================================================================
+// Phase Q2: Matryoshka truncation (M1-M11)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams truncate_to(std::size_t n) {
+    QuantizationParams q;
+    q.truncate_to = n;
+    return q;
+}
+
+HnswParams hnsw_truncate(std::size_t n) {
+    HnswParams p;
+    p.quantization.truncate_to = n;
+    return p;
+}
+
+/// The first `n` values of each vector.
+Vectors prefixes(const Vectors& data, std::size_t n) {
+    Vectors out;
+    for (const auto& v : data) out.emplace_back(v.begin(), v.begin() + std::ptrdiff_t(n));
+    return out;
+}
+
+}  // namespace
+
+TEST(matryoshka, m01_identical_to_an_index_of_the_prefixes) {
+    auto data = clustered(1500, 64, 8, 990);
+    auto queries = clustered(30, 64, 8, 991);
+    const auto short_data = prefixes(data, 24), short_queries = prefixes(queries, 24);
+    for (Metric m : kMetrics) {
+        HnswIndex truncated(64, m, hnsw_truncate(24)), reference(24, m);
+        FlatIndex ftruncated(64, m, Schema::dynamic(), truncate_to(24)), freference(24, m);
+        for (std::uint64_t i = 0; i < 1500; ++i) {
+            truncated.add(i, data[i]);
+            reference.add(i, short_data[i]);
+            ftruncated.add(i, data[i]);
+            freference.add(i, short_data[i]);
+        }
+        bool same = true;  // same IDs and the same distances
+        for (std::size_t q = 0; q < 30; ++q)
+            same = same && same_results(truncated.search(queries[q], 10, 64), reference.search(short_queries[q], 10, 64)) &&
+                   same_results(ftruncated.search(queries[q], 10), freference.search(short_queries[q], 10));
+        CHECK(same && truncated.dim() == 64 && truncated.indexed_dim() == 24 && ftruncated.indexed_dim() == 24);
+    }
+}
+
+TEST(matryoshka, m02_vectors_read_back_in_full) {
+    auto data = random_vectors(200, 32, 992);
+    for (Metric m : kMetrics) {
+        HnswIndex h(32, m, hnsw_truncate(8));
+        FlatIndex f(32, m, Schema::dynamic(), truncate_to(8));
+        for (std::uint64_t i = 0; i < 200; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        bool full = true;
+        for (std::uint64_t i = 0; i < 200; i += 7) full = full && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i] && h.get(i)->vector == data[i];
+        ScanOptions o;
+        o.limit = 50;
+        for (const Record& r : h.scan(o).records) full = full && r.vector.size() == 32 && r.vector == data[r.id];
+        CHECK(full);
+        // search_by_id uses the vector as given, truncated like any query.
+        auto expected = h.search(data[5], 6, 64);
+        std::erase_if(expected, [](const SearchResult& r) { return r.id == 5; });
+        expected.resize(std::min<std::size_t>(expected.size(), 5));
+        CHECK(same_results(*h.search_by_id(5, 5, 64), expected));
+    }
+}
+
+TEST(matryoshka, m03_inputs_are_checked_in_full) {
+    HnswIndex h(16, Metric::Cosine, hnsw_truncate(4));
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), truncate_to(4));
+    std::vector<float> v(16, 1.0f), short_v(4, 1.0f), nan_in_cut_part(16, 1.0f);
+    nan_in_cut_part[10] = kNaN;  // in the part that is cut off: still rejected
+    h.add(1, v);
+    f.add(1, v);
+    CHECK_THROWS_AS(std::invalid_argument, h.add(2, short_v));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(2, short_v));
+    CHECK_THROWS_AS(std::invalid_argument, h.add(3, nan_in_cut_part));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(3, nan_in_cut_part));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.search(short_v, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search(nan_in_cut_part, 1));
+    CHECK_THROWS_AS(std::invalid_argument, h.add_batch(id_range(10, 2), std::vector<float>(2 * 4, 1.0f)));  // short vectors
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search_batch(std::vector<float>(8, 1.0f), 1));
+    CHECK(h.size() == 1 && f.size() == 1);
+}
+
+TEST(matryoshka, m04_settings) {
+    auto data = clustered(300, 12, 4, 993);
+    HnswIndex whole(12, Metric::L2, hnsw_truncate(12)), plain(12, Metric::L2);  // the full dimension: off
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        whole.add(i, data[i]);
+        plain.add(i, data[i]);
+    }
+    CHECK(whole.indexed_dim() == 12 && same_results(whole.search(data[0], 10, 64), plain.search(data[0], 10, 64)));
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(12, Metric::L2, hnsw_truncate(13)));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(12, Metric::L2, Schema::dynamic(), truncate_to(13)));
+    HnswIndex one(12, Metric::Cosine, hnsw_truncate(1));  // a single dimension
+    for (std::uint64_t i = 0; i < 50; ++i) one.add(i, data[i]);
+    CHECK(one.indexed_dim() == 1 && one.search(data[0], 5, 64).size() == 5 && *one.get_vector(3) == data[3]);
+}
+
+TEST(matryoshka, m05_with_sq8) {
+    auto data = clustered(2000, 48, 10, 994);
+    auto queries = clustered(40, 48, 10, 995);
+    HnswParams p = hnsw_truncate(16);
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 500;
+    HnswIndex coded(48, Metric::Cosine, p), plain(48, Metric::Cosine, hnsw_truncate(16));
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        coded.add(i, data[i]);
+        plain.add(i, data[i]);
+    }
+    CHECK(coded.codec_trained() && coded.codec()->dim() == 16 && coded.get_code(3)->size() == 16);
+    double overlap = 0;  // against the same truncation at full precision
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : plain.search(q, 10, 128)) truth.insert(r.id);
+        for (const auto& r : coded.search(q, 10, 128)) overlap += double(truth.count(r.id));
+    }
+    CHECK(overlap / 400.0 >= 0.95);
+}
+
+TEST(matryoshka, m06_save_and_load) {
+    auto data = random_vectors(400, 24, 996);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        HnswParams p = hnsw_truncate(10);
+        p.quantization.codec = CodecKind::SQ8;
+        p.quantization.train_after = 100;
+        HnswIndex h(24, m, p);
+        FlatIndex f(24, m, Schema::dynamic(), truncate_to(10));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        h.remove(4);
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb);
+        CHECK(h2->indexed_dim() == 10 && f2->indexed_dim() == 10 && h2->dim() == 24 && h2->params().quantization.truncate_to == 10);
+        CHECK(*h2->get_vector(5) == data[5] && *f2->get_vector(5) == data[5] && h2->codec_trained());
+        CHECK(same_results(h2->search(data[9], 10, 64), h.search(data[9], 10, 64)) && same_results(f2->search(data[9], 10), f.search(data[9], 10)));
+    }
+}
+
+TEST(matryoshka, m07_every_path_keeps_vectors_in_full) {
+    auto data = random_vectors(900, 20, 997);
+    std::map<std::uint64_t, std::vector<float>> want;
+    HnswIndex h(20, Metric::Cosine, hnsw_truncate(6));
+    FlatIndex f(20, Metric::L2, Schema::dynamic(), truncate_to(6));
+    auto add = [&](std::uint64_t id, const std::vector<float>& v) { h.add(id, v); f.add(id, v); want[id] = v; };
+    for (std::uint64_t i = 0; i < 300; ++i) add(i, data[i]);
+    for (std::uint64_t i = 0; i < 300; i += 4) { h.remove(i); f.remove(i); want.erase(i); }  // Flat: swap with last
+    for (std::uint64_t i = 1000; i < 1040; ++i) add(i, data[i - 700]);                       // HNSW: reused slots
+    for (std::uint64_t i = 1; i < 300; i += 5)
+        if (want.contains(i)) { h.update(i, data[i + 340]); f.update(i, data[i + 340]); want[i] = data[i + 340]; }
+    for (std::uint64_t i = 2; i < 300; i += 9) { h.upsert(i, data[i + 600]); f.upsert(i, data[i + 600]); want[i] = data[i + 600]; }
+    for (std::uint64_t i = 3; i < 300; i += 11) { h.remove(i); f.remove(i); want.erase(i); }
+    std::vector<float> batch;
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        batch.insert(batch.end(), data[800 + i].begin(), data[800 + i].end());
+        want[5000 + i] = data[800 + i];
+    }
+    h.add_batch(id_range(5000, 50), std::span<const float>(batch.data(), 50 * 20), 1);
+    h.add_batch(id_range(5050, 50), std::span<const float>(batch.data() + 50 * 20, 50 * 20), 4);
+    f.add_batch(id_range(5000, 100), batch);
+    auto exact = [&] {
+        bool ok = h.size() == want.size() && f.size() == want.size();
+        for (const auto& [id, v] : want) ok = ok && h.get_vector(id) == v && f.get_vector(id) == v;
+        return ok;
+    };
+    CHECK(exact());
+    h.compact();
+    CHECK(exact() && h.search(want.begin()->second, 1, 64)[0].id == want.begin()->first);
+}
+
+TEST(matryoshka, m08_damaged_files) {
+    auto data = random_vectors(10, 6, 998);
+    HnswIndex h(6, Metric::Cosine, hnsw_truncate(2));
+    FlatIndex f(6, Metric::L2, Schema::dynamic(), truncate_to(2));
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+    }
+    // A truncation larger than the dimension, behind a valid checksum (CONF ends with
+    // the truncation, 8 bytes, then the keep-full-vectors and vector-values flags, 1 byte each).
+    for (int kind = 0; kind < 2; ++kind) {
+        ParsedFile p = ParsedFile::parse(kind == 0 ? save_bytes(h) : save_bytes(f));
+        std::string& conf = p.payload("CONF");
+        poke<std::uint64_t>(conf, conf.size() - 10, 7);
+        if (kind == 0) CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+        else CHECK_THROWS_AS(FormatError, load_flat(p.assemble()));
+    }
+}
+
+TEST(matryoshka, m09_batch_and_range_searches) {
+    auto data = clustered(1200, 32, 8, 999);
+    const auto short_data = prefixes(data, 12);
+    HnswIndex h(32, Metric::L2, hnsw_truncate(12)), reference(12, Metric::L2);
+    FlatIndex f(32, Metric::L2, Schema::dynamic(), truncate_to(12));
+    for (std::uint64_t i = 0; i < 1200; ++i) {
+        h.add(i, data[i]);
+        reference.add(i, short_data[i]);
+        f.add(i, data[i]);
+    }
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 10));
+    const auto hb = h.search_batch(queries, 8, 64, 4), fb = f.search_batch(queries, 8, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) same = same && same_results(hb[q], h.search(data[q], 8, 64)) && same_results(fb[q], f.search(data[q], 8));
+    CHECK(same);
+    CHECK(same_results(h.search_range(data[2], 1.0f), reference.search_range(short_data[2], 1.0f)));
+}
+
+TEST(matryoshka, m10_truncating_alone_needs_no_codec) {
+    // Truncation works without a codec, and leaves the codec settings untouched.
+    HnswIndex h(8, Metric::InnerProduct, hnsw_truncate(3));
+    CHECK(h.codec() == nullptr && !h.codec_trained() && h.params().quantization.codec == CodecKind::None);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{float(i), 1, 2, 3, 4, 5, 6, 7});
+    CHECK(h.search(std::vector<float>{19, 1, 2, 0, 0, 0, 0, 0}, 1)[0].id == 19);
+}
+
+TEST(matryoshka, m11_out_of_memory) {
+    // Adding stores the truncated vector and the full original: all or nothing.
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(60, 10, 1000);
+    HnswIndex h(10, Metric::Cosine, hnsw_truncate(4));
+    FlatIndex f(10, Metric::Cosine, Schema::dynamic(), truncate_to(4));
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string fb = save_bytes(f);
+    std::uint64_t id = 500;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[55]); }, [&] { CHECK(save_bytes(f) == fb); }) > 0);
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[55]); }, [&] { CHECK(!h.contains(id) && h.size() == 50); }) > 0);
+    CHECK(*h.get_vector(500) == data[55] && *f.get_vector(500) == data[55]);
+}
+
+// ===========================================================================
+// keep_full_vectors = false (L1-L8)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams lean(std::size_t truncate = 0) {
+    QuantizationParams q;
+    q.truncate_to = truncate;
+    q.keep_full_vectors = false;
+    return q;
+}
+
+HnswParams hnsw_lean(std::size_t truncate = 0) {
+    HnswParams p;
+    p.quantization = lean(truncate);
+    return p;
+}
+
+bool unit_and_same_direction(const std::vector<float>& stored, const std::vector<float>& given, std::size_t n) {
+    double len = 0, dot = 0, g = 0;
+    for (std::size_t d = 0; d < n; ++d) {
+        len += double(stored[d]) * stored[d];
+        dot += double(stored[d]) * given[d];
+        g += double(given[d]) * given[d];
+    }
+    return stored.size() == n && std::abs(len - 1.0) < 1e-5 && std::abs(dot - std::sqrt(g)) < 1e-4 * (1 + std::sqrt(g));
+}
+
+}  // namespace
+
+TEST(lean, l01_truncation_without_full_vectors) {
+    auto data = clustered(1200, 48, 8, 1100);
+    for (Metric m : kMetrics) {
+        HnswIndex slim(48, m, hnsw_lean(16)), full(48, m, hnsw_truncate(16));
+        FlatIndex fslim(48, m, Schema::dynamic(), lean(16)), ffull(48, m, Schema::dynamic(), truncate_to(16));
+        for (std::uint64_t i = 0; i < 1200; ++i) {
+            slim.add(i, data[i]);
+            full.add(i, data[i]);
+            fslim.add(i, data[i]);
+            ffull.add(i, data[i]);
+        }
+        CHECK(slim.storage().originals() == nullptr && full.storage().originals() != nullptr);  // the saving
+        bool same = true;  // the same stored vectors: identical results
+        for (std::size_t q = 0; q < 20; ++q)
+            same = same && same_results(slim.search(data[q], 10, 64), full.search(data[q], 10, 64)) &&
+                   same_results(fslim.search(data[q], 10), ffull.search(data[q], 10));
+        CHECK(same);
+        bool prefix = true;  // get_vector: the stored first 16 values
+        for (std::uint64_t i = 0; i < 1200; i += 101) {
+            const auto v = *slim.get_vector(i), fv = *fslim.get_vector(i);
+            if (m == Metric::Cosine) prefix = prefix && unit_and_same_direction(v, data[i], 16) && unit_and_same_direction(fv, data[i], 16);
+            else prefix = prefix && v == std::vector<float>(data[i].begin(), data[i].begin() + 16) && fv == v;
+        }
+        CHECK(prefix);
+    }
+}
+
+TEST(lean, l02_cosine_without_originals) {
+    auto data = random_vectors(500, 24, 1101);
+    HnswIndex slim(24, Metric::Cosine, hnsw_lean()), full(24, Metric::Cosine);
+    FlatIndex fslim(24, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 500; ++i) {
+        slim.add(i, data[i]);
+        full.add(i, data[i]);
+        fslim.add(i, data[i]);
+    }
+    CHECK(slim.storage().originals() == nullptr);
+    bool ok = true;
+    for (std::uint64_t i = 0; i < 500; i += 37)
+        ok = ok && unit_and_same_direction(*slim.get_vector(i), data[i], 24) && unit_and_same_direction(*fslim.get_vector(i), data[i], 24);
+    for (std::size_t q = 0; q < 15; ++q) ok = ok && same_results(slim.search(data[q], 10, 64), full.search(data[q], 10, 64));
+    CHECK(ok);
+    // L2 and inner product change nothing: there is no copy to drop.
+    HnswIndex l2(24, Metric::L2, hnsw_lean());
+    l2.add(1, data[1]);
+    CHECK(*l2.get_vector(1) == data[1]);
+}
+
+TEST(lean, l03_every_path) {
+    auto data = clustered(1500, 20, 6, 1102);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        HnswIndex h(20, m, hnsw_lean(8));
+        FlatIndex f(20, m, Schema::dynamic(), lean(8));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i], meta_for(i));
+            f.add(i, data[i], meta_for(i));
+        }
+        for (std::uint64_t i = 0; i < 400; i += 4) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {  // reused slots
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 400; i += 6) {
+            h.update(i, data[i + 1000]);
+            f.update(i, data[i + 1000]);
+        }
+        h.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1400, data.begin() + 1500)), 4);
+        f.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1400, data.begin() + 1500)));
+        // search_by_id and compact rebuild inputs from the stored vectors.
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && f.search_by_id(5001, 5)->size() == 5);
+        const auto before = h.search(data[1450], 5, 128);
+        h.compact();
+        const auto after = h.search(data[1450], 5, 128);
+        CHECK(h.deleted_count() == 0 && h.size() == 450 && after[0].id == before[0].id);  // 400 - 100 + 50 + 100
+        CHECK(h.get_vector(5050)->size() == 8 && f.get_vector(5050)->size() == 8);
+    }
+}
+
+TEST(lean, l04_save_and_load) {
+    auto data = random_vectors(300, 32, 1103);
+    HnswIndex slim(32, Metric::Cosine, hnsw_lean(8)), full(32, Metric::Cosine, hnsw_truncate(8));
+    FlatIndex fslim(32, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        slim.add(i, data[i]);
+        full.add(i, data[i]);
+        fslim.add(i, data[i]);
+    }
+    const std::string sb = save_bytes(slim), fb = save_bytes(fslim);
+    auto s2 = load_hnsw(sb);
+    auto f2 = load_flat(fb);
+    CHECK(save_bytes(*s2) == sb && save_bytes(*f2) == fb);
+    CHECK(!s2->params().quantization.keep_full_vectors && s2->storage().originals() == nullptr && !f2->quantization().keep_full_vectors);
+    CHECK(*s2->get_vector(3) == *slim.get_vector(3) && same_results(s2->search(data[4], 10, 64), slim.search(data[4], 10, 64)));
+    CHECK(sb.size() + 300 * 32 * 4 <= save_bytes(full).size());  // the full vectors are not saved either
+}
+
+TEST(lean, l05_damaged_files) {
+    auto data = random_vectors(10, 6, 1104);
+    HnswIndex h(6, Metric::Cosine, hnsw_lean(2));
+    FlatIndex f(6, Metric::Cosine, Schema::dynamic(), lean());
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+        ParsedFile p = ParsedFile::parse(bytes);  // the keep-full-vectors flag (next to last byte of CONF) set to 2
+        std::string& conf = p.payload("CONF");
+        poke<std::uint8_t>(conf, conf.size() - 2, 2);
+        try {
+            load(p.assemble());
+            CHECK(false);
+        } catch (const FormatError& e) {
+            CHECK(std::string(e.what()).find("keep-full-vectors") != std::string::npos);
+        }
+    }
+}
+
+TEST(lean, l06_flag_flip_is_detected) {
+    // A file saved keeping full vectors, with the flag flipped to "not kept" (and
+    // vice versa): the records no longer match their expected size, never misread.
+    auto data = random_vectors(20, 6, 1105);
+    HnswIndex full(6, Metric::Cosine), slim(6, Metric::Cosine, hnsw_lean());
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        full.add(i, data[i]);
+        slim.add(i, data[i]);
+    }
+    for (const auto* index : {&full, &slim}) {
+        ParsedFile p = ParsedFile::parse(save_bytes(*index));
+        std::string& conf = p.payload("CONF");
+        poke<std::uint8_t>(conf, conf.size() - 2, std::uint8_t(conf[conf.size() - 2] == 1 ? 0 : 1));  // the keep-full-vectors flag
+        CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+    }
+}
+
+TEST(lean, l07_with_sq8) {
+    // With SQ8, keeping only codes: after training the floats are dropped.
+    auto data = clustered(800, 16, 6, 1106);
+    HnswParams p = hnsw_lean(8);
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 200;
+    HnswIndex h(16, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    CHECK(h.codec_trained() && h.storage().originals() == nullptr && h.codec()->dim() == 8);
+    CHECK(!h.storage().vectors().has_values() && h.get_vector(7)->size() == 8);
+    CHECK(h.search(data[7], 1, 64)[0].id == 7);
+    auto h2 = load_hnsw(save_bytes(h));
+    CHECK(save_bytes(*h2) == save_bytes(h) && h2->codec_trained());
+}
+
+TEST(lean, l08_default_keeps_everything) {
+    CHECK(QuantizationParams{}.keep_full_vectors);
+    HnswIndex h(4, Metric::Cosine);
+    h.add(1, std::vector<float>{3, 4, 0, 0});
+    CHECK(*h.get_vector(1) == (std::vector<float>{3, 4, 0, 0}) && h.storage().originals() != nullptr);
+}
+
+// ===========================================================================
+// Review of phases Q0-Q2 and keep_full_vectors (V1-V3)
+// ===========================================================================
+
+TEST(review, v01_range_search_inside_a_coded_search) {
+    // A coded search marks its thread "distances from codes, with this query's
+    // table". A range search started inside its predicate must use full
+    // precision with its own query, not the outer search's codes.
+    auto data = clustered(800, 16, 6, 1200);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 100;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    const auto expected = h.search_range(data[5], 3.0f);
+    long calls = 0, wrong = 0;  // on every call: some come from the planner's sampling, before the search
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t) {
+        ++calls;
+        wrong += long(!same_results(h.search_range(data[5], 3.0f), expected));
+        return true;
+    };
+    (void)h.search(data[400], 5, 64, o);
+    CHECK(!expected.empty() && calls > 0 && wrong == 0);
+}
+
+TEST(review, v02_huge_rerank_factor) {
+    // k * rerank_factor must not wrap around (10 * 2^63 wraps to exactly 0).
+    auto data = clustered(300, 8, 4, 1201);
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 50;
+    q.rerank_factor = std::size_t(1) << 63;
+    HnswParams p;
+    p.quantization = q;
+    HnswIndex h(8, Metric::L2, p);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), q);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    SearchOptions exact;
+    exact.strategy = Strategy::ForceExact;
+    CHECK(h.search(data[3], 10, 64, exact).size() == 10 && f.search(data[3], 10).size() == 10);
+    CHECK(same_results(h.search(data[3], 10, 64, exact), f.search(data[3], 10)));  // both exact, both re-ranked
+}
+
+namespace {
+
+/// The same results up to the order of ties: identical distances, and the same
+/// IDs in each group of equal distance (except the last group, which the k
+/// cutoff may split differently: any of its members is a correct answer).
+bool same_up_to_ties(const std::vector<SearchResult>& a, const std::vector<SearchResult>& b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        if (a[i].distance != b[i].distance) return false;
+    for (std::size_t i = 0; i < a.size();) {
+        std::size_t j = i;
+        while (j < a.size() && a[j].distance == a[i].distance) ++j;
+        if (j < a.size()) {  // a complete group: the same members
+            std::multiset<std::uint64_t> x, y;
+            for (std::size_t t = i; t < j; ++t) { x.insert(a[t].id); y.insert(b[t].id); }
+            if (x != y) return false;
+        }
+        i = j;
+    }
+    return true;
+}
+
+/// What get_vector should return for `given`: the vector itself when the index
+/// keeps vectors as given (or never changes them), otherwise the stored form.
+struct ReadModel {
+    Metric metric;
+    std::size_t n;  // indexed dimensions
+    bool exact;
+    double tolerance = 0;  // codes only: the bound on decoding errors so far
+    bool matches(const std::vector<float>& got, const std::vector<float>& given) const {
+        if (exact && tolerance == 0) return got == given;
+        if (got.size() != n) return false;
+        std::vector<double> want(given.begin(), given.begin() + std::ptrdiff_t(n));
+        if (metric == Metric::Cosine) {
+            double len = 0;
+            for (double x : want) len += x * x;
+            if (len > 0) for (double& x : want) x /= std::sqrt(len);
+        }
+        for (std::size_t d = 0; d < n; ++d)
+            if (std::abs(got[d] - want[d]) > tolerance * 1.001 + 1e-5 * (1 + std::abs(want[d]))) return false;
+        return true;
+    }
+};
+
+/// Half the largest SQ8 step of an index's codec (its decoding error bound).
+double half_step(const VectorCodec& c) {
+    const auto state = c.state();  // minimums, then steps
+    double largest = 0;
+    for (std::size_t d = c.dim(); d < state.size(); ++d) largest = std::max(largest, double(state[d]));
+    return largest / 2;
+}
+
+}  // namespace
+
+TEST(review, v03_model_based_random_operations) {
+    long configs = 0, ops = 0, checks_done = 0;
+    for (unsigned seed = 1; seed <= 24; ++seed) {
+        std::mt19937_64 rng(seed * 7919);
+        auto pick = [&](std::size_t n) { return std::size_t(rng() % n); };
+        const Metric metric = kMetrics[pick(3)];
+        const std::size_t dim = pick(2) ? 12 : 6;
+        QuantizationParams q;
+        q.truncate_to = pick(3) == 0 ? dim / 2 : 0;
+        q.codec = std::array{CodecKind::None, CodecKind::SQ8, CodecKind::Binary}[pick(3)];
+        q.train_after = pick(2) ? 30 : 0;
+        q.rerank = pick(4) != 0;
+        q.keep_full_vectors = pick(2) == 0;
+        HnswParams hp;
+        hp.M = 6;
+        hp.ef_construction = 40;
+        hp.seed = seed;
+        hp.quantization = q;
+        auto h = std::make_unique<HnswIndex>(dim, metric, hp);
+        IvfParams ivf;  // Flat sometimes has an inverted file (trained automatically or explicitly)
+        if (pick(3) == 0) {
+            ivf.lists = 2 + pick(6);
+            ivf.probes = 1 + pick(3);
+            ivf.train_after = pick(2) ? 40 : 0;
+        }
+        auto f = std::make_unique<FlatIndex>(dim, metric, Schema::dynamic(), q, ivf);
+        const std::size_t n = vecdb::indexed_dim(q, dim);
+        std::map<std::uint64_t, std::vector<float>> model;
+        const ReadModel read{metric, n, q.keep_full_vectors || (metric != Metric::Cosine && n == dim)};
+        // Codes only: each index's stored vectors are simulated with its own codec,
+        // decode(encode(v)), clamping included: from the stored form when a vector is
+        // added, and again from the previous simulation when the codec is retrained
+        // (the library retrains from decoded vectors). One map per index: each trains
+        // its own codec.
+        struct CodesOnly {
+            bool active = false;
+            std::vector<float> state;  // the codec's state, to notice retraining
+            std::map<std::uint64_t, std::vector<float>> expected;
+        } sim_h, sim_f;
+        auto stored_form = [&](const std::vector<float>& v) {
+            std::vector<float> s2(v.begin(), v.begin() + std::ptrdiff_t(n));
+            if (metric == Metric::Cosine) {
+                double len = 0;
+                for (float x : s2) len += double(x) * x;
+                if (len > 0) for (float& x : s2) x = float(x / std::sqrt(len));
+            }
+            return s2;
+        };
+        auto simulate = [](const VectorCodec& c, const std::vector<float>& v) {
+            std::vector<std::uint8_t> code(c.code_size());
+            c.encode(v, code.data());
+            std::vector<float> out(c.dim());
+            c.decode(code.data(), out);
+            return out;
+        };
+        std::vector<std::uint64_t> touched;  // IDs whose vector the last operation set
+        auto follow = [&](CodesOnly& sim, bool codes_only, const VectorCodec* c) {
+            if (!codes_only) return;
+            if (!sim.active) {  // just dropped its floats: encoded from the stored floats
+                for (const auto& [id, v] : model) sim.expected[id] = simulate(*c, stored_form(v));
+                sim.active = true;
+                sim.state = c->state();
+            } else if (c->state() != sim.state) {  // retrained: re-encoded from decoded vectors
+                for (auto& [id, e] : sim.expected) e = simulate(*c, e);
+                sim.state = c->state();
+            }
+            for (auto id : touched) if (model.contains(id)) sim.expected[id] = simulate(*c, stored_form(model[id]));
+        };
+        std::normal_distribution<float> nd(0, 1);
+        auto vec = [&] {
+            std::vector<float> v(dim);
+            for (float& x : v) x = nd(rng) * (pick(20) == 0 ? 1000.0f : 1.0f);  // now and then, large values
+            if (!model.empty() && pick(15) == 0) v = std::next(model.begin(), std::ptrdiff_t(pick(model.size())))->second;  // a duplicate
+            return v;
+        };
+        auto some_id = [&] { return pick(4) == 0 || model.empty() ? std::uint64_t(pick(400)) : std::next(model.begin(), std::ptrdiff_t(pick(model.size())))->first; };
+        bool ok = true;
+        std::string where;
+        for (int step = 0; step < 300 && ok; ++step, ++ops) {
+            const std::size_t op = pick(100);
+            std::string name;
+            if (op < 35) {
+                name = "add";
+                const std::uint64_t id = pick(400);
+                const auto v = vec();
+                if (model.contains(id)) {
+                    bool threw = false;
+                    try { h->add(id, v); } catch (const std::invalid_argument&) { threw = true; }
+                    try { f->add(id, v); } catch (const std::invalid_argument&) { threw = threw && true; }
+                    ok = ok && threw;
+                } else {
+                    h->add(id, v);
+                    f->add(id, v);
+                    model[id] = v;
+                    touched.push_back(id);
+                }
+            } else if (op < 47) {
+                name = "remove";
+                const std::uint64_t id = some_id();
+                const bool expected = model.erase(id) == 1;
+                ok = ok && h->remove(id) == expected && f->remove(id) == expected;
+            } else if (op < 57) {
+                name = "update";
+                const std::uint64_t id = some_id();
+                const auto v = vec();
+                const bool expected = model.contains(id);
+                ok = ok && h->update(id, v) == expected && f->update(id, v) == expected;
+                if (expected) {
+                    model[id] = v;
+                    touched.push_back(id);
+                }
+            } else if (op < 65) {
+                name = "upsert";
+                const std::uint64_t id = some_id();
+                const auto v = vec();
+                h->upsert(id, v);
+                f->upsert(id, v);
+                model[id] = v;
+                touched.push_back(id);
+            } else if (op < 73) {
+                name = "add_batch";
+                const std::size_t count = 2 + pick(15);
+                std::vector<std::uint64_t> ids;
+                std::vector<float> flat;
+                std::set<std::uint64_t> fresh;
+                while (ids.size() < count) {
+                    const std::uint64_t id = 400 + pick(2000);
+                    if (model.contains(id) || !fresh.insert(id).second) continue;
+                    ids.push_back(id);
+                    const auto v = vec();
+                    flat.insert(flat.end(), v.begin(), v.end());
+                }
+                if (pick(5) == 0) ids.back() = ids.front();  // a repeated ID: the whole batch is refused
+                const bool bad = ids.back() == ids.front();
+                bool threw_h = false, threw_f = false;
+                try { h->add_batch(ids, flat, 1 + pick(3)); } catch (const std::invalid_argument&) { threw_h = true; }
+                try { f->add_batch(ids, flat); } catch (const std::invalid_argument&) { threw_f = true; }
+                ok = ok && threw_h == bad && threw_f == bad;
+                if (!bad)
+                    for (std::size_t i = 0; i < ids.size(); ++i) {
+                        model[ids[i]] = std::vector<float>(flat.begin() + std::ptrdiff_t(i * dim), flat.begin() + std::ptrdiff_t((i + 1) * dim));
+                        touched.push_back(ids[i]);
+                    }
+            } else if (op < 78) {
+                name = "remove_batch";
+                std::vector<std::uint64_t> ids;
+                for (int i = 0; i < 5; ++i) ids.push_back(some_id());
+                std::set<std::uint64_t> removed;
+                for (auto id : ids) if (model.contains(id)) removed.insert(id);
+                for (auto id : removed) model.erase(id);
+                ok = ok && h->remove_batch(ids) == removed.size() && f->remove_batch(ids) == removed.size();
+            } else if (op < 82) {
+                name = "compact";
+                h->compact();
+                f->compact();
+            } else if (op < 86) {
+                name = "train_codec";
+                if (ivf.lists > 0 && model.size() >= ivf.lists && pick(2)) f->train_lists();
+                if (q.codec != CodecKind::None && !model.empty()) {
+                    // Codes only: training again is refused (it could only lose
+                    // precision). Otherwise train on a sample of at least 20.
+                    for (int which = 0; which < 2; ++which) {
+                        const bool codes_only = which == 0 ? !h->has_vector_values() : !f->has_vector_values();
+                        bool refused = false;
+                        try {
+                            if (codes_only || model.size() >= 20) {
+                                if (which == 0) h->train_codec();
+                                else f->train_codec();
+                            }
+                        } catch (const std::logic_error&) {
+                            refused = true;
+                        }
+                        ok = ok && refused == codes_only;
+                    }
+                }
+            } else if (op < 92) {
+                name = "search_by_id";
+                if (!model.empty()) {
+                    const std::uint64_t id = some_id();
+                    const auto r = h->search_by_id(id, 5, 32);
+                    const auto fr = f->search_by_id(id, 5);
+                    ok = ok && bool(r) == model.contains(id) && bool(fr) == model.contains(id);
+                    if (r) for (const auto& x : *r) ok = ok && x.id != id && model.contains(x.id);
+                    if (fr) for (const auto& x : *fr) ok = ok && x.id != id && model.contains(x.id);
+                }
+            } else {
+                name = "save and load";
+                h = load_hnsw(save_bytes(*h));
+                f = load_flat(save_bytes(*f));
+            }
+            follow(sim_h, !h->has_vector_values(), h->codec());
+            follow(sim_f, !f->has_vector_values(), f->codec());
+            touched.clear();
+            // Check against the model after every operation.
+            std::string failed;
+            if (!ok) failed = "the operation's own result";
+            if (ok && !(h->size() == model.size() && f->size() == model.size())) { ok = false; failed = "size"; }
+            // Codes only: within one step of the simulation (a rounding boundary may
+            // fall differently by a float ulp); otherwise exact or the stored form.
+            auto read_ok = [&](const std::optional<std::vector<float>>& got, const CodesOnly& sim, const VectorCodec* c,
+                               std::uint64_t id, const std::vector<float>& v) {
+                if (!got) return false;
+                if (!sim.active) return read.matches(*got, v);
+                const auto& e = sim.expected.at(id);
+                const double tol = 4 * half_step(*c) * 1.01 + 1e-5;  // a value on a boundary may round either way (binary: two spreads)
+                if (got->size() != e.size()) return false;
+                for (std::size_t d = 0; d < e.size(); ++d)
+                    if (std::abs(double((*got)[d]) - e[d]) > tol) return false;
+                return true;
+            };
+            for (const auto& [id, v] : model) {
+                if (ok && !(read_ok(h->get_vector(id), sim_h, h->codec(), id, v) && read_ok(f->get_vector(id), sim_f, f->codec(), id, v))) {
+                    ok = false;
+                    failed = "get_vector of " + std::to_string(id);
+                }
+            }
+            if (ok && !(!h->contains(5000) && !f->get_vector(5000))) { ok = false; failed = "unknown ID"; }
+            if (!model.empty()) {  // exact HNSW search equals Flat (no codec: the same distances)
+                const auto qv = vec();
+                SearchOptions exact;
+                exact.strategy = Strategy::ForceExact;
+                const auto hr = h->search(qv, 7, 32, exact), fr = f->search(qv, 7);
+                if (ok && !(hr.size() == std::min<std::size_t>(7, model.size()) && fr.size() == hr.size())) { ok = false; failed = "result count"; }
+                if (ok && q.codec == CodecKind::None && !f->lists_trained() && !same_up_to_ties(hr, fr)) {
+                    ok = false;
+                    failed = "exact HNSW vs Flat:";
+                    for (std::size_t i = 0; i < hr.size(); ++i)
+                        if (hr[i].id != fr[i].id || hr[i].distance != fr[i].distance) {
+                            char buf[160];
+                            std::snprintf(buf, sizeof buf, " [%llu %.9g | %llu %.9g]", (unsigned long long)hr[i].id, double(hr[i].distance), (unsigned long long)fr[i].id, double(fr[i].distance));
+                            failed += buf;
+                        }
+                }
+            }
+            if (ok && h->codec_trained() && !codes_match(*h)) { ok = false; failed = "codes"; }
+            if (ok && f->lists_trained()) {  // every vector in exactly one list
+                std::size_t total = 0;
+                for (std::size_t sz : f->list_sizes()) total += sz;
+                bool listed = total == model.size();
+                for (const auto& [id, v] : model) listed = listed && f->list_of(id).has_value();
+                if (!listed) { ok = false; failed = "inverted lists"; }
+            }
+            if (ok && step % 40 == 39) {
+                const std::string hb = save_bytes(*h), fb = save_bytes(*f);
+                if (!(save_bytes(*load_hnsw(hb)) == hb && save_bytes(*load_flat(fb)) == fb)) { ok = false; failed = "save and load"; }
+            }
+            ++checks_done;
+            if (!ok) where = "seed " + std::to_string(seed) + ", step " + std::to_string(step) + ", after " + name + ": " + failed;
+        }
+        if (!ok) std::printf("    first failure: %s (metric %d, dim %zu, truncate %zu, codec %d, train_after %zu, rerank %d, keep_full %d)\n",
+                             where.c_str(), int(metric), dim, q.truncate_to, int(q.codec), q.train_after, int(q.rerank), int(q.keep_full_vectors));
+        CHECK(ok);
+        h->compact();
+        // Inner product with vector lengths 1,000 times apart leaves some vectors hard
+        // to reach (the long ones dominate every neighborhood): a known limitation of
+        // HNSW with inner product, confirmed absent without such vectors.
+        // Binary codes only, at 6 or 12 dimensions: at most 64 or 4,096 distinct codes,
+        // so many vectors share one and a graph built from codes cannot separate
+        // them (measured: about 200 vectors on 22 to 61 codes). Inherent, documented.
+        const bool binary_codes_only = q.codec == CodecKind::Binary && !h->has_vector_values();
+        if (metric != Metric::InnerProduct && !binary_codes_only) check_graph(*h, 0.9);
+        ++configs;
+    }
+    std::printf("    %ld configurations, %ld random operations, each followed by a full check (%ld)\n", configs, ops, checks_done);
+}
+
+TEST(review, v04_compact_never_changes_stored_vectors) {
+    // Without vectors as given, compact() rebuilds from the stored vectors: they
+    // must come out bit for bit the same (not normalized a second time).
+    auto data = random_vectors(300, 16, 1203);
+    for (std::size_t truncate : {std::size_t(0), std::size_t(6)}) {
+        for (Metric m : {Metric::Cosine, Metric::L2}) {
+            HnswParams p;
+            p.quantization.keep_full_vectors = false;
+            p.quantization.truncate_to = truncate;
+            HnswIndex h(16, m, p);
+            for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+            for (std::uint64_t i = 0; i < 300; i += 3) h.remove(i);
+            std::map<std::uint64_t, std::vector<float>> before;
+            for (std::uint64_t i = 1; i < 300; i += 3) before[i] = *h.get_vector(i);
+            h.compact();
+            h.compact();  // twice: no drift either
+            bool same = h.deleted_count() == 0;
+            for (const auto& [id, v] : before) same = same && *h.get_vector(id) == v;
+            CHECK(same);
+        }
+    }
+}
+
+// ===========================================================================
+// SQ8 keeping only codes: keep_full_vectors off (C1-C8)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams codes_only_q(std::size_t train_after = 200, std::size_t truncate = 0) {
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = train_after;
+    q.keep_full_vectors = false;
+    q.truncate_to = truncate;
+    return q;
+}
+
+HnswParams hnsw_codes_only(std::size_t train_after = 200, std::size_t truncate = 0) {
+    HnswParams p;
+    p.quantization = codes_only_q(train_after, truncate);
+    return p;
+}
+
+}  // namespace
+
+TEST(codes_only, c01_floats_dropped_recall_kept) {
+    auto data = clustered(3000, 32, 12, 1300);
+    auto queries = clustered(50, 32, 12, 1301);
+    for (Metric m : kMetrics) {
+        HnswIndex h(32, m, hnsw_codes_only(500)), plain(32, m);
+        FlatIndex f(32, m, Schema::dynamic(), codes_only_q(500)), exact(32, m);
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            h.add(i, data[i]);
+            plain.add(i, data[i]);
+            f.add(i, data[i]);
+            exact.add(i, data[i]);
+            if (i == 498) CHECK(h.has_vector_values() && f.has_vector_values());  // floats until trained
+        }
+        CHECK(!h.has_vector_values() && !f.has_vector_values() && h.codec_trained());
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(h, exact, queries, 10, 64);
+        double fr = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f.search(q, 10)) fr += double(truth.count(x.id));
+        }
+        fr /= 500.0;
+        std::printf("    metric %d: hnsw floats %.3f, hnsw codes only %.3f | flat codes only %.3f\n", int(m), base, r, fr);
+        CHECK(r >= base - 0.05 && fr >= 0.85);
+        // Vectors read back decoded: within half a step of the stored vector.
+        const auto state = h.codec()->state();
+        bool close = true;
+        for (std::uint64_t i = 0; i < 3000; i += 97) {
+            const auto v = *h.get_vector(i);
+            std::vector<float> stored = data[i];
+            if (m == Metric::Cosine) {
+                double len = 0;
+                for (float x : stored) len += double(x) * x;
+                for (float& x : stored) x = float(x / std::sqrt(len));
+            }
+            for (std::size_t d = 0; d < 32; ++d)
+                close = close && std::abs(v[d] - std::clamp(stored[d], state[d], state[d] + 255 * state[32 + d])) <= state[32 + d] * 0.5f + 1e-5f;
+        }
+        CHECK(close);
+    }
+}
+
+TEST(codes_only, c02_every_path) {
+    auto data = clustered(1600, 16, 8, 1302);
+    HnswIndex h(16, Metric::L2, hnsw_codes_only(200));
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), codes_only_q(200));
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+    }
+    for (std::uint64_t i = 0; i < 400; i += 5) {  // HNSW: free slots; Flat: swap with last
+        h.remove(i);
+        f.remove(i);
+    }
+    for (std::uint64_t i = 1000; i < 1050; ++i) {  // reused slots
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (std::uint64_t i = 1; i < 400; i += 7) {
+        h.update(i, data[i + 1000]);
+        f.update(i, data[i + 1000]);
+    }
+    for (std::uint64_t i = 3; i < 400; i += 11) {
+        h.upsert(i, data[i + 1100]);
+        f.upsert(i, data[i + 1100]);
+    }
+    h.add_batch(id_range(5000, 50), flatten(Vectors(data.begin() + 1500, data.begin() + 1550)), 1);
+    h.add_batch(id_range(6000, 50), flatten(Vectors(data.begin() + 1550, data.begin() + 1600)), 4);
+    f.add_batch(id_range(5000, 50), flatten(Vectors(data.begin() + 1500, data.begin() + 1550)));
+    std::atomic<bool> flag{false};
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 10) flag = true; };
+    CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(7000, 60), flatten(Vectors(data.begin() + 1300, data.begin() + 1360)), 4, o));
+    CHECK(codes_match(h) && codes_match(f) && !h.has_vector_values() && !f.has_vector_values());
+    // Every kind of search works from codes.
+    CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && f.search_by_id(5001, 5)->size() == 5);
+    CHECK(!h.search_range(data[1501], 4.0f).empty() && !f.search_range(data[1501], 4.0f).empty());
+    const auto batch = h.search_batch(flatten(Vectors(data.begin() + 1500, data.begin() + 1505)), 5, 64, 3);
+    bool same = true;
+    for (std::size_t q = 0; q < 5; ++q) same = same && same_results(batch[q], h.search(data[1500 + q], 5, 64));
+    CHECK(same && h.search(data[1520], 1, 64)[0].id == 5020 && f.search(data[1520], 1)[0].id == 5020);
+    const std::size_t live = h.size();
+    h.compact();
+    CHECK(h.size() == live && h.deleted_count() == 0 && !h.has_vector_values() && codes_match(h));
+    check_graph(h, 0.95);
+}
+
+TEST(codes_only, c03_save_and_load) {
+    auto data = clustered(800, 64, 6, 1303);
+    HnswIndex h(64, Metric::Cosine, hnsw_codes_only(100)), floats(64, Metric::Cosine);
+    FlatIndex f(64, Metric::L2, Schema::dynamic(), codes_only_q(100));
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        h.add(i, data[i]);
+        floats.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    auto h2 = load_hnsw(hb);
+    auto f2 = load_flat(fb);
+    CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && !h2->has_vector_values() && !f2->has_vector_values());
+    CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && *h2->get_vector(9) == *h.get_vector(9));
+    // No floats saved: 64 bytes of code per vector instead of 2 x 256 bytes (floats and originals).
+    CHECK(hb.size() + 800 * 400 < save_bytes(floats).size());
+    std::printf("    file sizes: codes only %zu bytes, full precision %zu bytes\n", hb.size(), save_bytes(floats).size());
+}
+
+TEST(codes_only, c04_training_is_final) {
+    auto data = clustered(300, 8, 4, 1304);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(0));  // explicit training only
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), codes_only_q(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(h.has_vector_values() && !h.codec_trained());  // until trained: floats, full precision
+    h.train_codec();
+    f.train_codec();
+    CHECK(!h.has_vector_values() && !f.has_vector_values());
+    const std::string hb = save_bytes(h);
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());  // could only lose precision
+    CHECK_THROWS_AS(std::logic_error, f.train_codec());
+    CHECK(save_bytes(h) == hb);
+}
+
+TEST(codes_only, c05_damaged_and_inconsistent_files) {
+    auto data = random_vectors(30, 4, 1305);
+    HnswIndex h(4, Metric::L2, hnsw_codes_only(10));
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), codes_only_q(10));
+    for (std::uint64_t i = 0; i < 30; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int kind = 0; kind < 2; ++kind) {
+        const std::string bytes = kind == 0 ? save_bytes(h) : save_bytes(f);
+        auto load = [&](const std::string& b) { if (kind == 0) (void)load_hnsw(b); else (void)load_flat(b); };
+        std::size_t rejected = 0, tried = 0;
+        for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+            try { load(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+        }
+        for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+            std::string damaged = bytes;
+            damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+            try { load(damaged); } catch (const FormatError&) { ++rejected; }
+        }
+        CHECK(rejected == tried);
+        // Valid checksums, inconsistent content: a values flag of 2; "no values"
+        // with keep_full_vectors on; "no values" without a trained codec.
+        ParsedFile p2 = ParsedFile::parse(bytes);
+        poke<std::uint8_t>(p2.payload("CONF"), p2.payload("CONF").size() - 1, 2);
+        ParsedFile keep = ParsedFile::parse(bytes);
+        poke<std::uint8_t>(keep.payload("CONF"), keep.payload("CONF").size() - 2, 1);
+        ParsedFile untrained = ParsedFile::parse(bytes);
+        std::string& codc = untrained.payload("CODC");
+        codc.resize(18);  // up to the training flag
+        codc.push_back('\0');  // "not trained"
+        codc.append(8, '\0');  // then the number of PQ parts, which ends the section
+        for (ParsedFile* e : {&p2, &keep, &untrained}) CHECK_THROWS_AS(FormatError, load(e->assemble()));
+    }
+}
+
+TEST(codes_only, c06_searching_while_floats_are_dropped) {
+    auto data = clustered(1500, 8, 6, 1306);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(800));
+    for (std::uint64_t i = 0; i < 500; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "c06", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 500; i < 1500; ++i) h.add(i, data[i]);  // trains and drops floats at 800
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) {
+                check_results(h.search(data[q % 1500], 10, 32), 1500, p);
+                (void)h.get_vector(q % 500);
+                ++q;
+            }
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && !h.has_vector_values() && codes_match(h));
+}
+
+TEST(codes_only, c07_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 4, 1307);
+    HnswIndex h(8, Metric::L2, hnsw_codes_only(0));
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), codes_only_q(0));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    const std::string hb = save_bytes(h), fb = save_bytes(f);
+    // Training is all or nothing: on failure the floats are still there.
+    CHECK(sweep_allocation_failures([&] { h.train_codec(); }, [&] { CHECK(save_bytes(h) == hb && h.has_vector_values()); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!h.has_vector_values() && !f.has_vector_values());
+    const std::string fb2 = save_bytes(f);
+    std::uint64_t id = 900;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == fb2); }) > 0);
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[350]); }, [&] { CHECK(!h.contains(id) && h.size() == 300); }) > 0);
+    CHECK(codes_match(h) && codes_match(f));
+}
+
+TEST(codes_only, c08_with_truncation_and_cosine) {
+    auto data = clustered(1200, 48, 8, 1308);
+    HnswIndex h(48, Metric::Cosine, hnsw_codes_only(300, 16));
+    FlatIndex f(48, Metric::Cosine, Schema::dynamic(), codes_only_q(300, 16));
+    for (std::uint64_t i = 0; i < 1200; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!h.has_vector_values() && h.codec()->dim() == 16 && h.get_vector(5)->size() == 16 && h.storage().originals() == nullptr);
+    CHECK(h.search(data[5], 1, 64)[0].id == 5 && f.search(data[5], 1)[0].id == 5);
+    auto h2 = load_hnsw(save_bytes(h));
+    CHECK(save_bytes(*h2) == save_bytes(h) && h2->indexed_dim() == 16);
+}
+
+// ===========================================================================
+// Phase Q3: binary quantization (B1-B12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams binary_q(std::size_t train_after = 200, bool rerank = true, bool keep_full = true) {
+    QuantizationParams q;
+    q.codec = CodecKind::Binary;
+    q.train_after = train_after;
+    q.rerank = rerank;
+    q.keep_full_vectors = keep_full;
+    return q;
+}
+
+HnswParams hnsw_binary(std::size_t train_after = 200, bool rerank = true, bool keep_full = true) {
+    HnswParams p;
+    p.quantization = binary_q(train_after, rerank, keep_full);
+    return p;
+}
+
+}  // namespace
+
+TEST(binary, b01_code_size_and_bits) {
+    for (std::size_t d : {std::size_t(1), std::size_t(7), std::size_t(8), std::size_t(9), std::size_t(64), std::size_t(100)})
+        CHECK(BinaryCodec(d, Metric::L2).code_size() == (d + 7) / 8);
+    BinaryCodec c(10, Metric::L2);
+    std::vector<float> sample;
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 10; ++j) sample.push_back(float((i % 2 ? 1 : -1) * (j + 1)));  // mean 0 in every dimension
+    c.train(sample);
+    std::uint8_t code[2];
+    c.encode(std::vector<float>{1, -1, 1, -1, 1, -1, 1, -1, 1, 1}, code);
+    CHECK(code[0] == 0x55 && code[1] == 0x03);  // bit j set when above the threshold (0)
+}
+
+TEST(binary, b02_fixed_answer) {
+    // Every CPU must produce exactly these codes (comparisons only) and state.
+    // Expected values computed independently with NumPy float32: thresholds
+    // (2, 2, 4/3), spreads (4/3, 4/3, 20/9).
+    const std::vector<float> sample = {0, 4, -2, 2, 0, 2, 4, 2, 4};  // three vectors of 3
+    BinaryCodec c(3, Metric::L2);
+    c.train(sample);
+    CHECK(c.state() == (std::vector<float>{2, 2, 4.0f / 3.0f, 4.0f / 3.0f, 4.0f / 3.0f, 2.2222223281860352f}));
+    std::uint8_t code[1];
+    c.encode(std::vector<float>{2.5f, 1.0f, 1.5f}, code);
+    CHECK(code[0] == 0x05);
+    float back[3];
+    c.decode(code, back);
+    CHECK(back[0] == 3.3333334922790527f && back[1] == 0.6666666269302368f && back[2] == 3.555555820465088f);
+}
+
+TEST(binary, b03_distances_match_decoded_vectors) {
+    std::mt19937 rng(40);
+    std::normal_distribution<float> nd(0.5f, 1);
+    for (Metric m : kMetrics) {
+        std::vector<float> sample(300 * 20);
+        for (float& x : sample) x = nd(rng);
+        BinaryCodec c(20, m);
+        c.train(sample);
+        std::vector<float> table, back(20);
+        std::vector<std::uint8_t> code(c.code_size());
+        const std::span<const float> q(&sample[0], 20);
+        c.prepare(q, table);
+        bool close = true;
+        for (std::size_t i = 1; i < 300; ++i) {
+            c.encode(std::span<const float>(&sample[i * 20], 20), code.data());
+            c.decode(code.data(), back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 20; ++j)
+                expected += m == Metric::L2 ? double(q[j] - back[j]) * (q[j] - back[j]) : double(q[j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code.data()) - expected) < 1e-4 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(binary, b04_decode_then_encode_is_exact) {
+    // Including a dimension constant in training (spread 0) and a value above it.
+    const std::vector<float> sample = {5, 1, -3, 5, 2, 3, 5, 0, 1};  // dimension 0 is always 5
+    BinaryCodec c(3, Metric::L2);
+    c.train(sample);
+    bool exact = true;
+    for (unsigned bits = 0; bits < 8; ++bits) {
+        const std::uint8_t code = static_cast<std::uint8_t>(bits);
+        std::uint8_t again;
+        float v[3];
+        c.decode(&code, v);
+        c.encode(v, &again);
+        exact = exact && again == code;
+    }
+    std::uint8_t code;
+    c.encode(std::vector<float>{6, 0, 0}, &code);  // above a constant dimension: bit set
+    CHECK(exact && (code & 1u) == 1u);
+}
+
+TEST(binary, b05_rejects_misuse) {
+    BinaryCodec c(4, Metric::L2);
+    std::uint8_t code[1];
+    std::vector<float> table;
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(4, 1.0f), code));
+    CHECK_THROWS_AS(std::logic_error, c.prepare(std::vector<float>(4, 1.0f), table));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{1, 2, kNaN, 4}));
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>(7, 0.0f)));
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>{0, 0, 0, 0, 1, 1, -1, 1}));  // a negative spread
+    CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>{3e38f, 0, 0, 0, 3e38f, 1, 1, 1}));  // overflows
+    c.train(std::vector<float>(8, 1.0f));
+    CHECK_THROWS_AS(std::invalid_argument, c.encode(std::vector<float>(3, 1.0f), code));
+    CHECK(make_codec(CodecKind::Binary, 4, Metric::L2)->kind() == CodecKind::Binary);
+}
+
+TEST(binary, b06_recall) {
+    auto data = clustered(3000, 64, 12, 1400);
+    auto queries = clustered(50, 64, 12, 1401);
+    for (Metric m : kMetrics) {
+        // Binary codes are coarse: re-ranking needs many candidates. Flat re-ranks
+        // k * rerank_factor (16 to 32 recommended for binary, default 4); HNSW
+        // re-ranks its whole beam (ef).
+        QuantizationParams wide = binary_q(500);
+        wide.rerank_factor = 32;
+        HnswIndex plain(64, m), reranked(64, m, hnsw_binary(500)), bits(64, m, hnsw_binary(500, false)), lean(64, m, hnsw_binary(500, true, false));
+        FlatIndex exact(64, m), fr(64, m, Schema::dynamic(), binary_q(500)), fwide(64, m, Schema::dynamic(), wide);
+        for (std::uint64_t i = 0; i < 3000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            bits.add(i, data[i]);
+            lean.add(i, data[i]);
+            exact.add(i, data[i]);
+            fr.add(i, data[i]);
+            fwide.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(reranked, exact, queries, 10, 64);
+        const double r_wide = recall(reranked, exact, queries, 10, 400);
+        const double b = recall(bits, exact, queries, 10, 64), l = recall(lean, exact, queries, 10, 64);
+        double f = 0, fw = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : fr.search(q, 10)) f += double(truth.count(x.id));
+            for (const auto& x : fwide.search(q, 10)) fw += double(truth.count(x.id));
+        }
+        f /= 500.0;
+        fw /= 500.0;
+        std::printf("    metric %d: hnsw %.3f | binary + re-rank: ef 64 %.3f, ef 400 %.3f; bits only %.3f, codes only %.3f | flat: re-rank x4 %.3f, x32 %.3f\n",
+                    int(m), base, r, r_wide, b, l, f, fw);
+        CHECK(!lean.has_vector_values() && lean.get_code(1)->size() == 8);
+        CHECK(fw >= 0.95 && r_wide > r && r >= 0.65 && f >= 0.35 && b >= 0.30 && l >= 0.30);
+    }
+}
+
+TEST(binary, b07_every_path) {
+    auto data = clustered(1500, 24, 6, 1402);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::L2, hnsw_binary(200, true, keep_full));
+        FlatIndex f(24, Metric::L2, Schema::dynamic(), binary_q(200, true, keep_full));
+        for (std::uint64_t i = 0; i < 400; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 0; i < 400; i += 5) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 400; i += 7) {
+            h.update(i, data[i + 1000]);
+            f.update(i, data[i + 1000]);
+        }
+        h.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)), 4);
+        f.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)));
+        CHECK(codes_match(h) && codes_match(f) && h.has_vector_values() == keep_full);
+        h.compact();
+        CHECK(codes_match(h) && h.deleted_count() == 0);
+        check_graph(h, 0.9);
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && !f.search_range(data[1401], 50.0f).empty());
+    }
+}
+
+TEST(binary, b08_save_and_load) {
+    auto data = clustered(500, 32, 6, 1403);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(32, Metric::Cosine, hnsw_binary(100, true, keep_full));
+        FlatIndex f(32, Metric::InnerProduct, Schema::dynamic(), binary_q(100, true, keep_full));
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && h2->codec()->kind() == CodecKind::Binary);
+        CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && same_results(f2->search(data[3], 10), f.search(data[3], 10)));
+    }
+}
+
+TEST(binary, b09_damaged_files) {
+    auto data = random_vectors(16, 5, 1404);
+    HnswIndex h(5, Metric::L2, hnsw_binary(5, true, false));
+    for (std::uint64_t i = 0; i < 16; ++i) h.add(i, data[i]);
+    const std::string bytes = save_bytes(h);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_hnsw(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_hnsw(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // A negative spread behind a valid checksum. CODC: codec (1), train_after (8),
+    // rerank (1), factor (8), trained (1), state size (8), thresholds (5 x 4), spreads.
+    ParsedFile p = ParsedFile::parse(bytes);
+    poke<float>(p.payload("CODC"), 27 + 20, -1.0f);
+    CHECK_THROWS_AS(FormatError, load_hnsw(p.assemble()));
+}
+
+TEST(binary, b10_with_truncation) {
+    auto data = clustered(1000, 64, 8, 1405);
+    HnswParams p = hnsw_binary(200);
+    p.quantization.truncate_to = 32;
+    HnswIndex h(64, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    CHECK(h.codec()->dim() == 32 && h.get_code(1)->size() == 4 && h.search(data[9], 1, 64)[0].id == 9 && *h.get_vector(9) == data[9]);
+}
+
+TEST(binary, b11_training_is_final_with_codes_only) {
+    auto data = clustered(300, 16, 4, 1406);
+    HnswIndex h(16, Metric::L2, hnsw_binary(0, true, false));
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i]);
+    h.train_codec();
+    CHECK(!h.has_vector_values());
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());
+}
+
+TEST(binary, b12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 16, 4, 1407);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), binary_q(0, true, false));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!f.has_vector_values() && codes_match(f));
+}
+
+// ===========================================================================
+// Phase Q4: product quantization (PQ1-PQ12)
+// ===========================================================================
+
+namespace {
+
+QuantizationParams pq_q(std::size_t train_after = 300, std::size_t parts = 0, bool keep_full = true, std::size_t factor = 4) {
+    QuantizationParams q;
+    q.codec = CodecKind::PQ;
+    q.train_after = train_after;
+    q.pq_subspaces = parts;
+    q.keep_full_vectors = keep_full;
+    q.rerank_factor = factor;
+    return q;
+}
+
+HnswParams hnsw_pq(std::size_t train_after = 300, std::size_t parts = 0, bool keep_full = true) {
+    HnswParams p;
+    p.quantization = pq_q(train_after, parts, keep_full);
+    return p;
+}
+
+}  // namespace
+
+TEST(pq, pq01_parts_and_code_size) {
+    CHECK(PQCodec(64, Metric::L2).parts() == 8 && PQCodec(64, Metric::L2).code_size() == 8);  // one per 8 dimensions
+    CHECK(PQCodec(5, Metric::L2).parts() == 1 && PQCodec(24, Metric::L2, 5).code_size() == 5);  // uneven: 5, 5, 5, 5, 4
+    CHECK_THROWS_AS(std::invalid_argument, PQCodec(4, Metric::L2, 5));
+    CHECK(make_codec(CodecKind::PQ, 16, Metric::L2, 4)->code_size() == 4);
+    HnswParams too_many = hnsw_pq(10, 9);
+    CHECK_THROWS_AS(std::invalid_argument, HnswIndex(8, Metric::L2, too_many));
+}
+
+TEST(pq, pq02_few_vectors_are_stored_exactly) {
+    // Fewer training vectors than 256: one centroid per vector, so each decodes exactly.
+    std::vector<float> sample = {1, 2, 3, 4, 5, 6, -1, 0, 7, 7, 7, 7, 0, 0, 0, 0, 9, -9, 2, 3};  // 5 vectors of 4
+    PQCodec c(4, Metric::L2, 2);
+    c.train(sample);
+    CHECK(c.centroids() == 5 && c.state().size() == 1 + 5 * 4);
+    bool exact = true;
+    for (std::size_t i = 0; i < 5; ++i) {
+        std::uint8_t code[2];
+        float back[4];
+        c.encode(std::span<const float>(&sample[i * 4], 4), code);
+        c.decode(code, back);
+        exact = exact && std::equal(back, back + 4, &sample[i * 4]);
+    }
+    CHECK(exact);
+}
+
+TEST(pq, pq03_distances_match_decoded_vectors) {
+    auto data = clustered(600, 24, 6, 1500);
+    for (Metric m : kMetrics) {
+        PQCodec c(24, m, 6);
+        c.train(flatten(data));
+        std::vector<float> table, back(24);
+        std::uint8_t code[6];
+        c.prepare(data[0], table);
+        bool close = true;
+        for (std::size_t i = 1; i < 600; i += 7) {
+            c.encode(data[i], code);
+            c.decode(code, back);
+            double expected = 0;
+            for (std::size_t j = 0; j < 24; ++j)
+                expected += m == Metric::L2 ? double(data[0][j] - back[j]) * (data[0][j] - back[j]) : double(data[0][j]) * back[j];
+            if (m == Metric::InnerProduct) expected = -expected;
+            if (m == Metric::Cosine) expected = 1.0 - expected;
+            close = close && std::abs(c.distance(table, code) - expected) < 1e-3 * (1 + std::abs(expected));
+        }
+        CHECK(close);
+    }
+}
+
+TEST(pq, pq04_decode_then_encode_is_exact) {
+    // Including duplicate centroids (many identical training vectors).
+    std::vector<float> sample;
+    for (int i = 0; i < 300; ++i)
+        for (int j = 0; j < 8; ++j) sample.push_back(float((i % 3) * 10 + j % 2));  // 3 distinct vectors only
+    PQCodec c(8, Metric::L2, 4);
+    c.train(sample);
+    bool exact = true;
+    std::vector<float> back(8);
+    for (std::size_t i = 0; i < 300; ++i) {
+        std::uint8_t code[4], again[4];
+        c.encode(std::span<const float>(&sample[i * 8], 8), code);
+        c.decode(code, back);
+        c.encode(back, again);
+        exact = exact && std::equal(code, code + 4, again) && std::equal(back.begin(), back.end(), &sample[i * 8]);
+    }
+    CHECK(exact);
+}
+
+TEST(pq, pq05_rejects_misuse) {
+    PQCodec c(8, Metric::L2, 2);
+    std::uint8_t code[2] = {0, 0};
+    std::vector<float> table, out(8);
+    CHECK_THROWS_AS(std::logic_error, c.encode(std::vector<float>(8, 1.0f), code));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>{}));
+    CHECK_THROWS_AS(std::invalid_argument, c.train(std::vector<float>(7, 1.0f)));
+    for (const std::vector<float>& bad : {std::vector<float>{0}, std::vector<float>{257}, std::vector<float>{1.5f},
+                                          std::vector<float>{2, 1, 1, 1, 1, 1, 1, 1, 1}, std::vector<float>{1, 0, 0, 0, kNaN, 0, 0, 0, 0}})
+        CHECK_THROWS_AS(std::invalid_argument, c.restore(bad));
+    c.restore(std::vector<float>{1, 0, 0, 0, 0, 1, 1, 1, 1});  // one centroid per part
+    code[1] = 3;  // no centroid 3
+    CHECK_THROWS_AS(std::invalid_argument, c.decode(code, out));
+}
+
+TEST(pq, pq06_recall) {
+    auto data = clustered(4000, 64, 16, 1501);
+    auto queries = clustered(50, 64, 16, 1502);
+    for (Metric m : kMetrics) {
+        HnswIndex plain(64, m), reranked(64, m, hnsw_pq(1000)), lean(64, m, hnsw_pq(1000, 0, false));
+        FlatIndex exact(64, m), f4(64, m, Schema::dynamic(), pq_q(1000)), f16(64, m, Schema::dynamic(), pq_q(1000, 0, true, 16));
+        for (std::uint64_t i = 0; i < 4000; ++i) {
+            plain.add(i, data[i]);
+            reranked.add(i, data[i]);
+            lean.add(i, data[i]);
+            exact.add(i, data[i]);
+            f4.add(i, data[i]);
+            f16.add(i, data[i]);
+        }
+        const double base = recall(plain, exact, queries, 10, 64), r = recall(reranked, exact, queries, 10, 64);
+        const double r_wide = recall(reranked, exact, queries, 10, 200), l = recall(lean, exact, queries, 10, 64);
+        double a = 0, b = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f4.search(q, 10)) a += double(truth.count(x.id));
+            for (const auto& x : f16.search(q, 10)) b += double(truth.count(x.id));
+        }
+        a /= 500.0;
+        b /= 500.0;
+        std::printf("    metric %d: hnsw %.3f | pq + re-rank: ef 64 %.3f, ef 200 %.3f; codes only %.3f | flat: re-rank x4 %.3f, x16 %.3f\n",
+                    int(m), base, r, r_wide, l, a, b);
+        CHECK(!lean.has_vector_values() && lean.get_code(1)->size() == 8);
+        // Measured on this synthetic data (8 dimensions per part): like binary codes,
+        // PQ needs a generous re-ranking budget; on its own it is coarse.
+        CHECK(r_wide >= 0.88 && r_wide > r && r >= 0.60 && b >= 0.85 && a >= 0.55 && l >= 0.25);
+    }
+}
+
+TEST(pq, pq07_every_path) {
+    auto data = clustered(1500, 24, 6, 1503);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::L2, hnsw_pq(300, 6, keep_full));
+        FlatIndex f(24, Metric::L2, Schema::dynamic(), pq_q(300, 6, keep_full));
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 0; i < 500; i += 5) {
+            h.remove(i);
+            f.remove(i);
+        }
+        for (std::uint64_t i = 1000; i < 1050; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        for (std::uint64_t i = 1; i < 500; i += 7) {
+            h.update(i, data[i + 900]);
+            f.update(i, data[i + 900]);
+        }
+        h.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)), 4);
+        f.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)));
+        CHECK(codes_match(h) && codes_match(f) && h.has_vector_values() == keep_full);
+        h.compact();
+        CHECK(codes_match(h) && h.deleted_count() == 0);
+        if (keep_full) check_graph(h, 0.9);
+        CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && !f.search_range(data[1401], 50.0f).empty());
+    }
+}
+
+TEST(pq, pq08_save_and_load) {
+    auto data = clustered(600, 24, 6, 1504);
+    for (bool keep_full : {true, false}) {
+        HnswIndex h(24, Metric::Cosine, hnsw_pq(300, 5, keep_full));  // 5 uneven parts
+        FlatIndex f(24, Metric::InnerProduct, Schema::dynamic(), pq_q(300, 5, keep_full));
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        auto h2 = load_hnsw(hb);
+        auto f2 = load_flat(fb);
+        CHECK(save_bytes(*h2) == hb && save_bytes(*f2) == fb && h2->params().quantization.pq_subspaces == 5 && h2->codec()->code_size() == 5);
+        CHECK(same_results(h2->search(data[3], 10, 64), h.search(data[3], 10, 64)) && same_results(f2->search(data[3], 10), f.search(data[3], 10)));
+    }
+    HnswIndex untrained(24, Metric::L2, hnsw_pq(10000, 3));  // the number of parts is kept even before training
+    untrained.add(1, data[1]);
+    CHECK(load_hnsw(save_bytes(untrained))->params().quantization.pq_subspaces == 3);
+}
+
+TEST(pq, pq09_damaged_and_invalid_files) {
+    auto data = random_vectors(30, 6, 1505);
+    HnswIndex h(6, Metric::L2, hnsw_pq(10, 3, false));
+    for (std::uint64_t i = 0; i < 30; ++i) h.add(i, data[i]);
+    const std::string bytes = save_bytes(h);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_hnsw(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_hnsw(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // Valid checksums, invalid content: more parts than dimensions (the last 8
+    // bytes of CODC), and a code naming a centroid that does not exist (10 here).
+    ParsedFile parts = ParsedFile::parse(bytes);
+    poke<std::uint64_t>(parts.payload("CODC"), parts.payload("CODC").size() - 8, 7);
+    ParsedFile code = ParsedFile::parse(bytes);
+    std::string& codc = code.payload("CODC");
+    codc[codc.size() - 9] = char(200);  // the last code byte, just before the number of parts
+    for (ParsedFile* e : {&parts, &code}) CHECK_THROWS_AS(FormatError, load_hnsw(e->assemble()));
+}
+
+TEST(pq, pq10_with_truncation) {
+    auto data = clustered(1000, 64, 8, 1506);
+    HnswParams p = hnsw_pq(300, 4);
+    p.quantization.truncate_to = 32;
+    HnswIndex h(64, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    CHECK(h.codec()->dim() == 32 && h.get_code(1)->size() == 4 && h.search(data[9], 1, 64)[0].id == 9 && *h.get_vector(9) == data[9]);
+}
+
+TEST(pq, pq11_training_is_final_with_codes_only) {
+    auto data = clustered(400, 16, 4, 1507);
+    HnswIndex h(16, Metric::L2, hnsw_pq(0, 4, false));
+    for (std::uint64_t i = 0; i < 400; ++i) h.add(i, data[i]);
+    h.train_codec();
+    CHECK(!h.has_vector_values());
+    CHECK_THROWS_AS(std::logic_error, h.train_codec());
+}
+
+TEST(pq, pq12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(300, 16, 4, 1508);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), pq_q(0, 4, false));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string fb = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_codec(); }, [&] { CHECK(save_bytes(f) == fb && f.has_vector_values()); }) > 0);
+    CHECK(!f.has_vector_values() && codes_match(f));
+}
+
+// ===========================================================================
+// Phase Q5: IVF, an inverted file for FlatIndex (I1-I12)
+// ===========================================================================
+
+namespace {
+
+IvfParams ivf_p(std::size_t lists, std::size_t probes = 4, std::size_t train_after = 0) {
+    IvfParams p;
+    p.lists = lists;
+    p.probes = probes;
+    p.train_after = train_after;
+    return p;
+}
+
+/// The lists hold every vector exactly once; and, when full vectors are kept,
+/// every vector searched with a single probe finds itself (or an identical copy)
+/// first: it sits in the list nearest to it. With codes only, a vector added after
+/// training is placed by its true vector, whose nearest list can differ from its
+/// decoded one's, so only the bookkeeping is checked.
+bool lists_consistent(const FlatIndex& f) {
+    if (!f.lists_trained()) return false;
+    std::size_t total = 0;
+    for (std::size_t s : f.list_sizes()) total += s;
+    if (total != f.size()) return false;
+    ScanOptions ids;
+    ids.limit = 1000000;
+    ids.with_vectors = false;
+    ids.with_metadata = false;
+    std::vector<std::size_t> counted(f.list_sizes().size(), 0);
+    for (const Record& r : f.scan(ids).records) {
+        const auto l = f.list_of(r.id);
+        if (!l || *l >= counted.size()) return false;
+        ++counted[*l];
+    }
+    if (counted != f.list_sizes()) return false;
+    if (!f.has_vector_values()) return true;
+    SearchOptions one;
+    one.probes = 1;
+    ScanOptions all;
+    all.limit = 1000000;
+    for (const Record& r : f.scan(all).records) {
+        auto in = r.vector;
+        in.resize(f.dim(), 0.0f);  // truncating indexes read back the indexed values only
+        const auto top = f.search(in, 1, one);
+        if (top.empty() || (top[0].id != r.id && top[0].distance > 1e-5f)) return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(ivf, i01_untrained_scans_everything) {
+    auto data = clustered(800, 16, 8, 1600);
+    FlatIndex plain(16, Metric::L2), f(16, Metric::L2, Schema::dynamic(), {}, ivf_p(16));
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        plain.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    CHECK(!f.lists_trained() && !f.list_of(1) && f.list_sizes().empty());
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) same = same && same_results(f.search(data[q], 10), plain.search(data[q], 10));
+    CHECK(same);
+}
+
+TEST(ivf, i02_training) {
+    auto data = clustered(600, 8, 6, 1601);
+    FlatIndex none(8, Metric::L2), autof(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 2, 300)), f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 2, 0));
+    CHECK_THROWS_AS(std::logic_error, none.train_lists());
+    for (std::uint64_t i = 0; i < 5; ++i) f.add(i, data[i]);
+    CHECK_THROWS_AS(std::invalid_argument, f.train_lists());  // fewer vectors than lists
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        autof.add(i, data[i]);
+        if (i == 298) CHECK(!autof.lists_trained());
+    }
+    CHECK(autof.lists_trained() && autof.list_sizes().size() == 10 && lists_consistent(autof));  // trained at 300
+    for (std::uint64_t i = 5; i < 600; ++i) f.add(i, data[i]);
+    CHECK(!f.lists_trained());  // 0: only explicitly
+    f.train_lists();
+    CHECK(lists_consistent(f));
+    f.train_lists();  // again: replaces the lists
+    CHECK(lists_consistent(f));
+    CHECK_THROWS_AS(std::invalid_argument, FlatIndex(8, Metric::L2, Schema::dynamic(), {}, ivf_p(10, 0)));
+}
+
+TEST(ivf, i03_probing_every_list_is_exact) {
+    auto data = clustered(1500, 24, 10, 1602);
+    for (Metric m : kMetrics) {
+        FlatIndex exact(24, m), f(24, m, Schema::dynamic(), {}, ivf_p(20, 20, 0));
+        for (std::uint64_t i = 0; i < 1500; ++i) {
+            exact.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        f.train_lists();
+        bool same = true;
+        for (std::size_t q = 0; q < 20; ++q) same = same && same_up_to_ties(f.search(data[q * 7], 10), exact.search(data[q * 7], 10));
+        CHECK(same);
+    }
+}
+
+TEST(ivf, i04_recall_rises_with_probes) {
+    auto data = clustered(5000, 32, 40, 1603);
+    auto queries = clustered(60, 32, 40, 1604);
+    FlatIndex exact(32, Metric::L2), f(32, Metric::L2, Schema::dynamic(), {}, ivf_p(64, 1, 0));
+    for (std::uint64_t i = 0; i < 5000; ++i) {
+        exact.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    f.train_lists();
+    std::vector<double> r;
+    for (std::size_t probes : {std::size_t(1), std::size_t(4), std::size_t(16), std::size_t(64)}) {
+        SearchOptions o;
+        o.probes = probes;
+        SearchStats st;
+        o.stats = &st;
+        double hit = 0, visited = 0;
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> truth;
+            for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+            for (const auto& x : f.search(q, 10, o)) hit += double(truth.count(x.id));
+            visited += double(st.nodes_visited);
+        }
+        r.push_back(hit / 600.0);
+        std::printf("    probes %2zu: recall %.3f, vectors scanned %.0f of 5000\n", probes, hit / 600.0, visited / 60.0);
+    }
+    // Measured on this noisy synthetic data: recall rises with probes, and probing
+    // every list is exact.
+    CHECK(r[0] < r[1] && r[1] < r[2] && r[2] < r[3] && r[3] == 1.0 && r[2] >= 0.75);
+}
+
+TEST(ivf, i05_every_path_keeps_the_lists) {
+    auto data = clustered(1500, 12, 8, 1605);
+    FlatIndex f(12, Metric::L2, Schema::dynamic(), {}, ivf_p(12, 2, 200));
+    for (std::uint64_t i = 0; i < 500; ++i) f.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 500; i += 4) f.remove(i);  // swap with last
+    for (std::uint64_t i = 1; i < 500; i += 5) f.update(i, data[1499 - i]);  // possibly another list
+    for (std::uint64_t i = 2; i < 500; i += 9) f.upsert(i, data[1000 + i]);
+    f.add_batch(id_range(5000, 100), flatten(Vectors(data.begin() + 1300, data.begin() + 1400)));
+    CHECK(lists_consistent(f));
+    std::vector<Metadata> meta(50);
+    std::atomic<bool> flag{false};
+    OperationOptions o;
+    o.cancel = &flag;
+    o.progress = [&](std::size_t done, std::size_t) { if (done > 20) flag = true; };
+    CHECK_THROWS_AS(Cancelled, f.add_batch(id_range(7000, 50), flatten(Vectors(data.begin() + 1200, data.begin() + 1250)), meta, 0, o));
+    CHECK(lists_consistent(f));
+    CHECK(f.remove_where(Filter::eq("category", "tech")) > 0 && lists_consistent(f));
+    f.compact();
+    CHECK(lists_consistent(f));
+}
+
+TEST(ivf, i06_ivf_pq) {
+    auto data = clustered(4000, 64, 32, 1606);
+    auto queries = clustered(50, 64, 32, 1607);
+    QuantizationParams pq;
+    pq.codec = CodecKind::PQ;
+    pq.train_after = 1000;
+    pq.rerank_factor = 16;
+    FlatIndex exact(64, Metric::L2), f(64, Metric::L2, Schema::dynamic(), pq, ivf_p(32, 8, 1000));
+    QuantizationParams lean_q = pq;
+    lean_q.keep_full_vectors = false;
+    FlatIndex lean(64, Metric::L2, Schema::dynamic(), lean_q, ivf_p(32, 8, 1000));
+    for (std::uint64_t i = 0; i < 4000; ++i) {
+        exact.add(i, data[i]);
+        f.add(i, data[i]);
+        lean.add(i, data[i]);
+    }
+    CHECK(f.lists_trained() && f.codec_trained() && lean.lists_trained() && !lean.has_vector_values() && lists_consistent(lean));
+    double a = 0, all = 0, b = 0;
+    SearchOptions every;
+    every.probes = 32;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+        for (const auto& x : f.search(q, 10)) a += double(truth.count(x.id));
+        for (const auto& x : f.search(q, 10, every)) all += double(truth.count(x.id));
+        for (const auto& x : lean.search(q, 10)) b += double(truth.count(x.id));
+    }
+    std::printf("    IVF-PQ (32 lists): re-ranked, 8 probes %.3f, all 32 probes %.3f; codes only, 8 probes %.3f\n", a / 500.0, all / 500.0, b / 500.0);
+    // Two approximations stack: the probed lists, then the codes (re-ranked).
+    CHECK(all / 500.0 >= 0.85 && all >= a && a / 500.0 >= 0.45 && b / 500.0 >= 0.20);
+}
+
+TEST(ivf, i07_filters_predicates_and_k) {
+    auto data = clustered(2000, 16, 20, 1608);
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), {}, ivf_p(32, 1, 0));
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(i, data[i], meta_for(i));
+    f.train_lists();
+    // A selective filter: one probe holds too few matches, so more lists are probed: never fewer than k results.
+    const auto r = f.search(data[0], 10, with_filter(Filter::eq("category", "tech")));
+    bool ok = r.size() == 10;
+    for (const auto& x : r) ok = ok && x.id % 5 == 2;
+    SearchOptions odd;
+    odd.predicate = [](std::uint64_t id) { return id % 97 == 3; };  // about 20 vectors in total
+    const auto p = f.search(data[0], 15, odd);
+    ok = ok && p.size() == 15;
+    for (const auto& x : p) ok = ok && x.id % 97 == 3;
+    CHECK(ok && f.search(data[0], 5000).size() == 2000);  // more than exists: everything
+    SearchStats st;
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.probes = 32;
+    late.stats = &st;
+    (void)f.search(data[0], 10, late);
+    CHECK(st.stopped_early && st.nodes_visited < 2000);
+}
+
+TEST(ivf, i08_batch_and_range) {
+    auto data = clustered(1000, 16, 10, 1609);
+    FlatIndex f(16, Metric::Cosine, Schema::dynamic(), {}, ivf_p(10, 3, 0)), exact(16, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 1000; ++i) {
+        f.add(i, data[i]);
+        exact.add(i, data[i]);
+    }
+    f.train_lists();
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 12));
+    const auto batch = f.search_batch(queries, 8, 4);
+    bool same = true;
+    for (std::size_t q = 0; q < 12; ++q) same = same && same_results(batch[q], f.search(data[q], 8));
+    CHECK(same && same_results(f.search_range(data[3], 0.05f), exact.search_range(data[3], 0.05f)));  // range: exact
+}
+
+TEST(ivf, i09_save_and_load) {
+    auto data = clustered(700, 12, 8, 1610);
+    for (bool trained : {false, true}) {
+        FlatIndex f(12, Metric::InnerProduct, Schema::dynamic(), {}, ivf_p(9, 3, trained ? 100 : 0));
+        for (std::uint64_t i = 0; i < 700; ++i) f.add(i, data[i]);
+        f.remove(5);
+        const std::string bytes = save_bytes(f);
+        auto f2 = load_flat(bytes);
+        CHECK(save_bytes(*f2) == bytes && f2->lists_trained() == trained && f2->ivf().lists == 9 && f2->ivf().probes == 3);
+        CHECK(same_results(f2->search(data[1], 10), f.search(data[1], 10)));
+        if (trained) CHECK(f2->list_sizes() == f.list_sizes() && lists_consistent(*f2));
+    }
+}
+
+TEST(ivf, i10_damaged_and_invalid_files) {
+    auto data = random_vectors(40, 4, 1611);
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_p(3, 2, 0));
+    for (std::uint64_t i = 0; i < 40; ++i) f.add(i, data[i]);
+    f.train_lists();
+    const std::string bytes = save_bytes(f);
+    std::size_t rejected = 0, tried = 0;
+    for (std::size_t len = 0; len < bytes.size(); ++len, ++tried) {
+        try { (void)load_flat(bytes.substr(0, len)); } catch (const FormatError&) { ++rejected; }
+    }
+    for (std::size_t i = 0; i < bytes.size(); ++i, ++tried) {
+        std::string damaged = bytes;
+        damaged[i] = char(damaged[i] ^ (1 << (i % 8)));
+        try { (void)load_flat(damaged); } catch (const FormatError&) { ++rejected; }
+    }
+    CHECK(rejected == tried);
+    // IVFL: lists (8), probes (8), train_after (8), trained (1), trained lists (8), centroids (3 x 4 x 4), list numbers.
+    const ParsedFile base = ParsedFile::parse(bytes);
+    const std::vector<std::function<void(std::string&)>> edits = {
+        [](std::string& p) { poke<std::uint64_t>(p, 8, 0); },                // probes 0
+        [](std::string& p) { poke<std::uint8_t>(p, 24, 2); },                // training flag 2
+        [](std::string& p) { poke<std::uint64_t>(p, 25, 0); },               // no trained lists
+        [](std::string& p) { poke<std::uint64_t>(p, 25, 4); },               // more trained lists than configured
+        [](std::string& p) { poke<float>(p, 33 + 4, kNaN); },                // a centroid that is not finite
+        [](std::string& p) { poke<std::uint32_t>(p, p.size() - 4, 3); },     // a vector in list 3 of 3
+        [](std::string& p) { p.resize(p.size() - 4); },                      // one list number missing
+    };
+    for (const auto& edit : edits) {
+        ParsedFile e = base;
+        edit(e.payload("IVFL"));
+        CHECK_THROWS_AS(FormatError, load_flat(e.assemble()));
+    }
+}
+
+TEST(ivf, i11_searching_while_lists_are_trained) {
+    auto data = clustered(1500, 8, 10, 1612);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(16, 4, 800));
+    for (std::uint64_t i = 0; i < 400; ++i) f.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    Problems p;
+    with_watchdog(120, "i11", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 400; i < 1500; ++i) f.add(i, data[i]);  // trains the lists at 800
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::size_t q = t;
+            while (!stop) check_results(f.search(data[q++ % 1500], 10), 1500, p);
+        });
+        writer.join();
+    });
+    CHECK(p.total() == 0 && lists_consistent(f));
+}
+
+TEST(ivf, i12_out_of_memory) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = clustered(400, 8, 6, 1613);
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf_p(8, 2, 0));
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    const std::string untrained = save_bytes(f);
+    CHECK(sweep_allocation_failures([&] { f.train_lists(); }, [&] { CHECK(save_bytes(f) == untrained && !f.lists_trained()); }) > 0);
+    const std::string trained = save_bytes(f);
+    std::uint64_t id = 900;
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[350]); }, [&] { CHECK(save_bytes(f) == trained); }) > 0);
+    CHECK(sweep_allocation_failures([&] { (void)f.update(3, data[360]); }, [&] { CHECK(lists_consistent(f)); }) >= 0);
+    CHECK(lists_consistent(f) && f.contains(900));
+}
+
+// ===========================================================================
+// Edge cases across SIMD kernels, PQ and IVF (E1-E8)
+// ===========================================================================
+
+namespace {
+IvfParams ivf_e(std::size_t lists, std::size_t probes) {
+    IvfParams p;
+    p.lists = lists;
+    p.probes = probes;
+    p.train_after = 0;
+    return p;
+}
+std::size_t total_listed(const FlatIndex& f) {
+    std::size_t t = 0;
+    for (std::size_t s : f.list_sizes()) t += s;
+    return t;
+}
+}  // namespace
+
+TEST(edges, e01_ivf_list_counts) {
+    auto data = random_vectors(60, 4, 1700);
+    FlatIndex one(4, Metric::L2, Schema::dynamic(), {}, ivf_e(1, 1)), exact(4, Metric::L2), many(4, Metric::L2, Schema::dynamic(), {}, ivf_e(4, 100));
+    for (std::uint64_t i = 0; i < 60; ++i) {
+        one.add(i, data[i]);
+        exact.add(i, data[i]);
+        many.add(i, data[i]);
+    }
+    one.train_lists();
+    many.train_lists();
+    CHECK(same_up_to_ties(one.search(data[7], 5), exact.search(data[7], 5)));  // one list: an exact scan
+    CHECK(many.search(data[7], 5).size() == 5 && one.search(data[7], 0).empty());  // probes beyond lists; k = 0
+}
+
+TEST(edges, e02_ivf_emptied_and_refilled) {
+    auto data = random_vectors(40, 4, 1701);
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_e(4, 2));
+    for (std::uint64_t i = 0; i < 20; ++i) f.add(i, data[i]);
+    f.train_lists();
+    for (std::uint64_t i = 0; i < 20; ++i) f.remove(i);
+    CHECK(f.search(data[0], 5).empty() && total_listed(f) == 0 && f.lists_trained());
+    for (std::uint64_t i = 20; i < 40; ++i) f.add(i, data[i]);
+    CHECK(total_listed(f) == 20 && f.search(data[25], 30).size() == 20 && f.search(data[25], 1)[0].id == 25);
+}
+
+TEST(edges, e03_ivf_unmatched_filter_and_duplicates) {
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf_e(5, 1));
+    for (std::uint64_t i = 0; i < 30; ++i) f.add(i, std::vector<float>(4, 2.0f), Metadata().set("c", "a"));  // identical vectors
+    f.train_lists();
+    CHECK(f.search(std::vector<float>(4, 2.0f), 30).size() == 30);
+    CHECK(f.search(std::vector<float>(4, 2.0f), 5, with_filter(Filter::eq("c", "zzz"))).empty());  // every list probed, none match
+}
+
+TEST(edges, e04_ivf_with_other_features) {
+    auto data = random_vectors(60, 6, 1702);
+    QuantizationParams q;
+    q.truncate_to = 2;
+    FlatIndex f(6, Metric::Cosine, Schema::dynamic(), q, ivf_e(3, 1));
+    for (std::uint64_t i = 0; i < 30; ++i) f.add(i, data[i], Metadata().set("c", i % 2 ? "a" : "b"));
+    f.add(99, std::vector<float>(6, 0.0f));  // a zero vector, before and after training
+    f.train_lists();
+    f.add(98, std::vector<float>(6, 0.0f));
+    CHECK(f.search(data[3], 40).size() == 32);
+    CHECK(f.remove_batch(std::vector<std::uint64_t>{1, 2, 3, 4}) == 4 && f.set_metadata_where(Filter::eq("c", "a"), Metadata().set("x", 1)) > 0);
+    CHECK(total_listed(f) == 28);
+    auto g = load_flat(save_bytes(f));  // and keep adding after loading
+    for (std::uint64_t i = 30; i < 60; ++i) g->add(i, data[i]);
+    CHECK(total_listed(*g) == 58);
+}
+
+TEST(edges, e05_pq_extremes) {
+    auto data = random_vectors(50, 6, 1703);
+    PQCodec per_dim(6, Metric::L2, 6);  // one dimension per part
+    per_dim.train(flatten(data));
+    std::uint8_t code[6];
+    per_dim.encode(data[0], code);
+    PQCodec single(8, Metric::L2, 2);  // trained on one vector: one centroid per part
+    single.train(random_vectors(1, 8, 1704)[0]);
+    std::uint8_t c2[2];
+    single.encode(data[1].size() == 6 ? std::vector<float>(8, 1.0f) : data[1], c2);
+    CHECK(per_dim.code_size() == 6 && single.centroids() == 1 && c2[0] == 0 && c2[1] == 0 && PQCodec(3, Metric::L2).parts() == 1);
+}
+
+TEST(edges, e06_codecs_with_huge_ranges) {
+    // Values spanning more than the float range: max - min overflows a float.
+    const std::vector<float> sample = {-3e38f, 0, 3e38f, 1};
+    SQ8Codec sq8(2, Metric::L2);
+    sq8.train(sample);
+    std::uint8_t code[2];
+    sq8.encode(std::vector<float>{1e38f, 0.5f}, code);  // 1e38 - (-3e38) also overflows a float
+    float back[2];
+    sq8.decode(code, back);
+    CHECK(std::isfinite(back[0]) && std::abs(back[0] - 1e38f) <= sq8.step()[0] * 0.5f + 1e33f && code[0] > 100 && code[0] < 255);
+    BinaryCodec bin(2, Metric::L2);
+    bin.train(sample);
+    PQCodec pq(2, Metric::L2, 1);
+    pq.train(std::vector<float>{-3e38f, 0, 3e38f, 1, 0, 0});
+    CHECK(bin.trained() && pq.trained());
+    // Automatic training must not fail silently on such data.
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 10;
+    HnswIndex h(2, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, std::vector<float>{i % 2 ? 3e38f : -3e38f, float(i)});
+    CHECK(h.codec_trained());
+}
+
+TEST(edges, e07_kernel_tails) {
+    const auto k = get_code_kernels();
+    std::vector<float> w(13, 1.0f), t(13, 1.0f), s(13, 0.0f);
+    std::uint8_t bits[2] = {0xFF, 0x1F}, bytes[13] = {};
+    CHECK(k.bits_sum(w.data(), bits, 13) == 13.0f && k.sq8_l2(t.data(), s.data(), bytes, 13) == 13.0f && k.sq8_dot(w.data(), bytes, 13) == 0.0f);
+}
+
+TEST(edges, e08_sq8_fixed_answers_unchanged) {
+    // Computing SQ8 in double (for huge ranges) must not change ordinary codes:
+    // the same values as q0_11, computed independently with NumPy float32.
+    const std::vector<float> sample = {0, -1, 2.5f, 255, 1, 0.5f, 127.5f, 0, -0.25f};
+    SQ8Codec c(3, Metric::L2);
+    c.train(sample);
+    std::uint8_t code[3];
+    c.encode(std::vector<float>{63.75f, 0.3f, 1.0f}, code);
+    CHECK(code[0] == 64 && code[1] == 166 && code[2] == 116);
+}
+
+TEST(edges, e09_codec_misuse_branches) {
+    BinaryCodec b(4, Metric::L2);
+    CHECK_THROWS_AS(std::invalid_argument, b.train(std::vector<float>(6, 1.0f)));  // not whole vectors
+    CHECK_THROWS_AS(std::invalid_argument, b.restore(std::vector<float>{kNaN, 0, 0, 0, 1, 1, 1, 1}));  // a threshold that is not finite
+    CHECK_THROWS_AS(std::invalid_argument, b.restore(std::vector<float>{-3e38f, 0, 0, 0, 3e38f, 1, 1, 1}));  // threshold - spread overflows
+    PQCodec q(8, Metric::L2, 2);
+    CHECK(q.state().empty() && !q.trained());  // untrained: no state
+    CHECK_THROWS_AS(std::invalid_argument, q.train(std::vector<float>{1, 2, 3, 4, 5, 6, 7, kInf}));
+    CHECK_THROWS_AS(std::invalid_argument, q.restore(std::vector<float>{}));
+}
+
+TEST(edges, e10_list_of_unknown_and_untrained) {
+    IvfParams ivf;
+    ivf.lists = 2;
+    ivf.train_after = 0;
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 10; ++i) f.add(i, random_vectors(1, 4, unsigned(1710 + i))[0]);
+    CHECK(!f.list_of(3));  // untrained
+    f.train_lists();
+    CHECK(f.list_of(3) && !f.list_of(999));  // unknown ID
+}
+
+TEST(edges, e11_inconsistent_codec_and_list_sections) {
+    // A trained CODC section with fewer than 8 bytes left for its last field
+    // (the number of PQ parts), and "trained" lists while no lists are configured.
+    auto data = random_vectors(20, 4, 1711);
+    HnswParams p;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 5;
+    p.quantization.pq_subspaces = 2;
+    HnswIndex h(4, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 20; ++i) h.add(i, data[i]);
+    ParsedFile short_codc = ParsedFile::parse(save_bytes(h));
+    std::string& codc = short_codc.payload("CODC");
+    codc.resize(codc.size() - 8 - 40 + 4);  // drop the field and the codes, keep 4 stray bytes
+    CHECK_THROWS_AS(FormatError, load_hnsw(short_codc.assemble()));
+    IvfParams ivf;
+    ivf.lists = 2;
+    ivf.train_after = 0;
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 20; ++i) f.add(i, data[i]);
+    f.train_lists();
+    ParsedFile no_lists = ParsedFile::parse(save_bytes(f));
+    poke<std::uint64_t>(no_lists.payload("IVFL"), 0, 0);  // lists = 0, yet trained
+    try {
+        (void)load_flat(no_lists.assemble());
+        CHECK(false);
+    } catch (const FormatError& e) {
+        CHECK(std::string(e.what()).find("training flag") != std::string::npos);  // rejected by its own rule
+    }
+}
+
+// ===========================================================================
+// Phase Q6a: the Vamana graph (VA1-VA8)
+// ===========================================================================
+
+namespace {
+
+/// Every node reachable from the medoid, by breadth-first search.
+std::size_t reachable_from_medoid(const VamanaGraph& g) {
+    std::vector<bool> seen(g.size(), false);
+    std::vector<NodeId> queue{g.medoid()};
+    seen[g.medoid()] = true;
+    for (std::size_t head = 0; head < queue.size(); ++head)
+        for (NodeId nb : g.neighbors(queue[head]))
+            if (!seen[nb]) {
+                seen[nb] = true;
+                queue.push_back(nb);
+            }
+    return queue.size();
+}
+
+double vamana_recall(const VamanaGraph& g, const Vectors& data, const Vectors& queries, Metric m, std::size_t L) {
+    FlatIndex exact(data[0].size(), m);
+    for (std::uint64_t i = 0; i < data.size(); ++i) exact.add(i, data[i]);
+    double hit = 0;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& r : exact.search(q, 10)) truth.insert(r.id);
+        for (const auto& r : g.search(q, 10, L)) hit += double(truth.count(r.id));
+    }
+    return hit / double(10 * queries.size());
+}
+
+}  // namespace
+
+TEST(vamana, va01_recall) {
+    auto data = clustered(4000, 32, 20, 1800);
+    auto queries = clustered(50, 32, 20, 1801);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const auto g = VamanaGraph::build(flatten(data), 32, m, VamanaParams{32, 64, 1.2f, 7});
+        const double r64 = vamana_recall(g, data, queries, m, 64), r128 = vamana_recall(g, data, queries, m, 128);
+        std::printf("    metric %d: recall@10 with L 64 %.3f, L 128 %.3f\n", int(m), r64, r128);
+        CHECK(r64 >= 0.90 && r128 >= r64);
+    }
+}
+
+TEST(vamana, va02_structure) {
+    auto data = clustered(3000, 16, 10, 1802);
+    const auto g = VamanaGraph::build(flatten(data), 16, Metric::L2, VamanaParams{24, 48, 1.2f, 3});
+    bool ok = g.size() == 3000;
+    std::size_t edges = 0;
+    for (NodeId p = 0; p < g.size(); ++p) {
+        const auto nbs = g.neighbors(p);
+        std::set<NodeId> unique(nbs.begin(), nbs.end());
+        ok = ok && nbs.size() <= 24 && unique.size() == nbs.size() && !unique.count(p) && !nbs.empty();
+        for (NodeId q : nbs) ok = ok && q < g.size();
+        edges += nbs.size();
+    }
+    std::printf("    average degree %.1f of at most 24; reachable from the medoid: %zu of 3000\n", double(edges) / 3000.0, reachable_from_medoid(g));
+    CHECK(ok && reachable_from_medoid(g) == 3000);
+}
+
+TEST(vamana, va03_alpha) {
+    // Both prune strengths give good graphs (alpha > 1 keeps long-range edges).
+    auto data = clustered(4000, 24, 30, 1803);
+    auto queries = clustered(40, 24, 30, 1804);
+    const auto one = VamanaGraph::build(flatten(data), 24, Metric::L2, VamanaParams{16, 40, 1.0f, 5});
+    const auto wide = VamanaGraph::build(flatten(data), 24, Metric::L2, VamanaParams{16, 40, 1.2f, 5});
+    double e_one = 0, e_wide = 0;
+    for (const auto& q : queries) {
+        std::size_t a = 0, b = 0;
+        (void)one.search(q, 10, 40, &a);
+        (void)wide.search(q, 10, 40, &b);
+        e_one += double(a);
+        e_wide += double(b);
+    }
+    const double r_one = vamana_recall(one, data, queries, Metric::L2, 40), r_wide = vamana_recall(wide, data, queries, Metric::L2, 40);
+    std::printf("    nodes expanded per search: alpha 1.0 %.1f (recall %.3f), alpha 1.2 %.1f (recall %.3f)\n",
+                e_one / 40, r_one, e_wide / 40, r_wide);
+    // Recorded, not asserted: with a fixed beam both expand about L nodes; alpha's
+    // benefit (a shorter graph diameter) is measured as disk reads in Q6c.
+    CHECK(r_one >= 0.85 && r_wide >= 0.85);
+}
+
+TEST(vamana, va04_deterministic) {
+    auto data = clustered(800, 8, 6, 1805);
+    const auto a = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 9});
+    const auto b = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 9});
+    const auto c = VamanaGraph::build(flatten(data), 8, Metric::Cosine, VamanaParams{12, 24, 1.2f, 10});
+    bool same = a.medoid() == b.medoid(), differs = false;
+    for (NodeId p = 0; p < 800; ++p) {
+        same = same && std::ranges::equal(a.neighbors(p), b.neighbors(p));
+        differs = differs || !std::ranges::equal(a.neighbors(p), c.neighbors(p));
+    }
+    CHECK(same && differs);
+}
+
+TEST(vamana, va05_small_and_degenerate) {
+    const auto one = VamanaGraph::build(std::vector<float>{1, 2, 3}, 3, Metric::L2, VamanaParams{4, 8});
+    CHECK(one.size() == 1 && one.neighbors(0).empty() && one.search(std::vector<float>{0, 0, 0}, 5, 8).size() == 1);
+    const auto two = VamanaGraph::build(std::vector<float>{0, 0, 1, 1}, 2, Metric::L2, VamanaParams{4, 8});
+    CHECK(two.neighbors(0).size() == 1 && two.neighbors(1).size() == 1 && two.search(std::vector<float>{1, 1}, 1, 8)[0].id == 1);
+    auto few = random_vectors(10, 4, 1806);  // fewer vectors than R: a complete graph
+    const auto complete = VamanaGraph::build(flatten(few), 4, Metric::L2, VamanaParams{32, 32});
+    bool full = true;
+    for (NodeId p = 0; p < 10; ++p) full = full && complete.neighbors(p).size() == 9;
+    CHECK(full && complete.search(few[4], 10, 32).size() == 10 && complete.search(few[4], 1, 32)[0].id == 4);
+    const auto same = VamanaGraph::build(std::vector<float>(200, 2.5f), 2, Metric::L2, VamanaParams{8, 16});  // 100 identical vectors
+    CHECK(same.search(std::vector<float>{2.5f, 2.5f}, 10, 16).size() == 10 && reachable_from_medoid(same) == 100);
+    std::vector<float> line;
+    for (int i = 0; i < 300; ++i) line.push_back(float(i));
+    const auto one_dim = VamanaGraph::build(line, 1, Metric::L2, VamanaParams{6, 12});
+    CHECK(one_dim.search(std::vector<float>{150.2f}, 1, 12)[0].id == 150 && reachable_from_medoid(one_dim) == 300);
+    CHECK(one_dim.search(std::vector<float>{3}, 0, 12).empty());
+}
+
+TEST(vamana, va06_rejects_invalid_input) {
+    const std::vector<float> v = {1, 2, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build({}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 3, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 0, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(std::vector<float>{1, kNaN}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{0, 8}));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 4}));  // L below R
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 8, 0.9f}));
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{8, 8, kNaN}));
+    const auto g = VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 4});
+    CHECK_THROWS_AS(std::invalid_argument, (void)g.search(std::vector<float>{1, 2, 3}, 1, 4));
+}
+
+TEST(vamana, va07_search_parameters) {
+    auto data = clustered(500, 8, 5, 1807);
+    const auto g = VamanaGraph::build(flatten(data), 8, Metric::L2, VamanaParams{16, 32});
+    CHECK(g.search(data[3], 600, 32).size() == 500 && g.search(data[3], 20, 5).size() == 20);  // k beyond n; L below k
+    const auto r = g.search(data[3], 10, 32);
+    bool sorted = true;
+    for (std::size_t i = 1; i < r.size(); ++i) sorted = sorted && r[i - 1].distance <= r[i].distance;
+    CHECK(sorted && r[0].id == 3 && r[0].distance == 0.0f);
+}
+
+TEST(vamana, va08_cosine_normalizes) {
+    // Scaled copies of a vector are the same direction: distance 0 under cosine.
+    auto data = random_vectors(300, 6, 1808);
+    const auto g = VamanaGraph::build(flatten(data), 6, Metric::Cosine, VamanaParams{12, 24});
+    std::vector<float> scaled = data[7];
+    for (float& x : scaled) x *= 9.5f;
+    const auto r = g.search(scaled, 1, 24);
+    CHECK(r[0].id == 7 && r[0].distance < 1e-5f);
+    const auto v = g.vector(7);
+    double len = 0;
+    for (float x : v) len += double(x) * x;
+    CHECK(std::abs(len - 1.0) < 1e-5);
+}
+
+TEST(vamana, va09_duplicate_groups_among_distinct_vectors) {
+    // 60 copies of one vector among 600 distinct ones, R = 8: a group larger than
+    // R links mostly within itself. Every vector must still be reachable, and
+    // the copies found.
+    auto data = clustered(600, 8, 6, 1809);
+    const auto copy = data[5];
+    for (int i = 0; i < 60; ++i) data.push_back(copy);
+    const auto g = VamanaGraph::build(flatten(data), 8, Metric::L2, VamanaParams{8, 24, 1.2f, 2});
+    auto queries = clustered(30, 8, 6, 1810);
+    const double r = vamana_recall(g, data, queries, Metric::L2, 48);
+    const std::size_t reach = reachable_from_medoid(g);
+    const auto at_copy = g.search(copy, 20, 48);
+    std::size_t zeros = 0;
+    for (const auto& x : at_copy) zeros += x.distance == 0.0f;
+    std::printf("    reachable %zu of 660; recall@10 %.3f; a query at the copies finds %zu of them at distance 0 (top 20)\n", reach, r, zeros);
+    CHECK(reach == 660 && r >= 0.85 && zeros == 20);  // every vector reachable (connectivity repair)
+}
+
+// ===========================================================================
+// Phase Q6b: the disk layout (DK1-DK8)
+// ===========================================================================
+
+namespace {
+
+/// Rewrites bytes of a disk index file and re-signs its header, so that checks
+/// beyond the header checksum are reached.
+void patch_disk_file(const std::string& path, std::size_t offset, const std::string& bytes, bool resign = true) {
+    std::string f = read_file(path);
+    f.replace(offset, bytes.size(), bytes);
+    if (resign) {
+        const std::size_t header_size = 168;
+        const std::uint32_t crc = persist::crc32(0, f.data(), header_size);
+        unsigned char b[4];
+        persist::to_little_endian(crc, b);
+        f.replace(header_size, 4, reinterpret_cast<const char*>(b), 4);
+    }
+    write_file(path, f);
+}
+
+template <class T>
+std::string le(T v) {
+    unsigned char b[sizeof(T)];
+    persist::to_little_endian(v, b);
+    return std::string(reinterpret_cast<const char*>(b), sizeof(T));
+}
+
+}  // namespace
+
+TEST(disk, dk01_round_trip_matches_the_graph) {
+    auto data = clustered(1000, 32, 8, 1900);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const std::string path = temp_path("dk01");
+        DiskIndexParams p;
+        p.graph = VamanaParams{16, 32, 1.2f, 4};
+        std::vector<Metadata> meta;
+        for (std::uint64_t i = 0; i < 1000; ++i) meta.push_back(meta_for(i));
+        DiskIndex::build(path, id_range(5000, 1000), flatten(data), 32, m, p, meta);
+        const auto d = DiskIndex::open(path);
+        const auto g = VamanaGraph::build(flatten(data), 32, m, p.graph);  // deterministic: the same graph
+        bool same = d->size() == 1000 && d->dim() == 32 && d->metric() == m && d->medoid() == g.medoid() && d->max_degree() == 16;
+        for (NodeId i = 0; i < 1000; ++i) {
+            const auto node = d->read_node(i);
+            same = same && std::ranges::equal(node.neighbors, g.neighbors(i)) && std::ranges::equal(node.vector, g.vector(i));
+            same = same && d->id_of(i) == 5000 + i && *d->node_of(5000 + i) == i && d->metadata().read(i) == meta_for(i);
+        }
+        CHECK(same && !d->node_of(42) && d->codec().trained() && d->codec().parts() == 16);  // one part per 2 dimensions
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk02_layouts) {
+    // Many nodes per block; a node filling a block exactly; a node spanning blocks.
+    struct Case { std::size_t dim, R, nodes_per_block, blocks_per_node; };
+    for (const Case c : {Case{4, 8, 4096 / 52, 1}, Case{1000, 23, 1, 1}, Case{2048, 8, 0, 3}}) {
+        auto data = random_vectors(40, c.dim, unsigned(1901 + c.dim));
+        const std::string path = temp_path("dk02");
+        DiskIndexParams p;
+        p.graph = VamanaParams{c.R, c.R + 8, 1.2f, 1};
+        DiskIndex::build(path, id_range(0, 40), flatten(data), c.dim, Metric::L2, p);
+        const auto d = DiskIndex::open(path);
+        bool ok = true;
+        for (NodeId i = 0; i < 40; ++i) ok = ok && d->read_node(i).vector == data[i];
+        const std::uint64_t blocks = c.nodes_per_block ? (40 + c.nodes_per_block - 1) / c.nodes_per_block : 40 * c.blocks_per_node;
+        CHECK(ok && d->blocks_read() == 40 * c.blocks_per_node);
+        CHECK(std::filesystem::file_size(path) > 4096 * (1 + blocks));
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk03_damaged_files) {
+    auto data = random_vectors(200, 8, 1904);
+    const std::string good = temp_path("dk03_good"), path = temp_path("dk03");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    DiskIndex::build(good, id_range(0, 200), flatten(data), 8, Metric::L2, p);
+    const std::string bytes = read_file(good);
+    auto rejects = [&](auto edit) {
+        write_file(path, bytes);
+        edit();
+        try {
+            (void)DiskIndex::open(path);
+            return false;
+        } catch (const FormatError&) {
+            return true;
+        }
+    };
+    // Header: magic, version, byte order, its own checksum (not re-signed).
+    CHECK(rejects([&] { patch_disk_file(path, 0, "X", false); }));
+    CHECK(rejects([&] { patch_disk_file(path, 8, le<std::uint32_t>(2)); }));
+    CHECK(rejects([&] { patch_disk_file(path, 12, le<std::uint32_t>(0x04030201)); }));
+    CHECK(rejects([&] { patch_disk_file(path, 16, le<std::uint64_t>(9), false); }));
+    // Re-signed, so the checks behind the checksum are reached.
+    CHECK(rejects([&] { patch_disk_file(path, 16, le<std::uint64_t>(9)); }));         // dimension: layout no longer matches
+    CHECK(rejects([&] { patch_disk_file(path, 24, le<std::uint32_t>(1)); }));         // inner product
+    CHECK(rejects([&] { patch_disk_file(path, 48, le<std::uint64_t>(200)); }));       // medoid out of range
+    CHECK(rejects([&] { patch_disk_file(path, 40, le<std::uint64_t>(0)); }));         // R = 0
+    CHECK(rejects([&] { patch_disk_file(path, 88, le<std::uint64_t>(4096)); }));      // a section offset
+    // Truncated, trailing data, and a damaged byte in each in-memory section.
+    CHECK(rejects([&] { write_file(path, bytes.substr(0, bytes.size() - 1)); }));
+    CHECK(rejects([&] { write_file(path, bytes.substr(0, 100)); }));
+    CHECK(rejects([&] { write_file(path, bytes + "x"); }));
+    for (int s = 0; s < 4; ++s) {
+        const std::uint64_t offset = persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + 88 + 20 * s));
+        CHECK(rejects([&] { patch_disk_file(path, offset + 2, std::string(1, char(bytes[offset + 2] ^ 0x40)), false); }));
+    }
+    // A damaged node block: opening succeeds; reading that node fails, others work.
+    write_file(path, bytes);
+    patch_disk_file(path, 4096 + 10, std::string(1, char(bytes[4096 + 10] ^ 1)), false);
+    const auto d = DiskIndex::open(path);
+    CHECK_THROWS_AS(FormatError, (void)d->read_node(0));
+    CHECK(d->read_node(199).vector == data[199]);
+    CHECK_THROWS_AS(std::out_of_range, (void)d->read_node(200));
+    std::filesystem::remove(good);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk04_rejects_invalid_input) {
+    const std::string path = temp_path("dk04");
+    const std::vector<float> v = {1, 2, 3, 4, 5, 6};
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 1, 2}, v, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2}, v, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{}, std::vector<float>{}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, v, 2, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, std::vector<float>{1, 2, kNaN, 4, 5, 6}, 2, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 2, 3}, v, 2, Metric::L2, {}, std::vector<Metadata>(2)));
+    CHECK(!std::filesystem::exists(path) && temporaries_left(path) == 0);
+    CHECK_THROWS_AS(std::runtime_error, (void)DiskIndex::open(temp_path("dk04_missing")));
+    write_file(path, "short");
+    CHECK_THROWS_AS(FormatError, (void)DiskIndex::open(path));
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk05_replaces_a_file_only_when_complete) {
+    auto data = random_vectors(50, 4, 1905);
+    const std::string path = temp_path("dk05");
+    write_file(path, "the previous file");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1, 1}, std::vector<float>(8, 1.0f), 4, Metric::L2));
+    CHECK(read_file(path) == "the previous file" && temporaries_left(path) == 0);
+    DiskIndex::build(path, id_range(0, 50), flatten(data), 4, Metric::L2);
+    CHECK(DiskIndex::open(path)->size() == 50 && temporaries_left(path) == 0);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk06_schema_and_metadata) {
+    auto data = random_vectors(30, 4, 1906);
+    const std::string path = temp_path("dk06");
+    std::vector<Metadata> meta(30);
+    for (std::size_t i = 0; i < 30; ++i) meta[i] = meta_for(i);
+    meta[7] = Metadata().set("not_in_schema", 1);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2, {}, meta, Schema::strict(search_fields())));
+    meta[7] = meta_for(7);
+    DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2, {}, meta, Schema::strict(search_fields()));
+    const auto d = DiskIndex::open(path);
+    CHECK(d->metadata().read(7) == meta_for(7) && d->metadata().find_field("category").has_value());
+    DiskIndex::build(path, id_range(0, 30), flatten(data), 4, Metric::L2);  // without metadata
+    CHECK(DiskIndex::open(path)->metadata().read(3) == Metadata());
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk07_concurrent_reads) {
+    auto data = random_vectors(600, 16, 1907);
+    const std::string path = temp_path("dk07");
+    DiskIndex::build(path, id_range(0, 600), flatten(data), 16, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    std::atomic<long> wrong{0}, reads{0};
+    with_watchdog(60, "dk07", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (NodeId i = NodeId(t); i < 600; i += 2) {
+                wrong += long(d->read_node(i).vector != data[i]);
+                ++reads;
+            }
+        });
+    });
+    CHECK(wrong == 0 && reads == 300 + 300 + 299 + 299 && d->blocks_read() == std::uint64_t(reads));  // one block per node here
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk08_single_vector) {
+    const std::string path = temp_path("dk08");
+    DiskIndex::build(path, std::vector<std::uint64_t>{77}, std::vector<float>{1, 2, 3}, 3, Metric::Cosine);
+    const auto d = DiskIndex::open(path);
+    CHECK(d->size() == 1 && d->medoid() == 0 && d->read_node(0).neighbors.empty() && d->id_of(0) == 77);
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// Phase Q6c: searching on disk (DK9-DK15)
+// ===========================================================================
+
+namespace {
+
+struct DiskRun {
+    double recall = 0, nodes = 0, blocks = 0, rounds = 0;
+};
+
+DiskRun disk_run(const DiskIndex& d, FlatIndex& exact, const Vectors& queries, DiskSearchParams p) {
+    DiskRun r;
+    for (const auto& q : queries) {
+        std::set<std::uint64_t> truth;
+        for (const auto& x : exact.search(q, 10)) truth.insert(x.id);
+        DiskSearchStats st;
+        for (const auto& x : d.search(q, 10, p, {}, &st)) r.recall += double(truth.count(x.id));
+        r.nodes += double(st.nodes_read);
+        r.blocks += double(st.blocks_read);
+        r.rounds += double(st.rounds);
+    }
+    const double n = double(queries.size());
+    r.recall /= 10 * n;
+    r.nodes /= n;
+    r.blocks /= n;
+    r.rounds /= n;
+    return r;
+}
+
+}  // namespace
+
+TEST(disk, dk09_recall_and_reads) {
+    auto data = clustered(5000, 32, 20, 1910);
+    auto queries = clustered(40, 32, 20, 1911);
+    const std::string path = temp_path("dk09");
+    DiskIndexParams p;
+    p.graph = VamanaParams{32, 64, 1.2f, 3};
+    DiskIndex::build(path, id_range(0, 5000), flatten(data), 32, Metric::L2, p);
+    const auto d = DiskIndex::open(path);
+    FlatIndex exact(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) exact.add(i, data[i]);
+    std::vector<DiskRun> runs;
+    for (std::size_t L : {std::size_t(20), std::size_t(50), std::size_t(100)}) {
+        runs.push_back(disk_run(*d, exact, queries, DiskSearchParams{L, 4}));
+        std::printf("    L %3zu, W 4: recall@10 %.3f, nodes read %.1f, blocks %.1f, rounds %.1f (of 5000 vectors)\n", L,
+                    runs.back().recall, runs.back().nodes, runs.back().blocks, runs.back().rounds);
+    }
+    const DiskRun w1 = disk_run(*d, exact, queries, DiskSearchParams{50, 1});
+    std::printf("    L  50, W 1: recall@10 %.3f, nodes read %.1f, rounds %.1f\n", w1.recall, w1.nodes, w1.rounds);
+    CHECK(runs[0].recall <= runs[1].recall + 0.02 && runs[1].recall <= runs[2].recall + 0.02 && runs[2].recall >= 0.95);
+    CHECK(runs[2].nodes < 400 && w1.rounds > runs[1].rounds * 2);  // a few hundred reads out of 5000; W 4: far fewer rounds
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk10_results_are_exact) {
+    auto data = clustered(1500, 16, 10, 1912);
+    for (Metric m : {Metric::L2, Metric::Cosine}) {
+        const std::string path = temp_path("dk10");
+        DiskIndex::build(path, id_range(100, 1500), flatten(data), 16, m);
+        const auto d = DiskIndex::open(path);
+        FlatIndex exact(16, m);
+        for (std::uint64_t i = 0; i < 1500; ++i) exact.add(100 + i, data[i]);
+        bool ok = true;
+        for (std::size_t q = 0; q < 20; ++q) {
+            const auto r = d->search(data[q * 50], 10, DiskSearchParams{60, 4});
+            ok = ok && r.size() == 10 && r[0].id == 100 + q * 50 && sorted_and_unique(r);
+            for (const auto& x : r) {  // the distance an exact index computes for the same vector
+                const auto e = exact.search(data[x.id - 100], 1);
+                ok = ok && x.id >= 100 && x.id < 1600 && std::abs(x.distance - exact.search(data[q * 50], 1500)[0].distance) >= 0;
+                (void)e;
+            }
+            const auto truth = exact.search(data[q * 50], 1500);
+            std::map<std::uint64_t, float> by_id;
+            for (const auto& t : truth) by_id[t.id] = t.distance;
+            for (const auto& x : r) ok = ok && std::abs(x.distance - by_id[x.id]) <= 1e-5f * (1 + by_id[x.id]);
+        }
+        if (m == Metric::Cosine) {  // a scaled query is the same direction
+            std::vector<float> scaled = data[7];
+            for (float& x : scaled) x *= 6.0f;
+            ok = ok && d->search(scaled, 1)[0].id == 107;
+        }
+        CHECK(ok && d->search(data[0], 0).empty());
+        CHECK(d->search(data[0], 5000, DiskSearchParams{2000, 8}).size() == 1500);  // k beyond n, a beam covering everything
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk11_rejects_invalid_searches) {
+    auto data = random_vectors(50, 4, 1913);
+    const std::string path = temp_path("dk11");
+    DiskIndex::build(path, id_range(0, 50), flatten(data), 4, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(data[0], 5, DiskSearchParams{0, 4}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(data[0], 5, DiskSearchParams{10, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(std::vector<float>{1, 2, 3}, 5));
+    CHECK_THROWS_AS(std::invalid_argument, (void)d->search(std::vector<float>{1, 2, kNaN, 4}, 5));
+    CHECK(d->search(data[0], 5, {}, with_filter(Filter::eq("c", 1))).empty());  // an unknown field (dynamic schema): nothing matches
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk12_deadlines_and_cancellation) {
+    auto data = random_vectors(500, 8, 1914);
+    const std::string path = temp_path("dk12");
+    DiskIndex::build(path, id_range(0, 500), flatten(data), 8, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    SearchStats ss;
+    late.stats = &ss;
+    DiskSearchStats st;
+    const auto r = d->search(data[0], 10, {}, late, &st);
+    CHECK(st.stopped_early && ss.stopped_early && st.nodes_read == 0 && r.empty());  // stopped before the first read
+    std::atomic<bool> cancel{true};
+    SearchOptions cancelled;
+    cancelled.cancel = &cancel;
+    CHECK(d->search(data[0], 10, {}, cancelled, &st).empty() && st.stopped_early);
+    SearchOptions far;
+    far.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    CHECK(same_results(d->search(data[0], 10, {}, far, &st), d->search(data[0], 10)) && !st.stopped_early);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk13_concurrent_searches) {
+    auto data = clustered(2000, 16, 10, 1915);
+    const std::string path = temp_path("dk13");
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::L2);
+    const auto d = DiskIndex::open(path);
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 40; ++q) expected.push_back(d->search(data[q * 37], 10));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk13", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (std::size_t round = 0; round < 3; ++round)
+                for (std::size_t q = t; q < 40; q += 2) wrong += long(!same_results(d->search(data[q * 37], 10), expected[q]));
+        });
+    });
+    CHECK(wrong == 0);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk14_damage_met_during_a_search) {
+    auto data = random_vectors(300, 8, 1916);
+    const std::string path = temp_path("dk14");
+    DiskIndex::build(path, id_range(0, 300), flatten(data), 8, Metric::L2);
+    const NodeId medoid = DiskIndex::open(path)->medoid();
+    const std::size_t per_block = 4096 / (4 * 8 + 4 + 4 * 64);
+    const std::uint64_t at = 4096 * (1 + medoid / per_block) + 5;
+    std::string bytes = read_file(path);
+    bytes[at] = char(bytes[at] ^ 0x10);
+    write_file(path, bytes);
+    const auto d = DiskIndex::open(path);  // opening does not read node blocks
+    CHECK_THROWS_AS(FormatError, (void)d->search(data[0], 5));  // every search starts at the medoid
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk15_alpha_and_reads) {
+    // Alpha's purpose, measured where it matters: disk reads for a given recall.
+    auto data = clustered(5000, 24, 30, 1917);
+    auto queries = clustered(40, 24, 30, 1918);
+    FlatIndex exact(24, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) exact.add(i, data[i]);
+    for (float alpha : {1.0f, 1.2f}) {
+        const std::string path = temp_path("dk15");
+        DiskIndexParams p;
+        p.graph = VamanaParams{24, 48, alpha, 6};
+        DiskIndex::build(path, id_range(0, 5000), flatten(data), 24, Metric::L2, p);
+        const auto d = DiskIndex::open(path);
+        for (std::size_t L : {std::size_t(30), std::size_t(60)}) {
+            const DiskRun r = disk_run(*d, exact, queries, DiskSearchParams{L, 4});
+            std::printf("    alpha %.1f, L %2zu: recall@10 %.3f, nodes read %.1f, rounds %.1f\n", double(alpha), L, r.recall, r.nodes, r.rounds);
+            CHECK(r.recall >= 0.80);
+        }
+        std::filesystem::remove(path);
+    }
+}
+
+namespace {
+/// The search fields plus "rare" (an int), for strict schemas in the disk tests.
+std::vector<FieldSpec> search_fields_with_rare() {
+    auto f = search_fields();
+    f.push_back({"rare", FieldType::Int});
+    return f;
+}
+}  // namespace
+
+// ===========================================================================
+// Phase Q6d: filters, records, batches (DK16-DK23)
+// ===========================================================================
+
+namespace {
+
+struct DiskFixture {
+    Vectors data;
+    std::string path;
+    std::unique_ptr<DiskIndex> d;
+    FlatIndex exact;
+    DiskFixture(std::size_t n, std::size_t dim, unsigned seed, Metric m = Metric::L2, Schema schema = Schema::dynamic())
+        : data(clustered(n, dim, 10, seed)), path(temp_path("dkfix")), exact(dim, m, schema) {
+        std::vector<Metadata> meta;
+        for (std::uint64_t i = 0; i < n; ++i) {
+            meta.push_back(meta_for(i).set("rare", std::int64_t(i % 50 == 0)));
+            exact.add(i, data[i], meta.back());
+        }
+        DiskIndex::build(path, id_range(0, n), flatten(data), dim, m, {}, meta, schema);
+        d = DiskIndex::open(path);
+    }
+    ~DiskFixture() {
+        d.reset();
+        std::filesystem::remove(path);
+    }
+};
+
+}  // namespace
+
+TEST(disk, dk16_filtered_graph_search) {
+    DiskFixture f(3000, 16, 1920);
+    double hit = 0;
+    bool only_matching = true, full = true;
+    for (std::size_t q = 0; q < 20; ++q) {
+        const auto opts = with_filter(Filter::eq("category", "tech"));  // a fifth of the vectors: the graph search
+        const auto r = f.d->search(f.data[q * 101], 10, DiskSearchParams{60, 4}, opts);
+        std::set<std::uint64_t> truth;
+        for (const auto& x : f.exact.search(f.data[q * 101], 10, opts)) truth.insert(x.id);
+        for (const auto& x : r) {
+            only_matching = only_matching && x.id % 5 == 2;
+            hit += double(truth.count(x.id));
+        }
+        full = full && r.size() == 10;
+    }
+    std::printf("    filtered (a fifth match): recall@10 %.3f\n", hit / 200.0);
+    CHECK(only_matching && full && hit / 200.0 >= 0.9);
+}
+
+TEST(disk, dk17_selective_filter_is_exact) {
+    DiskFixture f(3000, 16, 1921);
+    bool same = true;
+    for (std::size_t q = 0; q < 10; ++q) {  // 60 vectors match: at most L (100), read directly
+        const auto opts = with_filter(Filter::eq("rare", std::int64_t(1)));
+        DiskSearchStats st;
+        const auto r = f.d->search(f.data[q * 77], 10, {}, opts, &st);
+        same = same && same_up_to_ties(r, f.exact.search(f.data[q * 77], 10, opts)) && st.nodes_read == 60;
+    }
+    CHECK(same && f.d->search(f.data[0], 10, {}, with_filter(Filter::eq("category", "none"))).empty());  // nothing matches
+}
+
+TEST(disk, dk18_never_fewer_than_k) {
+    // 60 of 3000 match, more than L (20): the graph search, which widens L until it finds 10.
+    DiskFixture f(3000, 16, 1922);
+    bool ok = true;
+    for (std::size_t q = 0; q < 10; ++q) {
+        const auto opts = with_filter(Filter::eq("rare", std::int64_t(1)));
+        const auto r = f.d->search(f.data[q * 31], 10, DiskSearchParams{20, 4}, opts);
+        ok = ok && r.size() == 10;
+        for (const auto& x : r) ok = ok && x.id % 50 == 0;
+    }
+    SearchOptions odd;
+    odd.predicate = [](std::uint64_t id) { return id % 97 == 3; };  // about 31 match
+    const auto p = f.d->search(f.data[5], 25, DiskSearchParams{10, 4}, odd);
+    ok = ok && p.size() == 25;
+    for (const auto& x : p) ok = ok && x.id % 97 == 3;
+    CHECK(ok);
+}
+
+TEST(disk, dk19_predicates_and_schemas) {
+    DiskFixture f(1000, 8, 1923, Metric::L2, Schema::strict(search_fields_with_rare()));
+    SearchOptions both = with_filter(Filter::eq("category", "tech"));
+    both.predicate = [](std::uint64_t id) { return id % 2 == 0; };
+    bool ok = true;
+    for (const auto& x : f.d->search(f.data[3], 10, {}, both)) ok = ok && x.id % 5 == 2 && x.id % 2 == 0;
+    CHECK(ok);
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->search(f.data[3], 10, {}, with_filter(Filter::eq("no_such_field", 1))));
+}
+
+TEST(disk, dk20_records) {
+    DiskFixture f(500, 8, 1924, Metric::Cosine);
+    CHECK(f.d->contains(7) && !f.d->contains(500) && !f.d->get_vector(500) && !f.d->get(500));
+    const auto v = *f.d->get_vector(7);
+    double len = 0, dot = 0, given = 0;
+    for (std::size_t j = 0; j < 8; ++j) {
+        len += double(v[j]) * v[j];
+        dot += double(v[j]) * f.data[7][j];
+        given += double(f.data[7][j]) * f.data[7][j];
+    }
+    CHECK(std::abs(len - 1.0) < 1e-5 && std::abs(dot - std::sqrt(given)) < 1e-4);  // stored normalized for cosine
+    const auto r = *f.d->get(7);
+    CHECK(r.id == 7 && r.vector == v && r.metadata.get("category").has_value());
+    // scan: ascending IDs, pages, filters; without vectors it reads nothing from disk.
+    ScanOptions o;
+    o.limit = 64;
+    o.with_vectors = false;
+    std::vector<std::uint64_t> seen;
+    const std::uint64_t before = f.d->blocks_read();
+    for (Page page = f.d->scan(o);; page = f.d->scan(o)) {
+        for (const auto& rec : page.records) seen.push_back(rec.id);
+        if (!page.next) break;
+        o.after = page.next;
+    }
+    CHECK(seen == id_range(0, 500) && f.d->blocks_read() == before);
+    ScanOptions tech;
+    tech.filter = Filter::eq("category", "tech");
+    tech.limit = 1000;
+    const auto t = f.d->scan(tech);
+    CHECK(t.records.size() == 100 && !t.next && t.records[0].vector.size() == 8);
+    o.limit = 0;
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->scan(o));
+}
+
+TEST(disk, dk21_search_by_id) {
+    DiskFixture f(1000, 16, 1925);
+    const auto without = *f.d->search_by_id(42, 5);
+    const auto with = *f.d->search_by_id(42, 5, {}, {}, true);
+    CHECK(without.size() == 5 && std::none_of(without.begin(), without.end(), [](const SearchResult& x) { return x.id == 42; }));
+    CHECK(with[0].id == 42 && with[0].distance == 0.0f && !f.d->search_by_id(5000, 5) && f.d->search_by_id(42, 0)->empty());
+}
+
+TEST(disk, dk22_batches) {
+    DiskFixture f(1500, 16, 1926);
+    const auto queries = flatten(Vectors(f.data.begin(), f.data.begin() + 12));
+    bool same = true;
+    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+        const auto b = f.d->search_batch(queries, 8, {}, threads);
+        for (std::size_t q = 0; q < 12; ++q) same = same && same_results(b[q], f.d->search(f.data[q], 8));
+    }
+    CHECK(same && f.d->search_batch({}, 5).empty());
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.d->search_batch(std::vector<float>(17, 1.0f), 5));
+    SearchStats st;
+    SearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.stats = &st;
+    (void)f.d->search_batch(queries, 8, {}, 4, late);
+    CHECK(st.stopped_early);
+}
+
+TEST(disk, dk23_concurrent_filtered_searches) {
+    DiskFixture f(2000, 16, 1927);
+    const auto opts = with_filter(Filter::eq("category", "news"));
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 20; ++q) expected.push_back(f.d->search(f.data[q * 53], 10, {}, opts));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk23", [&] {
+        run_threads(4, [&](std::size_t t) {
+            for (std::size_t q = t; q < 20; q += 2) wrong += long(!same_results(f.d->search(f.data[q * 53], 10, {}, opts), expected[q]));
+        });
+    });
+    CHECK(wrong == 0);
+}
+
+namespace {
+
+/// Re-signs a whole disk index file after an edit: every node block's checksum,
+/// every section's, then the header's, so that the checks behind them are reached.
+void resign_disk(std::string& f) {
+    auto u64 = [&](std::size_t at) { return persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(f.data() + at)); };
+    auto put32 = [&](std::size_t at, std::uint32_t v) {
+        unsigned char b[4];
+        persist::to_little_endian(v, b);
+        f.replace(at, 4, reinterpret_cast<const char*>(b), 4);
+    };
+    const std::uint64_t blocks = u64(80), crc_at = u64(88);
+    for (std::uint64_t b = 0; b < blocks; ++b) put32(std::size_t(crc_at + 4 * b), persist::crc32(0, f.data() + 4096 * (1 + b), 4096));
+    for (std::size_t s = 0; s < 4; ++s) {
+        const std::uint64_t offset = u64(88 + 20 * s), size = u64(96 + 20 * s);
+        put32(104 + 20 * s, persist::crc32(0, f.data() + offset, std::size_t(size)));
+    }
+    put32(168, persist::crc32(0, f.data(), 168));
+}
+
+}  // namespace
+
+TEST(disk, dk24_inconsistent_files_behind_valid_checksums) {
+    auto data = random_vectors(60, 8, 1930);
+    const std::string good = temp_path("dk24_good"), path = temp_path("dk24");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    p.pq_subspaces = 2;
+    std::vector<Metadata> meta(60, Metadata().set("k", std::int64_t(1)));
+    DiskIndex::build(good, id_range(0, 60), flatten(data), 8, Metric::L2, p, meta);
+    const std::string bytes = read_file(good);
+    auto u64 = [&](std::size_t at) { return std::size_t(persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + at))); };
+    const std::size_t pq = u64(108), ids = u64(128), metas = u64(148);  // section offsets (PQ, IDs, metadata)
+    auto message = [&](auto edit) -> std::string {
+        std::string f = bytes;
+        edit(f);
+        resign_disk(f);
+        write_file(path, f);
+        try {
+            (void)DiskIndex::open(path);
+            return "accepted";
+        } catch (const FormatError& e) {
+            return e.what();
+        }
+    };
+    auto contains = [](const std::string& m, const char* what) { return m.find(what) != std::string::npos; };
+    CHECK(contains(message([&](std::string& f) { f.replace(pq, 8, le<std::uint64_t>(0)); }), "invalid PQ section"));       // no parts
+    CHECK(contains(message([&](std::string& f) { f.replace(pq + 8, 8, le<std::uint64_t>(1u << 30)); }), "invalid PQ section"));  // a huge state
+    CHECK(contains(message([&](std::string& f) { f.replace(pq + 16, 4, le<float>(0.0f)); }), "invalid PQ codebooks"));  // 0 centroids
+    CHECK(contains(message([&](std::string& f) { f.replace(u64(116) + pq - 1, 1, std::string(1, char(250))); }), "centroid that does not exist"));
+    CHECK(contains(message([&](std::string& f) { f.replace(ids + 8, 8, le<std::uint64_t>(0)); }), "repeated ID"));
+    CHECK(contains(message([&](std::string& f) { f[metas + 20] = char(f[metas + 20] ^ 0x5A); }), ""));  // inner damage: still a FormatError
+    CHECK(message([&](std::string& f) { f[metas + 20] = char(f[metas + 20] ^ 0x5A); }) != "accepted");
+    // Node records behind valid block checksums: an impossible degree, a missing neighbor.
+    const std::size_t degree_at = 4096 + 4 * 8;
+    for (int which = 0; which < 2; ++which) {
+        std::string f = bytes;
+        if (which == 0) f.replace(degree_at, 4, le<std::uint32_t>(9));          // R is 8
+        else f.replace(degree_at + 4, 4, le<std::uint32_t>(60));                // node 60 of 60
+        resign_disk(f);
+        write_file(path, f);
+        const auto d = DiskIndex::open(path);
+        try {
+            (void)d->read_node(0);
+            CHECK(false);
+        } catch (const FormatError& e) {
+            CHECK(contains(e.what(), which == 0 ? "invalid node degree" : "a neighbor does not exist"));
+        }
+    }
+    // Building into a directory that does not exist; reads past the end.
+    CHECK_THROWS_AS(std::runtime_error, DiskIndex::build(temp_path("no_such_dir") + "/x.idx", id_range(0, 60), flatten(data), 8, Metric::L2));
+    BlockFile file(good);
+    char buf[16];
+    CHECK_THROWS_AS(FormatError, file.read(file.size() - 4, buf, 16));
+    CHECK_THROWS_AS(FormatError, file.read(file.size() + 1, buf, 1));
+    std::filesystem::remove(good);
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// Extension E1: asynchronous reads (DK25-DK28)
+// ===========================================================================
+
+TEST(disk, dk25_async_results_are_identical) {
+    auto data = clustered(2000, 16, 10, 1940);
+    const std::string path = temp_path("dk25");
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 2000; ++i) meta.push_back(meta_for(i).set("rare", std::int64_t(i % 50 == 0)));
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::Cosine, {}, meta);
+    const auto sync = DiskIndex::open(path);
+    bool same = true;
+    for (std::size_t threads : {std::size_t(1), std::size_t(4), std::size_t(8)}) {
+        DiskOpenOptions o;
+        o.io_threads = threads;
+        const auto async = DiskIndex::open(path, o);
+        for (std::size_t w : {std::size_t(1), std::size_t(4), std::size_t(8)})
+            for (std::size_t q = 0; q < 10; ++q) {
+                const DiskSearchParams p{40, w};
+                DiskSearchStats a, b;
+                same = same && same_results(async->search(data[q * 91], 10, p, {}, &a), sync->search(data[q * 91], 10, p, {}, &b));
+                same = same && a.nodes_read == b.nodes_read && a.rounds == b.rounds;  // the same reads, in the same rounds
+                for (const auto& opts : {with_filter(Filter::eq("rare", std::int64_t(1))), with_filter(Filter::eq("category", "tech"))})
+                    same = same && same_results(async->search(data[q * 91], 10, p, opts), sync->search(data[q * 91], 10, p, opts));
+            }
+    }
+    CHECK(same);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk26_reads_overlap) {
+    // With slow storage (simulated: 3 ms a read) the W reads of a round overlap:
+    // a round takes about one latency instead of W. Sleeps need no CPU, so this
+    // holds on a loaded machine too.
+    auto data = clustered(1500, 16, 10, 1941);
+    const std::string path = temp_path("dk26");
+    DiskIndex::build(path, id_range(0, 1500), flatten(data), 16, Metric::L2);
+    DiskOpenOptions slow;
+    slow.simulated_latency = std::chrono::milliseconds(3);
+    DiskOpenOptions slow_async = slow;
+    slow_async.io_threads = 4;
+    const auto sync = DiskIndex::open(path, slow);
+    const auto async = DiskIndex::open(path, slow_async);
+    auto time = [&](const DiskIndex& d, std::size_t& rounds) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t q = 0; q < 5; ++q) {
+            DiskSearchStats st;
+            (void)d.search(data[q * 7], 10, DiskSearchParams{40, 4}, {}, &st);
+            rounds += st.rounds;
+        }
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    };
+    std::size_t rs = 0, ra = 0;
+    const double ts = time(*sync, rs), ta = time(*async, ra);
+    std::printf("    5 searches, W 4, 3 ms a read: one after another %.0f ms, concurrent %.0f ms (%zu rounds each)\n", ts, ta, rs);
+    CHECK(rs == ra && ta < 0.6 * ts && ta >= double(ra) * 3.0 * 0.9);  // about one latency per round, never less
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk27_errors_during_concurrent_reads) {
+    auto data = random_vectors(300, 8, 1942);
+    const std::string path = temp_path("dk27");
+    DiskIndex::build(path, id_range(0, 300), flatten(data), 8, Metric::L2);
+    std::size_t damaged_node;
+    {
+        const auto d = DiskIndex::open(path);
+        damaged_node = d->read_node(d->medoid()).neighbors.at(0);  // read in the first round, beside others
+    }
+    const std::size_t per_block = 4096 / (4 * 8 + 4 + 4 * 64), block = damaged_node / per_block;
+    std::string bytes = read_file(path);
+    bytes[4096 * (1 + block) + 7] = char(bytes[4096 * (1 + block) + 7] ^ 0x08);
+    write_file(path, bytes);
+    DiskOpenOptions o;
+    o.io_threads = 4;
+    o.simulated_latency = std::chrono::microseconds(500);  // the other reads still running when one fails
+    bool threw = false;
+    {
+        auto d = DiskIndex::open(path, o);
+        try {
+            (void)d->search(data[0], 10, DiskSearchParams{40, 8});
+        } catch (const FormatError&) {
+            threw = true;
+        }
+        CHECK(d->read_node(NodeId(block == 0 ? 299 : 0)).vector.size() == 8);  // still usable
+    }  // destroyed right after: no read may still be running (AddressSanitizer checks)
+    CHECK(threw);
+    std::filesystem::remove(path);
+}
+
+TEST(disk, dk28_searches_share_the_pool) {
+    auto data = clustered(2000, 16, 10, 1943);
+    const std::string path = temp_path("dk28");
+    DiskIndex::build(path, id_range(0, 2000), flatten(data), 16, Metric::L2);
+    DiskOpenOptions o;
+    o.io_threads = 3;
+    const auto d = DiskIndex::open(path, o);
+    std::vector<std::vector<SearchResult>> expected;
+    for (std::size_t q = 0; q < 24; ++q) expected.push_back(d->search(data[q * 41], 10));
+    std::atomic<long> wrong{0};
+    with_watchdog(60, "dk28", [&] {
+        run_threads(6, [&](std::size_t t) {  // more searching threads than readers
+            for (std::size_t round = 0; round < 3; ++round)
+                for (std::size_t q = t; q < 24; q += 3) wrong += long(!same_results(d->search(data[q * 41], 10), expected[q]));
+        });
+    });
+    CHECK(wrong == 0 && same_results(d->search_batch(flatten(Vectors(data.begin(), data.begin() + 6)), 5, {}, 4)[2], d->search(data[2], 5)));
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
+// Extension E2: building indexes larger than memory (DK29-DK34)
+// ===========================================================================
+
+namespace {
+
+std::size_t disk_reachable(const DiskIndex& d) {
+    std::vector<bool> seen(d.size(), false);
+    std::vector<NodeId> queue{d.medoid()};
+    seen[d.medoid()] = true;
+    for (std::size_t h = 0; h < queue.size(); ++h)
+        for (NodeId nb : d.read_node(queue[h]).neighbors)
+            if (!seen[nb]) {
+                seen[nb] = true;
+                queue.push_back(nb);
+            }
+    return queue.size();
+}
+
+std::size_t build_dirs_left(const std::string& path) {
+    std::size_t left = 0;
+    const std::filesystem::path dir = std::filesystem::path(path).parent_path();
+    const std::string name = std::filesystem::path(path).filename().string();
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().filename().string().rfind(name + ".build-", 0) == 0) ++left;
+    return left;
+}
+
+}  // namespace
+
+TEST(disk, dk29_fitting_in_the_budget_matches_build) {
+    auto data = clustered(800, 16, 6, 1950);
+    const std::string vec = temp_path("dk29_vectors"), a = temp_path("dk29_a"), b = temp_path("dk29_b");
+    write_vectors_file(vec, flatten(data), 16);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{16, 32, 1.2f, 4};
+    LargeBuildStats st;
+    DiskIndex::build_from_file(a, vec, Metric::Cosine, lp, {}, {}, Schema::dynamic(), &st);
+    DiskIndex::build(b, id_range(0, 800), flatten(data), 16, Metric::Cosine, lp.index);
+    CHECK(st.partitions == 1 && read_file(a) == read_file(b));  // byte for byte
+    for (const auto& f : {vec, a, b}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk30_partitioned_build) {
+    auto data = clustered(6000, 32, 30, 1951);
+    auto queries = clustered(40, 32, 30, 1952);
+    const std::string vec = temp_path("dk30_vectors"), path = temp_path("dk30");
+    write_vectors_file(vec, flatten(data), 32);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{32, 64, 1.2f, 1};
+    lp.memory_budget = std::size_t(400) << 10;
+    const std::size_t cap = lp.memory_budget / (4 * PreparedVector(32).stride() + 8 * 32 + 96);
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp, {}, {}, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    FlatIndex exact(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 6000; ++i) exact.add(i, data[i]);
+    // Built in pieces, the graph is a little weaker at a tight beam and the same at a
+    // normal one (measured: in memory 0.983 and 0.998, partitioned 0.950 and 0.998,
+    // at L 50 and 100, for the same reads).
+    const DiskRun tight = disk_run(*d, exact, queries, DiskSearchParams{50, 4});
+    const DiskRun r = disk_run(*d, exact, queries, DiskSearchParams{100, 4});
+    std::printf("    %zu partitions (largest %zu, cap %zu), %zu lists pruned at the merge; reachable %zu of 6000; recall@10 %.3f at L 50, %.3f at L 100\n",
+                st.partitions, st.largest_partition, cap, st.merged_and_pruned, disk_reachable(*d), tight.recall, r.recall);
+    CHECK(st.partitions > 1 && st.largest_partition <= cap && disk_reachable(*d) == 6000 && r.recall >= 0.97 && tight.recall >= 0.90);
+    CHECK(build_dirs_left(path) == 0);  // temporary files removed
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk31_ids_metadata_and_cosine) {
+    auto data = clustered(3000, 16, 12, 1953);
+    const std::string vec = temp_path("dk31_vectors"), path = temp_path("dk31");
+    write_vectors_file(vec, flatten(data), 16);
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 3000; ++i) meta.push_back(meta_for(i));
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{16, 32, 1.2f, 2};
+    lp.memory_budget = std::size_t(300) << 10;
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::Cosine, lp, id_range(9000, 3000), meta, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    bool ok = st.partitions > 1 && d->contains(9000) && !d->contains(0) && d->get(9007)->metadata == meta_for(7);
+    for (const auto& x : d->search(data[5], 10, {}, with_filter(Filter::eq("category", "tech")))) ok = ok && (x.id - 9000) % 5 == 2;
+    const auto v = *d->get_vector(9003);
+    double len = 0;
+    for (float x : v) len += double(x) * x;
+    CHECK(ok && std::abs(len - 1.0) < 1e-5 && d->search(data[11], 1)[0].id == 9011);
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk32_rejects_invalid_input) {
+    auto data = random_vectors(2000, 8, 1954);
+    const std::string vec = temp_path("dk32_vectors"), path = temp_path("dk32"), bad = temp_path("dk32_bad");
+    write_vectors_file(vec, flatten(data), 8);
+    write_file(path, "the previous index");
+    LargeBuildParams small;
+    small.memory_budget = std::size_t(64) << 10;
+    LargeBuildParams one = small;
+    one.replicas = 1;
+    LargeBuildParams few = small;
+    few.partitions = 3;
+    CHECK_THROWS_AS(std::runtime_error, DiskIndex::build_from_file(path, temp_path("dk32_missing"), Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::InnerProduct));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, one));   // partitions could not connect
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, few));   // too few for the budget
+    LargeBuildParams tiny;
+    tiny.memory_budget = 1000;
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, tiny));
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, {}, id_range(0, 5)));
+    std::string f = read_file(vec);
+    write_file(bad, f.substr(0, f.size() - 4));  // its size no longer matches
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));
+    write_file(bad, "abc");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));
+    const float nan = kNaN;
+    f.replace(8 + 4 * 100, 4, reinterpret_cast<const char*>(&nan), 4);
+    write_file(bad, f);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2, small));  // found while partitioning
+    CHECK(read_file(path) == "the previous index" && build_dirs_left(path) == 0 && temporaries_left(path) == 0);
+    for (const auto& x : {vec, path, bad}) std::filesystem::remove(x);
+}
+
+TEST(disk, dk33_vectors_files) {
+    const std::string vec = temp_path("dk33");
+    write_vectors_file(vec, std::vector<float>{1, 2, 3, 4, 5, 6}, 3);
+    const std::string f = read_file(vec);
+    CHECK(f.size() == 8 + 24 && persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(f.data())) == 2);
+    CHECK_THROWS_AS(std::invalid_argument, write_vectors_file(vec, std::vector<float>{1, 2, 3}, 0));
+    CHECK_THROWS_AS(std::invalid_argument, write_vectors_file(vec, std::vector<float>{1, 2, 3}, 2));
+    std::filesystem::remove(vec);
+}
+
+TEST(disk, dk34_the_budget_holds_with_more_replicas) {
+    // Found while measuring: 3 replicas once overfilled partitions (1,347 vectors
+    // against a cap of 853). The partition count now guarantees room.
+    auto data = clustered(4000, 32, 20, 1955);
+    const std::string vec = temp_path("dk34_vectors"), path = temp_path("dk34");
+    write_vectors_file(vec, flatten(data), 32);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{32, 64, 1.2f, 1};
+    lp.memory_budget = std::size_t(400) << 10;
+    lp.replicas = 3;
+    const std::size_t cap = lp.memory_budget / (4 * PreparedVector(32).stride() + 8 * 32 + 96);
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp, {}, {}, Schema::dynamic(), &st);
+    CHECK(st.partitions > 1 && st.largest_partition <= cap && disk_reachable(*DiskIndex::open(path)) == 4000);
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk35_replaced_or_deleted_while_open) {
+    // Found on Windows: an open index file could not be deleted or replaced
+    // (rebuilt in place), while POSIX allows both. Now the same everywhere: the
+    // open index keeps reading the file it opened.
+    auto old_data = random_vectors(200, 8, 1960), new_data = random_vectors(300, 8, 1961);
+    const std::string path = temp_path("dk35");
+    DiskIndex::build(path, id_range(0, 200), flatten(old_data), 8, Metric::L2);
+    const auto old_index = DiskIndex::open(path);
+    DiskIndex::build(path, id_range(0, 300), flatten(new_data), 8, Metric::L2);  // replaced while open
+    const auto new_index = DiskIndex::open(path);
+    CHECK(old_index->size() == 200 && new_index->size() == 300);
+    CHECK(old_index->search(old_data[7], 1)[0].id == 7 && *old_index->get_vector(9) == old_data[9]);  // still the old file
+    CHECK(new_index->search(new_data[7], 1)[0].id == 7);
+    // Deleted while two indexes have it open: the deletion succeeds and both keep
+    // working. (Whether the name disappears at once differs: older Windows keeps a
+    // file "delete pending" until its last reader closes.)
+    std::filesystem::remove(path);
+    CHECK(old_index->search(old_data[3], 1)[0].id == 3 && new_index->search(new_data[250], 1)[0].id == 250);
+}
+
+TEST(vamana, va10_remaining_settings_and_counts) {
+    const std::vector<float> v = {1, 2, 3, 4, 5, 6};
+    CHECK_THROWS_AS(std::invalid_argument, VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 8, kInf}));  // infinite alpha
+    const auto g = VamanaGraph::build(v, 2, Metric::L2, VamanaParams{4, 8});
+    std::size_t expanded = 99;
+    CHECK(g.search(std::vector<float>{1, 2}, 0, 8, &expanded).empty() && expanded == 0);  // k = 0 reports no reads
+}
+
+TEST(disk, dk36_build_settings_not_yet_covered) {
+    const std::string vec = temp_path("dk36_vectors"), path = temp_path("dk36"), bad = temp_path("dk36_bad");
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, std::vector<std::uint64_t>{1}, std::vector<float>{}, 0, Metric::L2));
+    auto data = clustered(1200, 8, 6, 1970);
+    write_vectors_file(vec, flatten(data), 8);
+    LargeBuildParams zero;
+    zero.replicas = 0;
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, vec, Metric::L2, zero));
+    auto header = [&](std::uint32_t n, std::uint32_t dim) { write_file(bad, le<std::uint32_t>(n) + le<std::uint32_t>(dim)); };
+    header(0, 8);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));  // no vectors
+    header(1, 0);
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build_from_file(path, bad, Metric::L2));  // dimension 0
+    // Fits the budget, without statistics: one in-memory build.
+    DiskIndex::build_from_file(path, vec, Metric::L2);
+    CHECK(DiskIndex::open(path)->size() == 1200);
+    // An explicit partition count, although everything would fit; without statistics.
+    LargeBuildParams forced;
+    forced.index.graph = VamanaParams{8, 16, 1.2f, 1};
+    forced.partitions = 6;
+    DiskIndex::build_from_file(path, vec, Metric::L2, forced);
+    CHECK(disk_reachable(*DiskIndex::open(path)) == 1200);
+    for (const auto& f : {vec, path, bad}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk37_partitioned_cosine_and_identical_vectors) {
+    // Cosine merges whose joined lists exceed R (a small R); and mostly identical
+    // vectors, whose partitions share copies (k-means centroids coincide).
+    auto data = clustered(1500, 8, 6, 1971);
+    const std::string vec = temp_path("dk37_vectors"), path = temp_path("dk37");
+    write_vectors_file(vec, flatten(data), 8);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{4, 8, 1.2f, 3};
+    lp.memory_budget = std::size_t(96) << 10;
+    LargeBuildStats st;
+    DiskIndex::build_from_file(path, vec, Metric::Cosine, lp, {}, {}, Schema::dynamic(), &st);
+    const auto d = DiskIndex::open(path);
+    CHECK(st.partitions > 1 && st.merged_and_pruned > 0 && d->search(data[9], 1, DiskSearchParams{60, 4})[0].id == 9);
+    Vectors same(1200, std::vector<float>(8, 0.5f));
+    for (std::size_t i = 0; i < 1200; i += 100) same[i][0] = float(i);  // a few distinct among identical ones
+    write_vectors_file(vec, flatten(same), 8);
+    LargeBuildParams many = lp;
+    many.index.graph = VamanaParams{8, 16, 1.2f, 3};
+    many.partitions = 12;
+    many.memory_budget = std::size_t(2) << 20;
+    DiskIndex::build_from_file(path, vec, Metric::L2, many, {}, {}, Schema::dynamic(), &st);
+    // Found here: merged graphs left 386 of 1,200 vectors unreachable (merge pruning
+    // broke ties by node number), then 75 (no connectivity repair after merging),
+    // then 4 (the repair counted incoming edges from unreachable vectors).
+    const auto d2 = DiskIndex::open(path);
+    CHECK(st.partitions == 12 && disk_reachable(*d2) == 1200 && d2->search(same[1], 1)[0].distance == 0.0f);
+    CHECK(d2->search(same[300], 1, DiskSearchParams{1200, 8})[0].id == 300);  // a lone vector among copies, reachable
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk38_invalid_headers_behind_valid_checksums) {
+    auto data = random_vectors(60, 8, 1972);
+    const std::string good = temp_path("dk38_good"), path = temp_path("dk38");
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    p.pq_subspaces = 2;
+    DiskIndex::build(good, id_range(0, 60), flatten(data), 8, Metric::L2, p);
+    const std::string bytes = read_file(good);
+    // Header fields: only the header is re-signed (its checks come before any
+    // section is read; resign_disk would follow the edited sizes past the file).
+    // Inside a section: everything is re-signed, the header being intact.
+    auto rejected = [&](std::size_t at, const std::string& value) {
+        std::string f = bytes;
+        f.replace(at, value.size(), value);
+        if (at >= 168) {
+            resign_disk(f);
+        } else {
+            unsigned char b[4];
+            persist::to_little_endian(persist::crc32(0, f.data(), 168), b);
+            f.replace(168, 4, reinterpret_cast<const char*>(b), 4);
+        }
+        write_file(path, f);
+        try {
+            (void)DiskIndex::open(path);
+            return false;
+        } catch (const FormatError&) {
+            return true;
+        }
+    };
+    CHECK(rejected(16, le<std::uint64_t>(0)) && rejected(16, le<std::uint64_t>(std::uint64_t(1) << 21)));  // dimension
+    CHECK(rejected(40, le<std::uint64_t>(std::uint64_t(1) << 17)) && rejected(32, le<std::uint64_t>(0)));    // R, n
+    CHECK(rejected(32, le<std::uint64_t>(0xFFFFFFFFull)));                                                 // n beyond node ids
+    for (std::size_t at : {56, 64, 72, 80}) CHECK(rejected(at, le<std::uint64_t>(12345)));               // each layout field
+    CHECK(rejected(96, le<std::uint64_t>(std::uint64_t(1) << 40)));  // a section larger than the file
+    const std::size_t pq = std::size_t(persist::from_little_endian<std::uint64_t>(reinterpret_cast<const unsigned char*>(bytes.data() + 108)));
+    CHECK(rejected(pq, le<std::uint64_t>(9)));                       // more PQ parts than dimensions
+    for (const auto& f : {good, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk39_search_paths_not_yet_covered) {
+    auto data = random_vectors(400, 8, 1973);
+    const std::string path = temp_path("dk39");
+    std::vector<Metadata> meta;
+    for (std::uint64_t i = 0; i < 400; ++i) meta.push_back(Metadata().set("rare", std::int64_t(i % 40 == 0)));
+    DiskIndex::build(path, id_range(0, 400), flatten(data), 8, Metric::L2, {}, meta);
+    const auto d = DiskIndex::open(path);
+    SearchOptions late = with_filter(Filter::eq("rare", std::int64_t(1)));  // 10 match: read directly
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    DiskSearchStats st;
+    CHECK(d->search(data[0], 5, {}, late, &st).empty() && st.stopped_early && st.nodes_read == 0);
+    CHECK(d->search_by_id(7, SIZE_MAX, DiskSearchParams{500, 8})->size() == 399);  // every other record
+    const auto other = *d->search_by_id(7, 3, {}, with_filter(Filter::eq("rare", std::int64_t(1))));  // 7 does not match
+    CHECK(other.size() == 3 && std::none_of(other.begin(), other.end(), [](const SearchResult& r) { return r.id == 7; }));
+    std::filesystem::remove(path);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -10108,7 +14119,7 @@ TEST(stress, st06_upper_blocks_recycled_under_churn) {
     // Reusing a slot at a higher level used to abandon its old link block.
     auto data = clustered(500, 4, 4, 380);
     auto pool = clustered(30000, 4, 4, 381);
-    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5});  // M = 4: levels vary a lot
+    HnswIndex h(4, Metric::L2, HnswParams{4, 32, 5, true, {}});  // M = 4: levels vary a lot
     for (std::size_t i = 0; i < data.size(); ++i) h.add(i, data[i]);
     std::vector<std::uint64_t> live(500);
     std::iota(live.begin(), live.end(), 0);
@@ -10166,7 +14177,7 @@ TEST(stress, st10_long_churn_memory_bounded) {
     // dictionary and link blocks all stay bounded, and results stay correct.
     auto pool = clustered(40000, 8, 8, 384);
     auto queries = clustered(10, 8, 8, 385);
-    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3});
+    HnswIndex h(8, Metric::L2, HnswParams{8, 64, 3, true, {}});
     FlatIndex f(8, Metric::L2);
     std::vector<std::uint64_t> live;
     std::mt19937 rng(386);
@@ -10279,7 +14290,7 @@ TEST(e2e, lifecycle_cosine) { lifecycle(Metric::Cosine); }
 TEST(e2e, larger_index_recall) {
     auto data = clustered(6000, 48, 30, 92);
     auto queries = clustered(100, 48, 30, 93);
-    HnswIndex h(48, Metric::L2, HnswParams{16, 100, 3});
+    HnswIndex h(48, Metric::L2, HnswParams{16, 100, 3, true, {}});
     FlatIndex f(48, Metric::L2);
     fill(h, f, data);
     CHECK(recall(h, f, queries, 10, 128) >= 0.95);
@@ -10356,13 +14367,14 @@ void print_usage() {
         "  patterns            run tests whose \"group.name\" contains any pattern\n"
         "  --group <name>      run only this group (repeatable)\n"
         "  --exclude <text>    skip tests whose \"group.name\" contains text (repeatable)\n"
+        "  --shard K/N         run every N-th selected test, from the K-th (CTest splits heavy groups)\n"
         "  --list              list the selected tests without running them\n"
         "  --fail-fast         stop after the first failing test\n"
         "  --write-golden      rewrite the saved-format golden files (format changes only)\n"
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -10379,6 +14391,7 @@ bool contains_text(const std::string& text, const std::string& part) {
 int main(int argc, char** argv) {
     std::vector<std::string> patterns, groups, excludes;
     bool list_only = false, fail_fast = false;
+    std::size_t shard = 0, shards = 1;  // --shard K/N: every N-th selected test, from the K-th (1-based)
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -10394,10 +14407,24 @@ int main(int argc, char** argv) {
             // deliberate format change: the files guard compatibility.
             // Writes the current format version's files; older versions' files are
             // frozen and must never be rewritten.
-            golden_hnsw()->save(golden_path("golden_hnsw_v2.bin"));
-            golden_flat()->save(golden_path("golden_flat_v2.bin"));
+            golden_hnsw()->save(golden_path("golden_hnsw_v3.bin"));
+            golden_flat()->save(golden_path("golden_flat_v3.bin"));
+            golden_sq8()->save(golden_path("golden_hnsw_sq8_v3.bin"));
+            golden_binary()->save(golden_path("golden_hnsw_binary_v3.bin"));
+            golden_pq()->save(golden_path("golden_hnsw_pq_v3.bin"));
+            golden_ivf()->save(golden_path("golden_flat_ivf_v3.bin"));
             std::printf("wrote golden files to %s\n", HNSW_TEST_DATA_DIR);
             return 0;
+        } else if (arg == "--shard") {
+            unsigned k = 0, n = 0;
+            if (i + 1 >= argc || std::sscanf(argv[i + 1], "%u/%u", &k, &n) != 2 || n == 0 || k == 0 || k > n) {
+                std::printf("--shard needs K/N with 1 <= K <= N, for example 2/4\n\n");
+                print_usage();
+                return 2;
+            }
+            ++i;
+            shard = k - 1;
+            shards = n;
         } else if (arg == "--group" || arg == "--exclude") {
             if (i + 1 >= argc) {
                 std::printf("Missing value after %s\n\n", arg.c_str());
@@ -10426,6 +14453,11 @@ int main(int argc, char** argv) {
                         [&](const std::string& e) { return contains_text(full, e); }))
             continue;
         selected.push_back(&t);
+    }
+    if (shards > 1) {  // round-robin, so a group's heavy tests spread over its shards
+        std::vector<const TestCase*> mine;
+        for (std::size_t i = shard; i < selected.size(); i += shards) mine.push_back(selected[i]);
+        selected.swap(mine);
     }
 
     if (list_only) {

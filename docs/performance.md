@@ -116,6 +116,59 @@ Removed HNSW slots are reused by later inserts, so memory stays bounded by the p
 
 `search_batch` with `threads = 0` uses one thread per CPU core. For `FlatIndex`, batches are also faster per query on one thread, because each stored vector loaded into the cache is compared with 16 queries at once.
 
+### Compression
+
+Measured recall@10 on synthetic clustered data (see the `sq8`, `binary`, `pq` and `codes_only` test groups). Code distances use SIMD kernels (AVX2, AVX-512, NEON). `bench_codecs [dimension]` times them against full-precision distances. Measured on a Windows desktop PC (AVX2, MinGW GCC, Release build), 768 dimensions, nanoseconds per distance:
+
+| Kernels | Float L2 | SQ8 L2 | SQ8 dot | Binary |
+|---|---|---|---|---|
+| Plain C++ | 467 | 471 | 459 | 4,169 |
+| AVX2 | 149 | 93 | 79 | 99 |
+
+With AVX2, SQ8 distances were 1.6 to 1.9 times faster than full-precision ones and binary distances 1.5 times faster, while reading 4 and 32 times less memory; binary distances without SIMD were about 9 times slower than floats (the AVX2 kernel is 42 times faster). An earlier run on a shared cloud machine with AVX-512 gave a similar picture (floats 115 ns; SQ8 70 and 57 ns; binary 51 ns). Whole-search speed has not been measured yet.
+
+| Setting | Recall@10 | Memory for vectors |
+|---|---|---|
+| Full precision (HNSW, `ef` 64) | 0.93 to 0.99 | 4 bytes per dimension |
+| SQ8, re-ranked (default) | the same as full precision | 5 bytes per dimension (codes and floats) |
+| SQ8, codes only (`keep_full_vectors = false`) | 0.972 to 0.976 (about 1.5% lower) | 1 byte per dimension |
+| Binary, re-ranked, Flat `rerank_factor` 32 or HNSW `ef` 400 | 0.96 to 0.99 | 4 bytes and 1 bit per dimension |
+| Binary, re-ranked with the defaults (`rerank_factor` 4, `ef` 64) | 0.63 to 0.79 | the same |
+| Binary, codes only | 0.34 to 0.39: not recommended | 1 bit per dimension |
+| PQ (8 dimensions per part), re-ranked: Flat `rerank_factor` 16, HNSW `ef` 200 | 0.89 to 0.97 | 4 bytes per dimension plus 1 byte per part |
+| PQ, codes only | 0.31 to 0.40 on this test data | 1 byte per part (32 times smaller by default) |
+
+- **SQ8** is the safe choice: re-ranked, it matches full precision; with codes only it saves three quarters of the vector memory for about 1.5% recall.
+- **Binary codes** need a large re-ranking budget: a `rerank_factor` of 16 to 32 for Flat, a larger `ef` for HNSW. Keep the full vectors with them.
+- **PQ** gives the smallest codes for a given recall once re-ranked with a generous budget; choose more parts (`pq_subspaces`) for better recall. Its training (k-means) is slower than SQ8's.
+- **Matryoshka truncation** (`truncate_to`) cuts the cost of every distance in proportion, for embeddings trained for it; add `keep_full_vectors = false` to save the memory too.
+- With codes only, training is final: train on a representative sample (`train_after`).
+
+### Inverted file (IVF)
+
+Measured on noisy synthetic data (5,000 vectors of 32 dimensions in 40 clusters, 64 lists; test `i04`):
+
+| Probes | Vectors scanned | Recall@10 |
+|---|---|---|
+| 1 | 1.5% | 0.16 |
+| 4 | 6% | 0.40 |
+| 16 | 25% | 0.81 |
+| 64 (all) | 100% | 1.00 (exact) |
+
+Scan time grows with the share scanned, so probes trade speed for recall; real embeddings cluster better than this data and usually need fewer. IVF-PQ (32 lists, PQ re-ranked with `rerank_factor` 16) reached 0.56 at 8 probes and 0.87 with all lists probed, the same as PQ alone. Measure on your data: start with `lists` near the square root of the number of vectors and raise `probes` until recall suffices.
+
+### Disk-based index
+
+Measured on 5,000 clustered vectors of 32 dimensions (R 32; tests `dk09` and `dk15`; reads counted, not timed):
+
+| `L` (W 4) | Nodes read per query | Rounds | Recall@10 |
+|---|---|---|---|
+| 20 | 30 (0.6%) | 9 | 0.86 |
+| 50 | 56 (1.1%) | 16 | 0.98 |
+| 100 | 105 (2.1%) | 27 | 1.00 |
+
+Each node read is one 4 KB block. `W` 1 needed 52 rounds at `L` 50 for the same reads: on storage with high latency, a larger `W` cuts waiting, and with `DiskOpenOptions::io_threads` the reads of a round also overlap. With a simulated 3 ms per read and W 4, five searches (60 rounds) took 679 ms with reads one after another and 194 ms with 4 reading threads (test `dk26`): about one latency per round, 3.5 times faster. Search time is roughly reads times the storage's latency (unless cached by the operating system), so measure on your storage. The navigation codes matter: with one PQ part per 8 dimensions instead of 2, recall at `L` 50 fell from 0.98 to 0.71 for the same reads.
+
 ### Build type
 
 Always measure Release builds. Debug builds are many times slower.

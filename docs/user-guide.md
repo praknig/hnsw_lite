@@ -21,6 +21,14 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Searching by stored ID](#searching-by-stored-id)
 - [Deadlines, cancellation and progress](#deadlines-cancellation-and-progress)
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
+- [Compressing vectors (SQ8)](#compressing-vectors-sq8)
+- [Binary quantization](#binary-quantization)
+- [Disk-based index](#disk-based-index)
+- [Inverted file (IVF)](#inverted-file-ivf)
+- [Product quantization (PQ)](#product-quantization-pq)
+- [Shorter vectors (Matryoshka truncation)](#shorter-vectors-matryoshka-truncation)
+- [Keeping only the stored vectors](#keeping-only-the-stored-vectors)
+- [Keeping only codes (SQ8 without full precision)](#keeping-only-codes-sq8-without-full-precision)
 - [Saving and loading](#saving-and-loading)
 - [Threads](#threads)
 - [Errors and guarantees](#errors-and-guarantees)
@@ -303,6 +311,8 @@ for (Page page = index.scan(o); ; page = index.scan(o)) {
 - **Each page costs one pass over the index**, which suits exports and administration; for finding similar vectors, use `search`.
 - All three are reads: they run alongside searches and are allowed inside them.
 
+**Ties.** Results with exactly equal distances (for example, copies of the same vector) come in an unspecified order, which may differ between HNSW and Flat and change after `compact()`. When a tie straddles the k-th place, any of the tied vectors is a correct answer.
+
 ## Searching by stored ID
 
 ```cpp
@@ -359,6 +369,156 @@ The three `_where` functions take the same filters as searches; all four return 
 - **`set_metadata_where` is all or nothing:** invalid changes throw `std::invalid_argument`, even when nothing matches, and if memory runs out no vector has changed. It works on a copy of the metadata and swaps it in when complete, so it briefly needs extra memory about the size of the index's metadata.
 - **Searches see the index before or after a change, never in between**, and like all changes these cannot be made from inside a search (`std::logic_error`); `count_where` is a read and can.
 
+## Compressing vectors (SQ8)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::SQ8;   // one byte per dimension
+p.quantization.train_after = 1000;       // train automatically at 1,000 vectors
+HnswIndex index(768, Metric::Cosine, p);
+
+FlatIndex flat(768, Metric::L2, Schema::dynamic(), p.quantization);
+flat.train_codec();                      // or train now, on the stored vectors
+```
+
+- **SQ8** stores each dimension as one of 256 levels between its smallest and largest trained value. Searches compare the query with these codes, then **re-rank** the best candidates at full precision (`rerank`, on by default). In tests, recall with re-ranking matched full precision exactly; with codes alone (`rerank = false`) it was about 1% lower.
+- **Training** happens automatically once `train_after` vectors are stored (0: only by `train_codec()`), and again whenever you call `train_codec()`. Until then, searches use full precision exactly as without a codec. Training is all or nothing; if memory runs out during automatic training, the add still completes and training is retried on a later add.
+- **Memory:** full-precision vectors are kept too (for re-ranking and `get_vector`), so for now SQ8 adds 25% to vector memory rather than saving it. The saving comes with full-precision vectors kept on disk; see the [plan](compression-and-index-types-plan.md).
+- Range searches use full precision. Batch, filtered and exact searches use codes. Saved files keep the codec, its training and the codes (file format version 3).
+- **Setting `HnswParams` positionally** (`HnswParams{16, 200, 42}`) leaves out `quantization`, and compilers warn about that with `-Wextra`. Set fields by name instead, as above.
+
+## Binary quantization
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::Binary;  // one bit per dimension
+p.quantization.rerank_factor = 32;         // binary needs many candidates re-ranked
+HnswIndex index(768, Metric::Cosine, p);
+auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: use a larger ef
+```
+
+- **One bit per dimension**, 32 times smaller than floats. Each dimension gets a threshold (its mean in the training sample); a bit records whether a value lies above it. Distances compare the full-precision query with each code's reconstruction (threshold plus or minus the dimension's average spread).
+- **Binary codes are coarse, so re-ranking at full precision is essential, with many candidates.** Measured recall@10 on 3,000 clustered vectors: Flat with `rerank_factor` 4 (the default, suited to SQ8) reached 0.63 to 0.73, with 16 about 0.86, and with 32 0.96 to 0.99; HNSW re-ranks its whole beam, and reached 0.74 to 0.79 at `ef` 64 and 0.98 to 0.99 at `ef` 400.
+- **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
+- Training, saving, truncation and everything else work as for SQ8.
+- Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Disk-based index
+
+```cpp
+// Build once (the vectors must fit in memory while building), then search from disk.
+DiskIndexParams params;
+params.graph.R = 64;      // neighbors per node
+params.graph.L = 100;     // beam while building
+DiskIndex::build("vectors.idx", ids, vectors, 768, Metric::Cosine, params, metadata);
+
+auto index = DiskIndex::open("vectors.idx");  // loads only PQ codes, IDs and metadata
+SearchOptions options;
+options.filter = Filter::eq("lang", "en");
+DiskSearchStats stats;
+auto results = index->search(query, 10, DiskSearchParams{100, 4}, options, &stats);
+// stats.nodes_read: disk reads for this query
+```
+
+- **For indexes larger than memory** (DiskANN-style): the graph and the full vectors stay on disk in 4 KB blocks, one read per node; memory holds only compact PQ codes (by default one byte per 2 dimensions, an eighth of the floats), the IDs and the metadata.
+- **Searching:** PQ codes rank the candidates; the best unread ones are read from disk, `beam_width` (W) per round, their exact distances computed from the vectors read, their neighbors added; the search ends when the best `L` candidates were all read. Results carry exact distances. Measured on 5,000 vectors of 32 dimensions: `L` 50 read 56 nodes (1.1%) for recall@10 0.98, `L` 100 read 105 for 1.00. Raise `L` for recall, `W` for fewer round trips (W 4 needed 3 times fewer rounds than W 1, for the same reads).
+- **The PQ codes guide which nodes are read**, so they are finer than PQ's general default: with one part per 8 dimensions, recall at `L` 50 fell to 0.71 for the same number of reads. Set `DiskIndexParams::pq_subspaces` to trade memory for fewer wasted reads.
+- **Filters and predicates:** only matching vectors are returned, never fewer than `k` if `k` match. A filter matching at most `L` vectors reads exactly those (an exact answer); a broader one searches the graph, widening `L` until it finds `k`.
+- **Records:** `contains`, `get_vector`, `get`, `scan`, `search_by_id` and `search_batch` work as for the in-memory indexes; vectors come back as stored (normalized for cosine). Deadlines and cancellation stop a search with the best results so far. Safe to search from many threads.
+- **Building larger than memory:** `write_vectors_file("vectors.fbin", vectors, dim)` (or any `.fbin` file: a 32-bit count, a 32-bit dimension, then the floats, as DiskANN and the big-ANN benchmarks use), then `LargeBuildParams build; build.memory_budget = 8ull << 30; DiskIndex::build_from_file("vectors.idx", "vectors.fbin", Metric::Cosine, build);`. If the vectors fit the budget it builds in memory (the same file as `build`); otherwise it divides them into partitions that fit (each vector joins its 2 nearest), builds a graph per partition, and merges them in one pass. No partition ever exceeds the budget; PQ codes, IDs and metadata (what a search holds in memory) come on top, and, while merging, an adjacency table of R numbers per vector (4R bytes each, about the size of the PQ codes) used to repair connectivity, so that every vector is reachable. Measured on 6,000 vectors built from 24 partitions: every vector reachable, recall@10 0.998 at `L` 100 (the same as an in-memory build) and 0.950 at `L` 50 (0.983 in memory): give partitioned builds a slightly larger `L`.
+- **Concurrent reads:** `DiskOpenOptions io; io.io_threads = 8; DiskIndex::open(path, io)` reads the W nodes of each round at the same time, so a round costs about one read's latency instead of W. Results are identical either way; several searches share the threads. It helps on storage with real latency (network disks, cloud volumes, hard disks); on a fast local SSD or with the file cached by the operating system, gains are small. Measured with a simulated 3 ms per read, W 4: 194 ms instead of 679 for the same 60 rounds.
+- **Read-only:** to change it, rebuild. Rebuilding in place works while the old index is open, on every platform: the open index keeps reading the file it opened, and opening again gives the new one. L2 and cosine only. Building writes a temporary file and replaces `path` only once complete. Every block is checksummed and checked when read: damage is reported as `FormatError` where it is met.
+
+## Inverted file (IVF)
+
+```cpp
+IvfParams ivf;
+ivf.lists = 1024;         // about the square root of the number of vectors is a common start
+ivf.probes = 32;          // lists searched per query: the speed and recall trade-off
+ivf.train_after = 50000;  // train automatically (or call train_lists())
+FlatIndex index(768, Metric::Cosine, Schema::dynamic(), QuantizationParams{}, ivf);
+
+SearchOptions o;
+o.probes = 64;            // more lists for this search only
+auto results = index.search(query, 10, o);
+```
+
+- **k-means divides the vectors into lists**, and a search scans only the lists nearest to the query instead of everything. It is an option of `FlatIndex`, so filters, metadata, deadlines, codecs, saving and everything else work as before.
+- **Probes trade speed for recall.** Measured on noisy synthetic data with 64 lists: 1 probe scanned 1.5% of the vectors for recall@10 of 0.16, 16 probes 25% for 0.81, all 64 probes everything for exact results. Real embeddings, which cluster better, usually need fewer probes.
+- **Never fewer than k results:** if the probed lists hold fewer than `k` matching vectors (with a selective filter, say), more lists are probed.
+- **IVF-PQ:** combine with `QuantizationParams{.codec = CodecKind::PQ}` for small codes and fast scans; re-ranking works as for PQ.
+- **Until trained**, searches scan everything. Training (`train_lists()`, or automatically at `train_after` vectors and at least `lists`) is all or nothing, and can be repeated. **Training costs** about lists × sampled vectors × dimensions × iterations (up to 25; at most 100,000 vectors are sampled): 1,024 lists over 50,000 vectors of 768 dimensions is around 10^12 operations, minutes on a few cores. k-means uses every core; train once on a representative sample. Vectors added later go to their nearest list. Range searches always scan everything.
+
+## Product quantization (PQ)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::PQ;
+p.quantization.pq_subspaces = 96;           // 768 dimensions in 96 parts of 8: 96 bytes per vector
+p.quantization.train_after = 10000;         // k-means needs a representative sample
+HnswIndex index(768, Metric::Cosine, p);
+auto results = index.search(query, 10, 200);  // re-ranked: give the search a generous beam
+```
+
+- **Each vector is split into parts**, and each part is stored as the index of its nearest of 256 centroids, learned by k-means: one byte per part. With the default (`pq_subspaces = 0`: one part per 8 dimensions) that is 32 times smaller than floats. Dimensions that do not divide evenly go to the first parts.
+- **Distances are table lookups:** a query computes its distance to every centroid once, then each code costs one lookup per part.
+- **Re-ranking is essential, as with binary codes.** Measured recall@10 on synthetic clustered data (64 dimensions, 8 per part): HNSW 0.70 to 0.79 at `ef` 64 and 0.92 to 0.97 at `ef` 200; Flat 0.62 to 0.74 with `rerank_factor` 4 and 0.89 to 0.95 with 16; codes only 0.31 to 0.40. More parts (fewer dimensions each) give better recall for more bytes; real embeddings usually suit PQ better than this noisy test data.
+- **Training** runs k-means on each part (up to 100,000 sample vectors), so it takes longer than for SQ8 or binary codes; with fewer than 256 training vectors there are fewer centroids. Training, saving, truncation and codes only work as for SQ8.
+
+## Shorter vectors (Matryoshka truncation)
+
+```cpp
+HnswParams p;
+p.quantization.truncate_to = 256;        // index only the first 256 of 768 dimensions
+HnswIndex index(768, Metric::Cosine, p);
+index.add(id, full_vector);              // vectors and queries are still given in full (768 values)
+auto results = index.search(full_query, 10);
+auto v = index.get_vector(id);           // all 768 values, exactly as given
+```
+
+- **Only for embeddings trained for it**, such as OpenAI's `text-embedding-3` models or Nomic Embed: these put the most important information first, so a prefix of the vector is still a good, slightly less precise embedding. With other embeddings, truncation damages results.
+- The index stores and searches only the first `truncate_to` values (re-normalized for cosine), so each distance costs proportionally less and building is faster. `dim()` stays the full dimension; `indexed_dim()` reports the truncated one.
+- Inputs are checked in full: a vector of the wrong size, or with NaN or infinity anywhere (even in the part that is cut off), is rejected.
+- **Memory:** by default the full vectors are kept too, so that `get_vector` returns them, which uses more memory, not less. Set `keep_full_vectors = false` (below) to keep only the truncated vectors: about a third of the memory for 768 to 256.
+- It combines with SQ8 (the codes then cover the first `truncate_to` dimensions), and is saved with the index (file format version 3). `0`, or the full dimension, means no truncation.
+
+## Keeping only the stored vectors
+
+```cpp
+HnswParams p;
+p.quantization.truncate_to = 256;
+p.quantization.keep_full_vectors = false;  // keep only the 256 stored values
+HnswIndex index(768, Metric::Cosine, p);
+index.get_vector(id);                      // 256 values (normalized, for cosine)
+```
+
+Cosine indexes (which normalize vectors) and truncating indexes keep a second copy of each vector exactly as given, so that `get_vector` can return it. `keep_full_vectors = false` drops that copy:
+
+- **Memory:** a cosine index stores about half as much; a truncating index only the truncated vectors.
+- **`get_vector`, `get` and `scan` return the stored vector:** normalized for cosine, and the first `truncate_to` values when truncating. Search results are identical, since the stored vectors are the same.
+- It changes nothing for L2 and inner-product indexes without truncation or a codec, which keep no second copy. With SQ8 it goes further: see the next section.
+- It is saved with the index.
+
+## Keeping only codes (SQ8 without full precision)
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::SQ8;
+p.quantization.train_after = 10000;        // train on a representative sample: this training is final
+p.quantization.keep_full_vectors = false;  // after training, keep only the codes
+HnswIndex index(768, Metric::Cosine, p);
+// ... add vectors ...
+index.has_vector_values();                 // false once trained: floats dropped
+```
+
+With a codec and `keep_full_vectors = false`, an index keeps full-precision vectors only until its codec is trained; then it drops them and keeps only the codes, one byte per dimension:
+
+- **Memory and files:** about a quarter of full precision for the vectors (in tests a saved index was 3.7 times smaller).
+- **Results:** searches compare codes and cannot re-rank (there is nothing left to re-rank with). In tests, recall@10 was about 1.5% below full precision (0.972 to 0.976 against 0.984 to 0.990).
+- **Reading back:** `get_vector`, `get` and `scan` return decoded vectors, within half a step of the stored ones; values outside the trained range come back clamped to it.
+- **Training is final.** `train_codec()` is refused once only codes are kept: training again could only use decoded vectors and lose more precision (a sample of a few vectors would collapse every code for good). So train on a representative sample: automatically at `train_after` vectors, or with `train_codec()` while the floats are still there. Vectors added later with values outside the trained range are clamped.
+- Everything else works from codes: adds, removals, updates, batches, `compact`, and every kind of search. `has_vector_values()` tells whether the floats are still kept.
+
 ## Saving and loading
 
 ```cpp
@@ -372,7 +532,7 @@ auto flat = FlatIndex::load("exact.flat");           // the same for FlatIndex
 - **Loaded files are checked thoroughly.** Each section carries a checksum, every count is checked before memory is allocated, and every link, level and value is validated. A damaged, truncated or foreign file throws `vecdb::FormatError`; a failed load never produces a half-built index.
 - **Streams work too:** `save(std::ostream&)` and `load(std::istream&)`, for example with `std::stringstream`. A stream given to `load` must be seekable (files and string streams are).
 - A save reads the index, so searches and other saves run alongside it, and changes wait until it finishes. Several threads may save to the **same path** at once: each writes its own temporary file and the last to finish wins, so the file is always complete. (On Windows, two renames over one file at the very same moment can be refused; that save then throws `std::runtime_error` and the file stays complete.)
-- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned; this version writes format 2 and reads 1 and 2). A cosine index saved in format 1, before originals were kept, still loads; `get_vector` then returns its normalized vectors.
+- Files are portable between operating systems and compilers, and stay readable by future versions of hnsw-lite (the format is versioned; this version writes format 3 and reads 1 to 3). A cosine index saved in format 1, before originals were kept, still loads; `get_vector` then returns its normalized vectors.
 
 ## Threads
 

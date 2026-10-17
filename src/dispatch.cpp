@@ -16,6 +16,10 @@
 #include <cmath>
 
 #include "distance.h"
+
+#include <string>
+
+#include <stdexcept>
 #include "kernels.h"
 
 #if defined(HNSW_LITE_HAVE_AVX2) || defined(HNSW_LITE_HAVE_AVX512)
@@ -134,6 +138,27 @@ Isa active_isa() {
             if (isa_supported(isa)) return isa;              // GCOVR_EXCL_BR_LINE: CPU-dependent
         return Isa::Scalar;                                  // GCOVR_EXCL_LINE: only on CPUs without SIMD
     }();                                                     // GCOVR_EXCL_BR_LINE: initialization guard
+    return best;
+}
+
+CodeKernels get_code_kernels(Isa isa) {
+    if (!isa_supported(isa)) throw std::invalid_argument(std::string("code kernels: CPU does not support ") + isa_name(isa));
+    switch (isa) {
+#if defined(HNSW_LITE_HAVE_AVX2)
+        case Isa::Avx2: return {kernels::sq8_l2_avx2, kernels::sq8_dot_avx2, kernels::bits_sum_avx2};
+#endif
+#if defined(HNSW_LITE_HAVE_AVX512)
+        case Isa::Avx512: return {kernels::sq8_l2_avx512, kernels::sq8_dot_avx512, kernels::bits_sum_avx512};
+#endif
+#if defined(HNSW_LITE_HAVE_NEON)
+        case Isa::Neon: return {kernels::sq8_l2_neon, kernels::sq8_dot_neon, kernels::bits_sum_neon};
+#endif
+        default: return {kernels::sq8_l2_scalar, kernels::sq8_dot_scalar, kernels::bits_sum_scalar};
+    }
+}
+
+CodeKernels get_code_kernels() {
+    static const CodeKernels best = get_code_kernels(active_isa());  // GCOVR_EXCL_BR_LINE: one-time initialization guard
     return best;
 }
 

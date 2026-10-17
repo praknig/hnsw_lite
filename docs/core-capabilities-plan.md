@@ -9,7 +9,7 @@ This document plans four capabilities that hnsw-lite lacks compared with product
 
 The test scenarios for these designs are in [core-capabilities-test-plan.md](core-capabilities-test-plan.md).
 
-Status: **1. Real deletion is implemented**; 2 to 4 are planned.
+Status: **all four are implemented** (real deletion, updating vectors, saving and loading, thread safety with parallel building). This document is the original design; the [architecture](architecture.md) describes the code as built, including later changes such as file format versions 2 and 3.
 
 ---
 

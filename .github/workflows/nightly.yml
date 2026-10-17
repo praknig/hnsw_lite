@@ -33,7 +33,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cpu: [Nehalem, Haswell]  # no AVX (plain C++ kernels); AVX2
+        include:
+          - cpu: Nehalem  # no AVX: the plain C++ kernels
+            qemu_cpu: Nehalem
+          # AVX2. Haswell's TSX (hle, rtm) is switched off: QEMU cannot emulate it and
+          # warns at every thread start, burying the output; hnsw-lite does not use it.
+          - cpu: Haswell
+            qemu_cpu: Haswell,-hle,-rtm
     steps:
       - uses: actions/checkout@v4
 
@@ -49,7 +55,7 @@ jobs:
       - name: Test
         run: |
           set -o pipefail
-          qemu-x86_64 -cpu ${{ matrix.cpu }} ./build/test_comprehensive 2>&1 | tee test.log
+          qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive 2>&1 | tee test.log
 
       - name: Summary
         if: always()

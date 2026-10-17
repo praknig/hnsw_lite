@@ -2,7 +2,7 @@
 
 Test scenarios for the four features designed in [core-capabilities-plan.md](core-capabilities-plan.md): real deletion, updating vectors, saving and loading, and concurrent inserts. The last section analyzes how these features affect the existing tests.
 
-Status: **section 1 (real deletion, D1 to D66) is implemented** in the `deletion` group, with every test named after its scenario ID; sections 2 to 4 are planned. Each scenario has an ID so it can be traced to its test once written. All tests go into `tests/test_comprehensive.cpp`.
+Status: **all four sections are implemented**, in the `deletion`, `update`, `persistence`, `concurrency` and `add_batch` groups, with every test named after its scenario ID (see the [testing page](testing.md) for the current suite). Each scenario has an ID so it can be traced to its test once written. All tests go into `tests/test_comprehensive.cpp`.
 
 **Types:** **P** positive (normal use) · **N** negative (invalid input or misuse) · **E** edge case · **S** stress · **M** out-of-memory sweep
 

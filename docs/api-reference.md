@@ -181,6 +181,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `FieldType` | `Int`, `Float`, `Bool`, `Keyword`, `Tags` |
 | `Value::from(x)` | Builds a value; the type comes from the C++ type of `x` |
+| `Value::of_int`, `of_float`, `of_bool`, `of_keyword`, `of_tags` | A metadata value of one exact type (`Value::from` picks the type from a C++ value) |
 | `Metadata().set(name, value)`, `set_tags(name, tags)`, `unset(name)` | Builds the fields of one vector; `unset` clears a field in `set_metadata` |
 | `Schema::strict(fields)`, `Schema::dynamic(fields = {})` | Schema modes; empty or duplicate names throw |
 | `MetadataStore` | Column storage: `validate`, `write`, `update`, `clear`, `move_row`, `read`, `index_field`, `value_count`, `present_count`, `compact_dictionary`, `unused_string_count`, fast column accessors |
@@ -190,6 +191,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | Name | Description |
 |---|---|
 | `Filter::eq/ne/lt/le/gt/ge(field, value)`, `between`, `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, `all()` | Conditions; combine with `&&`, `\|\|`, `!` |
+| `filter.is_all()`, `filter.root()` | Whether a filter matches everything (`Filter::all()`), and its condition tree, for inspection |
 | `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
 | `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |
 | `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
@@ -209,7 +211,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `search_range(query, radius, max_results = kNoLimit, options)` | Range search |
 | `set_planner_params`, `planner_params` (HNSW) | Index-wide planner settings; `planner_params()` returns a copy, safe while other threads change them |
 
-`thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
+`filter.h` also holds two helpers the indexes use internally: `plan_search` (the planner's choice between graph and exact search) and `validate_batch` (checks a batch of queries). `thread_pool.h` provides `ThreadPool` (`parallel_for`, exceptions rethrown to the caller), `SharedPool` and `effective_threads` (the thread cap); `Filter::kMaxDepth` is the nesting limit; `GraphStorage::upper_slots_allocated()` and `recycled_upper_blocks()` and `HnswIndex::pooled_visited_lists()` expose memory diagnostics; `search_result.h` adds `kNoLimit` and `l2_radius`.
 
 ## Hardening additions
 
@@ -240,3 +242,51 @@ Not copyable, movable. Frees its memory in the destructor.
 | `SearchStats::stopped_early` | Whether a deadline or cancel flag stopped the search |
 | `OperationOptions` (`deadline`, `cancel`, `progress`) | Control of `add_batch`, `compact` and `save`; `progress(done, total)` is called in order, at most about 100 times |
 | `Cancelled` (a `std::runtime_error`) | Thrown by a cancelled or late operation, after undoing it |
+
+## Training and codecs
+
+These are the building blocks of compressed indexes (see the [compression and index types plan](compression-and-index-types-plan.md)).
+
+| Name | Description |
+|---|---|
+| `kmeans(data, dim, KMeansParams)` | Clusters `data` (n * dim values) into `k` centroids; returns `KMeansResult` (`centroids`, `assignment`, `inertia`, `iterations_run`). Deterministic for a given seed, on every CPU and thread count |
+| `KMeansParams` | `k`, `iterations` (default 25), `seed`, `threads` (0: all cores) |
+| `nearest_centroid(centroids, dim, point, distance)` | Index of the nearest centroid (squared L2; ties to the lower index) |
+| `VectorCodec` | Interface: `kind()`, `code_size()`, `trained()`, `train(sample)`, `encode`, `decode`, `prepare(query, table)`, `distance(table, code)` |
+| `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
+| `BinaryCodec` | Binary quantization: one bit per dimension, with a learned threshold and spread per dimension |
+| `PQCodec(dim, metric, parts = 0)` | Product quantization: one byte per part, 256 centroids per part learned by k-means; `parts()`, `centroids()` |
+| `CodecKind`, `make_codec(kind, dim, metric, pq_subspaces = 0)` | Codec kinds (`None`, `SQ8`, `Binary`, `PQ`) and a factory |
+| `get_code_kernels()`, `get_code_kernels(isa)`, `CodeKernels` | The SIMD kernels behind code distances (`sq8_l2`, `sq8_dot`, `bits_sum`): the fastest for this CPU, or one instruction set (for tests and benchmarks) |
+| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`, `PQ`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given), `pq_subspaces` (PQ parts; 0: one per 8 dimensions); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
+| `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()`, `has_vector_values()` | On both indexes: train now (all or nothing; refused once only codes are kept), whether searches use codes, one stored code, the codec itself (for inspection), and whether full-precision vectors are still kept |
+| `VectorCodec::state()`, `restore(state)`, `clone()` | The trained state as numbers (saved in files), restoring it, and a copy |
+| `dim()`, `indexed_dim()` | On both indexes: the dimension of vectors and queries as given, and the dimensions stored and searched (fewer with truncation) |
+| `indexed_dim(params, dim)`, `prepare_truncated(out, v, input_dim, metric)` | The dimensions an index with these settings stores (throws if the truncation exceeds `dim`); preparing a full input vector for a truncating index |
+
+## Inverted file (IVF)
+
+| Name | Description |
+|---|---|
+| `IvfParams` | `lists` (0: none), `probes` (default 8), `train_after` (default 10,000; 0: only explicit); the last `FlatIndex` constructor argument |
+| `train_lists()`, `lists_trained()` | Train the lists now (k-means; all or nothing; may be repeated), and whether searches use them |
+| `list_of(id)`, `list_sizes()`, `ivf()` | The list holding a vector, the size of each list, and the settings |
+| `SearchOptions::probes` | Lists to probe for one search (0: the index's default) |
+
+## Disk-based index
+
+| Name | Description |
+|---|---|
+| `DiskIndex::build(path, ids, vectors, dim, metric, params, metadata, schema)` | Builds a Vamana graph and PQ codes, and writes the index file (replacing `path` only once complete). L2 and cosine |
+| `DiskIndex::build_from_file(path, vectors_path, metric, LargeBuildParams, ids, metadata, schema, &stats)` | Builds from a `.fbin` vectors file within a memory budget (partitions merged when it does not fit) |
+| `LargeBuildParams`, `LargeBuildStats` | `index`, `memory_budget`, `replicas` (at least 2 with several partitions), `partitions` (0: automatic); `partitions`, `largest_partition`, `merged_and_pruned` |
+| `write_vectors_file(path, vectors, dim)` | Writes vectors as a `.fbin` file |
+| `DiskIndex::open(path, DiskOpenOptions)` | Opens an index file, verifying everything held in memory |
+| `DiskOpenOptions` | `io_threads` (read each round's nodes concurrently; 0: one after another), `simulated_latency` (delays every read, for tests and benchmarks) |
+| `search(query, k, DiskSearchParams{L, beam_width}, options, &stats)` | Searches from disk; filters, predicates, deadlines; exact distances |
+| `search_batch`, `search_by_id`, `contains`, `get_vector`, `get`, `scan` | As for the in-memory indexes |
+| `read_node(node)`, `blocks_read()`, `medoid()`, `codec()`, `metadata()` | Inspection: one node as stored, blocks read since opening, the entry point, the PQ codec, the metadata |
+| `DiskIndexParams` | `graph` (`VamanaParams`), `pq_subspaces` (0: one part per 2 dimensions) |
+| `DiskSearchStats` | `nodes_read`, `blocks_read`, `rounds`, `stopped_early` |
+| `VamanaGraph::build(vectors, dim, metric, VamanaParams{R, L, alpha, seed})` | The Vamana graph alone, built and searched in memory (`search`, `neighbors`, `medoid`) |
+| `BlockFile` | Positional reads from a read-only file, safe from many threads |

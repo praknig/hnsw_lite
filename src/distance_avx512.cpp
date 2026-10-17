@@ -14,6 +14,8 @@
  */
 #include <immintrin.h>
 
+#include <cstdint>
+
 #include "kernels.h"
 
 namespace vecdb::kernels {
@@ -66,4 +68,47 @@ float ip_avx512(const float* a, const float* b, std::size_t n) { return -dot(a, 
 /// Cosine distance for normalized vectors: 1 - (a . b).
 float cos_avx512(const float* a, const float* b, std::size_t n) { return 1.0f - dot(a, b, n); }
 
+
+namespace {
+inline __m512 bytes16(const std::uint8_t* c) {  // 16 bytes, widened to 16 floats
+    return _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c))));
+}
+}  // namespace
+
+float sq8_l2_avx512(const float* t, const float* s, const std::uint8_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512 diff = _mm512_fnmadd_ps(bytes16(c + j), _mm512_loadu_ps(s + j), _mm512_loadu_ps(t + j));
+        acc = _mm512_fmadd_ps(diff, diff, acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) {
+        const float diff = t[j] - float(c[j]) * s[j];
+        sum += diff * diff;
+    }
+    return sum;
+}
+
+float sq8_dot_avx512(const float* w, const std::uint8_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) acc = _mm512_fmadd_ps(bytes16(c + j), _mm512_loadu_ps(w + j), acc);
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) sum += w[j] * float(c[j]);
+    return sum;
+}
+
+float bits_sum_avx512(const float* w, const std::uint8_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) {  // two code bytes are exactly a 16-lane mask
+        const __mmask16 m = static_cast<__mmask16>(c[j / 8] | (c[j / 8 + 1] << 8));
+        acc = _mm512_mask_add_ps(acc, m, acc, _mm512_loadu_ps(w + j));
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j)
+        if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
+    return sum;
+}
 }  // namespace vecdb::kernels

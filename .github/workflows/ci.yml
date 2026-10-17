@@ -171,7 +171,12 @@ jobs:
       # Emulation is slow, so the two exhaustive file-corruption sweeps and the
       # long-running stress group are left to the native jobs.
       - name: Test on the emulated CPU
-        run: qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_ --exclude stress.
+        # One emulated process per group, four at a time (the groups come from
+        # --list, keeping only group.test lines: it ends with a summary line, so
+        # new groups are included automatically); any failure fails the step.
+        run: |
+          ./build/test_comprehensive --list | grep -E '^[a-z0-9_]+[.][a-z0-9_]+$' | cut -d. -f1 | sort -u | grep -vx stress |
+            xargs -P 4 -I{} qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --group {} --exclude p20_ --exclude p21_
 
   # The toolchain used for local development on Windows (MinGW-w64 GCC).
   windows-mingw:
@@ -211,7 +216,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Linux / ASan + UBSan
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
@@ -225,7 +230,9 @@ jobs:
         run: cmake --build build --parallel
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        # The 36 groups are independent CTest tests: four at a time on the
+        # runner's 4 cores (one at a time took over 30 minutes in this build).
+        run: ctest --test-dir build --output-on-failure -j 4
 
   # Line and branch coverage of the library. Measured: 100% of lines, about
   # 98% of branches; the remaining branches are compiler-generated (inside
@@ -239,7 +246,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Linux / Coverage
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -256,7 +263,9 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive
 
       - name: Test
-        run: ./build/test_comprehensive
+        # Four groups at a time; GCC locks .gcda files while merging, so parallel
+        # processes add up their counts correctly.
+        run: ctest --test-dir build --output-on-failure -j 4
 
       - name: Coverage report
         run: |
@@ -272,10 +281,15 @@ jobs:
               SKIP_KERNELS="$SKIP_KERNELS --exclude $PWD/$file"
             fi
           done
+          # Hit counts above 2^32 are real here (the distance kernels run billions of
+          # times), not gcov bug 68080's garbage (near 2^64): gcovr's suspicious-hit
+          # check is kept, with its threshold raised to 2^40.
           gcovr -r . build \
             --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" $SKIP_KERNELS \
             --exclude-unreachable-branches --exclude-throw-branches \
             --gcov-ignore-parse-errors=negative_hits.warn_once_per_file --merge-lines \
+            --gcov-suspicious-hits-threshold 1099511627776 \
+            -j 4 \
             --print-summary --html-details coverage/index.html \
             --fail-under-line 99 --fail-under-branch 97
 
@@ -292,7 +306,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Linux / ThreadSanitizer
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
@@ -312,7 +326,8 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive
 
       - name: Test threaded groups
-        run: ./build/test_comprehensive --group concurrency --group helpers --group deletion --group add_batch
+        # The threaded groups (14), four at a time.
+        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk)(\..*)?$'
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).
