@@ -172,9 +172,10 @@ jobs:
       # long-running stress group are left to the native jobs.
       - name: Test on the emulated CPU
         # One emulated process per group, four at a time (the groups come from
-        # --list, so new groups are included automatically); any failure fails the step.
+        # --list, keeping only group.test lines: it ends with a summary line, so
+        # new groups are included automatically); any failure fails the step.
         run: |
-          ./build/test_comprehensive --list | cut -d. -f1 | sort -u | grep -vx stress |
+          ./build/test_comprehensive --list | grep -E '^[a-z0-9_]+[.][a-z0-9_]+$' | cut -d. -f1 | sort -u | grep -vx stress |
             xargs -P 4 -I{} qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --group {} --exclude p20_ --exclude p21_
 
   # The toolchain used for local development on Windows (MinGW-w64 GCC).

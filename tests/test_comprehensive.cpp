@@ -9818,9 +9818,13 @@ TEST(control, t02_cancel_from_another_thread) {
     SearchOptions o;
     o.cancel = &cancel;
     o.stats = &stats;
+    // At its 100th call the predicate waits until the other thread has set the
+    // flag: the cancel always lands mid-search. (Sleeping instead made this
+    // depend on timing: MinGW rounds sub-millisecond sleeps down to nothing, and
+    // the search finished before the cancel arrived.)
     o.predicate = [&](std::uint64_t) {
-        ++calls;
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        if (++calls == 100)
+            while (!cancel) std::this_thread::yield();
         return true;
     };
     with_watchdog(60, "t02", [&] {
