@@ -38,7 +38,8 @@
 namespace vecdb {
 
 /// Positional reads from a read-only file, safe from many threads at once
-/// (pread on POSIX, ReadFile with an offset on Windows).
+/// (pread on POSIX, ReadFile with an offset on Windows). On every platform the
+/// file may be deleted or replaced while open; reads continue from the old one.
 class BlockFile {
 public:
     explicit BlockFile(const std::string& path);  ///< throws std::runtime_error if it cannot be opened

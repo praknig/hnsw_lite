@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <functional>
@@ -44,7 +45,10 @@ namespace vecdb {
 
 BlockFile::BlockFile(const std::string& path) {
 #ifdef _WIN32
-    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    // FILE_SHARE_DELETE: as on POSIX, the file can be deleted or replaced (an
+    // index rebuilt in place) while open; this handle keeps reading the old one.
+    HANDLE h = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path);
     LARGE_INTEGER size;
     if (!GetFileSizeEx(h, &size)) {
@@ -192,8 +196,61 @@ struct Layout {
     }
 };
 
-/// Writes `fill` to a temporary file next to `path`, then renames it into place
-/// (an existing file is replaced only once the new one is complete).
+/// Moves `from` over `to`, replacing it. As on POSIX, `to` may be open (a
+/// DiskIndex reading it keeps reading the old file). On Windows, in order:
+/// a rename with POSIX semantics (atomic; Windows 10 or later on NTFS); the
+/// classic MoveFileEx (when `to` is not open); or moving the open `to` aside
+/// (allowed: BlockFile opens with FILE_SHARE_DELETE), moving `from` in and
+/// deleting the old file, which disappears once its last reader closes (not
+/// atomic: for a moment `to` does not exist).
+void replace_file(const std::string& from, const std::string& to) {
+#ifdef _WIN32
+    const std::wstring wfrom = std::filesystem::absolute(from).wstring(), wto = std::filesystem::absolute(to).wstring();
+    {
+        // FILE_RENAME_INFO with Flags (newer SDKs make it a union with
+        // ReplaceIfExists; this layout is the same), class FileRenameInfoEx (22).
+        struct RenameInfo {
+            DWORD flags;
+            HANDLE root;
+            DWORD length;
+            WCHAR name[1];
+        };
+        static_assert(offsetof(RenameInfo, root) == offsetof(FILE_RENAME_INFO, RootDirectory) &&
+                          offsetof(RenameInfo, length) == offsetof(FILE_RENAME_INFO, FileNameLength) &&
+                          offsetof(RenameInfo, name) == offsetof(FILE_RENAME_INFO, FileName),
+                      "RenameInfo must match FILE_RENAME_INFO");
+        HANDLE h = CreateFileW(wfrom.c_str(), DELETE | SYNCHRONIZE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            std::vector<char> buf(sizeof(RenameInfo) + wto.size() * sizeof(WCHAR), 0);
+            auto* info = reinterpret_cast<RenameInfo*>(buf.data());
+            info->flags = 0x1 | 0x2;  // FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS
+            info->root = nullptr;
+            info->length = static_cast<DWORD>(wto.size() * sizeof(WCHAR));
+            std::memcpy(info->name, wto.c_str(), wto.size() * sizeof(WCHAR));
+            const BOOL ok = SetFileInformationByHandle(h, static_cast<FILE_INFO_BY_HANDLE_CLASS>(22), info, static_cast<DWORD>(buf.size()));
+            CloseHandle(h);
+            if (ok) return;
+        }
+    }
+    if (MoveFileExW(wfrom.c_str(), wto.c_str(), MOVEFILE_REPLACE_EXISTING)) return;
+    const std::wstring aside = wto + L".old-" + std::to_wstring(std::random_device{}());
+    if (MoveFileExW(wto.c_str(), aside.c_str(), 0)) {
+        if (MoveFileExW(wfrom.c_str(), wto.c_str(), 0)) {
+            DeleteFileW(aside.c_str());  // pending until its readers close
+            return;
+        }
+        MoveFileExW(aside.c_str(), wto.c_str(), 0);  // put the old file back
+    }
+    throw std::runtime_error("cannot replace " + to);
+#else
+    std::filesystem::rename(from, to);
+#endif
+}
+
+/// Writes `fill` to a temporary file next to `path`, then moves it into place
+/// (an existing file is replaced only once the new one is complete, even while
+/// a DiskIndex has it open).
 template <class Fill>
 void write_atomically(const std::string& path, Fill&& fill) {
     static std::atomic<unsigned> counter{0};
@@ -206,7 +263,7 @@ void write_atomically(const std::string& path, Fill&& fill) {
             out.flush();
             if (!out) throw std::runtime_error("cannot write " + tmp);
         }
-        std::filesystem::rename(tmp, path);
+        replace_file(tmp, path);
     } catch (...) {
         std::error_code ignored;
         std::filesystem::remove(tmp, ignored);

@@ -6584,7 +6584,10 @@ std::unique_ptr<HnswIndex> load_hnsw(const std::string& bytes) {
 
 /// A unique temporary file path for one test.
 std::string temp_path(const std::string& name) {
-    return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + name + ".bin")).string();
+    // A token per process: test groups run in parallel (ctest -j), and two runs
+    // on one machine must never share a file.
+    static const std::string token = std::to_string(std::random_device{}());
+    return (std::filesystem::temp_directory_path() / ("hnsw_lite_test_" + token + "_" + name + ".bin")).string();
 }
 
 /// Temporary files a save left next to `path` ("<path>.tmp-..."): must be none.
@@ -13879,6 +13882,26 @@ TEST(disk, dk34_the_budget_holds_with_more_replicas) {
     DiskIndex::build_from_file(path, vec, Metric::L2, lp, {}, {}, Schema::dynamic(), &st);
     CHECK(st.partitions > 1 && st.largest_partition <= cap && disk_reachable(*DiskIndex::open(path)) == 4000);
     for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+TEST(disk, dk35_replaced_or_deleted_while_open) {
+    // Found on Windows: an open index file could not be deleted or replaced
+    // (rebuilt in place), while POSIX allows both. Now the same everywhere: the
+    // open index keeps reading the file it opened.
+    auto old_data = random_vectors(200, 8, 1960), new_data = random_vectors(300, 8, 1961);
+    const std::string path = temp_path("dk35");
+    DiskIndex::build(path, id_range(0, 200), flatten(old_data), 8, Metric::L2);
+    const auto old_index = DiskIndex::open(path);
+    DiskIndex::build(path, id_range(0, 300), flatten(new_data), 8, Metric::L2);  // replaced while open
+    const auto new_index = DiskIndex::open(path);
+    CHECK(old_index->size() == 200 && new_index->size() == 300);
+    CHECK(old_index->search(old_data[7], 1)[0].id == 7 && *old_index->get_vector(9) == old_data[9]);  // still the old file
+    CHECK(new_index->search(new_data[7], 1)[0].id == 7);
+    // Deleted while two indexes have it open: the deletion succeeds and both keep
+    // working. (Whether the name disappears at once differs: older Windows keeps a
+    // file "delete pending" until its last reader closes.)
+    std::filesystem::remove(path);
+    CHECK(old_index->search(old_data[3], 1)[0].id == 3 && new_index->search(new_data[250], 1)[0].id == 250);
 }
 
 // ===========================================================================
