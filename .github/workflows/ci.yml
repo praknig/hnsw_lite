@@ -281,10 +281,14 @@ jobs:
               SKIP_KERNELS="$SKIP_KERNELS --exclude $PWD/$file"
             fi
           done
+          # Hit counts above 2^32 are real here (the distance kernels run billions of
+          # times), not gcov bug 68080's garbage (near 2^64): gcovr's suspicious-hit
+          # check is kept, with its threshold raised to 2^40.
           gcovr -r . build \
             --filter "$PWD/include/" --filter "$PWD/src/" --exclude "$PWD/src/distance_neon.cpp" $SKIP_KERNELS \
             --exclude-unreachable-branches --exclude-throw-branches \
             --gcov-ignore-parse-errors=negative_hits.warn_once_per_file --merge-lines \
+            --gcov-suspicious-hits-threshold 1099511627776 \
             --print-summary --html-details coverage/index.html \
             --fail-under-line 99 --fail-under-branch 97
 
