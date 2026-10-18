@@ -84,4 +84,45 @@ struct HealthReport {
     double churn() const { return double(removals + updates) / double(live > 0 ? live : 1); }
 };
 
+/// What HnswIndex::upkeep does (both by default).
+struct UpkeepOptions {
+    /// Replace links to removed vectors, on every level, by the best of the
+    /// node's other links and the removed vectors' live links (as FreshDiskANN
+    /// consolidates deletions). Such links are followed by searches in vain, and
+    /// point at an unrelated vector once the slot is reused.
+    bool consolidate = true;
+    /// Give every vector that no search can reach an incoming link on level 0,
+    /// from a nearby reachable vector found by searching for it.
+    bool reconnect = true;
+    /// Vectors repaired per call (0: no limit). Upkeep is incremental: every
+    /// repaired vector leaves a valid graph, so calling again continues.
+    std::size_t max_nodes = 0;
+};
+
+struct UpkeepStats {
+    std::size_t nodes_repaired = 0;    ///< vectors whose links were consolidated
+    std::size_t links_replaced = 0;    ///< links to removed vectors removed
+    std::size_t reconnected = 0;       ///< unreachable vectors given an incoming link
+    std::size_t unreachable = 0;       ///< vectors still unreachable afterwards (only counted when complete)
+    /// Everything was done: no budget, deadline or cancellation stopped it. Then
+    /// the churn counters start again from zero.
+    bool complete = false;
+};
+
+/// What rebuild() does.
+struct RebuildOptions {
+    /// Train the codec (SQ8, binary, PQ) again on the current vectors, and for a
+    /// FlatIndex the IVF lists: what health() reports as drift. Without the
+    /// stored vectors (codes only) the codec is kept as it is.
+    bool retrain = true;
+};
+
+struct RebuildStats {
+    std::size_t kept = 0;          ///< vectors in the rebuilt index
+    std::size_t reclaimed = 0;     ///< free slots no longer needed
+    std::size_t caught_up = 0;     ///< IDs changed during the rebuild, copied in before the swap
+    bool codec_retrained = false;  ///< the codec was trained again
+    bool lists_retrained = false;  ///< the IVF lists were trained again (FlatIndex)
+};
+
 }  // namespace vecdb

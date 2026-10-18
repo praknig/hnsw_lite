@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -14364,6 +14364,515 @@ TEST(health, he15_disk_partitioned_identical_vectors_stay_reachable) {
 }
 
 // ===========================================================================
+// Upkeep step 2: repair under churn, incremental upkeep, automatic compact()
+// (UK1-UK8)
+// ===========================================================================
+
+namespace {
+
+HealthReport quick_health(const HnswIndex& h) {
+    HealthOptions o;
+    o.recall_sample = 0;
+    return h.health(o);
+}
+
+}  // namespace
+
+TEST(upkeep, uk01_update_churn_on_a_small_index) {
+    // The documented churn finding: 320 updates per vector of a 20-vector index.
+    // Measured before this step: unreachable vectors in 37 of 200 random orders
+    // (worst 7 of 20 reachable); better repair: 7 of 200 (worst 17); after upkeep:
+    // none.
+    auto pool = clustered(200, 8, 4, 611);
+    std::size_t damaged = 0, after = 0, worst = 20;
+    for (unsigned order = 0; order < 200; ++order) {
+        HnswIndex h(8, Metric::L2);
+        for (std::uint64_t id = 0; id < 20; ++id) h.add(id, pool[id]);
+        std::mt19937 rng(order);
+        for (int u = 0; u < 6400; ++u) h.upsert(rng() % 20, pool[rng() % 200]);
+        damaged += quick_health(h).unreachable > 0;
+        const UpkeepStats st = h.upkeep();
+        const HealthReport r = quick_health(h);
+        after += r.unreachable > 0;
+        worst = std::min(worst, r.live - r.unreachable);
+        if (!st.complete || st.unreachable != r.unreachable) ++after;
+    }
+    std::printf("    orders with unreachable vectors: %zu of 200 after the updates, %zu after upkeep (worst %zu of 20 reachable)\n", damaged, after, worst);
+    CHECK(damaged < 20 && after == 0 && worst == 20);
+}
+
+TEST(upkeep, uk02_update_churn_on_a_larger_index) {
+    auto data = clustered(6000, 16, 20, 7);
+    HnswParams p;
+    p.M = 8;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t id = 0; id < 2000; ++id) h.add(id, data[id]);
+    std::mt19937 rng(3);
+    for (int u = 0; u < 10000; ++u) h.upsert(rng() % 2000, data[rng() % 6000]);
+    const HealthReport before = h.health();
+    const UpkeepStats st = h.upkeep();
+    const HealthReport after = h.health();
+    std::printf("    unreachable %zu -> %zu, recall@10 %.3f -> %.3f (%zu reconnected, %zu links replaced)\n", before.unreachable, after.unreachable,
+                *before.recall, *after.recall, st.reconnected, st.links_replaced);
+    CHECK(st.complete && st.unreachable == 0 && after.unreachable == 0 && after.no_incoming == 0 && *after.recall >= *before.recall);
+    CHECK(before.updates == 10000 && after.updates == 0 && after.removals == 0);  // complete upkeep resets the counters
+}
+
+TEST(upkeep, uk03_consolidates_links_to_removed_vectors) {
+    auto data = clustered(3000, 16, 12, 2003);
+    HnswParams p;
+    p.M = 8;
+    p.repair_on_remove = false;  // removals leave their links behind
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (i % 5 != 0) h.remove(i);
+    const HealthReport before = h.health();
+    const UpkeepStats st = h.upkeep();
+    const HealthReport after = h.health();
+    std::printf("    links to removed %zu -> %zu (%zu vectors repaired); recall@10 %.3f -> %.3f\n", before.links_to_removed, after.links_to_removed,
+                st.nodes_repaired, *before.recall, *after.recall);
+    CHECK(before.links_to_removed > 1000 && after.links_to_removed == 0 && st.links_replaced >= before.links_to_removed);
+    CHECK(after.unreachable == 0 && *after.recall >= 0.95);
+    check_graph(h, 1.0);
+}
+
+TEST(upkeep, uk04_a_budget_makes_it_incremental) {
+    auto data = clustered(3000, 16, 12, 2004);
+    HnswParams p;
+    p.M = 8;
+    p.repair_on_remove = false;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 3000; i += 2) h.remove(i);
+    UpkeepOptions small;
+    small.max_nodes = 5;
+    const UpkeepStats first = h.upkeep(small);
+    CHECK(!first.complete && first.nodes_repaired + first.reconnected == 5 && quick_health(h).removals == 1500);  // counters kept until complete
+    std::size_t calls = 1;
+    for (UpkeepStats st = first; !st.complete; ++calls) st = h.upkeep(small);
+    const HealthReport r = quick_health(h);
+    std::printf("    %zu calls of at most 5 vectors each\n", calls);
+    CHECK(calls > 10 && r.links_to_removed == 0 && r.unreachable == 0 && r.removals == 0);
+    check_graph(h, 1.0);
+}
+
+TEST(upkeep, uk05_deadlines_and_cancellation_stop_it_cleanly) {
+    auto data = clustered(2000, 8, 8, 2005);
+    HnswParams p;
+    p.repair_on_remove = false;
+    HnswIndex h(8, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 2000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 2000; i += 3) h.remove(i);
+    OperationOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    const UpkeepStats a = h.upkeep({}, late);
+    std::atomic<bool> cancel{true};
+    OperationOptions cancelled;
+    cancelled.cancel = &cancel;
+    const UpkeepStats b = h.upkeep({}, cancelled);
+    CHECK(!a.complete && !b.complete && a.nodes_repaired == 0 && b.nodes_repaired == 0 && quick_health(h).removals > 0);
+    check_graph(h, 0.0);  // untouched and valid
+    CHECK(h.upkeep().complete && quick_health(h).links_to_removed == 0);
+}
+
+TEST(upkeep, uk06_codes_only_and_empty_indexes) {
+    HnswIndex empty(4, Metric::L2);
+    const UpkeepStats e = empty.upkeep();
+    CHECK(e.complete && e.nodes_repaired == 0 && e.unreachable == 0);
+    auto pool = clustered(200, 16, 4, 2006);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 20;
+    p.quantization.keep_full_vectors = false;
+    std::size_t damaged = 0, after = 0;
+    for (unsigned order = 0; order < 40; ++order) {  // churn as in uk01, codes only: hosts found through decoded codes
+        HnswIndex h(16, Metric::L2, p);
+        for (std::uint64_t id = 0; id < 30; ++id) h.add(id, pool[id]);
+        std::mt19937 rng(order);
+        for (int u = 0; u < 6000; ++u) h.upsert(rng() % 30, pool[rng() % 200]);
+        damaged += quick_health(h).unreachable > 0;
+        CHECK(!h.has_vector_values() && h.upkeep().complete);
+        after += quick_health(h).unreachable > 0;
+    }
+    std::printf("    codes only: %zu of 40 orders with unreachable vectors, %zu after upkeep\n", damaged, after);
+    CHECK(after == 0);
+}
+
+TEST(upkeep, uk07_automatic_compact) {
+    auto data = random_vectors(1000, 8, 2007);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i]);
+    CHECK(h.auto_compact() == 0.0);
+    for (std::uint64_t i = 0; i < 400; ++i) h.remove(i);
+    CHECK(quick_health(h).free_slots == 400);  // off by default: slots wait for reuse
+    HnswIndex g(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) g.add(i, data[i]);
+    g.set_auto_compact(0.3);
+    std::size_t compacted_at = 0;
+    for (std::uint64_t i = 0; i < 400 && compacted_at == 0; ++i) {
+        g.remove(i);
+        if (quick_health(g).free_slots == 0) compacted_at = i + 1;
+    }
+    // Free slots pass 30% of all slots at the 301st removal (301 of 1000 > 0.3).
+    const HealthReport r = quick_health(g);
+    CHECK(compacted_at == 301 && r.live == 699 && r.slots == 699 && r.removals == 0 && r.unreachable == 0);
+    g.update(500, data[0]);  // updates count too: a freed slot each
+    CHECK(quick_health(g).free_slots == 1);
+    CHECK_THROWS_AS(std::invalid_argument, g.set_auto_compact(-0.1));
+    CHECK_THROWS_AS(std::invalid_argument, g.set_auto_compact(0.95));
+    CHECK_THROWS_AS(std::invalid_argument, g.set_auto_compact(kNaN));
+    CHECK(load_hnsw(save_bytes(g))->auto_compact() == 0.0);  // a runtime setting: not saved
+    for (std::uint64_t i = 301; i < 1000; ++i) g.remove(i);  // to empty (compacting on the way): nothing left to compact
+    CHECK(g.size() == 0 && quick_health(g).live == 0);
+}
+
+TEST(upkeep, uk08_searches_between_budgeted_calls) {
+    auto data = clustered(3000, 16, 12, 2008);
+    HnswParams p;
+    p.repair_on_remove = false;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 3000; i += 2) h.remove(i);
+    std::atomic<bool> done{false};
+    std::atomic<long> bad{0};
+    with_watchdog(60, "uk08", [&] {
+        std::thread vacuum([&] {
+            UpkeepOptions o;
+            o.max_nodes = 20;
+            while (!h.upkeep(o).complete) {
+            }
+            done = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            while (!done)
+                for (const auto& x : h.search(data[1 + 2 * t], 5)) bad += long(x.id % 2 == 0);  // removed IDs never appear
+        });
+        vacuum.join();
+    });
+    CHECK(bad == 0 && quick_health(h).links_to_removed == 0);
+}
+
+// ===========================================================================
+// Upkeep step 3: rebuilding while in use, with an atomic swap (RB1-RB7)
+// ===========================================================================
+
+namespace {
+
+/// Every record of an index (ID, stored vector, metadata), for comparisons.
+std::map<std::uint64_t, std::pair<std::vector<float>, Metadata>> records_of(const HnswIndex& h) {
+    std::map<std::uint64_t, std::pair<std::vector<float>, Metadata>> out;
+    ScanOptions o;
+    o.limit = 1000000;
+    for (const Record& r : h.scan(o).records) out[r.id] = {r.vector, r.metadata};
+    return out;
+}
+
+}  // namespace
+
+TEST(rebuild, rb01_a_quiet_rebuild_is_a_compact) {
+    auto data = clustered(2000, 16, 10, 2100);
+    HnswIndex h(16, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 2000; ++i) h.add(i, data[i], meta_for(i));
+    for (std::uint64_t i = 0; i < 2000; i += 3) h.remove(i);
+    for (std::uint64_t i = 1; i < 2000; i += 7) h.update(i, data[(i * 13) % 2000]);
+    const auto before = records_of(h);
+    const RebuildStats st = h.rebuild();
+    const HealthReport r = h.health();
+    CHECK(st.kept == before.size() && st.reclaimed > 600 && st.caught_up == 0 && !st.codec_retrained && records_of(h) == before);
+    CHECK(r.free_slots == 0 && r.slots == r.live && r.unreachable == 0 && r.removals == 0 && r.updates == 0 && *r.recall >= 0.95);
+    check_graph(h, 1.0);
+}
+
+TEST(rebuild, rb02_retrains_a_drifted_codec) {
+    auto before = drifted(1000, 16, 2101, 0.0f), after = drifted(2000, 16, 2102, 0.0f, 3.0f);
+    for (bool retrain : {true, false}) {
+        HnswParams p;
+        p.quantization.codec = CodecKind::SQ8;
+        p.quantization.train_after = 1000;
+        HnswIndex h(16, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, before[i]);
+        for (std::uint64_t i = 0; i < 2000; ++i) h.add(5000 + i, after[i]);
+        HealthOptions o;
+        o.recall_sample = 0;
+        o.retrain_sample = 1000;
+        const HealthReport drift = h.health(o);
+        RebuildOptions ro;
+        ro.retrain = retrain;
+        const RebuildStats st = h.rebuild(ro);
+        const HealthReport now = h.health(o);
+        std::printf("    retrain %s: codec error %.2e -> %.2e (retrained sample %.2e), clipped %.3f -> %.3f\n", retrain ? "on " : "off",
+                    *drift.codec_error, *now.codec_error, *now.codec_error_retrained, *drift.clipped, *now.clipped);
+        if (retrain) CHECK(st.codec_retrained && *now.codec_error < 3.0 * *now.codec_error_retrained && *now.clipped < 0.01);
+        else CHECK(!st.codec_retrained && *now.codec_error == *drift.codec_error && *now.clipped == *drift.clipped);
+    }
+}
+
+TEST(rebuild, rb03_changes_made_during_a_rebuild_are_kept) {
+    // The progress callback runs while the new index is built, without the lock:
+    // changes made there are exactly those a rebuild must catch up on.
+    auto data = clustered(1500, 8, 6, 2103);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)));
+    std::size_t calls = 0;
+    OperationOptions o;
+    o.progress = [&](std::size_t, std::size_t) {
+        if (++calls != 2) return;
+        h.add(1000, data[1000], Metadata().set("c", std::int64_t(77)));           // new
+        h.remove(3);                                                               // gone
+        h.update(4, data[1004]);                                                   // moved
+        h.upsert(5, data[1005], Metadata().set("c", std::int64_t(55)));            // moved, new metadata
+        h.set_metadata(6, Metadata().set("c", std::int64_t(66)));                  // new metadata
+        h.remove_where(Filter::eq("c", std::int64_t(9)));                          // 9, 19, ...: gone
+        h.set_metadata_where(Filter::eq("c", std::int64_t(8)), Metadata().set("x", std::int64_t(1)));
+        h.add_batch(id_range(1100, 50), flatten(Vectors(data.begin() + 1100, data.begin() + 1150)));
+        h.remove(1000);                                                            // added, then gone again
+    };
+    const auto expected = [&] {  // the same changes on a copy, without any rebuild
+        auto copy = load_hnsw(save_bytes(h));
+        copy->add(1000, data[1000], Metadata().set("c", std::int64_t(77)));
+        copy->remove(3);
+        copy->update(4, data[1004]);
+        copy->upsert(5, data[1005], Metadata().set("c", std::int64_t(55)));
+        copy->set_metadata(6, Metadata().set("c", std::int64_t(66)));
+        copy->remove_where(Filter::eq("c", std::int64_t(9)));
+        copy->set_metadata_where(Filter::eq("c", std::int64_t(8)), Metadata().set("x", std::int64_t(1)));
+        copy->add_batch(id_range(1100, 50), flatten(Vectors(data.begin() + 1100, data.begin() + 1150)));
+        copy->remove(1000);
+        return records_of(*copy);
+    }();
+    const RebuildStats st = h.rebuild({}, o);
+    std::printf("    caught up %zu changed IDs\n", st.caught_up);
+    CHECK(calls >= 2 && records_of(h) == expected && st.kept == expected.size() && st.caught_up >= 100 + 50 + 5);
+    CHECK(h.search(data[1004], 1)[0].id == 4 && !h.contains(1000) && h.contains(1149));
+    check_graph(h, 1.0);
+    CHECK(h.health().free_slots <= st.caught_up);  // IDs removed while catching up leave slots for reuse
+}
+
+TEST(rebuild, rb04_searches_and_changes_continue_during_a_rebuild) {
+    auto data = clustered(4000, 16, 12, 2104);
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    std::atomic<bool> done{false};
+    std::atomic<long> bad{0};
+    std::map<std::uint64_t, std::size_t> shadow;  // ID -> data row, as the writer leaves it
+    for (std::uint64_t i = 0; i < 3000; ++i) shadow[i] = i;
+    with_watchdog(120, "rb04", [&] {
+        std::thread rebuilder([&] {
+            for (int round = 0; round < 3; ++round) (void)h.rebuild();
+            done = true;
+        });
+        std::thread writer([&] {
+            std::mt19937 rng(7);
+            while (!done) {
+                const std::uint64_t id = rng() % 3500;
+                const std::size_t row = rng() % 4000;
+                if (rng() % 3 == 0) {
+                    h.remove(id);
+                    shadow.erase(id);
+                } else {
+                    h.upsert(id, data[row]);
+                    shadow[id] = row;
+                }
+            }
+        });
+        run_threads(2, [&](std::size_t t) {
+            while (!done)
+                for (const auto& x : h.search(data[t * 11], 10)) bad += long(x.id >= 3500);
+        });
+        rebuilder.join();
+        writer.join();
+    });
+    bool same = h.size() == shadow.size();
+    for (const auto& [id, row] : shadow) same = same && h.get_vector(id) && *h.get_vector(id) == data[row];
+    CHECK(bad == 0 && same);
+    check_graph(h, 0.99);
+}
+
+TEST(rebuild, rb05_cancellation_leaves_the_index_as_it_was) {
+    auto data = random_vectors(800, 8, 2105);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 800; i += 4) h.remove(i);
+    const std::string bytes = save_bytes(h);
+    OperationOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    CHECK_THROWS_AS(Cancelled, (void)h.rebuild({}, late));
+    std::atomic<bool> cancel{true};
+    OperationOptions cancelled;
+    cancelled.cancel = &cancel;
+    CHECK_THROWS_AS(Cancelled, (void)h.rebuild({}, cancelled));
+    CHECK(save_bytes(h) == bytes);
+    h.add(5000, data[1]);  // changes after a cancelled rebuild work normally
+    CHECK(h.rebuild().kept == 601 && h.contains(5000));  // and a new rebuild runs
+}
+
+TEST(rebuild, rb06_one_at_a_time_and_codes_only) {
+    auto data = random_vectors(600, 16, 2106);
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 600; ++i) h.add(i, data[i]);
+    bool refused = false;
+    OperationOptions o;
+    o.progress = [&](std::size_t, std::size_t) {
+        if (refused) return;
+        try {
+            (void)h.rebuild();
+        } catch (const std::logic_error&) {
+            refused = true;
+        }
+    };
+    (void)h.rebuild({}, o);
+    CHECK(refused && h.size() == 600);
+    HnswParams p;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 300;
+    p.quantization.keep_full_vectors = false;
+    HnswIndex lean(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 600; ++i) lean.add(i, data[i]);
+    const auto before = records_of(lean);
+    const RebuildStats st = lean.rebuild();  // codes only: nothing to retrain on
+    CHECK(!st.codec_retrained && !lean.has_vector_values() && records_of(lean) == before);
+    check_graph(lean, 1.0);
+}
+
+TEST(rebuild, rb07_out_of_memory_leaves_the_index_as_it_was) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
+    auto data = random_vectors(60, 8, 2107);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 20;
+    HnswIndex h(8, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 60; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 60; i += 5) h.remove(i);
+    std::string bytes = save_bytes(h);
+    bool intact = true;
+    const long points = sweep_allocation_failures([&] { (void)h.rebuild(); },
+                                                  [&] { intact = intact && save_bytes(h) == bytes; });
+    std::printf("    %ld allocation points\n", points);
+    CHECK(points > 100 && intact && h.health().free_slots == 0);
+    CHECK(h.rebuild().kept == 48);  // tracking was reset after every failure
+}
+
+TEST(rebuild, rb08_flat_retrains_drifted_lists) {
+    auto before = drifted(2000, 16, 2110, 0.0f), after = drifted(4000, 16, 2111, 6.0f);
+    IvfParams ivf;
+    ivf.lists = 16;
+    ivf.probes = 2;
+    ivf.train_after = 0;
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(i, before[i]);
+    f.train_lists();
+    for (std::uint64_t i = 0; i < 4000; ++i) f.add(10000 + i, after[i]);
+    HealthOptions o;
+    o.retrain_sample = 1000;
+    const HealthReport drift = f.health(o);
+    const RebuildStats st = f.rebuild();
+    const HealthReport now = f.health(o);
+    std::printf("    centroid distance %.1f -> %.1f (retrained sample %.1f), imbalance %.1f -> %.1f, recall@10 with 2 probes %.3f -> %.3f\n",
+                *drift.centroid_distance, *now.centroid_distance, *now.centroid_distance_retrained, drift.list_imbalance, now.list_imbalance,
+                *drift.recall, *now.recall);
+    CHECK(st.lists_retrained && !st.codec_retrained && st.kept == 6000 && st.caught_up == 0);
+    // Drifted lists mostly cost speed (a probe scans an oversized list), not recall.
+    CHECK(*now.centroid_distance < 1.5 * *now.centroid_distance_retrained && now.list_imbalance < 0.3 * drift.list_imbalance && *now.recall >= *drift.recall - 0.01);
+    CHECK(lists_consistent(f));
+}
+
+TEST(rebuild, rb09_flat_codec_and_codes_only) {
+    auto before = drifted(1000, 16, 2112, 0.0f), after = drifted(2000, 16, 2113, 0.0f, 3.0f);
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 1000;
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), q);
+    for (std::uint64_t i = 0; i < 1000; ++i) f.add(i, before[i]);
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(5000 + i, after[i]);
+    HealthOptions o;
+    o.recall_sample = 0;
+    const double clipped = *f.health(o).clipped;
+    const RebuildStats st = f.rebuild();
+    CHECK(st.codec_retrained && !st.lists_retrained && clipped > 0.2 && *f.health(o).clipped < 0.01);
+    QuantizationParams lean = q;
+    lean.keep_full_vectors = false;
+    IvfParams ivf;
+    ivf.lists = 8;
+    ivf.train_after = 0;
+    FlatIndex c(16, Metric::L2, Schema::dynamic(), lean, ivf);
+    for (std::uint64_t i = 0; i < 1000; ++i) c.add(i, before[i]);
+    c.train_lists();
+    for (std::uint64_t i = 0; i < 2000; ++i) c.add(5000 + i, after[i]);
+    const RebuildStats sc = c.rebuild();  // the lists can still be retrained, from decoded codes
+    CHECK(!c.has_vector_values() && !sc.codec_retrained && sc.lists_retrained && lists_consistent(c));  // codes kept: nothing to retrain them on
+    FlatIndex plain(4, Metric::L2);
+    plain.add(1, std::vector<float>{1, 2, 3, 4});
+    const RebuildStats nothing = plain.rebuild();  // no codec, no lists: nothing to do
+    CHECK(!nothing.codec_retrained && !nothing.lists_retrained && nothing.kept == 1);
+}
+
+TEST(rebuild, rb10_flat_changes_during_a_rebuild) {
+    auto data = clustered(3000, 8, 8, 2114);
+    IvfParams ivf;
+    ivf.lists = 12;
+    ivf.train_after = 0;
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 500;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), q, ivf);
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)));
+    f.train_lists();
+    std::size_t calls = 0;
+    OperationOptions o;
+    o.progress = [&](std::size_t, std::size_t) {
+        if (++calls != 3) return;
+        f.add(2000, data[2000]);
+        f.remove(7);
+        f.update(8, data[2008]);
+        f.remove_where(Filter::eq("c", std::int64_t(9)));
+        f.add_batch(id_range(2100, 40), flatten(Vectors(data.begin() + 2100, data.begin() + 2140)));
+    };
+    const RebuildStats st = f.rebuild({}, o);
+    std::printf("    caught up %zu rows\n", st.caught_up);
+    CHECK(calls >= 3 && st.codec_retrained && st.lists_retrained && st.caught_up >= 1 + 1 + 40 && lists_consistent(f));
+    CHECK(f.size() == 2000 + 1 - 1 - 200 + 40 && !f.contains(7) && f.contains(2139) && *f.get_vector(8) == data[2008]);
+    // Every list probed: exactly the exact results.
+    FlatIndex exact(8, Metric::L2);
+    ScanOptions all;
+    all.limit = 100000;
+    for (const Record& r : f.scan(all).records) exact.add(r.id, r.vector);
+    SearchOptions every;
+    every.probes = 12;
+    bool same = true;
+    for (std::size_t qi = 0; qi < 20; ++qi) same = same && same_up_to_ties(f.search(data[qi * 97], 10, every), exact.search(data[qi * 97], 10));
+    CHECK(same);
+}
+
+TEST(rebuild, rb11_flat_cancellation_and_out_of_memory) {
+    auto data = clustered(300, 8, 4, 2115);
+    IvfParams ivf;
+    ivf.lists = 4;
+    ivf.train_after = 0;
+    QuantizationParams q;
+    q.codec = CodecKind::PQ;
+    q.train_after = 100;
+    q.pq_subspaces = 2;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), q, ivf);
+    for (std::uint64_t i = 0; i < 300; ++i) f.add(i, data[i]);
+    f.train_lists();
+    const std::string bytes = save_bytes(f);
+    OperationOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    CHECK_THROWS_AS(Cancelled, (void)f.rebuild({}, late));
+    CHECK(save_bytes(f) == bytes);
+    if constexpr (HNSW_ALLOC_HOOK) {
+        bool intact = true;
+        std::string current = bytes;
+        const long points = sweep_allocation_failures([&] { (void)f.rebuild(); },
+                                                      [&] { intact = intact && save_bytes(f) == current; });
+        std::printf("    %ld allocation points\n", points);
+        CHECK(points > 50 && intact && lists_consistent(f));
+    }
+    CHECK(f.rebuild().lists_retrained);  // tracking was reset every time
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -14710,7 +15219,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

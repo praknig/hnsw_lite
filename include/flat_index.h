@@ -9,6 +9,7 @@
 #include <string>
 #include <optional>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "distance.h"
@@ -89,6 +90,16 @@ public:
     /// compression drift, an estimate of recall, and the removals and updates
     /// since the last upkeep. Takes the shared lock; then runs sampled searches.
     HealthReport health(const HealthOptions& options = {}) const;
+
+    /// Retrains the codec and the IVF lists on the current vectors while the index
+    /// stays in use (see RebuildOptions): under the lock, a snapshot of the stored
+    /// vectors; without it, training, and every snapshot vector's new code and
+    /// list; under the lock again, rows changed meanwhile are encoded and assigned
+    /// anew, and everything swapped in at once. Rows stay packed, so a flat index
+    /// has nothing else to rebuild. Needs memory for a copy of the stored vectors.
+    /// One rebuild at a time (std::logic_error); a deadline or cancellation throws
+    /// Cancelled and leaves the index as it is; so does running out of memory.
+    RebuildStats rebuild(const RebuildOptions& rebuild_options = {}, const OperationOptions& options = {});
 
     std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, const SearchOptions& options = {},
                                                          bool include_self = false) const;
@@ -336,6 +347,10 @@ private:
     std::size_t live_ = 0;
     std::size_t removals_since_upkeep_ = 0;  // for health(): counted where each change is final
     std::size_t updates_since_upkeep_ = 0;
+    std::optional<std::unordered_set<std::uint64_t>> changed_;  // while rebuild() runs: IDs changed since its snapshot
+    void note_change(std::uint64_t id) {  // caller holds the write lock; call before changing anything
+        if (changed_) changed_->insert(id);
+    }
     mutable SharedPool pool_;
     IndexLock lock_;  // reads share it, changes take it alone (see IndexLock)
 };

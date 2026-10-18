@@ -130,10 +130,12 @@ hnsw-lite/
 │   ├── vamana.cpp              # Building and searching Vamana graphs
 │   ├── disk_index.cpp          # The disk index: file layout, reads, search
 │   ├── health.cpp              # Health reports for every index type
+│   ├── upkeep.cpp              # Incremental upkeep (consolidation, reconnection)
+│   ├── rebuild.cpp             # Rebuilding while in use, with an atomic swap
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 766 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 785 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -403,6 +405,10 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Rebuilding** (`rebuild.cpp`). While a rebuild runs, every write path records the IDs it is about to change (`note_change`, before anything can fail; recording an unchanged ID is harmless, missing one would revive stale data). HNSW: phase 1 copies every record under the lock and samples stored vectors to train a codec on; phase 2, without any lock, builds a new index from the copy (a new codec trained first, or the old one cloned when only codes are kept); phase 3, under the lock, removes and re-adds each recorded ID through the new index's own unlocked paths (public calls from inside an index operation are refused), upkeeps the new graph if that removed anything, and moves the new state in. Flat: phase 1 copies the stored vectors; phase 2 trains the codec and k-means centroids on a sample and computes every copied vector's code and list; phase 3 matches current rows to the copy by ID (rows move when others are removed), recomputes the recorded ones, and swaps codec, codes, centroids, lists and positions together. Everything that can fail runs before the commit, and a failure stops the tracking.
+
+**Upkeep** (`upkeep.cpp`). Under the lock alone: consolidation walks every live node and, on each level where it links to removed nodes, chooses its links again (with the usual diversity rule) from its live links and the removed nodes' live links; reconnection walks level 0 through live nodes only from the entry point and, for each unreachable vector, searches for it (descent plus `search_level`, which only visits reachable nodes) and links it from the nearest result with a free slot, or in place of a link whose target keeps another incoming link from a reachable node; repeated until all are reachable (at most 16 rounds). Removal repair (`repair_neighbors`) now also gives each of the removed node's former neighbors a link back from its nearest group member with a free slot, written in place without allocating, so an update that runs out of memory cannot leave its old version without incoming links. `compact()` is split into a locking wrapper and `compact_unlocked`, which removals and updates call when the automatic threshold is passed.
 
 **Health reports** (`health.cpp`). Under the shared lock: one walk over the graph (degrees, incoming links, stale links and links to removed nodes on level 0) and a depth-first walk from the entry point that, like a search, may pass removed nodes; exact top-k answers for a sample of stored vectors, using the index's own distance function; and, on a second sample, the codec's reconstruction error (with a codec of the same kind retrained on a third, disjoint sample, since a codec flatters its training data) and the distance of vectors to their IVF centroids (and to centroids from a fresh k-means). The lock is then released and the sampled searches run through `search_by_id`, so the estimate is a snapshot. Removals and updates are counted where each change becomes final, so cancelled or rolled-back changes never count. `DiskIndex::health` reads every node once, in order, keeping the neighbor lists and finding the exact answers for its sample during the pass.
 

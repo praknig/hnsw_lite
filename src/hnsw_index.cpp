@@ -287,6 +287,7 @@ void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 }
 
 void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared) {
+    note_change(id);  // for a running rebuild(); harmless if nothing changes
     // 1. Validate everything before changing anything (or drawing a random level).
     if (prepared) scratch_.prepare(vector, Metric::L2);  // copied exactly (L2 never normalizes): see the header
     else prepare_truncated(scratch_, vector, dim(), metric_);
@@ -356,6 +357,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     const std::size_t n = ids.size(), d = dim();
     if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
     if (n == 0) return;
+    for (std::uint64_t id : ids) note_change(id);  // for a running rebuild(), before anything changes
     const Metadata none;  // for batches without metadata
     auto row = [&](std::size_t i) -> const Metadata& { return metadata ? metadata[i] : none; };
     auto vec = [&](std::size_t i) { return vectors.subspan(i * d, d); };
@@ -612,8 +614,9 @@ void HnswIndex::repair_neighbors(NodeId node) {
         // Each former neighbor lost an incoming link (the removed node's), and the
         // diversity rule above can leave one with none from this group: under
         // update churn such vectors became unreachable (see the project notes).
-        // Give each one a link back from its nearest group member, in a free slot
-        // or in place of that member's farthest link (lists are sorted by distance).
+        // Give each one a link back from its nearest group member, if that member
+        // has a free slot: never in place of another link, which could cut some
+        // other vector's last incoming link (measured: replacing gained nothing more).
         for (NodeId x : around) {
             bool linked = false;
             NodeId host = kEmpty;
@@ -633,11 +636,13 @@ void HnswIndex::repair_neighbors(NodeId node) {
                 }
             }
             if (linked || host == kEmpty) continue;  // already linked, or alone
+            // Written into the first empty slot: nothing here allocates, so this
+            // step cannot fail. (It runs after every neighbor was re-linked without
+            // the removed node; failing here would abandon an update whose old
+            // version no longer had any incoming link.)
             const auto slots = graph.links(host, l);
-            std::vector<NodeId> list(slots.begin(), slots.begin() + std::ptrdiff_t(GraphStorage::count(slots)));
-            if (list.size() >= capacity) continue;  // VARIANT: free slots only
-            list.push_back(x);
-            graph.set_links(host, l, list);
+            const std::size_t count = GraphStorage::count(slots);
+            if (count < capacity && count < slots.size()) slots[count] = x;
         }
     }
 }
@@ -660,6 +665,7 @@ bool HnswIndex::remove(std::uint64_t id) {
     IdMap& ids = storage_.ids();
     const auto node = ids.find(id);
     if (!node) return false;
+    note_change(id);
     reserve_one_more(free_slots_);  // may throw; nothing changed yet
 
     // Repair first, while the node is still live: if memory runs out here, the
@@ -673,6 +679,7 @@ bool HnswIndex::remove(std::uint64_t id) {
     ++removals_since_upkeep_;
     free_slots_.push_back(*node);
     if (*node == entry_) choose_new_entry();
+    maybe_auto_compact();
     return true;
 }
 
@@ -707,6 +714,7 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     IdMap& ids = storage_.ids();
     const auto found = ids.find(id);
     if (!found) return false;
+    note_change(id);
     const NodeId old = *found;
     reserve_one_more(free_slots_);  // room for the old slot (or an abandoned new one)
 
@@ -754,6 +762,7 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     free_slots_.push_back(old);
     if (old == entry_) choose_new_entry();
     ++updates_since_upkeep_;
+    maybe_auto_compact();
     return true;
 }
 
@@ -930,6 +939,7 @@ std::size_t HnswIndex::remove_batch(std::span<const std::uint64_t> ids) {
 
 std::size_t HnswIndex::remove_slots(const std::vector<NodeId>& slots) {
     if (slots.empty()) return 0;
+    for (NodeId n : slots) note_change(storage_.ids().external(n));  // before anything changes
     free_slots_.reserve(free_slots_.size() + slots.size());  // the last step that can fail
 
     // 1. Remove every match. Nothing here allocates, so this always completes.
@@ -952,6 +962,7 @@ std::size_t HnswIndex::remove_slots(const std::vector<NodeId>& slots) {
         } catch (const std::bad_alloc&) {  // GCOVR_EXCL_BR_LINE: repair can only fail by running out of memory
         }
     }
+    maybe_auto_compact();
     return slots.size();
 }
 
@@ -960,6 +971,7 @@ std::size_t HnswIndex::set_metadata_where(const Filter& filter, const Metadata& 
     metadata_.validate(changes);  // rejected even when nothing matches
     const std::vector<NodeId> slots = matching_slots(filter);
     if (slots.empty()) return 0;
+    for (NodeId n : slots) note_change(storage_.ids().external(n));
     MetadataStore staged = metadata_;  // all or nothing: change a copy, swap it in when complete
     for (NodeId n : slots) staged.update(n, changes);
     metadata_ = std::move(staged);
@@ -970,6 +982,7 @@ bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
     const auto guard = lock_.write("set_metadata");
     const auto node = storage_.ids().find(id);
     if (!node) return false;
+    note_change(id);
     metadata_.update(*node, metadata);
     return true;
 }
@@ -1205,6 +1218,30 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
 
 CompactStats HnswIndex::compact(const OperationOptions& options) {
     const auto guard = lock_.write("compact");
+    return compact_unlocked(options);
+}
+
+void HnswIndex::set_auto_compact(double fraction) {
+    if (!(fraction >= 0.0 && fraction <= 0.9)) throw std::invalid_argument("set_auto_compact: fraction must be in [0, 0.9]");
+    const auto guard = lock_.write("set_auto_compact");
+    auto_compact_ = fraction;
+}
+
+double HnswIndex::auto_compact() const {
+    const auto guard = lock_.read();
+    return auto_compact_;
+}
+
+void HnswIndex::maybe_auto_compact() noexcept {
+    const std::size_t free = free_slots_.size();
+    if (auto_compact_ <= 0 || live_ == 0 || double(free) <= auto_compact_ * double(live_ + free)) return;
+    try {
+        (void)compact_unlocked({});
+    } catch (...) {  // GCOVR_EXCL_LINE: only out of memory; the index is intact (compact's guarantee), so the next change tries again
+    }
+}
+
+CompactStats HnswIndex::compact_unlocked(const OperationOptions& options) {
     const std::size_t reclaimed = deleted_count();
     // Build the replacement completely first, so a failure leaves this index intact.
     HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());  // the same truncation
@@ -1235,6 +1272,8 @@ CompactStats HnswIndex::compact(const OperationOptions& options) {
     max_level_ = fresh.max_level_;
     live_ = fresh.live_;
     free_slots_ = std::move(fresh.free_slots_);
+    removals_since_upkeep_ = 0;  // a rebuilt graph carries no churn
+    updates_since_upkeep_ = 0;
     visited_pool_.clear();  // pooled lists were sized for the old, larger index
     return {live_, reclaimed};
 }

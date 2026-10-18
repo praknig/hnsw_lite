@@ -13,7 +13,7 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 These are deliberate for the current stage:
 
 - **Changes run one at a time.** Indexes are thread-safe, and adds, updates and removes take the lock alone. `add_batch` links its vectors on several threads, but searches wait while it runs; letting searches run during inserts would need the lowest storage layer redesigned for concurrent readers.
-- **Heavy update churn gradually weakens the graph.** Each update links a new version and repairs around the old one, and these small losses add up: after 320 updates per vector on a 20-vector index, one or two vectors were unreachable from the entry point in 27 of 200 random update orders (worst 90% reachable), single-threaded as well as with threads. `compact()` rebuilds the graph and restores it fully, so call it after heavy update workloads. (hnswlib has the same weakness with repeated updates.)
+- **Heavy update churn weakens the graph until upkeep.** Each update links a new version and repairs around the old one; small losses add up. Measured with 320 updates per vector of a 20-vector index: vectors became unreachable in 37 of 200 random orders, 7 since removal repair keeps each former neighbor's incoming link, and none after `upkeep()`, which reconnects them (see the [user guide](user-guide.md#upkeep)). `compact()` still rebuilds the graph completely. (hnswlib has the same weakness with repeated updates.)
 - **Inner product with vectors of very different lengths:** vectors whose lengths differ by orders of magnitude leave some vectors hard to reach in an HNSW graph (the long ones dominate every neighborhood), a known property of HNSW with inner product. Normalize the vectors (or use cosine) when their lengths vary widely.
 - **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
 - **Many exact copies of the same vector weaken the graph,** especially combined with heavy removal and update churn: graph reachability drops noticeably (hnswlib shares this limitation).
@@ -57,7 +57,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] An inverted file (IVF, and IVF-PQ) for `FlatIndex`
 - [x] A disk-based index, read-only (see the [plan](compression-and-index-types-plan.md))
 - [x] Health reports for every index type (step 1 of index upkeep)
-- [ ] Index upkeep: incremental graph repair, then rebuilds with an atomic swap (like a database's vacuum)
+- [x] Index upkeep: better repair under churn, incremental `upkeep()`, automatic `compact()` (step 2)
+- [x] Rebuilds while in use, with an atomic swap, retraining codecs and IVF lists (step 3)
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

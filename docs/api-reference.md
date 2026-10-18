@@ -301,3 +301,14 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `HealthReport` graph | `levels` (`nodes`, `expected` per level), `mean_degree`, `min_degree`, `underfull`, `no_incoming`, `unreachable`, `links_to_removed`, `stale_links` |
 | `HealthReport` drift | `codec_error`, `codec_error_retrained`, `clipped` (SQ8); `lists`, `lists_trained`, `largest_list`, `empty_lists`, `list_imbalance`, `centroid_distance`, `centroid_distance_retrained` |
 | `HealthReport` quality and churn | `recall` (optional), `removals`, `updates`, `churn()` |
+
+## Upkeep
+
+| Name | Description |
+|---|---|
+| `upkeep(UpkeepOptions, OperationOptions)` | On `HnswIndex`: consolidates links to removed vectors and reconnects unreachable ones; returns `UpkeepStats`. A deadline or cancellation stops it early without error |
+| `UpkeepOptions` | `consolidate` (true), `reconnect` (true), `max_nodes` (0: no limit; vectors repaired per call) |
+| `UpkeepStats` | `nodes_repaired`, `links_replaced`, `reconnected`, `unreachable` (afterwards), `complete` (then the churn counters are reset) |
+| `rebuild(RebuildOptions, OperationOptions)` | On `HnswIndex` and `FlatIndex`: retrains the codec (and IVF lists) while the index stays in use, then swaps atomically; returns `RebuildStats`. Cancelled, or out of memory: unchanged. One at a time (`std::logic_error`) |
+| `RebuildOptions`, `RebuildStats` | `retrain` (true); `kept`, `reclaimed`, `caught_up` (IDs changed during the rebuild), `codec_retrained`, `lists_retrained` |
+| `set_auto_compact(fraction)`, `auto_compact()` | Automatic `compact()` once free slots exceed `fraction` of all slots (0: off; at most 0.9); not saved |

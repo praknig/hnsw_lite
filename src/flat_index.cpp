@@ -33,6 +33,7 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 }
 
 void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    note_change(id);  // for a running rebuild(); harmless if nothing changes
     // 1. Validate everything before changing anything.
     prepare_truncated(scratch_, vector, dim(), metric_);
     metadata_.validate(metadata);
@@ -367,6 +368,7 @@ std::size_t FlatIndex::set_metadata_where(const Filter& filter, const Metadata& 
     metadata_.validate(changes);  // rejected even when nothing matches
     const std::vector<NodeId> slots = matching_slots(filter);
     if (slots.empty()) return 0;
+    for (NodeId n : slots) note_change(ids_.external(n));  // every write path records its IDs (harmless here)
     MetadataStore staged = metadata_;  // all or nothing: change a copy, swap it in when complete
     for (NodeId n : slots) staged.update(n, changes);
     metadata_ = std::move(staged);
@@ -374,6 +376,7 @@ std::size_t FlatIndex::set_metadata_where(const Filter& filter, const Metadata& 
 }
 
 bool FlatIndex::remove_unlocked(std::uint64_t id) {
+    note_change(id);
     const auto node = ids_.find(id);
     if (!node) return false;
     // Swap-with-last: move the last vector (and its metadata) into the freed slot,
@@ -428,6 +431,7 @@ void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const fl
 
 void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                                    const Metadata* metadata, const OperationOptions& options) {
+    for (std::uint64_t id : ids) note_change(id);  // for a running rebuild(), before anything changes
     const std::size_t n = ids.size(), d = dim();
     if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
     if (n == 0) return;
@@ -516,6 +520,7 @@ bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 }
 
 bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+    note_change(id);
     prepare_truncated(scratch_, vector, dim(), metric_);  // validates; may throw before any change
     if (metadata) metadata_.validate(*metadata);
     const auto node = ids_.find(id);
@@ -545,6 +550,7 @@ bool FlatIndex::contains(std::uint64_t id) const {
 }
 
 bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
+    note_change(id);
     const auto guard = lock_.write("set_metadata");
     const auto node = ids_.find(id);
     if (!node) return false;
