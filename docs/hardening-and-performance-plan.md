@@ -181,7 +181,7 @@ Decisions applied: **D1** (levels identical on every platform; a fixed-answer te
 | 1. Harden | **Done** (see Phase 1 results) |
 | 2. Quick wins | Not started |
 | 3. Concurrency stage A (one lock) | **Done** (see [Thread safety](architecture.md#thread-safety)) |
-| 4. Layout decision | Not started |
-| 5. Persistence | **Done** (file format version 1; see [Architecture and design](architecture.md#saving-and-loading)) |
+| 4. Layout decision | SQ8 part **done** (decision D4; see the [compression and index types plan](compression-and-index-types-plan.md)); node layout not started |
+| 5. Persistence | **Done** (file format version 1, now version 3; see [Architecture and design](architecture.md#saving-and-loading)) |
 | 6. Parallel build | **Done** (`add_batch`; see [Parallel building](architecture.md#parallel-building-add_batch)) |
 | 7. Filtered and Flat speed | Not started |

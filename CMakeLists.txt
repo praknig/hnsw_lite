@@ -26,6 +26,7 @@ file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
         src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
         src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
+        src/kmeans.cpp src/codec.cpp src/vamana.cpp src/disk_index.cpp                    # training, codecs, Vamana, disk index
         ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
@@ -44,6 +45,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
   target_compile_definitions(hnsw_lite PRIVATE HNSW_LITE_HAVE_NEON)
+endif()
+
+# Training and codecs must give bit-identical results on every CPU (their output
+# is saved in index files), so a*b + c is never fused into one instruction:
+# GCC does that by default on ARM, changing rounding there. MSVC's default
+# (/fp:precise) does not fuse.
+if(NOT MSVC)
+  set_source_files_properties(src/kmeans.cpp src/codec.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 endif()
 
 # Warnings and optional sanitizers for every target we build
@@ -72,13 +81,13 @@ if(HNSW_LITE_BUILD_TESTS)
   target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
   hnsw_lite_setup(test_comprehensive)
   foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-          metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control stress e2e)
+          metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk stress e2e)
     add_test(NAME comprehensive.${group} COMMAND test_comprehensive --group ${group})
   endforeach()
 endif()
 
 if(HNSW_LITE_BUILD_BENCHMARKS)
-  foreach(name bench_distance bench_search bench_baseline)
+  foreach(name bench_distance bench_search bench_baseline bench_codecs)
     add_executable(${name} bench/${name}.cpp)
     target_link_libraries(${name} PRIVATE hnsw_lite)
     hnsw_lite_setup(${name})

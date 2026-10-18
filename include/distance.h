@@ -16,6 +16,7 @@
  */
 #pragma once
 #include <cstddef>
+#include <cstdint>
 #include <span>
 
 namespace vecdb {
@@ -48,5 +49,21 @@ const char* isa_name(Isa isa);
 /// Scales `v` to length 1, in place. A zero vector is left unchanged.
 /// Call this before storing vectors (and on queries) when using Metric::Cosine.
 void normalize(std::span<float> v);
+
+/// The kernels behind codec distances (codec.h): for SQ8 the sum over j of
+/// (t[j] - c[j] * s[j])^2 and of w[j] * c[j]; for binary codes the sum of w[j]
+/// over the set bits of c (bit j is c[j / 8] >> (j % 8)).
+struct CodeKernels {
+    float (*sq8_l2)(const float* t, const float* s, const std::uint8_t* c, std::size_t n);
+    float (*sq8_dot)(const float* w, const std::uint8_t* c, std::size_t n);
+    float (*bits_sum)(const float* w, const std::uint8_t* c, std::size_t n);
+};
+
+/// The fastest code kernels this CPU supports (the same choice as get_distance).
+CodeKernels get_code_kernels();
+
+/// The code kernels of one instruction set (for tests and benchmarks).
+/// Throws std::invalid_argument if this CPU does not support it.
+CodeKernels get_code_kernels(Isa isa);
 
 }  // namespace vecdb

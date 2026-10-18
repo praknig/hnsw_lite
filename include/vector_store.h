@@ -56,6 +56,7 @@ public:
     NodeId add(std::span<const float> v) {
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
         if (count_ >= kEmpty) throw std::length_error("too many vectors");  // GCOVR_EXCL_BR_LINE: needs 4 billion vectors
+        if (!values_) return static_cast<NodeId>(count_++);  // slots only: counted, not stored
         if ((count_ >> shelf_bits_) >= shelves_.size())  // row lies past the last shelf
             shelves_.emplace_back((mask_ + 1) * stride_ * sizeof(float));
         std::copy(v.begin(), v.end(), row(count_));  // padding stays zero
@@ -63,10 +64,21 @@ public:
     }
 
     // A read-only window onto vector `id` (no copy). Length = dim.
-    std::span<const float> get(NodeId id) const { return {row(check(id)), dim_}; }
+    // Throws std::logic_error once values were dropped (see drop_values).
+    std::span<const float> get(NodeId id) const { return {row(check_values(id)), dim_}; }
 
     // Same, but including the zero padding. Length = stride.
-    std::span<const float> get_padded(NodeId id) const { return {row(check(id)), stride_}; }
+    std::span<const float> get_padded(NodeId id) const { return {row(check_values(id)), stride_}; }
+
+    /// Frees every stored value but keeps counting rows ("slots only"), so row
+    /// numbers, removal and reuse work unchanged; for indexes that keep only
+    /// codes. Afterwards add, overwrite and move_row still check their arguments
+    /// but store nothing, and reading a value throws std::logic_error. Final.
+    void drop_values() noexcept {
+        std::vector<AlignedBlock>().swap(shelves_);  // frees the memory
+        values_ = false;
+    }
+    bool has_values() const { return values_; }
 
     std::size_t size() const { return count_; }
 
@@ -83,14 +95,15 @@ public:
     /// before changing anything.
     void overwrite(NodeId id, std::span<const float> v) {
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
-        std::copy(v.begin(), v.end(), row(check(id)));
+        const std::size_t r = check(id);
+        if (values_) std::copy(v.begin(), v.end(), row(r));
     }
 
     /// Copies row `from` over row `to`, padding included (used by swap-with-last
     /// removal). Throws std::out_of_range for an unknown row, before changing anything.
     void move_row(NodeId from, NodeId to) {
-        const float* src = row(check(from));
-        std::copy_n(src, stride_, row(check(to)));
+        const std::size_t f = check(from), t = check(to);
+        if (values_) std::copy_n(row(f), stride_, row(t));
     }
     std::size_t rows_per_shelf() const { return mask_ + 1; }
     std::size_t dim() const { return dim_; }
@@ -106,7 +119,12 @@ private:
         if (id >= count_) throw std::out_of_range("unknown vector id");
         return id;
     }
+    std::size_t check_values(NodeId id) const {
+        if (!values_) throw std::logic_error("vector values are not stored (codes only)");
+        return check(id);
+    }
 
+    bool values_ = true;  // false: slots only (see drop_values)
     std::size_t dim_, stride_;
     unsigned shelf_bits_;
     std::size_t mask_;

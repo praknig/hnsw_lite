@@ -19,6 +19,7 @@
 #include "prepared_vector.h"
 #include "search_result.h"
 #include "storage.h"
+#include "codec.h"
 #include "thread_pool.h"
 #include "visited_list.h"
 
@@ -63,6 +64,8 @@ struct HnswParams {
     /// its links from its own links plus the removed vector's links. Keeps search
     /// quality high under heavy churn; costs some time per remove.
     bool repair_on_remove = true;
+    /// Compact storage of vectors (codecs), with re-ranking at full precision.
+    QuantizationParams quantization;
 };
 
 /**
@@ -164,6 +167,33 @@ public:
                                                          const SearchOptions& options = {}, bool include_self = false) const;
 
     std::optional<std::vector<float>> get_vector(std::uint64_t id) const;
+
+    /// Trains the codec (HnswParams::quantization) on the stored vectors now, and
+    /// encodes every vector; vectors added later are encoded as they arrive.
+    /// Training again replaces the previous training. All or nothing. Throws
+    /// std::logic_error if no codec is configured, or once only codes are kept
+    /// (keep_full_vectors off: training again from decoded vectors could only lose
+    /// precision, so the first training is final), std::invalid_argument if the
+    /// index is empty. (Training also happens automatically: see train_after.)
+    void train_codec();
+
+    /// Whether searches use codes (a codec is configured and trained).
+    bool codec_trained() const;
+
+    /// Whether full-precision vector values are stored: false once an index that
+    /// keeps only codes (a codec, keep_full_vectors off) has been trained.
+    bool has_vector_values() const {
+        const auto guard = lock_.read();
+        return storage_.vectors().has_values();
+    }
+
+    /// The codec, for inspection while no other thread changes the index (like
+    /// storage()); null without quantization.
+    const VectorCodec* codec() const { return codec_.get(); }
+
+    /// The code stored for `id`, or nothing if `id` is not stored or no codec
+    /// is trained. For inspection and tests.
+    std::optional<std::vector<std::uint8_t>> get_code(std::uint64_t id) const;
 
     /// Removes every listed ID that is stored and returns how many it removed;
     /// unknown and repeated IDs are skipped. Always completes, like remove_where.
@@ -348,7 +378,10 @@ public:
         return storage_.size();
     }
 
-    std::size_t dim() const { return storage_.vectors().dim(); }
+    /// The dimension of vectors and queries as given.
+    std::size_t dim() const { return input_dim_; }
+    /// The dimensions stored and searched: dim(), or fewer with Matryoshka truncation.
+    std::size_t indexed_dim() const { return storage_.vectors().dim(); }
     Metric metric() const { return metric_; }
     const HnswParams& params() const { return params_; }
 
@@ -366,11 +399,35 @@ public:
     const Storage& storage() const { return storage_; }
 
 private:
+    /// A stored vector as input again (for compact and search_by_id): the vector as
+    /// given if kept, otherwise the stored one, padded with zeros to dim() when
+    /// truncating (truncation ignores those values).
+    std::vector<float> as_input(NodeId slot) const;
+
+    /// Whether only codes are kept (no stored floats): after training, when
+    /// keep_full_vectors is false and a codec is configured.
+    bool codes_only() const { return !storage_.vectors().has_values(); }
+    /// The stored vector of `slot`, padded to the stride: the floats, or decoded
+    /// from its code into `buffer` (codes only).
+    std::span<const float> stored_padded(NodeId slot, std::vector<float>& buffer) const;
+    /// The stored vector of `slot` (indexed_dim() values), as a copy.
+    std::vector<float> stored_copy(NodeId slot) const;
+    /// A vector to read back for `slot`: the vector as given if kept, otherwise
+    /// the stored one (decoded, with codes only).
+    std::vector<float> read_back(NodeId slot) const;
+
     /// Draws a random top level: floor(-ln(u) / ln(M)), u uniform in (0, 1].
     int random_level();
 
     /// Distance from a prepared vector (padded row) to stored node `node`.
     float distance_to(const float* query, NodeId node) const;
+
+    /// Codes: make room for `slot`'s code (may throw: called before any change),
+    /// encode the vector stored in `slot` (cannot fail), train when due.
+    void reserve_code(NodeId slot);
+    void encode_slot(NodeId slot);
+    void maybe_train() noexcept;
+    void train_codec_unlocked();
 
     /// Distance between two stored nodes.
     float distance_between(NodeId a, NodeId b) const;
@@ -460,7 +517,10 @@ private:
 
     /// update() and upsert(): `metadata` null keeps the old metadata.
     bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
-    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);  // caller holds the write lock
+    /// The caller holds the write lock. `prepared`: `vector` is a stored vector of
+    /// this index (indexed_dim() values, already normalized), copied exactly; for
+    /// compact() without originals, so rebuilding never changes a stored vector.
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared = false);
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.
@@ -479,6 +539,7 @@ private:
     /// entry point to kEmpty and the top level to -1 if no node is live.
     void choose_new_entry();
 
+    std::size_t input_dim_;  // as given; the stored vectors may be truncated (see indexed_dim)
     Metric metric_;
     DistanceFn distance_;  // fastest kernel for this CPU, chosen once
     HnswParams params_;
@@ -487,6 +548,8 @@ private:
     std::size_t stride_;
     PreparedVector scratch_;  // reused by add(); search() uses its own copy
     SplitMix64 rng_;  // random levels
+    std::unique_ptr<VectorCodec> codec_;  // null without quantization
+    std::vector<std::uint8_t> codes_;     // trained: code_size() bytes per slot (at least as many slots as stored)
     NodeId entry_ = kEmpty;
     int max_level_ = -1;
     std::size_t live_ = 0;
