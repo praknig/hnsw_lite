@@ -79,7 +79,7 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 7.1 | **Index health report:** memory breakdown, graph reachability, share of removed slots, update churn, with advice on when to compact | new | | 1 day |
+| 7.1 | **Index health report:** memory breakdown, graph reachability, share of removed slots, update churn, with advice on when to compact | **done**: `health()` on every index type (graph, recall, drift, churn); upkeep in progress | | 1 day |
 | 7.2 | **Graph upkeep under churn:** better repair during updates, and an optional automatic `compact()` past a threshold | roadmap + new | The update-churn finding (see [project notes](project-notes.md#limitations)); N5 | 1–2 days |
 | 7.3 | **Check and repair:** validate a loaded or running index, and repair what can be repaired | new | | 1 day |
 

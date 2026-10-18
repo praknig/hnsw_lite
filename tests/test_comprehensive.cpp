@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -14028,6 +14028,342 @@ TEST(disk, dk39_search_paths_not_yet_covered) {
 }
 
 // ===========================================================================
+// Upkeep step 1a: health reports (HE1-HE8)
+// ===========================================================================
+
+TEST(health, he01_a_fresh_index_is_healthy) {
+    auto data = clustered(3000, 16, 10, 2000);
+    HnswParams p;
+    p.M = 12;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    const HealthReport r = h.health();
+    std::printf("    live %zu, levels %zu (level 1: %zu, expected %.0f), mean degree %.1f (min %zu), underfull %zu, recall@10 %.3f\n",
+                r.live, r.levels.size(), r.levels.size() > 1 ? r.levels[1].nodes : 0, r.levels.size() > 1 ? r.levels[1].expected : 0.0,
+                r.mean_degree, r.min_degree, r.underfull, r.recall.value_or(-1));
+    CHECK(r.live == 3000 && r.slots == 3000 && r.free_slots == 0 && r.levels[0].nodes == 3000 && r.levels[0].expected == 3000);
+    CHECK(r.levels.size() >= 2 && std::abs(double(r.levels[1].nodes) - r.levels[1].expected) < 0.3 * r.levels[1].expected);
+    CHECK(r.unreachable == 0 && r.links_to_removed == 0 && r.stale_links == 0 && r.mean_degree > 12 && r.min_degree >= 1);
+    CHECK(r.recall && *r.recall >= 0.95 && r.removals == 0 && r.updates == 0 && r.churn() == 0.0);
+}
+
+TEST(health, he02_reachability_agrees_with_an_independent_walk) {
+    // Heavy removal with repair (the default) can leave nodes unreachable (he04
+    // measured one); the report's count must agree with the tests' own walk.
+    // Graphs can differ slightly between CPUs, so agreement is checked, not a count.
+    auto data = clustered(3000, 16, 12, 2003);
+    HnswParams p;
+    p.M = 8;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 3000; ++i)
+        if (i % 5 != 0) h.remove(i);
+    HealthOptions quick;
+    quick.recall_sample = 0;
+    const HealthReport r = h.health(quick);
+    const double independent = level0_reachable(h);  // fraction of live nodes reached, walked by the tests
+    std::printf("    unreachable %zu of %zu live (independent walk: %.4f reached)\n", r.unreachable, r.live, independent);
+    CHECK(std::abs(double(r.live - r.unreachable) / double(r.live) - independent) < 1e-12);
+}
+
+TEST(health, he03_churn_counts_exactly_the_committed_changes) {
+    auto data = random_vectors(300, 8, 2002);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)));
+    HealthOptions quick;
+    quick.recall_sample = 0;
+    CHECK(h.health(quick).removals == 0);
+    h.remove(1);
+    h.remove(1);                                                       // already gone: nothing
+    h.remove_batch(std::vector<std::uint64_t>{2, 3, 4, 999});          // three exist
+    h.remove_where(Filter::eq("c", std::int64_t(9)));                  // 9, 19, ..., 299: 30
+    h.update(5, data[6]);
+    h.upsert(6, data[7]);                                              // exists: an update
+    h.upsert(1000, data[8]);                                           // new: an insert, not counted
+    h.add(1001, data[9]);
+    const HealthReport r = h.health(quick);
+    CHECK(r.removals == 1 + 3 + 30 && r.updates == 2 && r.live == 300 - 34 + 2);
+    CHECK(std::abs(r.churn() - double(36) / double(r.live)) < 1e-12 && !r.recall);
+    auto again = load_hnsw(save_bytes(h));  // counted since construction or loading
+    CHECK(again->health(quick).removals == 0 && again->health(quick).updates == 0);
+}
+
+TEST(health, he04_degradation_shows) {
+    // Heavy removal: without neighbor repair, links to removed nodes pile up; the
+    // report must show the difference that upkeep would act on.
+    auto data = clustered(3000, 16, 12, 2003);
+    std::size_t to_removed[2];
+    double recall[2];
+    for (int repair = 0; repair < 2; ++repair) {
+        HnswParams p;
+        p.M = 8;
+        p.repair_on_remove = repair == 1;
+        HnswIndex h(16, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+        for (std::uint64_t i = 0; i < 3000; ++i)
+            if (i % 5 != 0) h.remove(i);  // 80% removed
+        const HealthReport r = h.health();
+        to_removed[repair] = r.links_to_removed;
+        recall[repair] = r.recall.value_or(-1);
+        std::printf("    repair %s: live %zu, free slots %zu, links to removed %zu, underfull %zu, no incoming %zu, unreachable %zu, recall@10 %.3f, churn %.1f\n",
+                    repair ? "on " : "off", r.live, r.free_slots, r.links_to_removed, r.underfull, r.no_incoming, r.unreachable, recall[repair], r.churn());
+        CHECK(r.live == 600 && r.free_slots == 2400 && r.removals == 2400 && r.churn() == 4.0);
+    }
+    CHECK(to_removed[0] > 2 * to_removed[1] && recall[1] >= 0.8);
+}
+
+TEST(health, he05_empty_and_codes_only) {
+    HnswIndex empty(4, Metric::L2);
+    const HealthReport e = empty.health();
+    CHECK(e.live == 0 && e.levels.empty() && !e.recall && e.unreachable == 0 && e.churn() == 0.0);
+    auto data = random_vectors(500, 16, 2004);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 100;
+    p.quantization.keep_full_vectors = false;
+    HnswIndex lean(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 500; ++i) lean.add(i, data[i]);
+    const HealthReport r = lean.health();
+    CHECK(!lean.has_vector_values() && !r.recall && r.live == 500 && r.unreachable == 0);  // no exact answers without vectors
+    HealthOptions none;
+    none.recall_sample = 0;
+    HnswIndex one(4, Metric::L2);
+    one.add(7, std::vector<float>{1, 2, 3, 4});
+    const HealthReport o = one.health();
+    CHECK(!one.health(none).recall && o.recall && *o.recall == 1.0 && o.live == 1 && o.no_incoming == 0);
+}
+
+TEST(health, he06_recall_follows_the_beam) {
+    auto data = clustered(4000, 24, 30, 2005);
+    HnswParams p;
+    p.M = 4;
+    p.ef_construction = 20;  // a deliberately weak graph
+    HnswIndex h(24, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 4000; ++i) h.add(i, data[i]);
+    HealthOptions narrow, wide;
+    narrow.ef = 10;
+    wide.ef = 300;
+    const double a = *h.health(narrow).recall, b = *h.health(wide).recall;
+    std::printf("    recall@10 at ef 10: %.3f, at ef 300: %.3f\n", a, b);
+    CHECK(a < b && b >= 0.9);
+    HealthOptions same = narrow;  // the same sample, the same estimate
+    CHECK(*h.health(same).recall == a);
+}
+
+TEST(health, he07_concurrent_with_searches_and_changes) {
+    auto data = clustered(2000, 16, 10, 2006);
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i]);
+    std::atomic<bool> stop{false};
+    std::atomic<long> reports{0}, bad{0};
+    with_watchdog(60, "he07", [&] {
+        std::thread writer([&] {
+            for (std::uint64_t i = 1500; i < 2000; ++i) {
+                h.add(i, data[i]);
+                if (i % 2 == 0) h.remove(i - 1500);
+            }
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            HealthOptions o;
+            o.recall_sample = 20;
+            while (!stop) {
+                if (t == 0) {
+                    const HealthReport r = h.health(o);
+                    ++reports;
+                    bad += long(r.live + r.free_slots != r.slots || (r.recall && (*r.recall < 0 || *r.recall > 1)));
+                } else {
+                    (void)h.search(data[t * 7], 10);
+                }
+            }
+        });
+        writer.join();
+    });
+    CHECK(bad == 0 && reports > 0 && h.health().removals == 250);
+}
+
+TEST(health, he08_levels_and_stale_links_after_removing_the_top) {
+    // Removing every node above level 0: the entry point moves down; links on
+    // upper levels must not point at nodes without those levels.
+    auto data = random_vectors(1500, 8, 2007);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i]);
+    const GraphStorage& g = h.storage().graph();
+    std::size_t upper = 0;
+    for (NodeId n = 0; n < 1500; ++n)
+        if (g.level(n) > 0) {
+            h.remove(h.storage().ids().external(n));
+            ++upper;
+        }
+    const HealthReport r = h.health();
+    CHECK(upper > 0 && r.live == 1500 - upper && r.levels.size() == std::size_t(h.max_level() + 1));
+    CHECK(r.stale_links == 0 && r.levels[0].nodes == r.live && r.unreachable == 0);
+}
+
+namespace {
+
+/// Vectors around 10 cluster centres, shifted by `shift` in every dimension and
+/// scaled by `scale`: the same kind of data, moved (drift).
+Vectors drifted(std::size_t n, std::size_t dim, unsigned seed, float shift, float scale = 1.0f) {
+    auto v = clustered(n, dim, 10, seed);
+    for (auto& x : v)
+        for (float& y : x) y = y * scale + shift;
+    return v;
+}
+
+}  // namespace
+
+TEST(health, he09_flat_storage_recall_and_churn) {
+    auto data = random_vectors(400, 8, 2010);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 400; ++i) f.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)));
+    f.remove(1);
+    f.remove_batch(std::vector<std::uint64_t>{2, 3, 999});
+    f.remove_where(Filter::eq("c", std::int64_t(9)));  // 40
+    f.update(5, data[6]);
+    f.upsert(6, data[7]);
+    f.upsert(1000, data[8]);
+    const HealthReport r = f.health();
+    CHECK(r.live == 400 - 43 + 1 && r.slots == r.live && r.free_slots == 0 && r.removals == 43 && r.updates == 2);
+    CHECK(r.recall && *r.recall == 1.0 && r.lists == 0 && !r.lists_trained && !r.codec_error && r.levels.empty());
+}
+
+TEST(health, he10_ivf_balance_and_drift) {
+    // Lists trained on one distribution; then twice as many vectors from a moved one.
+    auto before = drifted(2000, 16, 2011, 0.0f), after = drifted(4000, 16, 2012, 6.0f);
+    IvfParams ivf;
+    ivf.lists = 16;
+    ivf.train_after = 0;
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 2000; ++i) f.add(i, before[i]);
+    f.train_lists();
+    HealthOptions o;
+    o.retrain_sample = 1000;
+    const HealthReport fresh = f.health(o);
+    for (std::uint64_t i = 0; i < 4000; ++i) f.add(10000 + i, after[i]);
+    const HealthReport moved = f.health(o);
+    for (const auto* r : {&fresh, &moved})
+        std::printf("    %s: largest list %zu (imbalance %.1f), empty %zu, centroid distance %.1f, retrained %.1f\n", r == &fresh ? "fresh" : "moved",
+                    r->largest_list, r->list_imbalance, r->empty_lists, *r->centroid_distance, *r->centroid_distance_retrained);
+    CHECK(fresh.lists == 16 && fresh.lists_trained && *fresh.centroid_distance < 1.5 * *fresh.centroid_distance_retrained);
+    CHECK(*moved.centroid_distance > 2.0 * *moved.centroid_distance_retrained && moved.list_imbalance > fresh.list_imbalance);
+}
+
+TEST(health, he11_sq8_drift) {
+    // SQ8 trained on values in one range; later values three times wider.
+    auto before = drifted(1000, 16, 2013, 0.0f), after = drifted(2000, 16, 2014, 0.0f, 3.0f);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 1000;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, before[i]);
+    HealthOptions o;
+    o.retrain_sample = 1000;
+    o.recall_sample = 0;
+    const HealthReport fresh = h.health(o);
+    for (std::uint64_t i = 0; i < 2000; ++i) h.add(5000 + i, after[i]);
+    const HealthReport moved = h.health(o);
+    std::printf("    fresh: error %.2e, retrained %.2e, clipped %.3f | moved: error %.2e, retrained %.2e, clipped %.3f\n", *fresh.codec_error,
+                *fresh.codec_error_retrained, *fresh.clipped, *moved.codec_error, *moved.codec_error_retrained, *moved.clipped);
+    CHECK(*fresh.clipped < 0.01 && *moved.clipped > 0.2);
+    CHECK(*moved.codec_error > 5.0 * *moved.codec_error_retrained && *fresh.codec_error < 3.0 * *fresh.codec_error_retrained);
+}
+
+TEST(health, he12_pq_drift) {
+    auto before = drifted(1500, 16, 2015, 0.0f), after = drifted(3000, 16, 2016, 8.0f);
+    HnswParams p;
+    p.quantization.codec = CodecKind::PQ;
+    p.quantization.train_after = 1500;
+    p.quantization.pq_subspaces = 4;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, before[i]);
+    HealthOptions o;
+    o.retrain_sample = 1000;
+    o.recall_sample = 0;
+    const HealthReport fresh = h.health(o);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(5000 + i, after[i]);
+    const HealthReport moved = h.health(o);
+    std::printf("    fresh: error %.3f, retrained %.3f | moved: error %.3f, retrained %.3f\n", *fresh.codec_error, *fresh.codec_error_retrained,
+                *moved.codec_error, *moved.codec_error_retrained);
+    CHECK(!fresh.clipped && *moved.codec_error > 2.0 * *moved.codec_error_retrained && *fresh.codec_error < 2.0 * *fresh.codec_error_retrained);
+}
+
+TEST(health, he13_options_and_probes) {
+    auto data = clustered(3000, 16, 20, 2017);
+    IvfParams ivf;
+    ivf.lists = 32;
+    ivf.probes = 1;
+    ivf.train_after = 0;
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 500;
+    FlatIndex f(16, Metric::L2, Schema::dynamic(), q, ivf);
+    for (std::uint64_t i = 0; i < 3000; ++i) f.add(i, data[i]);
+    f.train_lists();
+    HealthOptions none;
+    none.codec_sample = 0;
+    none.recall_sample = 0;
+    const HealthReport bare = f.health(none);
+    CHECK(!bare.codec_error && !bare.centroid_distance && !bare.recall && bare.lists_trained && bare.largest_list > 0);
+    const HealthReport some = f.health();  // retrain_sample 0 by default: no comparison
+    CHECK(some.codec_error && some.clipped && !some.codec_error_retrained && some.centroid_distance && !some.centroid_distance_retrained);
+    CHECK(some.recall && *some.recall < 1.0);  // one probe of 32 lists
+    IvfParams all = ivf;
+    all.probes = 32;
+    FlatIndex g(16, Metric::L2, Schema::dynamic(), {}, all);
+    for (std::uint64_t i = 0; i < 3000; ++i) g.add(i, data[i]);
+    g.train_lists();
+    CHECK(*g.health().recall == 1.0);  // every list probed: exact
+    QuantizationParams lean = q;
+    lean.keep_full_vectors = false;
+    FlatIndex c(16, Metric::L2, Schema::dynamic(), lean);
+    for (std::uint64_t i = 0; i < 1000; ++i) c.add(i, data[i]);
+    const HealthReport codes = c.health();
+    CHECK(!c.has_vector_values() && !codes.codec_error && !codes.recall && codes.live == 1000);
+}
+
+TEST(health, he14_disk_index) {
+    auto data = clustered(3000, 16, 12, 2020);
+    const std::string path = temp_path("he14");
+    DiskIndexParams dp;
+    dp.graph = VamanaParams{24, 48, 1.2f, 2};
+    DiskIndex::build(path, id_range(0, 3000), flatten(data), 16, Metric::L2, dp);
+    const auto d = DiskIndex::open(path);
+    HealthOptions o;
+    o.ef = 100;
+    o.retrain_sample = 1000;
+    const std::uint64_t before = d->blocks_read();
+    const HealthReport r = d->health(o);
+    const std::uint64_t reads = d->blocks_read() - before;
+    std::printf("    mean degree %.1f (min %zu), underfull %zu, unreachable %zu, recall@10 %.3f, PQ error %.4f (retrained %.4f), %llu blocks read\n",
+                r.mean_degree, r.min_degree, r.underfull, r.unreachable, r.recall.value_or(-1), r.codec_error.value_or(-1),
+                r.codec_error_retrained.value_or(-1), (unsigned long long)reads);
+    CHECK(r.live == 3000 && r.slots == 3000 && r.levels.size() == 1 && r.levels[0].nodes == 3000 && r.mean_degree <= 24);
+    CHECK(r.unreachable == 3000 - disk_reachable(*d) && r.unreachable == 0 && r.recall && *r.recall >= 0.95);
+    CHECK(r.codec_error && r.codec_error_retrained && *r.codec_error < 2.0 * *r.codec_error_retrained && r.churn() == 0.0);
+    CHECK(reads >= 3000 + 100 && !r.clipped && r.lists == 0);  // one pass, plus the probes and their searches
+    std::filesystem::remove(path);
+}
+
+TEST(health, he15_disk_partitioned_identical_vectors_stay_reachable) {
+    // dk37's data: before this round's fixes, 386 of 1,200 were unreachable.
+    Vectors same(1200, std::vector<float>(8, 0.5f));
+    for (std::size_t i = 0; i < 1200; i += 100) same[i][0] = float(i);
+    const std::string vec = temp_path("he15_vectors"), path = temp_path("he15");
+    write_vectors_file(vec, flatten(same), 8);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{8, 16, 1.2f, 3};
+    lp.partitions = 12;
+    lp.memory_budget = std::size_t(2) << 20;
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp);
+    HealthOptions o;
+    o.recall_sample = 0;
+    const HealthReport r = DiskIndex::open(path)->health(o);
+    CHECK(r.live == 1200 && r.unreachable == 0 && !r.recall);
+    for (const auto& f : {vec, path}) std::filesystem::remove(f);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -14374,7 +14710,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

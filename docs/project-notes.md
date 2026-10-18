@@ -56,6 +56,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Product quantization
 - [x] An inverted file (IVF, and IVF-PQ) for `FlatIndex`
 - [x] A disk-based index, read-only (see the [plan](compression-and-index-types-plan.md))
+- [x] Health reports for every index type (step 1 of index upkeep)
+- [ ] Index upkeep: incremental graph repair, then rebuilds with an atomic swap (like a database's vacuum)
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

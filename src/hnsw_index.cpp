@@ -609,6 +609,36 @@ void HnswIndex::repair_neighbors(NodeId node) {
                           options.end());
             graph.set_links(n, l, select_neighbors(options, capacity));
         }
+        // Each former neighbor lost an incoming link (the removed node's), and the
+        // diversity rule above can leave one with none from this group: under
+        // update churn such vectors became unreachable (see the project notes).
+        // Give each one a link back from its nearest group member, in a free slot
+        // or in place of that member's farthest link (lists are sorted by distance).
+        for (NodeId x : around) {
+            bool linked = false;
+            NodeId host = kEmpty;
+            float nearest = 0;
+            for (NodeId n : around) {
+                if (n == x) continue;
+                const auto slots = graph.links(n, l);
+                const std::size_t count = GraphStorage::count(slots);
+                if (std::find(slots.begin(), slots.begin() + std::ptrdiff_t(count), x) != slots.begin() + std::ptrdiff_t(count)) {
+                    linked = true;
+                    break;
+                }
+                const float d = distance_between(n, x);
+                if (host == kEmpty || d < nearest) {
+                    host = n;
+                    nearest = d;
+                }
+            }
+            if (linked || host == kEmpty) continue;  // already linked, or alone
+            const auto slots = graph.links(host, l);
+            std::vector<NodeId> list(slots.begin(), slots.begin() + std::ptrdiff_t(GraphStorage::count(slots)));
+            if (list.size() >= capacity) continue;  // VARIANT: free slots only
+            list.push_back(x);
+            graph.set_links(host, l, list);
+        }
     }
 }
 
@@ -640,6 +670,7 @@ bool HnswIndex::remove(std::uint64_t id) {
     ids.release(id);
     metadata_.clear(*node);
     --live_;
+    ++removals_since_upkeep_;
     free_slots_.push_back(*node);
     if (*node == entry_) choose_new_entry();
     return true;
@@ -722,6 +753,7 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     if (reuse) free_slots_.pop_back();
     free_slots_.push_back(old);
     if (old == entry_) choose_new_entry();
+    ++updates_since_upkeep_;
     return true;
 }
 
@@ -908,6 +940,7 @@ std::size_t HnswIndex::remove_slots(const std::vector<NodeId>& slots) {
         --live_;
         free_slots_.push_back(n);
     }
+    removals_since_upkeep_ += slots.size();
     if (ids.is_deleted(entry_)) choose_new_entry();  // something matched, so there was an entry point
 
     // 2. Repair around them, as remove() does, best effort. All are removed by

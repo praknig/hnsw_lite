@@ -20,6 +20,11 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # Every ctest call runs four entries at a time (GitHub's runners have 2 to 4
+  # cores; the heaviest groups are split into shards that start first).
+  CTEST_PARALLEL_LEVEL: 4
+
 jobs:
   # Which kinds of files changed? Builds and tests run only when code changed;
   # the documentation check runs only when documentation changed. A job skipped
@@ -171,12 +176,14 @@ jobs:
       # Emulation is slow, so the two exhaustive file-corruption sweeps and the
       # long-running stress group are left to the native jobs.
       - name: Test on the emulated CPU
-        # One emulated process per group, four at a time (the groups come from
-        # --list, keeping only group.test lines: it ends with a summary line, so
-        # new groups are included automatically); any failure fails the step.
+        # CTest's own entries (shards included, read from `ctest -N -V`, so they
+        # follow CMakeLists.txt), each under QEMU, four at a time, sharded entries
+        # first; stress is left out. Any failure fails the step.
         run: |
-          ./build/test_comprehensive --list | grep -E '^[a-z0-9_]+[.][a-z0-9_]+$' | cut -d. -f1 | sort -u | grep -vx stress |
-            xargs -P 4 -I{} qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --group {} --exclude p20_ --exclude p21_
+          ctest --test-dir build -N -V | sed -n 's/^[0-9]*: Test command: [^ ]* //p' | tr -d '"' |
+            grep -vx -- '--group stress' |
+            awk '/--shard/ {print; next} {rest = rest $0 "\n"} END {printf "%s", rest}' |
+            xargs -P 4 -L 1 qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_
 
   # The toolchain used for local development on Windows (MinGW-w64 GCC).
   windows-mingw:
@@ -327,7 +334,7 @@ jobs:
 
       - name: Test threaded groups
         # The threaded groups (14), four at a time.
-        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk)(\..*)?$'
+        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk|health)(\..*)?$'
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).

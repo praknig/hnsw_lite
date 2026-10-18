@@ -407,6 +407,7 @@ bool FlatIndex::remove_unlocked(std::uint64_t id) {
     vectors_.pop_back();
     if (originals_) originals_->pop_back();
     --live_;
+    ++removals_since_upkeep_;
     return true;
 }
 
@@ -534,6 +535,7 @@ bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     }
     if (originals_) originals_->overwrite(*node, vector);
     if (codec_ && codec_->trained()) codec_->encode(scratch_.values(), codes_.data() + std::size_t(*node) * codec_->code_size());
+    ++updates_since_upkeep_;
     return true;
 }
 

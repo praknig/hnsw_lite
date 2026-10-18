@@ -23,6 +23,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
 - [Binary quantization](#binary-quantization)
+- [Health reports](#health-reports)
 - [Disk-based index](#disk-based-index)
 - [Inverted file (IVF)](#inverted-file-ivf)
 - [Product quantization (PQ)](#product-quantization-pq)
@@ -402,6 +403,24 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
 - Training, saving, truncation and everything else work as for SQ8.
 - Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Health reports
+
+```cpp
+HealthOptions options;
+options.retrain_sample = 2000;   // also measure what retraining codecs and IVF lists would gain
+HealthReport r = index.health(options);   // HnswIndex, FlatIndex and DiskIndex
+std::printf("recall %.3f, unreachable %zu, churn %.0f%%\n", r.recall.value_or(-1), r.unreachable, 100 * r.churn());
+```
+
+After many changes an index still works but can slowly get worse: removals disturb the graph, and data added later may no longer fit the trained compression or IVF lists. `health()` measures this, the first step toward upkeep (like a database's vacuum). It takes the shared lock, so searches continue; for a disk index it reads every node once.
+
+- **Churn:** removals and updates since the last upkeep (counted from construction or loading for now), and their share of the live vectors (`churn()`).
+- **Graph:** vectors per level against the expected count; level-0 degrees (mean, minimum, `underfull`: fewer than M neighbors, R/2 for a disk index); vectors nothing links to; `unreachable` vectors (never found by any search); links to removed vectors (followed by searches: wasted work); stale links.
+- **Recall:** searches for a sample of stored vectors compared with exact answers (`recall_sample`, default 100; 0 to skip). Not available when only codes are stored.
+- **Drift:** the codec's reconstruction error and, for SQ8, the share of values outside its trained range (`clipped`); IVF list balance and the distance of vectors to their list's centroid. With `retrain_sample`, the same figures after retraining on a current sample, in memory: a much lower figure means retraining would help.
+
+Reading it: compare graph figures with a freshly built index of the same data, not with zero (a fresh HNSW index with M 12 had 19% of its vectors below M neighbors, by design). Measured after removing 80% of 3,000 vectors: with neighbor repair (the default), 450 of 600 left underfull and 1 unreachable, recall 0.987; without it, 5,386 links to removed vectors. For drift, the ratio is what counts: in a healthy index retraining gains nothing, while data moved after training showed 100 times (IVF) to 5,000 times (SQ8, 43% of values clipped) lower figures when retrained.
 
 ## Disk-based index
 

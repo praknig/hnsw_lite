@@ -15,6 +15,7 @@
 
 #include "distance.h"
 #include "filter.h"
+#include "health.h"
 #include "metadata.h"
 #include "prepared_vector.h"
 #include "search_result.h"
@@ -163,6 +164,11 @@ public:
     /// "More like this": searches with the vector stored for `id`, under one lock
     /// (so it cannot change in between). Returns nothing if `id` is not stored.
     /// The record itself is left out unless `include_self` is true.
+    /// A health report: storage, graph structure, an estimate of recall, and the
+    /// removals and updates since the last upkeep (see health.h). Takes the shared
+    /// lock, so searches continue meanwhile; then runs the sampled searches.
+    HealthReport health(const HealthOptions& options = {}) const;
+
     std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, std::size_t ef = 64,
                                                          const SearchOptions& options = {}, bool include_self = false) const;
 
@@ -554,6 +560,8 @@ private:
     int max_level_ = -1;
     std::size_t live_ = 0;
     std::vector<NodeId> free_slots_;  // slots of removed vectors, reused last in first out
+    std::size_t removals_since_upkeep_ = 0;  // for health(): counted where each change is final
+    std::size_t updates_since_upkeep_ = 0;
     MetadataStore metadata_;
     PlannerParams planner_;
     mutable VisitedListPool visited_pool_;

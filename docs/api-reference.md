@@ -290,3 +290,14 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `DiskSearchStats` | `nodes_read`, `blocks_read`, `rounds`, `stopped_early` |
 | `VamanaGraph::build(vectors, dim, metric, VamanaParams{R, L, alpha, seed})` | The Vamana graph alone, built and searched in memory (`search`, `neighbors`, `medoid`) |
 | `BlockFile` | Positional reads from a read-only file, safe from many threads |
+
+## Health reports
+
+| Name | Description |
+|---|---|
+| `health(HealthOptions)` | On `HnswIndex`, `FlatIndex` and `DiskIndex`: a `HealthReport`; shared lock (searches continue), then the sampled searches |
+| `HealthOptions` | `recall_sample` (100; 0: no estimate), `k` (10), `ef` (64), `seed`, `codec_sample` (500: vectors for compression and IVF figures), `retrain_sample` (0: no retraining comparison) |
+| `HealthReport` storage | `live`, `slots`, `free_slots` |
+| `HealthReport` graph | `levels` (`nodes`, `expected` per level), `mean_degree`, `min_degree`, `underfull`, `no_incoming`, `unreachable`, `links_to_removed`, `stale_links` |
+| `HealthReport` drift | `codec_error`, `codec_error_retrained`, `clipped` (SQ8); `lists`, `lists_trained`, `largest_list`, `empty_lists`, `list_imbalance`, `centroid_distance`, `centroid_distance_retrained` |
+| `HealthReport` quality and churn | `recall` (optional), `removals`, `updates`, `churn()` |

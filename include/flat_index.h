@@ -13,6 +13,7 @@
 
 #include "distance.h"
 #include "filter.h"
+#include "health.h"
 #include "id_map.h"
 #include "metadata.h"
 #include "prepared_vector.h"
@@ -84,6 +85,11 @@ public:
     /// "More like this": searches with the vector stored for `id`, under one lock
     /// (so it cannot change in between). Returns nothing if `id` is not stored.
     /// The record itself is left out unless `include_self` is true.
+    /// A health report (see health.h): storage, IVF list balance and drift,
+    /// compression drift, an estimate of recall, and the removals and updates
+    /// since the last upkeep. Takes the shared lock; then runs sampled searches.
+    HealthReport health(const HealthOptions& options = {}) const;
+
     std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, const SearchOptions& options = {},
                                                          bool include_self = false) const;
 
@@ -328,6 +334,8 @@ private:
     MetadataStore metadata_;
     PreparedVector scratch_;  // reused by add(); searches use their own copy
     std::size_t live_ = 0;
+    std::size_t removals_since_upkeep_ = 0;  // for health(): counted where each change is final
+    std::size_t updates_since_upkeep_ = 0;
     mutable SharedPool pool_;
     IndexLock lock_;  // reads share it, changes take it alone (see IndexLock)
 };

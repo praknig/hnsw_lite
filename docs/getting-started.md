@@ -61,16 +61,16 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### What a successful run looks like
 
-CTest runs the tests as 46 entries (one per group, the heaviest in shards):
+CTest runs the tests as 47 entries (one per group, the heaviest in shards):
 
 ```
-100% tests passed, 0 tests failed out of 46
+100% tests passed, 0 tests failed out of 47
 ```
 
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 751 tests
+./build/test_comprehensive                   # all 766 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```
