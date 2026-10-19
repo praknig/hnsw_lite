@@ -4826,7 +4826,10 @@ TEST(payload, pi01_counts_match_data_after_churn) {
             live[pos] = live.back();
             live.pop_back();
         } else {
-            h.set_metadata(live[rng() % live.size()], meta_for(rng() % 1000));
+            {
+                const std::uint64_t who = live[rng() % live.size()];  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+                h.set_metadata(who, meta_for(rng() % 1000));
+            }
         }
     }
     const MetadataStore& m = h.metadata();
@@ -7560,7 +7563,10 @@ TEST(concurrency, c03_mixed_operations_from_many_threads) {
                             }
                             break;
                         case 3:
-                            if (!mine.empty() && !h.update(mine[rng() % mine.size()], data[6000 + rng() % 2000])) ++p.unexpected_exception;
+                            if (!mine.empty()) {
+                                const std::uint64_t who = mine[rng() % mine.size()];  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+                                if (!h.update(who, data[6000 + rng() % 2000])) ++p.unexpected_exception;
+                            }
                             break;
                         case 4:
                             check_results(h.search(data[rng() % 8000], 10, 32), 6000, p);
@@ -7659,10 +7665,14 @@ TEST(concurrency, c07_save_during_searches_and_changes) {
     HnswIndex h(8, Metric::L2);
     for (std::size_t i = 0; i < 400; ++i) h.add(i, data[i], meta_for(i));
     std::atomic<bool> stop{false};
-    std::vector<std::string> snapshots;
+    std::vector<std::string> snapshots;  // only the saver touches it until the threads are joined
+    std::atomic<long> saves{0};
     Problems p;
     with_watchdog(180, "c07", [&] {
         std::thread writer([&] {
+            // The saver must be running first: under load (parallel CI) this thread
+            // could otherwise finish before it ever saved (found on Windows).
+            while (saves.load() == 0) std::this_thread::yield();
             for (std::size_t i = 400; i < 1200; ++i) {
                 h.add(i, data[i], meta_for(i));
                 if (i % 5 == 0) h.remove(i - 300);
@@ -7670,7 +7680,10 @@ TEST(concurrency, c07_save_during_searches_and_changes) {
             stop = true;
         });
         std::thread saver([&] {
-            while (!stop) snapshots.push_back(save_bytes(h));
+            while (!stop) {
+                snapshots.push_back(save_bytes(h));
+                ++saves;
+            }
         });
         run_threads(2, [&](std::size_t t) {
             std::size_t q = t;
@@ -14404,7 +14417,10 @@ TEST(upkeep, uk01_update_churn_on_a_small_index) {
         HnswIndex h(8, Metric::L2);
         for (std::uint64_t id = 0; id < 20; ++id) h.add(id, pool[id]);
         std::mt19937 rng(order);
-        for (int u = 0; u < 6400; ++u) h.upsert(rng() % 20, pool[rng() % 200]);
+        for (int u = 0; u < 6400; ++u) {
+            const std::uint64_t id = rng() % 20;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, pool[rng() % 200]);
+        }
         damaged += quick_health(h).unreachable > 0;
         const UpkeepStats st = h.upkeep();
         const HealthReport r = quick_health(h);
@@ -14423,7 +14439,10 @@ TEST(upkeep, uk02_update_churn_on_a_larger_index) {
     HnswIndex h(16, Metric::L2, p);
     for (std::uint64_t id = 0; id < 2000; ++id) h.add(id, data[id]);
     std::mt19937 rng(3);
-    for (int u = 0; u < 10000; ++u) h.upsert(rng() % 2000, data[rng() % 6000]);
+    for (int u = 0; u < 10000; ++u) {
+            const std::uint64_t id = rng() % 2000;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, data[rng() % 6000]);
+        }
     const HealthReport before = h.health();
     const UpkeepStats st = h.upkeep();
     const HealthReport after = h.health();
@@ -14505,7 +14524,10 @@ TEST(upkeep, uk06_codes_only_and_empty_indexes) {
         HnswIndex h(16, Metric::L2, p);
         for (std::uint64_t id = 0; id < 30; ++id) h.add(id, pool[id]);
         std::mt19937 rng(order);
-        for (int u = 0; u < 6000; ++u) h.upsert(rng() % 30, pool[rng() % 200]);
+        for (int u = 0; u < 6000; ++u) {
+            const std::uint64_t id = rng() % 30;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, pool[rng() % 200]);
+        }
         damaged += quick_health(h).unreachable > 0;
         CHECK(!h.has_vector_values() && h.upkeep().complete);
         after += quick_health(h).unreachable > 0;
@@ -15086,7 +15108,10 @@ TEST(upkeep, uk10_every_path) {
     HnswIndex h(8, Metric::L2, p);
     for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i]);
     std::mt19937 rng(11);
-    for (int u = 0; u < 6000; ++u) h.upsert(rng() % 1500, data[rng() % 3000]);
+    for (int u = 0; u < 6000; ++u) {
+            const std::uint64_t id = rng() % 1500;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, data[rng() % 3000]);
+        }
     for (std::uint64_t i = 0; i < 1500; i += 7) h.remove(i);
     UpkeepOptions only_reconnect;
     only_reconnect.consolidate = false;
@@ -15163,12 +15188,17 @@ TEST(upkeep, uk11_a_graph_almost_entirely_unreachable) {
         p.ef_construction = 4;
         HnswIndex h(4, Metric::L2, p);
         for (std::uint64_t i = 0; i < 600; ++i) h.add(i, std::vector<float>{float(int(i) % values), 0, 0, 0});
-        for (int u = 0; u < 4000; ++u) h.upsert(rng() % 600, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        for (int u = 0; u < 4000; ++u) {
+            const std::uint64_t id = rng() % 600;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        }
         for (std::uint64_t i = 0; i < 600; i += 5) h.remove(i);
         const std::size_t before = quick_health(h).unreachable;
         const UpkeepStats st = h.upkeep();
         std::printf("    %d distinct value(s): %zu of %zu unreachable before upkeep, %zu after\n", values, before, h.size(), st.unreachable);
-        CHECK(before > h.size() / 2 && st.complete && st.unreachable == 0 && quick_health(h).unreachable == 0);
+        // A badly damaged graph, to exercise the fallback (more than half before
+        // identical vectors were linked at the source; now 234 to 365 of 480).
+        CHECK(before >= 100 && st.complete && st.unreachable == 0 && quick_health(h).unreachable == 0);
     }
 }
 
@@ -15188,7 +15218,10 @@ TEST(upkeep, uk12_identical_vectors_are_linked_at_the_source) {
         HnswIndex h(4, Metric::L2, p);
         for (std::uint64_t i = 0; i < 600; ++i) h.add(i, std::vector<float>{float(int(i) % values), 0, 0, 0});
         const std::size_t fresh = h.health(quick).unreachable;
-        for (int u = 0; u < 4000; ++u) h.upsert(rng() % 600, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        for (int u = 0; u < 4000; ++u) {
+            const std::uint64_t id = rng() % 600;  // drawn in order: argument evaluation order is unspecified (GCC and Clang differ)
+            h.upsert(id, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        }
         const std::size_t churned = h.health(quick).unreachable;
         const UpkeepStats st = h.upkeep();
         std::printf("    %2d distinct value(s): unreachable %zu of 600 fresh, %zu after churn, %zu after upkeep\n", values, fresh, churned, st.unreachable);
