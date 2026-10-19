@@ -217,25 +217,64 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
     return results.take_sorted();
 }
 
-std::vector<NodeId> HnswIndex::select_neighbors(const std::vector<Candidate>& sorted,
+std::vector<NodeId> HnswIndex::select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                                 std::size_t max) const {
-    std::vector<NodeId> kept;
-    kept.reserve(max);
-    for (const Candidate& c : sorted) {
-        if (kept.size() >= max) break;
+    // Equal distances (identical vectors) in an order that differs for every base
+    // node, a hash of the pair, not by node number: otherwise every copy would
+    // prefer the same lowest-numbered copies (hubs) and leave the rest unreachable.
+    // Most candidate lists have no ties, and then nothing is reordered.
+    auto tie = [base](NodeId q) {
+        std::uint64_t z = (std::uint64_t(base) << 32 | q) + 0x9E3779B97F4A7C15ull;
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return z ^ (z >> 31);
+    };
+    bool ties = false;
+    for (std::size_t i = 1; i < sorted.size() && !ties; ++i) ties = sorted[i].distance == sorted[i - 1].distance;
+    std::vector<Candidate> reordered;
+    if (ties) {
+        reordered = sorted;
+        // std::sort, not stable_sort: stable_sort asks for a buffer with a non-throwing
+        // allocation and quietly falls back without it, so a failed allocation would
+        // go unreported (found by md50). The order is total, so sort is deterministic.
+        std::sort(reordered.begin(), reordered.end(), [&](const Candidate& a, const Candidate& b) {
+            if (a.distance != b.distance) return a.distance < b.distance;
+            const std::uint64_t ta = tie(a.id), tb = tie(b.id);
+            return ta != tb ? ta < tb : a.id < b.id;
+        });
+    }
+    const std::vector<Candidate>& order = ties ? reordered : sorted;
+    // Copies of the base node itself (distance 0) are exempt from the diversity
+    // rule: with one link each, identical vectors were almost all unreachable (591
+    // of 600). Distinct neighbors are chosen first, by the usual rule, but only up
+    // to the list minus room for the copies (half the list, or all the copies if
+    // fewer); copies then fill whatever room remains. So a group of copies among
+    // distinct vectors keeps half its links outward (it cannot close itself off),
+    // and a group with nothing distinct near it uses its whole list to stay connected.
+    std::vector<NodeId> copies, distinct;
+    for (const Candidate& c : order)
+        if (c.distance == 0) copies.push_back(c.id);
+    const std::size_t copy_room = std::min(copies.size(), std::max<std::size_t>(1, max / 2));
+    distinct.reserve(max);
+    for (const Candidate& c : order) {
+        if (c.distance == 0) continue;
+        if (distinct.size() + copy_room >= max) break;
         // Skip c if an already-kept neighbor is closer to it than the base node is
         // (c is then reachable through that neighbor), or is an exact copy of it.
-        // Without the copy check, identical vectors (all at distance 0, a tie)
-        // would fill every list near them and cut links to the rest of the graph.
         bool diverse = true;
-        for (NodeId k : kept) {
+        for (NodeId k : distinct) {
             if (same_vector(c.id, k) || distance_between(c.id, k) < c.distance) {
                 diverse = false;
                 break;
             }
         }
-        if (diverse) kept.push_back(c.id);
+        if (diverse) distinct.push_back(c.id);
     }
+    // Nearest first, as callers expect: the copies (distance 0), then the others.
+    std::vector<NodeId> kept;
+    kept.reserve(max);
+    for (std::size_t i = 0; i < copies.size() && kept.size() + distinct.size() < max; ++i) kept.push_back(copies[i]);
+    kept.insert(kept.end(), distinct.begin(), distinct.end());
     return kept;
 }
 
@@ -277,7 +316,7 @@ void HnswIndex::link_back(NodeId node, const std::vector<NodeId>& neighbors, int
             options.push_back({distance_between(neighbor, c), c});
         }
         std::sort(options.begin(), options.end());
-        graph.set_links(neighbor, level, select_neighbors(options, capacity));
+        graph.set_links(neighbor, level, select_neighbors(neighbor, options, capacity));
     }
 }
 
@@ -566,9 +605,9 @@ void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* 
             found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only(), nullptr, locks);
         }
         if (locks) {
-            chosen.push_back(select_neighbors(found, params_.M));
+            chosen.push_back(select_neighbors(node, found, params_.M));
         } else {
-            connect(node, select_neighbors(found, params_.M), l);
+            connect(node, select_neighbors(node, found, params_.M), l);
         }
         if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
     }
@@ -609,7 +648,7 @@ void HnswIndex::repair_neighbors(NodeId node) {
             options.erase(std::unique(options.begin(), options.end(),
                                       [](const Candidate& a, const Candidate& b) { return a.id == b.id; }),
                           options.end());
-            graph.set_links(n, l, select_neighbors(options, capacity));
+            graph.set_links(n, l, select_neighbors(n, options, capacity));
         }
         // Each former neighbor lost an incoming link (the removed node's), and the
         // diversity rule above can leave one with none from this group: under

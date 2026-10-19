@@ -68,7 +68,7 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
                 options_l.erase(std::unique(options_l.begin(), options_l.end(),
                                             [](const Candidate& a, const Candidate& b) { return a.id == b.id; }),
                                 options_l.end());
-                graph.set_links(node, l, select_neighbors(options_l, l == 0 ? graph.M0() : graph.M()));
+                graph.set_links(node, l, select_neighbors(node, options_l, l == 0 ? graph.M0() : graph.M()));
                 repaired = true;
             }
             st.nodes_repaired += repaired;

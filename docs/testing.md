@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 792 individually named tests** in 39 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 793 individually named tests** in 39 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -44,7 +44,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `vamana` | 10 | Phase Q6a: recall of the graph searched in memory (L2, cosine); structure (degrees at most R, no self loops or repeated edges, every node reachable from the medoid); alpha 1.0 against 1.2 (recorded); determinism; one and two vectors, fewer vectors than R, identical vectors, one dimension; invalid input; search parameters; cosine normalization; a large group of identical vectors among distinct ones |
 | `disk` | 39 | Phases Q6b to Q6d: every node read back equal to the graph built in memory; three block layouts; damaged files (header, sizes behind a valid checksum, truncation, trailing data, every section, a damaged node block met when read); invalid input; replacing a file only when complete; metadata and schemas; concurrent reads; recall against reads and rounds; exact distances; invalid searches; deadlines; concurrent searches; damage met during a search; alpha against reads; filtered searches (graph, direct, widening until k are found, shown to fail without widening), predicates, records, `search_by_id`, batches, concurrent filtered searches; files inconsistent behind valid checksums, each rejected by its own check; concurrent reads (identical results and statistics for every thread count and beam width; the overlap measured with simulated latency; an error during concurrent reads, then destroying the index; many searches sharing the readers); building from files (byte-identical to `build` when it fits; partitioned builds with every vector reachable and recall checked against an exact index; IDs, metadata and cosine; invalid files and settings, leaving an existing index and no temporary files; vectors files; the budget held with 3 replicas); an index file replaced and deleted while open |
 | `health` | 17 | Upkeep step 1: health reports. A fresh index (levels against their expected sizes, recall); reachability agreeing with an independent walk where nodes are unreachable; churn counted exactly on every change path (and not for unknown IDs, inserts or loading); degradation after removing 80% with and without neighbor repair; empty and codes-only indexes; recall following the search beam; reports during searches and changes; removing every upper-level node; Flat storage and churn; IVF balance and drift, SQ8 drift (clipping) and PQ drift against retrained samples; options and probes; the disk index (reachability agreeing with an independent walk, one pass of reads), and its identical-vector case staying reachable |
-| `upkeep` | 11 | Upkeep step 2: update churn on a small index over 200 random orders (none left with unreachable vectors after upkeep) and on a larger one (recall restored, counters reset); consolidation of links to removed vectors; budgets making it incremental; deadlines and cancellation stopping it cleanly; codes-only and empty indexes; automatic compaction (threshold, updates, validation, not saved); searches between budgeted calls |
+| `upkeep` | 12 | Upkeep step 2: update churn on a small index over 200 random orders (none left with unreachable vectors after upkeep) and on a larger one (recall restored, counters reset); consolidation of links to removed vectors; budgets making it incremental; deadlines and cancellation stopping it cleanly; codes-only and empty indexes; automatic compaction (threshold, updates, validation, not saved); searches between budgeted calls |
 | `rebuild` | 13 | Upkeep step 3: a quiet rebuild equals a compact; retraining a drifted codec (and keeping it when asked); changes made during a rebuild (adds, removals, updates, metadata, filters, batches) kept exactly, against the same changes applied to a copy; searches and a writer running through three rebuilds; cancellation and running out of memory at every allocation leaving the index byte for byte as it was; one rebuild at a time; codes-only indexes; flat indexes retraining drifted IVF lists and codecs, catching up changed rows, and exact with every list probed |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
@@ -56,7 +56,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 792 test names
+test_comprehensive --list               # list all 793 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -70,13 +70,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 792 of 792 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 793 of 793 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-792 passed, 0 failed, 0 skipped, 0 not run, 36485 checks, 111.24 s
+793 passed, 0 failed, 0 skipped, 0 not run, 37296 checks, 128.14 s
 All selected tests passed.
 ```
 
@@ -124,7 +124,7 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 50 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 792 tests selected`: that entry's share, not tests left out. Together the 50 entries run all 792 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 50 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 793 tests selected`: that entry's share, not tests left out. Together the 50 entries run all 793 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
  1/50 Test # 1: comprehensive.layer1 ...........   Passed
@@ -349,6 +349,11 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 79. **Upkeep could give up on reconnecting.** It looked for hosts near each unreachable vector by searching from the entry point; when the reachable part was tiny (many identical vectors, 4 links per vector: 478 of 480 unreachable) those few hosts filled up and 321 to 440 vectors stayed unreachable. It now falls back to the nearest reachable vector with a free slot and continues while rounds make progress: none stay unreachable (`uk11`, shown to fail without the fix).
 80. **A requested retraining comparison could be skipped silently:** on a small index the evaluation sample took every vector. The two samples now share the vectors in proportion (`he17`).
 81. **A false "deadlock" under coverage.** `rb04`'s watchdog fired in an unoptimized, instrumented build on one core: each rebuild took about 40 s, and the busy writer added catch-up work the longer it took. Timing each rebuild showed progress, not a deadlock; with half the data the test takes 44 s there.
+
+**Found while linking identical vectors at the source:**
+
+82. **Identical vectors were almost all unreachable from the start.** Measured before changing anything: a fresh build of 600 identical vectors with M 8 left 591 unreachable, and 50 values with 12 copies each left 396, without any churn. Neighbor selection skipped every candidate that copied a kept neighbor, so each vector kept one link per group of copies, and ties went to the lowest node numbers. Keeping copies of the vector itself (up to the room distinct neighbors do not need) and ordering ties by a hash of the pair: 0 unreachable with 12 copies per value, about 10% with all identical (`upkeep()` reconnects those), and ordinary data unchanged (`uk12`). The four HNSW golden files were written again; the same on x86 and ARM64; older files still load.
+83. **`std::stable_sort` can hide an allocation failure.** It asks for its buffer with a non-throwing allocation and quietly falls back without one, so `md50`, which fails every allocation of an insert in turn, reported a failure swallowed instead of reported. The order used is total, so `std::sort` gives the same result without allocating.
 
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 

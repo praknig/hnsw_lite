@@ -15172,6 +15172,32 @@ TEST(upkeep, uk11_a_graph_almost_entirely_unreachable) {
     }
 }
 
+TEST(upkeep, uk12_identical_vectors_are_linked_at_the_source) {
+    // Neighbor selection kept one link per group of copies (every copy was a copy
+    // of the first one kept) and broke ties by node number, so with M 8 a fresh
+    // build left 396 of 600 vectors unreachable with 12 copies per value, and 591 of
+    // 600 when all were identical. Copies of a vector are now kept, ties broken by a
+    // hash of the pair.
+    HealthOptions quick;
+    quick.recall_sample = 0;
+    for (int values : {50, 1}) {
+        std::mt19937 rng(1);
+        HnswParams p;
+        p.M = 8;
+        p.ef_construction = 32;
+        HnswIndex h(4, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 600; ++i) h.add(i, std::vector<float>{float(int(i) % values), 0, 0, 0});
+        const std::size_t fresh = h.health(quick).unreachable;
+        for (int u = 0; u < 4000; ++u) h.upsert(rng() % 600, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        const std::size_t churned = h.health(quick).unreachable;
+        const UpkeepStats st = h.upkeep();
+        std::printf("    %2d distinct value(s): unreachable %zu of 600 fresh, %zu after churn, %zu after upkeep\n", values, fresh, churned, st.unreachable);
+        if (values == 50) CHECK(fresh == 0 && churned == 0);  // a dozen copies per value: nothing lost at all
+        else CHECK(fresh <= 90 && churned <= 90);             // all identical: at most 15% (was 98.5%)
+        CHECK(st.complete && st.unreachable == 0);
+    }
+}
+
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================

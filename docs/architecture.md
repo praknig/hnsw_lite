@@ -135,7 +135,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 792 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 793 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -407,6 +407,8 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 ### Compressed indexes
 
 **Rebuilding** (`rebuild.cpp`). While a rebuild runs, every write path records the IDs it is about to change (`note_change`, before anything can fail; recording an unchanged ID is harmless, missing one would revive stale data). HNSW: phase 1 copies every record under the lock and samples stored vectors to train a codec on; phase 2, without any lock, builds a new index from the copy (a new codec trained first, or the old one cloned when only codes are kept); phase 3, under the lock, removes and re-adds each recorded ID through the new index's own unlocked paths (public calls from inside an index operation are refused), upkeeps the new graph if that removed anything, and moves the new state in. Flat: phase 1 copies the stored vectors; phase 2 trains the codec and k-means centroids on a sample and computes every copied vector's code and list; phase 3 matches current rows to the copy by ID (rows move when others are removed), recomputes the recorded ones, and swaps codec, codes, centroids, lists and positions together. Everything that can fail runs before the commit, and a failure stops the tracking.
+
+**Neighbor selection.** `select_neighbors(base, candidates, max)` applies HNSW's diversity rule (skip a candidate that a kept neighbor is closer to, or that is a copy of one) to distinct candidates, choosing them first but only up to the list minus room for copies of the base itself (half the list, or all the copies if fewer); the copies, exempt from the rule, then fill whatever room remains. Equal distances are ordered by a hash of (base, candidate), with a full order so `std::sort` is deterministic and allocation-free (`stable_sort` falls back silently when its buffer cannot be allocated). Before, every copy was a copy of the first one kept, so a vector kept one link per group of copies, and ties went to the lowest node numbers: identical vectors were almost all unreachable.
 
 **Upkeep** (`upkeep.cpp`). Under the lock alone: consolidation walks every live node and, on each level where it links to removed nodes, chooses its links again (with the usual diversity rule) from its live links and the removed nodes' live links; reconnection walks level 0 through live nodes only from the entry point and, for each unreachable vector, searches for it (descent plus `search_level`, which only visits reachable nodes) and links it from the nearest result with a free slot, or in place of a link whose target keeps another incoming link from a reachable node; repeated until all are reachable (at most 16 rounds). Removal repair (`repair_neighbors`) now also gives each of the removed node's former neighbors a link back from its nearest group member with a free slot, written in place without allocating, so an update that runs out of memory cannot leave its old version without incoming links. `compact()` is split into a locking wrapper and `compact_unlocked`, which removals and updates call when the automatic threshold is passed.
 

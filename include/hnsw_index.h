@@ -511,7 +511,7 @@ private:
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
     /// is closer to the base node than to every already-kept neighbor and is not
     /// an exact copy of one, up to `max`.
-    std::vector<NodeId> select_neighbors(const std::vector<Candidate>& sorted,
+    std::vector<NodeId> select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
 
     /// Steps 4 to 6 of add(): finds neighbors on every level, links the new node
