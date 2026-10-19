@@ -176,6 +176,12 @@ jobs:
       # Emulation is slow, so the two exhaustive file-corruption sweeps and the
       # long-running stress group are left to the native jobs.
       - name: Test on the emulated CPU
+        # Measurements of algorithms (recall, churn, partitioning), not of
+        # instruction sets: they run natively on every other platform, and under
+        # emulation took 300 to 1,700 s each (pq06 alone 28 minutes), pushing the
+        # job past 60 minutes. The kernels themselves stay fully tested here.
+        env:
+          HEAVY: --exclude pq06_ --exclude pq12_ --exclude uk01_ --exclude uk06_ --exclude dk15_ --exclude dk30_ --exclude dk34_
         # CTest's own entries (shards included, read from `ctest -N -V`, so they
         # follow CMakeLists.txt), each under QEMU, four at a time, sharded entries
         # first; stress is left out. Any failure fails the step.
@@ -183,7 +189,7 @@ jobs:
           ctest --test-dir build -N -V | sed -n 's/^[0-9]*: Test command: [^ ]* //p' | tr -d '"' |
             grep -vx -- '--group stress' |
             awk '/--shard/ {print; next} {rest = rest $0 "\n"} END {printf "%s", rest}' |
-            xargs -P 4 -L 1 qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_
+            xargs -P 4 -L 1 qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_ $HEAVY
 
   # The toolchain used for local development on Windows (MinGW-w64 GCC).
   windows-mingw:
