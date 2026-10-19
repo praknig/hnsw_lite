@@ -26,7 +26,8 @@ struct HealthOptions {
     std::size_t codec_sample = 500;
     /// Stored vectors (apart from those above) on which the codec and the IVF
     /// centroids are retrained, in memory, to show what retraining would gain
-    /// (0: no comparison). Costs a training (k-means for PQ and IVF).
+    /// (0: no comparison). Costs a training (k-means for PQ and IVF). When the two
+    /// samples do not both fit, the live vectors are split between them in proportion.
     std::size_t retrain_sample = 0;
 };
 
@@ -88,7 +89,8 @@ struct HealthReport {
 struct UpkeepOptions {
     /// Replace links to removed vectors, on every level, by the best of the
     /// node's other links and the removed vectors' live links (as FreshDiskANN
-    /// consolidates deletions). Such links are followed by searches in vain, and
+    /// consolidates deletions); stale links (to a vector without that level, after
+    /// slot reuse) are replaced too. Such links are followed by searches in vain, and
     /// point at an unrelated vector once the slot is reused.
     bool consolidate = true;
     /// Give every vector that no search can reach an incoming link on level 0,
@@ -101,7 +103,7 @@ struct UpkeepOptions {
 
 struct UpkeepStats {
     std::size_t nodes_repaired = 0;    ///< vectors whose links were consolidated
-    std::size_t links_replaced = 0;    ///< links to removed vectors removed
+    std::size_t links_replaced = 0;    ///< links to removed vectors, and stale links, removed
     std::size_t reconnected = 0;       ///< unreachable vectors given an incoming link
     std::size_t unreachable = 0;       ///< vectors still unreachable afterwards (only counted when complete)
     /// Everything was done: no budget, deadline or cancellation stopped it. Then

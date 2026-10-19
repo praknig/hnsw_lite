@@ -7482,6 +7482,9 @@ TEST(concurrency, c01_searches_while_one_thread_adds) {
     std::atomic<long> searches{0};
     with_watchdog(120, "c01", [&] {
         std::thread writer([&] {
+            // The others must be running first: under load (parallel CI) this thread
+            // could otherwise finish before they ever ran.
+            while (searches.load() == 0) std::this_thread::yield();
             for (std::size_t i = 500; i < 1500; ++i) {
                 h.add(i, data[i]);
                 added.store(i + 1);
@@ -8448,6 +8451,9 @@ TEST(add_batch, b09_searches_see_all_of_a_batch_or_none) {
     Problems p;
     with_watchdog(120, "b09", [&] {
         std::thread batches([&] {
+            // The others must be running first: under load (parallel CI) this thread
+            // could otherwise finish before they ever ran.
+            while (observations.load() == 0) std::this_thread::yield();
             for (std::uint64_t k = 0; k < 5; ++k)  // five batches of 200
                 h.add_batch(id_range(200 + 200 * k, 200), flatten(Vectors(data.begin() + std::ptrdiff_t(200 + 200 * k), data.begin() + std::ptrdiff_t(400 + 200 * k))), 4);
             stop = true;
@@ -8993,6 +8999,9 @@ TEST(bulk, w13_searches_see_all_of_a_change_or_none) {
     std::atomic<long> partial{0}, observations{0};
     with_watchdog(120, "w13", [&] {
         std::thread changer([&] {
+            // The others must be running first: under load (parallel CI) this thread
+            // could otherwise finish before they ever ran.
+            while (observations.load() == 0) std::this_thread::yield();
             for (std::int64_t g = 0; g < 3; ++g) {
                 h.set_metadata_where(Filter::eq("g", g), Metadata().set("flag", true));  // 500 rows at once
                 h.remove_where(Filter::eq("g", g));                                     // then remove them
@@ -9307,6 +9316,9 @@ TEST(records, r10_paging_while_the_index_changes) {
     std::atomic<long> bad{0}, pages{0};
     with_watchdog(120, "r10", [&] {
         std::thread writer([&] {
+            // The others must be running first: under load (parallel CI) this thread
+            // could otherwise finish before they ever ran.
+            while (pages.load() == 0) std::this_thread::yield();
             for (std::uint64_t i = 1000; i < 2000; ++i) {
                 h.add(i, data[i], meta_for(i));
                 if (i % 3 == 0) h.remove(i - 900);
@@ -14158,6 +14170,9 @@ TEST(health, he07_concurrent_with_searches_and_changes) {
     std::atomic<long> reports{0}, bad{0};
     with_watchdog(60, "he07", [&] {
         std::thread writer([&] {
+            // The others must be running first: under load (parallel CI) this thread
+            // could otherwise finish before they ever ran.
+            while (reports.load() == 0) std::this_thread::yield();
             for (std::uint64_t i = 1500; i < 2000; ++i) {
                 h.add(i, data[i]);
                 if (i % 2 == 0) h.remove(i - 1500);
@@ -14650,13 +14665,16 @@ TEST(rebuild, rb03_changes_made_during_a_rebuild_are_kept) {
 }
 
 TEST(rebuild, rb04_searches_and_changes_continue_during_a_rebuild) {
-    auto data = clustered(4000, 16, 12, 2104);
+    // Small enough for slow builds: under coverage on one core each rebuild of
+    // 3,000 vectors took about 40 s, and the busy writer adds catch-up work the
+    // longer a rebuild takes (three took 140 s, past the watchdog).
+    auto data = clustered(2000, 16, 12, 2104);
     HnswIndex h(16, Metric::L2);
-    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 1200; ++i) h.add(i, data[i]);
     std::atomic<bool> done{false};
     std::atomic<long> bad{0};
     std::map<std::uint64_t, std::size_t> shadow;  // ID -> data row, as the writer leaves it
-    for (std::uint64_t i = 0; i < 3000; ++i) shadow[i] = i;
+    for (std::uint64_t i = 0; i < 1200; ++i) shadow[i] = i;
     with_watchdog(120, "rb04", [&] {
         std::thread rebuilder([&] {
             for (int round = 0; round < 3; ++round) (void)h.rebuild();
@@ -14665,8 +14683,8 @@ TEST(rebuild, rb04_searches_and_changes_continue_during_a_rebuild) {
         std::thread writer([&] {
             std::mt19937 rng(7);
             while (!done) {
-                const std::uint64_t id = rng() % 3500;
-                const std::size_t row = rng() % 4000;
+                const std::uint64_t id = rng() % 1400;
+                const std::size_t row = rng() % 2000;
                 if (rng() % 3 == 0) {
                     h.remove(id);
                     shadow.erase(id);
@@ -14678,7 +14696,7 @@ TEST(rebuild, rb04_searches_and_changes_continue_during_a_rebuild) {
         });
         run_threads(2, [&](std::size_t t) {
             while (!done)
-                for (const auto& x : h.search(data[t * 11], 10)) bad += long(x.id >= 3500);
+                for (const auto& x : h.search(data[t * 11], 10)) bad += long(x.id >= 1400);
         });
         rebuilder.join();
         writer.join();
@@ -14765,15 +14783,31 @@ TEST(rebuild, rb08_flat_retrains_drifted_lists) {
     for (std::uint64_t i = 0; i < 4000; ++i) f.add(10000 + i, after[i]);
     HealthOptions o;
     o.retrain_sample = 1000;
+    auto scanned = [&] {  // vectors scanned per query with the index's 2 probes
+        std::size_t total = 0;
+        for (std::size_t q = 0; q < 50; ++q) {
+            SearchStats ss;
+            SearchOptions so;
+            so.stats = &ss;
+            (void)f.search(after[q * 37], 10, so);
+            total += ss.distance_computations;
+        }
+        return double(total) / 50.0;
+    };
     const HealthReport drift = f.health(o);
+    const double work_before = scanned();
     const RebuildStats st = f.rebuild();
     const HealthReport now = f.health(o);
-    std::printf("    centroid distance %.1f -> %.1f (retrained sample %.1f), imbalance %.1f -> %.1f, recall@10 with 2 probes %.3f -> %.3f\n",
+    const double work_after = scanned();
+    std::printf("    centroid distance %.1f -> %.1f (retrained sample %.1f), imbalance %.1f -> %.1f; with 2 probes: vectors scanned per query %.0f -> %.0f, recall@10 %.3f -> %.3f\n",
                 *drift.centroid_distance, *now.centroid_distance, *now.centroid_distance_retrained, drift.list_imbalance, now.list_imbalance,
-                *drift.recall, *now.recall);
+                work_before, work_after, *drift.recall, *now.recall);
     CHECK(st.lists_retrained && !st.codec_retrained && st.kept == 6000 && st.caught_up == 0);
-    // Drifted lists mostly cost speed (a probe scans an oversized list), not recall.
-    CHECK(*now.centroid_distance < 1.5 * *now.centroid_distance_retrained && now.list_imbalance < 0.3 * drift.list_imbalance && *now.recall >= *drift.recall - 0.01);
+    CHECK(*now.centroid_distance < 1.5 * *now.centroid_distance_retrained && now.list_imbalance < 0.3 * drift.list_imbalance);
+    // Drifted lists cost speed: a probe scans an oversized list. At the same probes,
+    // recall can dip slightly after retraining (fewer vectors scanned: measured
+    // 0.881 -> 0.859 with one standard library's data, 0.873 -> 0.874 with another's).
+    CHECK(work_after < 0.7 * work_before && *now.recall >= 0.8);
     CHECK(lists_consistent(f));
 }
 
@@ -14870,6 +14904,272 @@ TEST(rebuild, rb11_flat_cancellation_and_out_of_memory) {
         CHECK(points > 50 && intact && lists_consistent(f));
     }
     CHECK(f.rebuild().lists_retrained);  // tracking was reset every time
+}
+
+TEST(health, he16_boundaries) {
+    auto data = random_vectors(200, 8, 2200);
+    HnswIndex small(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 5; ++i) small.add(i, std::vector<float>(data[i].begin(), data[i].begin() + 4));
+    HealthOptions big;  // k and every sample larger than the index
+    big.k = 50;
+    big.recall_sample = 500;
+    big.codec_sample = 900;
+    big.retrain_sample = 900;
+    HealthOptions no_k;
+    no_k.k = 0;
+    CHECK(*small.health(big).recall == 1.0 && !small.health(no_k).recall);
+    for (std::uint64_t i = 0; i < 5; ++i) small.remove(i);  // only removed vectors left
+    const HealthReport gone = small.health();
+    CHECK(gone.live == 0 && gone.free_slots == 5 && gone.removals == 5 && !gone.recall);
+    HnswParams p;
+    p.quantization.truncate_to = 4;  // Matryoshka: searched with the stored, truncated vectors
+    HnswIndex cut(8, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 200; ++i) cut.add(i, data[i]);
+    CHECK(cut.health().recall && *cut.health().recall > 0.9);
+    IvfParams ivf;
+    ivf.lists = 4;
+    ivf.train_after = 0;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 40; ++i) f.add(i, data[i]);
+    f.train_lists();
+    for (std::uint64_t i = 0; i < 40; ++i) f.remove(i);
+    const HealthReport e = f.health();
+    CHECK(e.live == 0 && e.lists_trained && e.empty_lists == 4 && e.list_imbalance == 0 && !e.centroid_distance);
+}
+
+TEST(upkeep, uk09_boundaries) {
+    auto data = random_vectors(400, 8, 2201);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) h.add(i, data[i]);
+    h.remove(3);
+    UpkeepOptions nothing;
+    nothing.consolidate = false;
+    nothing.reconnect = false;
+    CHECK(h.upkeep(nothing).complete && quick_health(h).removals == 0);  // nothing to do still resets the counters
+    for (std::uint64_t i = 0; i < 50; ++i) h.remove(i);  // only removed vectors left
+    CHECK(h.upkeep().complete && h.size() == 0);
+    HnswParams p;
+    p.quantization.truncate_to = 4;
+    p.repair_on_remove = false;
+    HnswIndex cut(8, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 400; ++i) cut.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 400; i += 2) cut.remove(i);
+    UpkeepOptions one;
+    one.max_nodes = 1;
+    std::size_t calls = 1;
+    while (!cut.upkeep(one).complete) ++calls;
+    const HealthReport r = quick_health(cut);
+    CHECK(calls > 10 && r.links_to_removed == 0 && r.unreachable == 0);
+}
+
+TEST(rebuild, rb12_boundaries) {
+    auto data = random_vectors(600, 8, 2202);
+    HnswIndex empty(8, Metric::L2);
+    CHECK(empty.rebuild().kept == 0 && empty.size() == 0);
+    HnswIndex gone(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) gone.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 10; ++i) gone.remove(i);
+    const RebuildStats g = gone.rebuild();
+    gone.add(5, data[5]);
+    CHECK(g.kept == 0 && g.reclaimed == 10 && gone.size() == 1 && gone.search(data[5], 1)[0].id == 5);
+    HnswParams later;  // a codec not trained yet stays so
+    later.quantization.codec = CodecKind::SQ8;
+    later.quantization.train_after = 100;
+    HnswIndex untrained(8, Metric::L2, later);
+    for (std::uint64_t i = 0; i < 50; ++i) untrained.add(i, data[i]);
+    CHECK(!untrained.rebuild().codec_retrained && !untrained.codec_trained());
+    // Settings survive: a strict schema, payload indexes, automatic compaction.
+    HnswIndex strict(8, Metric::L2, {}, Schema::strict({{"c", FieldType::Keyword}}));
+    strict.create_payload_index("c");
+    strict.set_auto_compact(0.25);
+    for (std::uint64_t i = 0; i < 50; ++i) strict.add(i, data[i], Metadata().set("c", std::to_string(i % 3)));
+    strict.rebuild();
+    SearchOptions so = with_filter(Filter::eq("c", "1"));
+    SearchStats st;
+    so.stats = &st;
+    (void)strict.search(data[0], 5, 64, so);
+    CHECK_THROWS_AS(std::invalid_argument, strict.add(99, data[9], Metadata().set("zz", 1)));
+    CHECK(st.exact_count && strict.auto_compact() == 0.25);
+    // Automatic compaction renumbering the old index during a rebuild.
+    HnswIndex busy(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 600; ++i) busy.add(i, data[i]);
+    busy.set_auto_compact(0.1);
+    std::size_t calls = 0;
+    OperationOptions o;
+    o.progress = [&](std::size_t, std::size_t) {
+        if (++calls == 3)
+            for (std::uint64_t i = 0; i < 200; ++i) busy.remove(i);
+    };
+    busy.rebuild({}, o);
+    bool same = busy.size() == 400;
+    for (std::uint64_t i = 200; i < 600; ++i) same = same && *busy.get_vector(i) == data[i];
+    CHECK(same && quick_health(busy).unreachable == 0);
+    // Truncated vectors are kept as given; saving afterwards round-trips.
+    HnswParams cut;
+    cut.quantization.truncate_to = 4;
+    HnswIndex t(8, Metric::L2, cut);
+    for (std::uint64_t i = 0; i < 100; ++i) t.add(i, data[i]);
+    t.rebuild();
+    CHECK(*t.get_vector(1) == data[1] && save_bytes(*load_hnsw(save_bytes(t))) == save_bytes(t));
+    // Flat: lists trained, then emptied (found by the edge review: k-means had no points).
+    IvfParams ivf;
+    ivf.lists = 16;
+    ivf.train_after = 0;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 100; ++i) f.add(i, data[i]);
+    f.train_lists();
+    for (std::uint64_t i = 0; i < 95; ++i) f.remove(i);  // fewer vectors than lists
+    CHECK(f.rebuild().lists_retrained && load_flat(save_bytes(f))->size() == 5 && lists_consistent(f));
+    for (std::uint64_t i = 95; i < 100; ++i) f.remove(i);
+    const RebuildStats fe = f.rebuild();
+    f.add(1, data[1]);
+    CHECK(fe.kept == 0 && !fe.lists_retrained && f.size() == 1 && lists_consistent(f));
+}
+
+TEST(health, he17_every_codec_and_every_switch) {
+    auto data = clustered(600, 16, 6, 2210);
+    for (CodecKind kind : {CodecKind::Binary, CodecKind::SQ8, CodecKind::PQ}) {
+        HnswParams p;
+        p.quantization.codec = kind;
+        p.quantization.train_after = 200;
+        HnswIndex h(16, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 600; ++i) h.add(i, data[i]);
+        for (std::uint64_t i = 0; i < 600; i += 3) h.remove(i);  // samples skip removed slots
+        HealthOptions o;
+        o.retrain_sample = 100;
+        const HealthReport r = h.health(o);
+        HealthOptions off = o;
+        off.codec_sample = 0;
+        CHECK(r.codec_error && r.codec_error_retrained && bool(r.clipped) == (kind == CodecKind::SQ8) && !h.health(off).codec_error);
+    }
+    HnswParams sq;  // all-zero vectors: no length to relate the error to
+    sq.quantization.codec = CodecKind::SQ8;
+    sq.quantization.train_after = 10;
+    HnswIndex zeros(4, Metric::L2, sq);
+    for (std::uint64_t i = 0; i < 20; ++i) zeros.add(i, std::vector<float>(4, 0.0f));
+    CHECK(*zeros.health().codec_error == 0.0);
+    // Flat: each measurement on its own, and switched off.
+    QuantizationParams q;
+    q.codec = CodecKind::SQ8;
+    q.train_after = 100;
+    FlatIndex coded(16, Metric::L2, Schema::dynamic(), q);
+    IvfParams ivf;
+    ivf.lists = 4;
+    ivf.train_after = 0;
+    FlatIndex listed(16, Metric::L2, Schema::dynamic(), {}, ivf);
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        coded.add(i, data[i]);
+        listed.add(i, data[i]);
+    }
+    listed.train_lists();
+    HealthOptions none;
+    none.recall_sample = 0;
+    none.k = 0;
+    const HealthReport a = coded.health(), b = listed.health(), c = listed.health(none);
+    CHECK(a.codec_error && !a.centroid_distance && !b.codec_error && b.centroid_distance && !c.recall && c.centroid_distance);
+    // Disk: k = 0, and no compression sample.
+    const std::string path = temp_path("he17");
+    DiskIndex::build(path, id_range(0, 600), flatten(data), 16, Metric::L2);
+    HealthOptions disk_off;
+    disk_off.k = 0;
+    disk_off.codec_sample = 0;
+    const HealthReport d = DiskIndex::open(path)->health(disk_off);
+    CHECK(!d.recall && !d.codec_error && d.live == 600 && d.unreachable == 0);
+    std::filesystem::remove(path);
+}
+
+TEST(upkeep, uk10_every_path) {
+    auto data = clustered(3000, 8, 10, 2211);
+    // Reconnection alone: the walk meets removed vectors still linked.
+    HnswParams p;
+    p.M = 2;  // at most 4 links per vector: hosts fill up, so the fallbacks run
+    HnswIndex h(8, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i]);
+    std::mt19937 rng(11);
+    for (int u = 0; u < 6000; ++u) h.upsert(rng() % 1500, data[rng() % 3000]);
+    for (std::uint64_t i = 0; i < 1500; i += 7) h.remove(i);
+    UpkeepOptions only_reconnect;
+    only_reconnect.consolidate = false;
+    only_reconnect.max_nodes = 3;  // a budget that runs out while reconnecting
+    const std::size_t before = quick_health(h).unreachable;
+    const UpkeepStats partial = h.upkeep(only_reconnect);
+    std::atomic<bool> no{false};
+    OperationOptions untriggered;  // options present, not triggered
+    untriggered.cancel = &no;
+    untriggered.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    const UpkeepStats full = h.upkeep({}, untriggered);
+    std::printf("    unreachable before %zu; budget of 3: %zu reconnected (complete %d); then %zu more, %zu left\n", before,
+                partial.reconnected, int(partial.complete), full.reconnected, full.unreachable);
+    CHECK(before > 3 && !partial.complete && partial.reconnected == 3 && full.complete && full.unreachable == 0);
+    CHECK(quick_health(h).unreachable == 0);
+    check_graph(h, 1.0);
+}
+
+TEST(rebuild, rb13_every_path) {
+    auto data = clustered(800, 8, 6, 2212);
+    // HNSW keeping vectors as given (cosine): changes during the rebuild come from those.
+    HnswIndex h(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 400; ++i) h.add(i, data[i]);
+    std::size_t calls = 0;
+    OperationOptions o;
+    o.progress = [&](std::size_t, std::size_t) {
+        if (++calls == 2) h.update(5, data[500]);
+    };
+    const RebuildStats st = h.rebuild({}, o);
+    CHECK(st.caught_up == 1 && *h.get_vector(5) == data[500]);
+    // Flat: one rebuild at a time; retrain switched off; a binary codec.
+    QuantizationParams q;
+    q.codec = CodecKind::Binary;
+    q.train_after = 100;
+    IvfParams ivf;
+    ivf.lists = 4;
+    ivf.train_after = 0;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), q, ivf);
+    for (std::uint64_t i = 0; i < 800; ++i) f.add(i, data[i]);
+    f.train_lists();
+    bool refused = false;
+    OperationOptions nested;
+    nested.progress = [&](std::size_t, std::size_t) {
+        if (refused) return;
+        try {
+            (void)f.rebuild();
+        } catch (const std::logic_error&) {
+            refused = true;
+        }
+    };
+    const RebuildStats fb = f.rebuild({}, nested);
+    RebuildOptions keep;
+    keep.retrain = false;
+    const RebuildStats fk = f.rebuild(keep);
+    std::size_t listed = 0;
+    bool every = true;
+    for (std::size_t s : f.list_sizes()) listed += s;
+    for (std::uint64_t i = 0; i < 800; ++i) every = every && f.list_of(i).has_value();
+    // Bookkeeping checked directly: lists_consistent also expects a one-probe search
+    // to find each vector first, which 1-bit codes rank too coarsely to promise.
+    CHECK(refused && fb.codec_retrained && fb.lists_retrained && !fk.codec_retrained && !fk.lists_retrained && listed == 800 && every);
+}
+
+TEST(upkeep, uk11_a_graph_almost_entirely_unreachable) {
+    // Many identical vectors with at most 4 links each, then heavy churn: almost
+    // nothing stays reachable. Found by the edge review: reconnection searched only
+    // near each vector, the few hosts filled up, and 321 to 440 of 480 vectors stayed
+    // unreachable. It now falls back to the nearest reachable vector with a free slot,
+    // and continues while rounds make progress.
+    std::mt19937 rng(1);
+    for (int values : {1, 3}) {
+        HnswParams p;
+        p.M = 2;
+        p.ef_construction = 4;
+        HnswIndex h(4, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 600; ++i) h.add(i, std::vector<float>{float(int(i) % values), 0, 0, 0});
+        for (int u = 0; u < 4000; ++u) h.upsert(rng() % 600, std::vector<float>{float(int(rng()) % values), 0, 0, 0});
+        for (std::uint64_t i = 0; i < 600; i += 5) h.remove(i);
+        const std::size_t before = quick_health(h).unreachable;
+        const UpkeepStats st = h.upkeep();
+        std::printf("    %d distinct value(s): %zu of %zu unreachable before upkeep, %zu after\n", values, before, h.size(), st.unreachable);
+        CHECK(before > h.size() / 2 && st.complete && st.unreachable == 0 && quick_health(h).unreachable == 0);
+    }
 }
 
 // ===========================================================================

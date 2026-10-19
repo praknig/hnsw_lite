@@ -25,6 +25,16 @@ void sample_first(std::vector<NodeId>& nodes, std::size_t take, std::uint64_t se
     for (std::size_t i = 0; i < take; ++i) std::swap(nodes[i], nodes[i + std::size_t(rng() % (nodes.size() - i))]);
 }
 
+/// The evaluation and retraining sample sizes for `live` vectors: as asked, or,
+/// when both do not fit, the live vectors split between them in proportion, so a
+/// requested retraining comparison is never silently skipped.
+std::pair<std::size_t, std::size_t> sample_sizes(const HealthOptions& o, std::size_t live) {
+    const std::size_t e = o.codec_sample, t = o.retrain_sample;
+    if (e == 0 || e + t <= live) return {std::min(e, live), std::min(t, live)};
+    const std::size_t eval = std::max<std::size_t>(1, std::size_t(double(live) * double(e) / double(e + t)));
+    return {std::min(eval, live), live - std::min(eval, live)};
+}
+
 /// Squared reconstruction error relative to squared length, over `vectors`.
 double relative_error(const VectorCodec& codec, const std::vector<std::span<const float>>& vectors, std::size_t dim) {
     std::vector<std::uint8_t> code(codec.code_size());
@@ -171,10 +181,10 @@ HealthReport HnswIndex::health(const HealthOptions& options) const {
             std::vector<NodeId> nodes;
             for (NodeId node = 0; node < n; ++node)
                 if (!ids.is_deleted(node)) nodes.push_back(node);
-            sample_first(nodes, options.codec_sample + options.retrain_sample, options.seed + 1);
+            const auto [e_size, t_size] = sample_sizes(options, nodes.size());
+            sample_first(nodes, e_size + t_size, options.seed + 1);
             std::vector<std::span<const float>> eval, train;
-            for (std::size_t i = 0; i < nodes.size() && i < options.codec_sample + options.retrain_sample; ++i)
-                (i < options.codec_sample ? eval : train).push_back(storage_.vectors().get(nodes[i]));
+            for (std::size_t i = 0; i < e_size + t_size; ++i) (i < e_size ? eval : train).push_back(storage_.vectors().get(nodes[i]));
             measure_codec(r, *codec_, eval, train, storage_.vectors().dim(), metric_);
         }
     }
@@ -189,7 +199,7 @@ HealthReport HnswIndex::health(const HealthOptions& options) const {
             for (const auto& x : *found) hits += truth.count(x.id);
             wanted += p.truth.size();
         }
-        if (wanted > 0) r.recall = double(hits) / double(wanted);
+        if (wanted > 0) r.recall = double(hits) / double(wanted);  // GCOVR_EXCL_BR_LINE: zero only if every probe was removed meanwhile (a race)
     }
     return r;
 }
@@ -239,10 +249,10 @@ HealthReport FlatIndex::health(const HealthOptions& options) const {
         // Compression and IVF figures on a second sample (and retraining on a third).
         if (options.codec_sample > 0 && ((codec_ && codec_->trained()) || r.lists_trained)) {
             for (NodeId i = 0; i < live_; ++i) rows[i] = i;
-            sample_first(rows, options.codec_sample + options.retrain_sample, options.seed + 1);
+            const auto [e_size, t_size] = sample_sizes(options, rows.size());
+            sample_first(rows, e_size + t_size, options.seed + 1);
             std::vector<std::span<const float>> eval, train;
-            for (std::size_t i = 0; i < rows.size() && i < options.codec_sample + options.retrain_sample; ++i)
-                (i < options.codec_sample ? eval : train).push_back(vectors_.get(rows[i]));
+            for (std::size_t i = 0; i < e_size + t_size; ++i) (i < e_size ? eval : train).push_back(vectors_.get(rows[i]));
             if (codec_ && codec_->trained()) measure_codec(r, *codec_, eval, train, dim, metric_);
             if (r.lists_trained && !eval.empty()) {
                 double total = 0;
@@ -273,7 +283,7 @@ HealthReport FlatIndex::health(const HealthOptions& options) const {
             for (const auto& x : *found) hits += truth.count(x.id);
             wanted += p.truth.size();
         }
-        if (wanted > 0) r.recall = double(hits) / double(wanted);
+        if (wanted > 0) r.recall = double(hits) / double(wanted);  // GCOVR_EXCL_BR_LINE: zero only if every probe was removed meanwhile (a race)
     }
     return r;
 }
@@ -297,10 +307,10 @@ HealthReport DiskIndex::health(const HealthOptions& options) const {
     std::vector<std::vector<std::pair<float, NodeId>>> best(probes);  // max-heaps of the k nearest so far
     std::vector<NodeId> pq_nodes(n);
     for (NodeId i = 0; i < n; ++i) pq_nodes[i] = i;
-    sample_first(pq_nodes, options.codec_sample + options.retrain_sample, options.seed + 1);
+    const auto [e_size, t_size] = sample_sizes(options, n);
+    sample_first(pq_nodes, e_size + t_size, options.seed + 1);
     std::vector<int> pq_role(n, 0);  // 1: evaluation, 2: retraining
-    for (std::size_t i = 0; i < pq_nodes.size() && i < options.codec_sample + options.retrain_sample; ++i)
-        pq_role[pq_nodes[i]] = i < options.codec_sample ? 1 : 2;
+    for (std::size_t i = 0; i < e_size + t_size; ++i) pq_role[pq_nodes[i]] = i < e_size ? 1 : 2;
     std::vector<std::vector<float>> eval_vectors, train_vectors;
 
     // One pass in node order: neighbor lists, distances to the probes, PQ samples.

@@ -39,8 +39,11 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
             for (int l = 0; l <= graph.level(node); ++l) {
                 const auto slots = graph.links(node, l);
                 const std::size_t count = GraphStorage::count(slots);
+                // Links to removed vectors, and stale links: to a vector without this
+                // level, after a removed vector's slot was reused by a lower one (found
+                // by uk10: such links were reported by health() but never repaired).
                 bool dangling = false;
-                for (std::size_t i = 0; i < count && !dangling; ++i) dangling = ids.is_deleted(slots[i]);
+                for (std::size_t i = 0; i < count && !dangling; ++i) dangling = ids.is_deleted(slots[i]) || graph.level(slots[i]) < l;
                 if (!dangling) continue;
                 if (stop()) return st;
                 std::vector<Candidate> options_l;
@@ -50,12 +53,12 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
                 };
                 for (std::size_t i = 0; i < count; ++i) {
                     const NodeId c = slots[i];
-                    if (!ids.is_deleted(c)) {
+                    if (!ids.is_deleted(c) && graph.level(c) >= l) {
                         consider(c);
                         continue;
                     }
                     ++st.links_replaced;
-                    if (graph.level(c) < l) continue;  // a stale link: nothing to borrow
+                    if (graph.level(c) < l || !ids.is_deleted(c)) continue;  // stale: nothing to borrow on this level
                     for (NodeId c2 : graph.links(c, l)) {
                         if (c2 == kEmpty) break;
                         consider(c2);
@@ -101,7 +104,9 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
     if (upkeep_options.reconnect) {
         std::vector<float> buffer;
         const Eligibility live{&ids};
-        for (int round = 0; round < 16 && reachable < live_; ++round) {
+        // Rounds continue while they make progress: each newly reached vector brings its
+        // own links, and with them more of the graph.
+        while (reachable < live_) {
             std::vector<std::uint32_t> indegree(n, 0);
             for (NodeId v = 0; v < n; ++v)
                 if (reached[v])
@@ -142,7 +147,30 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
                             break;
                         }
                 }
-                if (!linked) continue;  // GCOVR_EXCL_LINE: every reachable host's every link is its target's only one
+                // Else the nearest reachable vector with a free slot, found by a scan: when the
+                // reachable part is tiny, a search finds only a few hosts, soon full (found
+                // with many identical vectors and 4 links per vector: 440 of 480 stayed
+                // unreachable). Only here does upkeep pay for a pass over the reachable vectors.
+                if (!linked) {
+                    NodeId best = kEmpty;
+                    float best_d = 0;
+                    for (NodeId v = 0; v < n; ++v) {
+                        if (!reached[v] || v == u) continue;
+                        const auto slots = graph.links(v, 0);
+                        if (GraphStorage::count(slots) >= slots.size()) continue;
+                        const float d = distance_to(q, v);
+                        if (best == kEmpty || d < best_d) {
+                            best = v;
+                            best_d = d;
+                        }
+                    }
+                    if (best != kEmpty) {
+                        const auto slots = graph.links(best, 0);
+                        slots[GraphStorage::count(slots)] = u;
+                        linked = true;
+                    }
+                }
+                if (!linked) continue;  // GCOVR_EXCL_LINE: every reachable vector's list is full, and every link its target's only one
                 ++indegree[u];
                 ++st.reconnected;
                 changed = true;

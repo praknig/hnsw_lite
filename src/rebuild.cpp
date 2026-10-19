@@ -48,8 +48,8 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
                 const std::size_t d = storage_.vectors().dim(), take = std::min<std::size_t>(live_, 100000);
                 sample.reserve(take * d);
                 std::size_t i = 0;
-                for (NodeId n = 0; n < storage_.size() && i < take; ++n)
-                    if (!ids.is_deleted(n) && (n % std::max<std::size_t>(1, live_ / take) == 0)) {
+                for (NodeId n = 0; n < storage_.size() && i < take; ++n)  // GCOVR_EXCL_BR_LINE: the sample is smaller only beyond 100,000 vectors
+                    if (!ids.is_deleted(n) && (n % std::max<std::size_t>(1, live_ / take) == 0)) {  // GCOVR_EXCL_BR_LINE: likewise
                         const auto v = storage_.vectors().get(n);
                         sample.insert(sample.end(), v.begin(), v.end());
                         ++i;
@@ -146,6 +146,7 @@ RebuildStats FlatIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
         stride = vectors_.stride();
         retrain_codec = rebuild_options.retrain && codec_ && codec_->trained() && vectors_.has_values();
         retrain_lists = rebuild_options.retrain && ivf_trained();
+        if (live_ == 0) retrain_codec = retrain_lists = false;  // nothing to train on (k-means needs points)
         st.kept = live_;
         if (!retrain_codec && !retrain_lists) return st;  // rows stay packed: nothing else to rebuild
         if (retrain_codec) {
@@ -176,7 +177,7 @@ RebuildStats FlatIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
     try {
         std::vector<float> sample;
         const std::size_t take = std::min<std::size_t>(n, 100000), step = std::max<std::size_t>(1, n / std::max<std::size_t>(take, 1));
-        for (std::size_t i = 0; i < n && sample.size() < take * d; i += step)
+        for (std::size_t i = 0; i < n && sample.size() < take * d; i += step)  // GCOVR_EXCL_BR_LINE: the sample is smaller only beyond 100,000 vectors
             sample.insert(sample.end(), snapshot.begin() + std::ptrdiff_t(i * d), snapshot.begin() + std::ptrdiff_t((i + 1) * d));
         if (retrain_codec) {
             codec = make_codec(kind, d, metric_, parts);

@@ -390,6 +390,9 @@ private:
         if (done != 0 && done != total_ && percent <= last_percent_.load(std::memory_order_relaxed)) return;
         const std::lock_guard<std::mutex> lock(m_);
         if (reported_any_ && done <= last_done_) return;  // never backwards, never twice
+        // Checked again under the lock: two threads can both pass the check above
+        // for the same percent (found under load: more than one report per percent).
+        if (reported_any_ && done != total_ && percent <= last_percent_.load(std::memory_order_relaxed)) return;
         last_percent_.store(percent, std::memory_order_relaxed);
         last_done_ = done;
         reported_any_ = true;
