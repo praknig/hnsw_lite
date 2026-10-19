@@ -147,7 +147,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Linux / emulated ${{ matrix.cpu }} (${{ matrix.kernel }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
