@@ -13,10 +13,10 @@ hnsw-lite implements that core in a small, readable codebase, with every design 
 These are deliberate for the current stage:
 
 - **Changes run one at a time.** Indexes are thread-safe, and adds, updates and removes take the lock alone. `add_batch` links its vectors on several threads, but searches wait while it runs; letting searches run during inserts would need the lowest storage layer redesigned for concurrent readers.
-- **Heavy update churn gradually weakens the graph.** Each update links a new version and repairs around the old one, and these small losses add up: after 320 updates per vector on a 20-vector index, one or two vectors were unreachable from the entry point in 27 of 200 random update orders (worst 90% reachable), single-threaded as well as with threads. `compact()` rebuilds the graph and restores it fully, so call it after heavy update workloads. (hnswlib has the same weakness with repeated updates.)
+- **Heavy update churn weakens the graph until upkeep.** Each update links a new version and repairs around the old one; small losses add up. Measured with 320 updates per vector of a 20-vector index: vectors became unreachable in 37 of 200 random orders, 7 since removal repair keeps each former neighbor's incoming link, and none after `upkeep()`, which reconnects them (see the [user guide](user-guide.md#upkeep)). `compact()` still rebuilds the graph completely. (hnswlib has the same weakness with repeated updates.)
 - **Inner product with vectors of very different lengths:** vectors whose lengths differ by orders of magnitude leave some vectors hard to reach in an HNSW graph (the long ones dominate every neighborhood), a known property of HNSW with inner product. Normalize the vectors (or use cosine) when their lengths vary widely.
 - **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
-- **Many exact copies of the same vector weaken the graph,** especially combined with heavy removal and update churn: graph reachability drops noticeably (hnswlib shares this limitation).
+- **Graphs made almost entirely of identical vectors keep some of them unreachable until upkeep.** Neighbor selection now keeps copies of a vector (up to the room distinct neighbors do not need) and breaks distance ties by a hash of the pair: with a dozen copies per value nothing becomes unreachable; with 600 identical vectors and M 8 about 10% do (98.5% before), and `upkeep()` reconnects them. Run it after building heavily duplicated data.
 - **HNSW build speed.** One-by-one adds are single-threaded (use `add_batch` to build on several threads), and every access is bounds-checked for safety. Unchecked accessors in the hot loops are future optimizations.
 - **Saving cannot force data onto the physical disk:** a save is atomic (temporary file, then rename), but a power cut right after `save` returns could lose that latest save. Loading is not memory-mapped, so a large index is read fully into memory.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
@@ -27,7 +27,6 @@ These are deliberate for the current stage:
 - **Filter-aware graph construction is not implemented.** Very selective filters go to exact search; between roughly 1% and 10% selectivity the planner's thresholds matter most, and may need tuning per dataset.
 - **HNSW range search is approximate**, like k-nearest search; use `Strategy::ForceExact` when every vector in the radius must be found.
 - **Custom predicates must be thread-safe** when used with batch search, and the planner can only estimate them by sampling.
-- **Exact duplicates cannot all stay reachable.** Each node has a fixed number of link slots, and once one copy of a point is linked, further copies add nothing, so some copies become unreachable (with 200 identical vectors, about 60% stay reachable). They no longer harm other vectors, but deduplicate data if every copy must be returned.
 - **Inner product is harder than L2 and cosine.** It is not a true distance, so recall is lower on un-normalized data (about 0.86 to 0.90 at `ef = 100` in tests, versus 0.997 or higher for L2 and cosine), and a small fraction of short vectors may become unreachable. This matches hnswlib. Use cosine, or normalize vectors, when possible.
 - **Very small `M` builds a sparse graph.** `M = 2` works but leaves about 10% of nodes unreachable in tests; use `M >= 8`.
 - **Kernels compare one pair of vectors at a time.** Batched query-vs-many kernels and matrix-multiplication-based flat search are possible future optimizations.
@@ -56,6 +55,9 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Product quantization
 - [x] An inverted file (IVF, and IVF-PQ) for `FlatIndex`
 - [x] A disk-based index, read-only (see the [plan](compression-and-index-types-plan.md))
+- [x] Health reports for every index type (step 1 of index upkeep)
+- [x] Index upkeep: better repair under churn, incremental `upkeep()`, automatic `compact()` (step 2)
+- [x] Rebuilds while in use, with an atomic swap, retraining codecs and IVF lists (step 3)
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

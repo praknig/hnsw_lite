@@ -11,10 +11,12 @@
 #include <string>
 #include <random>
 #include <span>
+#include <unordered_set>
 #include <vector>
 
 #include "distance.h"
 #include "filter.h"
+#include "health.h"
 #include "metadata.h"
 #include "prepared_vector.h"
 #include "search_result.h"
@@ -163,6 +165,36 @@ public:
     /// "More like this": searches with the vector stored for `id`, under one lock
     /// (so it cannot change in between). Returns nothing if `id` is not stored.
     /// The record itself is left out unless `include_self` is true.
+    /// A health report: storage, graph structure, an estimate of recall, and the
+    /// removals and updates since the last upkeep (see health.h). Takes the shared
+    /// lock, so searches continue meanwhile; then runs the sampled searches.
+    HealthReport health(const HealthOptions& options = {}) const;
+
+    /// Incremental upkeep, like a database's vacuum: consolidates links to removed
+    /// vectors and reconnects unreachable ones (see UpkeepOptions). Takes the lock
+    /// alone; use max_nodes to keep each call short, so searches run in between.
+    /// A deadline or cancellation (options) stops it early without error: what was
+    /// repaired stays repaired. When complete, the churn counters are reset.
+    UpkeepStats upkeep(const UpkeepOptions& upkeep_options = {}, const OperationOptions& options = {});
+
+    /// Automatic compact() once removed vectors' free slots exceed `fraction` of
+    /// all slots (0: off, the default; at most 0.9). Runs inside the change that
+    /// crosses the threshold, which then takes as long as a compact(); if it fails
+    /// (out of memory) the change still stands and the next one tries again. A
+    /// runtime setting: not saved with the index.
+    void set_auto_compact(double fraction);
+    double auto_compact() const;
+
+    /// Rebuilds the index while it stays in use, like compact() but retraining the
+    /// codec (RebuildOptions) and without blocking: a snapshot of the records is
+    /// taken under the lock, a new index is built from it without any lock
+    /// (searches and changes continue meanwhile), and then, under the lock, the
+    /// IDs changed in between are copied in and the new index swapped in. Needs
+    /// memory for a second copy while it runs. One rebuild at a time
+    /// (std::logic_error otherwise). A deadline or cancellation throws Cancelled
+    /// and leaves this index as it is; so does running out of memory.
+    RebuildStats rebuild(const RebuildOptions& rebuild_options = {}, const OperationOptions& options = {});
+
     std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, std::size_t ef = 64,
                                                          const SearchOptions& options = {}, bool include_self = false) const;
 
@@ -479,7 +511,7 @@ private:
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
     /// is closer to the base node than to every already-kept neighbor and is not
     /// an exact copy of one, up to `max`.
-    std::vector<NodeId> select_neighbors(const std::vector<Candidate>& sorted,
+    std::vector<NodeId> select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
 
     /// Steps 4 to 6 of add(): finds neighbors on every level, links the new node
@@ -554,6 +586,16 @@ private:
     int max_level_ = -1;
     std::size_t live_ = 0;
     std::vector<NodeId> free_slots_;  // slots of removed vectors, reused last in first out
+    std::size_t removals_since_upkeep_ = 0;  // for health(): counted where each change is final
+    std::size_t updates_since_upkeep_ = 0;
+    double auto_compact_ = 0;  // see set_auto_compact
+    std::optional<std::unordered_set<std::uint64_t>> changed_;  // while rebuild() runs: IDs changed since its snapshot
+    void note_change(std::uint64_t id) {  // caller holds the write lock; call before changing anything
+        if (changed_) changed_->insert(id);
+    }
+    CompactStats compact_unlocked(const OperationOptions& options);  // caller holds the write lock
+    void maybe_auto_compact() noexcept;                             // caller holds the write lock
+    UpkeepStats upkeep_unlocked(const UpkeepOptions& upkeep_options, const OperationOptions& options);  // likewise
     MetadataStore metadata_;
     PlannerParams planner_;
     mutable VisitedListPool visited_pool_;

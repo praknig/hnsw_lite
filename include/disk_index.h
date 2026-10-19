@@ -32,6 +32,7 @@
 
 #include "codec.h"
 #include "filter.h"
+#include "health.h"
 #include "metadata.h"
 #include "vamana.h"
 
@@ -207,6 +208,13 @@ public:
     std::optional<Record> get(std::uint64_t id) const;
     /// Pages of records in ascending ID order, as for the in-memory indexes.
     Page scan(const ScanOptions& options = {}) const;
+
+    /// A health report (see health.h): degrees, reachability from the medoid, an
+    /// estimate of recall, and PQ drift. Reads every node once, in order, keeping
+    /// the neighbor lists in memory (4R bytes per vector); the exact answers for
+    /// the recall sample are computed during that pass. The index is read-only,
+    /// so churn is always 0; underfull means fewer than R/2 neighbors.
+    HealthReport health(const HealthOptions& options = {}) const;
 
     /// Blocks read from disk since opening (each node read counts its blocks).
     std::uint64_t blocks_read() const { return blocks_read_.load(std::memory_order_relaxed); }
