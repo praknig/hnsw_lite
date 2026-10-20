@@ -11,6 +11,7 @@ namespace vecdb {
 
 UpkeepStats HnswIndex::upkeep(const UpkeepOptions& upkeep_options, const OperationOptions& options) {
     const auto guard = lock_.write("upkeep");
+    const Logged logged(this, log_begin(walop::kUpkeep, [&] { return walop::encode_upkeep(upkeep_options); }));
     return upkeep_unlocked(upkeep_options, options);
 }
 

@@ -23,6 +23,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
 - [Binary quantization](#binary-quantization)
+- [Durability](#durability)
 - [Health reports](#health-reports)
 - [Upkeep](#upkeep)
 - [Disk-based index](#disk-based-index)
@@ -404,6 +405,23 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
 - Training, saving, truncation and everything else work as for SQ8.
 - Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Durability
+
+```cpp
+DurableOptions options;                       // Durability::Grouped by default
+auto index = HnswIndex::open_durable("vectors.db", 768, Metric::Cosine, {}, Schema::dynamic(), options);
+index->add(1, vector, metadata);              // logged before it is applied
+index->checkpoint();                          // a snapshot; older log segments are deleted
+// After a crash, open_durable() on the same directory recovers every acknowledged change.
+```
+
+`open_durable()` (on `HnswIndex` and `FlatIndex`) creates a directory or recovers it. Every change is appended to a write-ahead log under the write lock before it is applied; a change that then fails is followed by an abort record. Recovery loads the newest snapshot that reads cleanly (falling back to an older one), then replays every logged change since, giving back the same index byte for byte where building is deterministic (always, except a parallel `add_batch` or a `rebuild()` running alongside writers, whose records are identical but whose graph or codes can differ slightly).
+
+- **Modes:** every change reaches the operating system at once, so a process crash never loses an acknowledged change. `Buffered` flushes to the disk itself at checkpoints and on close; `Grouped` (the default) also every `group_interval` (10 ms) from a background thread, so a power loss can lose at most that interval; `Synced` flushes before each change is applied. Measured on a virtual disk, 2,000 additions of 64 dimensions: not durable 10,000 per second, `Buffered` 3% slower, `Grouped` 13%, `Synced` 2.4 times slower. On real disks a flush costs 0.1 to several milliseconds, so `Synced` can be 10 to 50 times slower there; run `bench_durability` on your storage.
+- **Checkpoints** start a new log segment and write a snapshot as of that point (searches continue; changes wait while it is written), then delete what the kept snapshots (`keep_snapshots`, 2) no longer need. Call them when the log has grown; recovery replays everything since the last one.
+- **Recovery refuses what a crash cannot cause:** damage before the end of the log, a missing segment, a segment of another index. A record cut short at the very end is a crash and is discarded. If the final logged operation fails on replay, it was in progress at the crash (logged, failed, and stopped before its abort record): it is dropped, and a checkpoint taken.
+- **One process per directory** (a lock file); attaching or detaching another log is refused. If a flush fails, or an abort record cannot be written, changes are refused until the next `checkpoint()`, which writes the true state. In `Synced` mode a change reported as failed because its flush failed may still appear after a crash (its record may have reached the disk anyway), as with any database.
 
 ## Health reports
 

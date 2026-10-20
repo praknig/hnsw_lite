@@ -312,3 +312,15 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `rebuild(RebuildOptions, OperationOptions)` | On `HnswIndex` and `FlatIndex`: retrains the codec (and IVF lists) while the index stays in use, then swaps atomically; returns `RebuildStats`. Cancelled, or out of memory: unchanged. One at a time (`std::logic_error`) |
 | `RebuildOptions`, `RebuildStats` | `retrain` (true); `kept`, `reclaimed`, `caught_up` (IDs changed during the rebuild), `codec_retrained`, `lists_retrained` |
 | `set_auto_compact(fraction)`, `auto_compact()` | Automatic `compact()` once free slots exceed `fraction` of all slots (0: off; at most 0.9); not saved |
+
+## Durability
+
+| Name | Description |
+|---|---|
+| `open_durable(dir, ...)` | On `HnswIndex` (`dir, dim, metric, params, schema, options, stats`) and `FlatIndex` (`dir, dim, metric, schema, quantization, ivf, options, stats`): creates or recovers a durable directory |
+| `checkpoint()`, `durable()` | A snapshot and a new log segment (returns its LSN); whether the index is durable |
+| `DurableOptions` | `keep_snapshots` (2), `durability` (`Buffered`, `Grouped`, `Synced`), `group_interval` (10 ms) |
+| `RecoveryStats` | `created`, `snapshot_lsn`, `fallbacks`, `segments`, `replayed`, `torn_bytes`, `dropped_unfinished` |
+| `attach_log(WalWriter)`, `detach_log()`, `replay(records)` | Lower level: log a non-durable index's changes yourself; replay returns whether an unfinished final operation was dropped |
+| `WalWriter`, `wal::read_segment`, `WalScan`, `WalRecord` | Log segments: appending, syncing, reading with torn-tail detection |
+

@@ -11,12 +11,16 @@
 #include <string>
 #include <random>
 #include <span>
+#include <exception>
 #include <unordered_set>
 #include <vector>
 
 #include "distance.h"
 #include "filter.h"
 #include "health.h"
+#include "wal_ops.h"
+#include "durable.h"
+#include "wal.h"
 #include "metadata.h"
 #include "prepared_vector.h"
 #include "search_result.h"
@@ -195,6 +199,40 @@ public:
     /// and leaves this index as it is; so does running out of memory.
     RebuildStats rebuild(const RebuildOptions& rebuild_options = {}, const OperationOptions& options = {});
 
+    /// Write-ahead logging (durability): with a log attached, every change is
+    /// appended to it under the write lock before it is applied, and a change that
+    /// then fails (invalid input, out of memory) is followed by an abort record.
+    /// If the log cannot be written the change is not made (an exception); if
+    /// even an abort record cannot be written, the index refuses further changes
+    /// until a new log is attached. The log's next LSN must be at least 1.
+    void attach_log(WalWriter log);
+    /// Detaches and returns the log, if any.
+    std::optional<WalWriter> detach_log();
+    /// Applies logged records in order (skipping aborted ones), as recovery does.
+    /// No log may be attached (std::logic_error). Throws FormatError for a record
+    /// that cannot be decoded.
+    /// Returns true if the final operation failed on replay and was dropped: it was in
+    /// progress when the process stopped (logged, failed, then stopped before its abort
+    /// record). A failure anywhere else means the log does not match: FormatError.
+    bool replay(std::span<const WalRecord> records);
+
+    /// Opens a durable index directory (see durable.h): creates it with an empty
+    /// index (dim, metric, params, schema as given), or recovers it, in which case the
+    /// snapshot's settings apply and dim and metric must match it
+    /// (std::invalid_argument otherwise). The log is attached; every change is
+    /// logged until the index is destroyed. Throws std::runtime_error if another
+    /// process has the directory open, FormatError if it cannot be recovered.
+    static std::unique_ptr<HnswIndex> open_durable(const std::string& dir, std::size_t dim, Metric metric, const HnswParams& params = {},
+                                                   Schema schema = Schema::dynamic(), const DurableOptions& options = {},
+                                                   RecoveryStats* stats = nullptr);
+    /// Starts a new log segment and writes a snapshot as of that point (searches
+    /// continue; changes wait while the snapshot is written), then deletes what the
+    /// kept snapshots no longer need. Returns the snapshot's LSN. Also clears a
+    /// failed log (the snapshot holds the true state). Only for durable indexes
+    /// (std::logic_error).
+    std::uint64_t checkpoint();
+    bool durable() const { return durable_ != nullptr; }
+
     std::optional<std::vector<SearchResult>> search_by_id(std::uint64_t id, std::size_t k, std::size_t ef = 64,
                                                          const SearchOptions& options = {}, bool include_self = false) const;
 
@@ -344,6 +382,7 @@ public:
     /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
     void create_payload_index(std::string_view field) {
         const auto guard = lock_.write("create_payload_index");
+        const Logged logged(this, log_begin(walop::kCreatePayloadIndex, [&] { return walop::encode_field(field); }));
         metadata_.index_field(field);
     }
 
@@ -351,6 +390,7 @@ public:
     void set_planner_params(const PlannerParams& p) {
         const auto guard = lock_.write("set_planner_params");
         validate(p);
+        const Logged logged(this, log_begin(walop::kSetPlanner, [&] { return walop::encode_planner(p); }));
         planner_ = p;
     }
     /// A copy, so it is safe to call while other threads change the settings.
@@ -590,6 +630,46 @@ private:
     std::size_t updates_since_upkeep_ = 0;
     double auto_compact_ = 0;  // see set_auto_compact
     std::optional<std::unordered_set<std::uint64_t>> changed_;  // while rebuild() runs: IDs changed since its snapshot
+    std::optional<WalWriter> log_;   // write-ahead log, if attached
+    std::shared_ptr<detail::DurableState> durable_;  // the directory, if opened with open_durable
+    bool log_broken_ = false;
+    bool log_sync_each_ = false;     // Durability::Synced
+    std::uint64_t log_synced_ = 0;   // log size at the last background flush (under the checkpoint mutex)
+    void flush_log() noexcept;       // makes the log durable if it grew (flusher, closing)        // an abort record could not be written: changes refused
+    /// Appends an operation to the log (0 if none is attached). Caller holds the write lock.
+    template <class Encode>
+    std::uint64_t log_begin(std::uint8_t type, Encode&& encode) {
+        if (!log_) return 0;
+        if (log_broken_) throw std::runtime_error("index changes refused: its write-ahead log failed (attach a new one)");
+        const std::uint64_t lsn = log_->append(type, encode());
+        if (log_sync_each_) log_->sync();  // Durability::Synced: on disk before the change is made
+        return lsn;  // throws if it cannot write: the change is then not made
+    }
+    void log_abort(std::uint64_t lsn) noexcept;
+    void save_unlocked(std::ostream& out, const OperationOptions& options) const;  // caller holds a lock
+    /// Restores the level generator if an operation leaves by an exception: a
+    /// failed change must leave the index exactly as it was, generator included,
+    /// or later inserts would draw other levels than if it had never been tried
+    /// (and replaying a log, which skips it, could not reproduce the index).
+    struct RngGuard {
+        SplitMix64& rng;
+        SplitMix64 saved;
+        int exceptions;
+        explicit RngGuard(SplitMix64& r) : rng(r), saved(r), exceptions(std::uncaught_exceptions()) {}
+        ~RngGuard() {
+            if (std::uncaught_exceptions() > exceptions) rng = saved;
+        }
+    };
+    /// Appends an abort record if the logged operation leaves by an exception.
+    struct Logged {
+        HnswIndex* index;
+        std::uint64_t lsn;
+        int exceptions;
+        Logged(HnswIndex* i, std::uint64_t l) : index(i), lsn(l), exceptions(std::uncaught_exceptions()) {}
+        ~Logged() {
+            if (lsn != 0 && std::uncaught_exceptions() > exceptions) index->log_abort(lsn);
+        }
+    };
     void note_change(std::uint64_t id) {  // caller holds the write lock; call before changing anything
         if (changed_) changed_->insert(id);
     }

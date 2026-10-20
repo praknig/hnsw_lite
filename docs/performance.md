@@ -169,6 +169,10 @@ Measured on 5,000 clustered vectors of 32 dimensions (R 32; tests `dk09` and `dk
 
 Each node read is one 4 KB block. `W` 1 needed 52 rounds at `L` 50 for the same reads: on storage with high latency, a larger `W` cuts waiting, and with `DiskOpenOptions::io_threads` the reads of a round also overlap. With a simulated 3 ms per read and W 4, five searches (60 rounds) took 679 ms with reads one after another and 194 ms with 4 reading threads (test `dk26`): about one latency per round, 3.5 times faster. Search time is roughly reads times the storage's latency (unless cached by the operating system), so measure on your storage. The navigation codes matter: with one PQ part per 8 dimensions instead of 2, recall at `L` 50 fell from 0.98 to 0.71 for the same reads.
 
+### Durability
+
+`bench_durability [count] [directory]` times additions without durability and in each mode. Measured on a virtual disk (2,000 additions of 64 dimensions): not durable 10,013 per second, `Buffered` 9,726, `Grouped` 8,863, `Synced` 4,222. The difference is the cost of a flush, which on real disks is 0.1 to several milliseconds: `Synced` can then be 10 to 50 times slower, while `Grouped` stays close to `Buffered`. Run it on the disk you will use.
+
 ### Build type
 
 Always measure Release builds. Debug builds are many times slower.

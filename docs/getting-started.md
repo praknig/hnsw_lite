@@ -61,16 +61,16 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### What a successful run looks like
 
-CTest runs the tests as 50 entries (one per group, the heaviest in shards). Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 793 tests selected`: that entry's share, not tests left out. Together the 50 entries run all 793 tests; `test_comprehensive` on its own runs them all in one process.
+CTest runs the tests as 52 entries (one per group, the heaviest in shards). Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 827 tests selected`: that entry's share, not tests left out. Together the 52 entries run all 827 tests; `test_comprehensive` on its own runs them all in one process.
 
 ```
-100% tests passed, 0 tests failed out of 50
+100% tests passed, 0 tests failed out of 52
 ```
 
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 793 tests
+./build/test_comprehensive                   # all 827 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```
@@ -111,8 +111,8 @@ set(CMAKE_CXX_STANDARD 20)
 
 include(FetchContent)
 FetchContent_Declare(hnsw_lite
-        GIT_REPOSITORY https://github.com/praknig/hnsw_lite.git
-        GIT_TAG master)   # or a release tag, to pin a version
+    GIT_REPOSITORY https://github.com/praknig/hnsw_lite.git
+    GIT_TAG master)   # or a release tag, to pin a version
 FetchContent_MakeAvailable(hnsw_lite)
 
 add_executable(my_app main.cpp)
