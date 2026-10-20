@@ -322,7 +322,7 @@ void HnswIndex::link_back(NodeId node, const std::vector<NodeId>& neighbors, int
 
 void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     const auto guard = lock_.write("add");
-    const Logged logged(this, log_begin(walop::kAdd, [&] { return walop::encode_add(id, vector, metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAdd, [&] { return walop::encode_add(id, vector, metadata); }));
     add_unlocked(id, vector, metadata);
 }
 
@@ -383,7 +383,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
 void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads,
                           const OperationOptions& options) {
     const auto guard = lock_.write("add_batch");
-    const Logged logged(this, log_begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
     add_batch_unlocked(ids, vectors, nullptr, threads, options);
 }
 
@@ -391,7 +391,7 @@ void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const fl
                           std::span<const Metadata> metadata, std::size_t threads, const OperationOptions& options) {
     if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
     const auto guard = lock_.write("add_batch");
-    const Logged logged(this, log_begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
     add_batch_unlocked(ids, vectors, metadata.data(), threads, options);
 }
 
@@ -709,7 +709,7 @@ bool HnswIndex::remove(std::uint64_t id) {
     IdMap& ids = storage_.ids();
     const auto node = ids.find(id);
     if (!node) return false;
-    const Logged logged(this, log_begin(walop::kRemove, [&] { return walop::encode_ids(std::span<const std::uint64_t>(&id, 1)); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemove, [&] { return walop::encode_ids(std::span<const std::uint64_t>(&id, 1)); }));
     note_change(id);
     reserve_one_more(free_slots_);  // may throw; nothing changed yet
 
@@ -732,7 +732,7 @@ bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) {
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
-    const Logged logged(this, log_begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, nullptr); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, nullptr); }));
     return replace(id, vector, nullptr);
 }
 
@@ -740,14 +740,14 @@ bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Me
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
-    const Logged logged(this, log_begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, &metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, &metadata); }));
     return replace(id, vector, &metadata);
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = storage_.ids().find(id).has_value();  // logged as what it does: an update or an add
-    const Logged logged(this, log_begin(exists ? walop::kUpdate : walop::kAdd, [&] {
+    const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, nullptr) : walop::encode_add(id, vector, {});
     }));
     if (replace(id, vector, nullptr)) return false;
@@ -758,7 +758,7 @@ bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = storage_.ids().find(id).has_value();
-    const Logged logged(this, log_begin(exists ? walop::kUpdate : walop::kAdd, [&] {
+    const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, &metadata) : walop::encode_add(id, vector, metadata);
     }));
     if (replace(id, vector, &metadata)) return false;
@@ -904,7 +904,7 @@ void HnswIndex::train_codec_unlocked() {
 
 void HnswIndex::train_codec() {
     const auto guard = lock_.write("train_codec");
-    const Logged logged(this, log_begin(walop::kTrainCodec, [] { return std::vector<unsigned char>{}; }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kTrainCodec, [] { return std::vector<unsigned char>{}; }));
     train_codec_unlocked();
 }
 
@@ -986,7 +986,7 @@ std::size_t HnswIndex::remove_where(const Filter& filter) {
     const auto guard = lock_.write("remove_where");
     const std::vector<NodeId> slots = matching_slots(filter);
     if (slots.empty()) return 0;
-    const Logged logged(this, log_begin(walop::kRemoveBatch, [&] {  // logged as the IDs it matched
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] {  // logged as the IDs it matched
         std::vector<std::uint64_t> ids;
         for (NodeId n : slots) ids.push_back(storage_.ids().external(n));
         return walop::encode_ids(ids);
@@ -996,7 +996,7 @@ std::size_t HnswIndex::remove_where(const Filter& filter) {
 
 std::size_t HnswIndex::remove_batch(std::span<const std::uint64_t> ids) {
     const auto guard = lock_.write("remove_batch");
-    const Logged logged(this, log_begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     std::vector<NodeId> slots;
     slots.reserve(ids.size());
     for (std::uint64_t id : ids)
@@ -1040,7 +1040,7 @@ std::size_t HnswIndex::set_metadata_where(const Filter& filter, const Metadata& 
     metadata_.validate(changes);  // rejected even when nothing matches
     const std::vector<NodeId> slots = matching_slots(filter);
     if (slots.empty()) return 0;
-    const Logged logged(this, log_begin(walop::kSetMetadataIds, [&] {  // logged as the IDs it matched
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetMetadataIds, [&] {  // logged as the IDs it matched
         std::vector<std::uint64_t> ids;
         for (NodeId n : slots) ids.push_back(storage_.ids().external(n));
         return walop::encode_set_metadata(ids, changes);
@@ -1056,7 +1056,7 @@ bool HnswIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
     const auto guard = lock_.write("set_metadata");
     const auto node = storage_.ids().find(id);
     if (!node) return false;
-    const Logged logged(this, log_begin(walop::kSetMetadata, [&] { return walop::encode_set_metadata(std::span<const std::uint64_t>(&id, 1), metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetMetadata, [&] { return walop::encode_set_metadata(std::span<const std::uint64_t>(&id, 1), metadata); }));
     note_change(id);
     metadata_.update(*node, metadata);
     return true;
@@ -1293,14 +1293,14 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
 
 CompactStats HnswIndex::compact(const OperationOptions& options) {
     const auto guard = lock_.write("compact");
-    const Logged logged(this, log_begin(walop::kCompact, [] { return std::vector<unsigned char>{}; }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCompact, [] { return std::vector<unsigned char>{}; }));
     return compact_unlocked(options);
 }
 
 void HnswIndex::set_auto_compact(double fraction) {
     if (!(fraction >= 0.0 && fraction <= 0.9)) throw std::invalid_argument("set_auto_compact: fraction must be in [0, 0.9]");
     const auto guard = lock_.write("set_auto_compact");
-    const Logged logged(this, log_begin(walop::kSetAutoCompact, [&] { return walop::encode_fraction(fraction); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetAutoCompact, [&] { return walop::encode_fraction(fraction); }));
     auto_compact_ = fraction;
 }
 

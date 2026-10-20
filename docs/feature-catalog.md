@@ -36,7 +36,7 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 | 2.1 | **Search by stored ID:** "more like record 42", without fetching its vector first | **done** (`search_by_id`) | | Half a day |
 | 2.2 | **Recommendations:** several positive and negative examples, given as vectors or IDs (as in Qdrant) | new | Builds on 2.1 | 1–2 days |
 | 2.3 | **Diversity re-ranking (MMR):** results that are relevant and different from each other | new | | 1 day |
-| 2.4 | **Hybrid search:** keyword matching (BM25) and sparse vectors (such as SPLADE), merged with dense results by rank fusion | new | Hybrid keyword search; sparse vectors | 1–1.5 weeks |
+| 2.4 | **Hybrid search:** keyword matching (BM25) and sparse vectors (such as SPLADE), merged with dense results by rank fusion | **done**: `SparseIndex`, `Bm25`, `hybrid_search()` with RRF | Hybrid keyword search; sparse vectors | 1–1.5 weeks |
 | 2.5 | **Deadlines and cancellation:** for searches (returning the best results found so far) and for long operations (`add_batch`, `compact`, `save`), with progress reports | **done** | Search deadlines; progress and cancellation | 1–2 days |
 | 2.6 | **Automatic ef:** choose `ef` per query or per index to reach a target recall | new | | 1–2 days |
 | 2.7 | **More metrics:** Hamming for binary vectors, Manhattan (L1) | new | | 1–2 days |

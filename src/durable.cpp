@@ -181,15 +181,14 @@ Opened<Index> open_dir(const std::string& dir, Kind kind, Create&& create, Load&
 /// A checkpoint, given the index's log and a way to save it (the caller holds a
 /// lock that excludes changes). Returns the snapshot's LSN.
 template <class Save>
-std::uint64_t checkpoint_dir(detail::DurableState& d, std::optional<WalWriter>& log, bool& log_broken, Save&& save) {
-    const std::uint64_t lsn = log->next_lsn();
+std::uint64_t checkpoint_dir(detail::DurableState& d, ChangeLog& log, Save&& save) {
+    const std::uint64_t lsn = log.writer().next_lsn();
     const std::string snap = join(d.dir, snapshot_name(lsn));
     if (fs::exists(snap)) return lsn;  // nothing logged since the last one
     // 1. A new segment, so that the snapshot covers exactly what precedes it.
-    if (!log->broken()) log->sync();
-    log = WalWriter::create(join(d.dir, segment_name(lsn)), d.identity, lsn);
+    if (!log.writer().broken()) log.writer().sync();
+    log.rotate(WalWriter::create(join(d.dir, segment_name(lsn)), d.identity, lsn));  // heals a failed log: the snapshot holds the true state
     wal::sync_directory(d.dir);
-    log_broken = false;  // the snapshot below holds the true state
     // 2. The snapshot.
     write_durably(d.dir, snap, save);
     // 3. Prune: keep the newest snapshots, and the segments the oldest kept one needs.
@@ -216,10 +215,10 @@ std::unique_ptr<HnswIndex> HnswIndex::open_durable(const std::string& dir, std::
         [](const std::string& path) { return HnswIndex::load(path); }, options, stats);
     if (o.index->dim() != dim || o.index->metric() != metric)
         throw std::invalid_argument("open_durable: the directory holds an index of another dimension or metric");
-    o.index->log_sync_each_ = options.durability == Durability::Synced;
+    o.index->log_.set_sync_each(options.durability == Durability::Synced);
     o.index->attach_log(std::move(*o.log));
     o.index->durable_ = std::move(o.state);
-    o.index->durable_->start([raw = o.index.get()] { raw->flush_log(); });
+    o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
     if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
     return std::move(o.index);
 }
@@ -228,7 +227,7 @@ std::uint64_t HnswIndex::checkpoint() {
     if (!durable_) throw std::logic_error("checkpoint: not a durable index (open it with open_durable)");
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
     const auto guard = lock_.read();  // no change can run until the snapshot is written
-    return checkpoint_dir(*durable_, log_, log_broken_, [&](std::ostream& out) { save_unlocked(out, {}); });
+    return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out, {}); });
 }
 
 // ---------------------------------------------------------------- FlatIndex
@@ -241,10 +240,10 @@ std::unique_ptr<FlatIndex> FlatIndex::open_durable(const std::string& dir, std::
         [](const std::string& path) { return FlatIndex::load(path); }, options, stats);
     if (o.index->dim() != dim || o.index->metric() != metric)
         throw std::invalid_argument("open_durable: the directory holds an index of another dimension or metric");
-    o.index->log_sync_each_ = options.durability == Durability::Synced;
+    o.index->log_.set_sync_each(options.durability == Durability::Synced);
     o.index->attach_log(std::move(*o.log));
     o.index->durable_ = std::move(o.state);
-    o.index->durable_->start([raw = o.index.get()] { raw->flush_log(); });
+    o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
     if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
     return std::move(o.index);
 }
@@ -253,7 +252,7 @@ std::uint64_t FlatIndex::checkpoint() {
     if (!durable_) throw std::logic_error("checkpoint: not a durable index (open it with open_durable)");
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
     const auto guard = lock_.read();
-    return checkpoint_dir(*durable_, log_, log_broken_, [&](std::ostream& out) { save_unlocked(out, {}); });
+    return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out, {}); });
 }
 
 }  // namespace vecdb

@@ -29,7 +29,7 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, Quantization
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     const auto guard = lock_.write("add");
-    const Logged logged(this, log_begin(walop::kAdd, [&] { return walop::encode_add(id, vector, metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAdd, [&] { return walop::encode_add(id, vector, metadata); }));
     add_unlocked(id, vector, metadata);
 }
 
@@ -91,7 +91,7 @@ void FlatIndex::add_vector(std::span<const float> original) {
 bool FlatIndex::remove(std::uint64_t id) {
     const auto guard = lock_.write("remove");
     if (!ids_.find(id)) return false;
-    const Logged logged(this, log_begin(walop::kRemove, [&] { return walop::encode_ids(std::span<const std::uint64_t>(&id, 1)); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemove, [&] { return walop::encode_ids(std::span<const std::uint64_t>(&id, 1)); }));
     return remove_unlocked(id);
 }
 
@@ -120,7 +120,7 @@ std::optional<std::vector<SearchResult>> FlatIndex::search_by_id(std::uint64_t i
 
 std::size_t FlatIndex::remove_batch(std::span<const std::uint64_t> ids) {
     const auto guard = lock_.write("remove_batch");
-    const Logged logged(this, log_begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     std::size_t removed = 0;
     for (std::uint64_t id : ids) removed += remove_unlocked(id) ? 1 : 0;  // unknown or already removed: skipped
     return removed;
@@ -155,7 +155,7 @@ void FlatIndex::train_codec_unlocked() {
 
 void FlatIndex::train_codec() {
     const auto guard = lock_.write("train_codec");
-    const Logged logged(this, log_begin(walop::kTrainCodec, [] { return std::vector<unsigned char>{}; }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kTrainCodec, [] { return std::vector<unsigned char>{}; }));
     train_codec_unlocked();
 }
 
@@ -281,7 +281,7 @@ void FlatIndex::train_lists_unlocked() {
 
 void FlatIndex::train_lists() {
     const auto guard = lock_.write("train_lists");
-    const Logged logged(this, log_begin(walop::kTrainLists, [] { return std::vector<unsigned char>{}; }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kTrainLists, [] { return std::vector<unsigned char>{}; }));
     train_lists_unlocked();
 }
 
@@ -366,7 +366,7 @@ std::size_t FlatIndex::remove_where(const Filter& filter) {
     ids.reserve(slots.size());
     for (NodeId n : slots) ids.push_back(ids_.external(n));
     if (ids.empty()) return 0;
-    const Logged logged(this, log_begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));  // the IDs it matched
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));  // the IDs it matched
     for (std::uint64_t id : ids) remove_unlocked(id);
     return ids.size();
 }
@@ -376,7 +376,7 @@ std::size_t FlatIndex::set_metadata_where(const Filter& filter, const Metadata& 
     metadata_.validate(changes);  // rejected even when nothing matches
     const std::vector<NodeId> slots = matching_slots(filter);
     if (slots.empty()) return 0;
-    const Logged logged(this, log_begin(walop::kSetMetadataIds, [&] {  // logged as the IDs it matched
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetMetadataIds, [&] {  // logged as the IDs it matched
         std::vector<std::uint64_t> ids;
         for (NodeId n : slots) ids.push_back(ids_.external(n));
         return walop::encode_set_metadata(ids, changes);
@@ -431,7 +431,7 @@ void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const fl
                           const OperationOptions& options) {
     (void)threads;  // Flat inserts are copies, done on the calling thread
     const auto guard = lock_.write("add_batch");
-    const Logged logged(this, log_begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
     add_batch_unlocked(ids, vectors, nullptr, options);
 }
 
@@ -440,7 +440,7 @@ void FlatIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const fl
     (void)threads;
     if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
     const auto guard = lock_.write("add_batch");
-    const Logged logged(this, log_begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
     add_batch_unlocked(ids, vectors, metadata.data(), options);
 }
 
@@ -514,7 +514,7 @@ bool FlatIndex::update(std::uint64_t id, std::span<const float> vector) {
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
-    const Logged logged(this, log_begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, nullptr); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, nullptr); }));
     return replace(id, vector, nullptr);
 }
 
@@ -522,14 +522,14 @@ bool FlatIndex::update(std::uint64_t id, std::span<const float> vector, const Me
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
-    const Logged logged(this, log_begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, &metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, &metadata); }));
     return replace(id, vector, &metadata);
 }
 
 bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector) {
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = ids_.find(id).has_value();  // logged as what it does: an update or an add
-    const Logged logged(this, log_begin(exists ? walop::kUpdate : walop::kAdd, [&] {
+    const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, nullptr) : walop::encode_add(id, vector, {});
     }));
     if (replace(id, vector, nullptr)) return false;
@@ -540,7 +540,7 @@ bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector) {
 bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = ids_.find(id).has_value();
-    const Logged logged(this, log_begin(exists ? walop::kUpdate : walop::kAdd, [&] {
+    const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, &metadata) : walop::encode_add(id, vector, metadata);
     }));
     if (replace(id, vector, &metadata)) return false;
@@ -583,7 +583,7 @@ bool FlatIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
     const auto node = ids_.find(id);
     if (!node) return false;
     note_change(id);  // under the lock (it ran before it: a data race with rebuild)
-    const Logged logged(this, log_begin(walop::kSetMetadata, [&] { return walop::encode_set_metadata(std::span<const std::uint64_t>(&id, 1), metadata); }));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetMetadata, [&] { return walop::encode_set_metadata(std::span<const std::uint64_t>(&id, 1), metadata); }));
     metadata_.update(*node, metadata);
     return true;
 }

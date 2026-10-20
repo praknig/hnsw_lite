@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -73,6 +73,7 @@
 #include "disk_index.h"
 #include "kmeans.h"
 #include "vamana.h"
+#include "sparse.h"
 #include "wal.h"
 #include "wal_ops.h"
 #include "codec.h"
@@ -16283,7 +16284,7 @@ TEST(durable, du14_real_process_kills) {
                 ::_exit(0);
             }
             ::close(pipe_fd[1]);
-            const std::uint32_t kill_after = 20 + rng() % 400;
+            const auto kill_after = static_cast<std::uint32_t>(20 + rng() % 400);
             std::uint32_t acked = 0, value = 0;
             while (acked < kill_after && ::read(pipe_fd[0], &value, sizeof value) == sizeof value) acked = value;
             ::kill(child, SIGKILL);
@@ -16457,6 +16458,437 @@ TEST(durable, du15_every_path) {
     std::filesystem::remove_all(durable_dir("du15f"));
     std::filesystem::remove_all(dir);
     std::filesystem::remove(temp_path("du15l"));
+}
+
+// ===========================================================================
+// Sparse vectors, BM25 and hybrid search (SP1-SP11)
+// ===========================================================================
+
+namespace {
+
+SparseVector random_sparse(std::mt19937& rng, std::uint32_t vocab, std::size_t min_terms, std::size_t max_terms, bool negative = false) {
+    std::uniform_real_distribution<float> w(negative ? -1.0f : 0.05f, 1.0f);
+    std::set<std::uint32_t> terms;
+    const std::size_t n = min_terms + rng() % (max_terms - min_terms + 1);
+    while (terms.size() < n) terms.insert(std::uint32_t(rng() % vocab));
+    SparseVector v;
+    for (const std::uint32_t t : terms) {
+        v.indices.push_back(t);
+        v.values.push_back(w(rng));
+    }
+    std::shuffle(v.indices.begin(), v.indices.end(), rng);  // order does not matter on input
+    return v;
+}
+
+/// The exact answer, accumulated the way the index does (float, query terms ascending).
+std::vector<SearchResult> sparse_reference(const std::map<std::uint64_t, SparseVector>& docs, const SparseVector& query, std::size_t k,
+                                           const std::function<bool(std::uint64_t)>& keep = {}) {
+    std::vector<std::pair<std::uint32_t, float>> q;
+    for (std::size_t i = 0; i < query.size(); ++i)
+        if (query.values[i] != 0) q.push_back({query.indices[i], query.values[i]});
+    std::sort(q.begin(), q.end());
+    std::vector<SearchResult> out;
+    for (const auto& [id, d] : docs) {
+        if (keep && !keep(id)) continue;
+        std::map<std::uint32_t, float> dw;
+        for (std::size_t i = 0; i < d.size(); ++i)
+            if (d.values[i] != 0) dw[d.indices[i]] = d.values[i];
+        float score = 0;
+        bool shared = false;
+        for (const auto& [t, w] : q)
+            if (const auto it = dw.find(t); it != dw.end()) {
+                score += w * it->second;
+                shared = true;
+            }
+        if (shared) out.push_back({id, -score});
+    }
+    std::sort(out.begin(), out.end(), [](const SearchResult& a, const SearchResult& b) { return a.distance < b.distance || (a.distance == b.distance && a.id < b.id); });
+    if (out.size() > k) out.resize(k);
+    return out;
+}
+
+}  // namespace
+
+TEST(sparse, sp01_search_is_exact) {
+    std::mt19937 rng(3000);
+    SparseIndex s;
+    std::map<std::uint64_t, SparseVector> docs;
+    for (std::uint64_t i = 0; i < 1500; ++i) {
+        docs[i] = random_sparse(rng, 400, 1, 40, i % 3 == 0);
+        s.add(i, docs[i]);
+    }
+    bool exact = true;
+    for (int qn = 0; qn < 60; ++qn) {
+        const SparseVector q = random_sparse(rng, 400, 1, 12, qn % 4 == 0);
+        for (std::size_t k : {std::size_t(1), std::size_t(10), std::size_t(5000)}) exact = exact && same_results(s.search(q, k), sparse_reference(docs, q, k));
+    }
+    CHECK(exact && s.size() == 1500);
+    CHECK(sparse_dot(docs[1], docs[1]) > 0 && sparse_dot(docs[2], SparseVector{}) == 0);
+}
+
+TEST(sparse, sp02_input_rules) {
+    SparseIndex s(Schema::strict({{"k", FieldType::Keyword}}));
+    s.add(1, {{5, 2, 9}, {0.5f, 1.0f, 0.0f}});  // unsorted, a zero weight
+    CHECK(s.get_vector(1) == SparseVector({2, 5}, {1.0f, 0.5f}) && s.terms() == 2 && s.document_frequency(9) == 0);
+    CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{1, 2}, {1.0f}}));                 // lengths differ
+    CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{3, 3}, {1.0f, 2.0f}}));            // a repeated term
+    CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{3}, {kNaN}}));                     // not finite
+    CHECK_THROWS_AS(std::invalid_argument, s.add(1, {{3}, {1.0f}}));                     // duplicate ID
+    CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{3}, {1.0f}}, Metadata().set("zz", 1)));  // not in the schema
+    CHECK_THROWS_AS(std::invalid_argument, (void)s.search({{1, 1}, {1.0f, 1.0f}}, 3));
+    CHECK(s.size() == 1 && s.terms() == 2 && s.postings() == 2);
+    s.add(2, {});  // an empty document: stored, never found
+    CHECK(s.contains(2) && s.search({{2}, {1.0f}}, 5).size() == 1 && s.search({}, 5).empty() && s.search({{2}, {1.0f}}, 0).empty());
+    CHECK(!s.get_vector(9) && !s.get_metadata(9) && !s.remove(9) && !s.update(9, {}) && !s.set_metadata(9, {}));
+}
+
+TEST(sparse, sp03_changes_against_a_model) {
+    std::mt19937 rng(3001);
+    SparseIndex s;
+    std::map<std::uint64_t, SparseVector> model;
+    std::map<std::uint32_t, std::size_t> df_seen;
+    bool ok = true;
+    std::size_t compactions = 0, last_dead = 0;
+    for (int step = 0; step < 6000; ++step) {
+        const std::uint64_t id = rng() % 400;
+        const SparseVector v = random_sparse(rng, 300, 1, 30);
+        switch (rng() % 5) {
+            case 0: case 1: ok = ok && s.upsert(id, v) == !model.count(id); model[id] = v; break;
+            case 2: ok = ok && s.remove(id) == (model.erase(id) == 1); break;
+            case 3: ok = ok && s.update(id, v) == (model.count(id) == 1); if (model.count(id)) model[id] = v; break;
+            default: {
+                const std::vector<std::uint64_t> ids = {id, (id + 1) % 400, 9999};
+                std::size_t n = 0;
+                for (const std::uint64_t x : ids) n += model.erase(x);
+                ok = ok && s.remove_batch(ids) == n;
+            }
+        }
+        if (s.dead_postings() < last_dead) ++compactions;
+        last_dead = s.dead_postings();
+        if (step % 500 == 499) {
+            for (int qn = 0; qn < 5; ++qn) {
+                const SparseVector q = random_sparse(rng, 300, 1, 8);
+                ok = ok && same_results(s.search(q, 15), sparse_reference(model, q, 15));
+            }
+            std::map<std::uint32_t, std::size_t> df;
+            for (const auto& [i, d] : model)
+                for (const std::uint32_t t : d.indices) ++df[t];
+            for (const auto& [t, n] : df) ok = ok && s.document_frequency(t) == n;
+            ok = ok && s.terms() == df.size() && s.size() == model.size();
+        }
+    }
+    s.compact();
+    CHECK(ok && compactions > 0 && s.dead_postings() == 0);
+    const auto recs = s.records();
+    bool same = recs.size() == model.size();
+    for (const auto& r : recs) same = same && model.count(r.id) && sparse_dot(r.vector, model[r.id]) == sparse_dot(model[r.id], model[r.id]);
+    CHECK(same);
+}
+
+TEST(sparse, sp04_metadata_filters_and_predicates) {
+    std::mt19937 rng(3002);
+    SparseIndex s;
+    std::map<std::uint64_t, SparseVector> docs;
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        docs[i] = random_sparse(rng, 100, 3, 20);
+        s.add(i, docs[i], meta_for(i));
+    }
+    bool ok = true;
+    for (int qn = 0; qn < 20; ++qn) {
+        const SparseVector q = random_sparse(rng, 100, 1, 6);
+        SearchOptions o;
+        o.filter = Filter::eq("category", "tech");
+        o.predicate = [](std::uint64_t id) { return id % 3 != 0; };
+        const auto got = s.search(q, 20, o);
+        const auto want = sparse_reference(docs, q, 20, [&](std::uint64_t id) { return meta_for(id).get("category") == Metadata().set("c", "tech").get("c") && id % 3 != 0; });
+        ok = ok && same_results(got, want);
+    }
+    CHECK(ok);
+    CHECK(s.set_metadata(5, Metadata().set("category", "zzz")) && s.get_metadata(5)->get("category")->s == "zzz");
+    const std::size_t music = std::size_t(std::count_if(docs.begin(), docs.end(), [&](const auto& d) { return s.get_metadata(d.first)->get("category")->s == "music"; }));
+    CHECK(s.remove_where(Filter::eq("category", "music")) == music && s.size() == 800 - music);
+    s.update(6, docs[7]);  // the vector changes, the metadata stays
+    CHECK(s.get_metadata(6) == meta_for(6) && s.get_vector(6) == SparseIndex().get_vector(0).value_or(*s.get_vector(6)));
+    s.update(6, docs[7], Metadata().set("x", std::int64_t(1)));
+    CHECK(s.get_metadata(6) == Metadata().set("x", std::int64_t(1)));
+}
+
+TEST(sparse, sp05_save_and_load) {
+    std::mt19937 rng(3003);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 300; ++i) s.add(i * 7, random_sparse(rng, 200, 1, 15), meta_for(i));
+    for (std::uint64_t i = 0; i < 100; ++i) (void)s.remove(i * 14);
+    const std::string path = temp_path("sp05");
+    s.save(path);
+    auto t = SparseIndex::load(path);
+    bool same = t->size() == s.size() && t->terms() == s.terms() && t->dead_postings() == 0;
+    const auto a = s.records(), b = t->records();
+    for (std::size_t i = 0; i < a.size() && same; ++i) same = a[i].id == b[i].id && a[i].vector == b[i].vector && a[i].metadata == b[i].metadata;
+    for (int qn = 0; qn < 10 && same; ++qn) {
+        const SparseVector q = random_sparse(rng, 200, 1, 6);
+        same = same_results(s.search(q, 10), t->search(q, 10));
+    }
+    CHECK(same);
+    std::ostringstream again;
+    t->save(again);
+    std::ostringstream first;
+    SparseIndex::load(path)->save(first);
+    CHECK(again.str() == first.str());  // saving is deterministic
+    const std::string bytes = read_file(path);
+    bool rejected = true;
+    for (std::size_t cut = 0; cut < bytes.size(); cut += 37) {  // every truncation step
+        std::istringstream in(bytes.substr(0, cut));
+        try { (void)SparseIndex::load(in); rejected = false; } catch (const FormatError&) {}
+    }
+    for (std::size_t at = 24; at < bytes.size(); at += 53) {  // damage behind the header: a checksum catches it
+        std::string d = bytes;
+        d[at] = char(d[at] ^ 0x5A);
+        std::istringstream in(d);
+        try { (void)SparseIndex::load(in); rejected = false; } catch (const FormatError&) {}
+    }
+    CHECK(rejected);
+    HnswIndex h(4, Metric::L2);
+    h.save(path);
+    CHECK_THROWS_AS(FormatError, (void)SparseIndex::load(path));
+    s.save(path);
+    try {
+        (void)HnswIndex::load(path);
+        CHECK(false);
+    } catch (const FormatError& e) {
+        CHECK(std::string(e.what()) == "the file holds a sparse index");
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(sparse, sp06_bm25) {
+    const std::vector<std::string> corpus = {
+        "The quick brown fox jumps over the lazy dog",
+        "A fast brown fox, a FAST fox!",
+        "Vector databases store embeddings for semantic search",
+        "Sparse vectors capture exact keyword matches; BM25 weights them",
+        "the the the dog dog",
+        "Zürich café 42 naïve",
+    };
+    CHECK(Bm25::tokenize("A FAST fox, a-fast!") == std::vector<std::string>({"a", "fast", "fox", "a", "fast"}));
+    CHECK(Bm25::tokenize("Zürich 42") == std::vector<std::string>({"zürich", "42"}) && Bm25::tokenize("  ,;  ").empty());
+    std::vector<std::string_view> views(corpus.begin(), corpus.end());
+    Bm25 bm;
+    bm.fit(views);
+    CHECK(std::abs(bm.params().avg_doc_length - 41.0 / 6.0) < 1e-12);
+    SparseIndex s;
+    for (std::size_t i = 0; i < corpus.size(); ++i) s.add(i, bm.encode_document(corpus[i]));
+    // The reference: BM25 computed directly from token counts.
+    auto bm25 = [&](const std::string& query, std::size_t doc) {
+        const auto d = Bm25::tokenize(corpus[doc]);
+        double score = 0;
+        for (const auto& qt : Bm25::tokenize(query)) {
+            double df = 0;
+            for (const auto& c : corpus) {
+                const auto ct = Bm25::tokenize(c);
+                df += std::find(ct.begin(), ct.end(), qt) != ct.end();
+            }
+            if (df == 0) continue;
+            const double tf = double(std::count(d.begin(), d.end(), qt));
+            const double idf = std::log(1 + (6 - df + 0.5) / (df + 0.5));
+            score += idf * tf * 2.2 / (tf + 1.2 * (0.25 + 0.75 * double(d.size()) / (41.0 / 6.0)));
+        }
+        return score;
+    };
+    bool ok = true;
+    for (const std::string q : {"fast fox", "dog", "keyword search", "café naïve", "unknownword", "the dog"}) {
+        const auto got = s.search(bm.encode_query(q, s), 6);
+        for (const auto& r : got) ok = ok && std::abs(-r.distance - bm25(q, r.id)) < 1e-4 * std::max(1.0, bm25(q, r.id));
+        std::size_t matching = 0;
+        for (std::size_t i = 0; i < corpus.size(); ++i) matching += bm25(q, i) > 0;
+        ok = ok && got.size() == matching;
+    }
+    CHECK(ok);
+    CHECK(s.search(bm.encode_query("fast fox", s), 1)[0].id == 1);  // two "fast", two "fox"
+    CHECK(bm.encode_query("unknownword", s).empty() && Bm25::term_id("fox") == Bm25::term_id("fox") && Bm25::term_id("fox") != Bm25::term_id("dog"));
+    CHECK_THROWS_AS(std::invalid_argument, Bm25(Bm25Params{1.2, 1.5, 100}));
+    Bm25 unchanged;
+    unchanged.fit({});
+    CHECK(unchanged.params().avg_doc_length == 100.0);
+}
+
+TEST(sparse, sp07_fusion) {
+    const std::vector<SearchResult> dense = {{1, 0.1f}, {2, 0.2f}, {3, 0.4f}}, sparse = {{3, -9.0f}, {4, -5.0f}, {1, -1.0f}};
+    const auto rrf = fuse(dense, sparse, 10);
+    auto expect = [](double v, double w) { return std::abs(v - w) < 1e-12; };
+    CHECK(rrf.size() == 4 && rrf[0].id == 1 && expect(rrf[0].score, 1 / 61.0 + 1 / 63.0) && rrf[1].id == 3 && expect(rrf[1].score, 1 / 63.0 + 1 / 61.0));
+    CHECK(rrf[0].dense_rank == 1u && rrf[0].sparse_rank == 3u && rrf[2].id == 2 && !rrf[2].sparse_rank && rrf[3].id == 4 && *rrf[3].sparse_score == 5.0f);
+    HybridOptions w;
+    w.fusion = Fusion::Weighted;
+    w.dense_weight = 0.5;
+    const auto weighted = fuse(dense, sparse, 2, w);  // dense scaled: 1, 2/3, 0; sparse: 1, 0.5, 0
+    CHECK(weighted.size() == 2 && weighted[0].id == 3 && expect(weighted[0].score, 1.0) && weighted[1].id == 1 && expect(weighted[1].score, 0.5));
+    HybridOptions only_sparse;
+    only_sparse.dense_weight = 0;
+    CHECK(fuse(dense, sparse, 1, only_sparse)[0].id == 3);
+    CHECK(fuse({}, {}, 5).empty() && fuse(dense, {}, 0).empty());
+    const std::vector<SearchResult> one = {{7, 1.0f}};
+    HybridOptions wo;
+    wo.fusion = Fusion::Weighted;
+    CHECK(fuse(one, one, 3, wo)[0].score == 2.0);  // a single result scales to 1
+    const std::vector<SearchResult> repeated = {{1, 0.1f}, {1, 0.3f}};
+    CHECK(fuse(repeated, {}, 5).size() == 1 && expect(fuse(repeated, {}, 5)[0].score, 1 / 61.0));
+    HybridOptions bad;
+    bad.rrf_k = -1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse(dense, sparse, 3, bad));
+    bad.rrf_k = 60;
+    bad.sparse_weight = -0.5;
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse(dense, sparse, 3, bad));
+}
+
+TEST(sparse, sp08_hybrid_search) {
+    // Each document: a dense vector near one of 8 topics, and words; the query's
+    // dense side finds its topic, its sparse side a rare keyword in another topic.
+    auto data = clustered(1200, 16, 8, 3004);
+    HnswIndex h(16, Metric::L2);
+    FlatIndex f(16, Metric::L2);
+    SparseIndex s;
+    Bm25 bm;
+    for (std::uint64_t i = 0; i < 1200; ++i) {
+        std::string text = "topic" + std::to_string(i % 8) + " common words here";
+        if (i == 777) text += " zebra";
+        h.add(i, data[i], meta_for(i));
+        f.add(i, data[i], meta_for(i));
+        s.add(i, bm.encode_document(text), meta_for(i));
+    }
+    const SparseVector q = bm.encode_query("zebra", s);
+    for (int which = 0; which < 2; ++which) {
+        const auto r = which == 0 ? hybrid_search(h, data[10], s, q, 10) : hybrid_search(f, data[10], s, q, 10);
+        const bool has_keyword = std::any_of(r.begin(), r.end(), [](const HybridResult& x) { return x.id == 777 && x.sparse_rank == 1u; });
+        CHECK(r.size() == 10 && r[0].dense_rank == 1u && has_keyword);
+    }
+    HybridOptions o;
+    o.filter = Filter::eq("category", "tech");
+    const auto filtered = hybrid_search(h, data[10], s, bm.encode_query("topic3 zebra", s), 15, o);
+    CHECK(!filtered.empty() && std::all_of(filtered.begin(), filtered.end(), [](const HybridResult& x) { return meta_for(x.id).get("category")->s == "tech"; }));
+    o.dense_k = 3;
+    o.sparse_k = 2;
+    CHECK(hybrid_search(f, data[10], s, q, 50, o).size() <= 5);
+}
+
+TEST(sparse, sp09_deadlines_and_stats) {
+    std::mt19937 rng(3005);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 500; ++i) s.add(i, random_sparse(rng, 50, 5, 20));
+    SearchStats st;
+    SearchOptions o;
+    o.stats = &st;
+    const SparseVector q = random_sparse(rng, 50, 3, 5);
+    const auto all = s.search(q, 10, o);
+    CHECK(all.size() == 10 && st.nodes_visited > 10 && st.distance_computations >= st.nodes_visited && !st.stopped_early);
+    o.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    CHECK(s.search(q, 10, o).empty() && st.stopped_early);
+    std::atomic<bool> cancel{true};
+    SearchOptions c;
+    c.cancel = &cancel;
+    c.stats = &st;
+    CHECK(s.search(q, 10, c).empty() && st.stopped_early);
+    SparseIndex empty;
+    CHECK(empty.search(q, 10).empty() && empty.size() == 0 && empty.records().empty());
+}
+
+TEST(sparse, sp10_concurrent_searches_and_changes) {
+    std::mt19937 seed(3006);
+    std::vector<SparseVector> pool;
+    for (int i = 0; i < 400; ++i) pool.push_back(random_sparse(seed, 200, 1, 20));
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 300; ++i) s.add(i, pool[i]);
+    std::atomic<bool> stop{false};
+    std::atomic<long> searches{0}, bad{0};
+    with_watchdog(60, "sp10", [&] {
+        std::thread writer([&] {
+            while (searches.load() == 0) std::this_thread::yield();
+            for (int step = 0; step < 3000; ++step) {
+                const std::uint64_t id = std::uint64_t(step % 350);
+                if (step % 3 == 0) (void)s.remove(id);
+                else (void)s.upsert(id, pool[std::size_t(step) % 400]);
+            }
+            stop = true;
+        });
+        run_threads(3, [&](std::size_t t) {
+            std::mt19937 rng(static_cast<unsigned>(t));
+            while (!stop) {
+                const auto r = s.search(pool[rng() % 400], 10);
+                for (std::size_t i = 1; i < r.size(); ++i) bad += r[i - 1].distance > r[i].distance;
+                ++searches;
+            }
+        });
+        writer.join();
+    });
+    CHECK(bad == 0 && searches > 0);
+}
+
+TEST(sparse, sp11_out_of_memory_changes_nothing) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("needs the allocation hook");
+    std::mt19937 rng(3007);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 50; ++i) s.add(i, random_sparse(rng, 80, 1, 10), meta_for(i));
+    const SparseVector v = random_sparse(rng, 120, 5, 15);  // new terms too
+    std::ostringstream before;
+    s.save(before);
+    bool ok = true;
+    long failed = 0;
+    for (int which = 0; which < 2; ++which) {
+        for (long n = 0; n < 500; ++n) {
+            alloc_hook::fail_after(n);
+            try {
+                if (which == 0) s.add(1000, v, Metadata().set("new_field", "x"));
+                else (void)s.upsert(3, v, Metadata().set("other", std::int64_t(2)));
+                alloc_hook::disarm();
+                break;
+            } catch (const std::bad_alloc&) {
+                alloc_hook::disarm();
+                ++failed;
+                std::ostringstream now;
+                s.save(now);
+                ok = ok && now.str() == before.str();
+            }
+        }
+        std::ostringstream after;
+        s.save(after);
+        before.str(after.str());
+    }
+    CHECK(ok && failed > 10 && s.contains(1000) && s.get_vector(3) == SparseIndex().get_vector(0).value_or(*s.get_vector(3)));
+}
+
+TEST(sparse, sp12_edges_found_on_review) {
+    // Updates of an empty document leave dead slots but no dead posting entries:
+    // compaction must count slots too, or they grow without bound.
+    SparseIndex s;
+    s.add(1, {{4}, {1.0f}});
+    for (int i = 0; i < 5000; ++i) (void)s.upsert(2, {});
+    CHECK(s.size() == 2 && s.slots() <= 2 + 1025);
+    // A search inside a predicate on the same thread: its own buffers, both exact.
+    std::mt19937 rng(3010);
+    std::map<std::uint64_t, SparseVector> docs;
+    SparseIndex t;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        docs[i] = random_sparse(rng, 60, 2, 10);
+        t.add(i, docs[i]);
+    }
+    const SparseVector q = random_sparse(rng, 60, 2, 5), inner = random_sparse(rng, 60, 2, 5);
+    bool inner_ok = true;
+    SearchOptions o;
+    o.predicate = [&](std::uint64_t id) {
+        if (id % 50 == 0) inner_ok = inner_ok && same_results(t.search(inner, 5), sparse_reference(docs, inner, 5));
+        return true;
+    };
+    CHECK(same_results(t.search(q, 20, o), sparse_reference(docs, q, 20)) && inner_ok);
+    CHECK(same_results(t.search(q, 20), sparse_reference(docs, q, 20)));  // the shared buffers were reset
+    // k = 0 searches nothing; non-finite fusion options are rejected.
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{0, 0});
+    CHECK(hybrid_search(f, std::vector<float>{0, 0}, s, {{4}, {1.0f}}, 0).empty());
+    HybridOptions bad;
+    bad.dense_weight = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(std::invalid_argument, (void)hybrid_search(f, std::vector<float>{0, 0}, s, {{4}, {1.0f}}, 0, bad));
+    bad.dense_weight = 1;
+    bad.rrf_k = kNaN;
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 3, bad));
 }
 
 // ===========================================================================
@@ -16806,7 +17238,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
