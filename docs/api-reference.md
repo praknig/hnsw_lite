@@ -336,3 +336,15 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `HybridOptions` | `fusion` (`Rrf`, `Weighted`), `rrf_k` (60), `dense_weight`, `sparse_weight` (1), `dense_k`, `sparse_k` (0: max(4k, 20)), `dense_ef` (0: max(dense_k, 64)), `filter`, `dense_options`, `sparse_options` |
 | `HybridResult` | `id`, `score` (higher is better), `dense_rank`, `sparse_rank` (1-based), `dense_distance`, `sparse_score` |
 
+## Supporting types
+
+| Name | Description |
+|---|---|
+| `CompareOp` | `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, for comparison filters |
+| `FieldSpec`, `SchemaMode` | A field's name and type in a `Schema`; `Strict` (only declared fields) or `Dynamic` (fields created on first use) |
+| `PlanDecision`, `PlanReason` | What the query planner chose (strategy, estimated matches and selectivity, beam width) and why, from `plan_search()` |
+| `LevelHealth` | Nodes on one HNSW level against the number expected, in `HealthReport` |
+| `SparseRecord` | `id`, `vector`, `metadata`, from `SparseIndex::records()` |
+| `Fusion` | `Rrf` or `Weighted`, in `HybridOptions` |
+| `DiskIndex::max_degree()`, `id_of(node)`, `node_of(id)` | The graph's maximum degree, and conversions between internal node numbers and user IDs |
+

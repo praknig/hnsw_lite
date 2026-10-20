@@ -1,6 +1,8 @@
 # Compression and index types plan
 
-The plan for items 4.1 to 4.4 of the [feature catalog](feature-catalog.md): quantization (SQ8, binary and product quantization), shorter vectors (Matryoshka truncation), an IVF index, and a disk-based index in the style of DiskANN.
+> **Status: completed.** Everything planned here is implemented; see the [user guide](user-guide.md) and the [features](feature-catalog.md). Kept as a record of the design decisions.
+
+The plan for quantization (SQ8, binary and product quantization), shorter vectors (Matryoshka truncation), an IVF index, and a disk-based index in the style of DiskANN.
 
 ## Contents
 

@@ -1,126 +1,111 @@
-# Feature catalog
+# Features
 
-Every feature that could be added to hnsw-lite, in one place: the open roadmap items, the open items of the [hardening and performance plan](hardening-and-performance-plan.md) (N1 to N10, decisions D3 to D5, the Phase 2 quick wins), the testing ideas, and new features. Overlapping ideas are merged into one entry; the **Merges** column records what each entry absorbed, so nothing is lost.
-
-**Status:** *roadmap* means already on the [roadmap](project-notes.md#roadmap) or in a plan; *new* means proposed here. **Effort** is a rough estimate for one developer, including tests and documentation.
+Everything hnsw-lite does today, how it compares with similar libraries, and what could come next.
 
 ## Contents
 
-1. [Records and data access](#1-records-and-data-access)
-2. [Search](#2-search)
-3. [Filtering](#3-filtering)
-4. [Memory and index types](#4-memory-and-index-types)
-5. [Storage and durability](#5-storage-and-durability)
-6. [Concurrency](#6-concurrency)
-7. [Health and maintenance](#7-health-and-maintenance)
-8. [Performance](#8-performance)
-9. [Interfaces](#9-interfaces)
-10. [Quality and portability](#10-quality-and-portability)
+- [What hnsw-lite has](#what-hnsw-lite-has)
+- [Compared with similar libraries](#compared-with-similar-libraries)
+- [Open features](#open-features)
 - [Left out deliberately](#left-out-deliberately)
 - [Suggested order](#suggested-order)
 
-## 1. Records and data access
+## What hnsw-lite has
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 1.1 | **Read back records:** `get_vector(id)`; list and page through all records, optionally filtered; `count(filter)` | **done** (`get_vector`, `get`, `scan`, `count_where`) | A gap today: a stored vector can only be read through internal storage | 1 day |
-| 1.2 | **Bulk changes:** `remove_batch`, plus removing and updating metadata by filter (`remove_where`, `set_metadata_where`) | **done** | Delete or update by filter | |
-| 1.3 | **String and UUID IDs**, alongside 64-bit numbers | new | | 2 days |
-| 1.4 | **Multi-vector records:** several vectors per record, either named (for example title and body) or as chunks of one document, with results grouped per record | new | Named vectors; several vectors per document | 4–5 days |
-| 1.5 | **Expiry (TTL):** records removed automatically after a set time | new | | 1 day |
+A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 and ARM). The [user guide](user-guide.md) explains each feature; the [API reference](api-reference.md) lists every call.
 
-## 2. Search
+| Area | Features |
+|---|---|
+| **Index types** | `HnswIndex` (graph, approximate); `FlatIndex` (exact), optionally an **inverted file (IVF, IVF-PQ)**; `DiskIndex` (DiskANN-style Vamana graph on disk, read-only, built within a memory budget); `SparseIndex` (inverted index for sparse vectors, exact) |
+| **Metrics and speed** | Squared L2, inner product, cosine; SIMD kernels (AVX2, AVX-512, NEON, scalar) chosen at run time, with identical results on every CPU |
+| **Search** | k-nearest search with per-query beam width; batch search on a thread pool; range search; search by stored ID; deadlines, cancellation and progress reports; search statistics |
+| **Hybrid search** | Sparse vectors (SPLADE, or BM25 from the built-in `Bm25` encoder); `hybrid_search()` fusing dense and sparse results by Reciprocal Rank Fusion or weighted scores |
+| **Metadata and filters** | Typed fields (integer, float, boolean, keyword, tags), strict or dynamic schemas; filters with comparisons, ranges, membership, tags and boolean logic, plus custom predicates; a query planner choosing graph or exact search by selectivity; payload indexes with exact counts |
+| **Records and changes** | Add, `add_batch` (parallel graph building), update, upsert, real deletion with graph repair and slot reuse, `remove_batch`, bulk changes by filter (`remove_where`, `set_metadata_where`, `count_where`); reading back (`get_vector`, `get`, paged `scan`) |
+| **Compression** | SQ8, binary and product quantization (PQ), each with optional re-ranking at full precision and SIMD code kernels; Matryoshka truncation; keeping only codes to save memory |
+| **Storage** | Versioned, checksummed file format (older versions still load); atomic saves; deterministic files, identical across platforms |
+| **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
+| **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
+| **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 839 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 2.1 | **Search by stored ID:** "more like record 42", without fetching its vector first | **done** (`search_by_id`) | | Half a day |
-| 2.2 | **Recommendations:** several positive and negative examples, given as vectors or IDs (as in Qdrant) | new | Builds on 2.1 | 1–2 days |
-| 2.3 | **Diversity re-ranking (MMR):** results that are relevant and different from each other | new | | 1 day |
-| 2.4 | **Hybrid search:** keyword matching (BM25) and sparse vectors (such as SPLADE), merged with dense results by rank fusion | **done**: `SparseIndex`, `Bm25`, `hybrid_search()` with RRF | Hybrid keyword search; sparse vectors | 1–1.5 weeks |
-| 2.5 | **Deadlines and cancellation:** for searches (returning the best results found so far) and for long operations (`add_batch`, `compact`, `save`), with progress reports | **done** | Search deadlines; progress and cancellation | 1–2 days |
-| 2.6 | **Automatic ef:** choose `ef` per query or per index to reach a target recall | new | | 1–2 days |
-| 2.7 | **More metrics:** Hamming for binary vectors, Manhattan (L1) | new | | 1–2 days |
+## Compared with similar libraries
 
-## 3. Filtering
+Summarized from each project's public documentation as of October 2026; these projects move quickly, so check their current documentation before deciding.
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 3.1 | **New field kinds:** geographic points (within a radius or a bounding box), dates and times, text prefix and contains | new | Geographic filters; date fields; text matching | 3–4 days |
-| 3.2 | **Facet counts:** the number of matches per value, for building filter menus | new | Builds on the payload index, which already counts values | 1 day |
-| 3.3 | **Faster filtered search:** payload posting lists, reusable compiled filters, cached selectivity estimates | roadmap | Posting lists (roadmap); N2; N3 | 3 days |
-| 3.4 | **Filter-aware graph and multi-tenancy:** high recall for selective filters, including a tenant field that isolates each customer's data | roadmap + new | Filter-aware graph construction (roadmap); multi-tenancy | 1–1.5 weeks |
+### Embedded libraries
 
-## 4. Memory and index types
+Libraries linked into your program, like hnsw-lite.
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 4.1 | **Quantization:** 8-bit (SQ8), binary and product quantization (PQ), each optional per index and with optional re-ranking at full precision. Needs file format version 3 (version 2 added cosine originals). **Done:** SQ8, binary and PQ, with SIMD kernels; see the [compression and index types plan](compression-and-index-types-plan.md) | **done** | SQ8 (roadmap, decision D4: an option); binary quantization; PQ | 3–4 days for SQ8; 2–3 more for binary; 1 week more for PQ |
-| 4.2 | **Shorter vectors (Matryoshka truncation):** keep only the first N dimensions of embeddings trained for it | **done** ([plan](compression-and-index-types-plan.md)) | | 1 day |
-| 4.3 | **An IVF index:** a second index type, for very large datasets and fast builds | **done**, as an option of `FlatIndex` (IVF-PQ with PQ; [plan](compression-and-index-types-plan.md)) | | 1 week |
-| 4.4 | **A disk-based index (DiskANN-style):** indexes larger than memory | **done**, read-only ([plan](compression-and-index-types-plan.md)) | | |
+| | Index types | Compression | Filtering | Updates and deletes | Crash-safe log | Sparse and hybrid | Languages |
+|---|---|---|---|---|---|---|---|
+| **hnsw-lite** | HNSW, flat, IVF, disk graph (Vamana), sparse | SQ8, binary, PQ, Matryoshka | Typed metadata, query planner, payload indexes | Real deletion with graph repair; upkeep and rebuilds | **Yes** | **Yes** (BM25, SPLADE, RRF) | C++ |
+| [hnswlib](https://github.com/nmslib/hnswlib) | HNSW | None | Filter callback | Mark deleted; replace deleted slots | No | No | C++, Python |
+| [USearch](https://github.com/unum-cloud/usearch) | HNSW | f16, bf16, i8, binary | Filter callback | Yes | No | No | C++ and 10+ bindings |
+| [FAISS](https://github.com/facebookresearch/faiss) | Flat, IVF, HNSW, NSG and many more | SQ, PQ, OPQ, RaBitQ, and more | ID selectors | Depends on the index type | No | No | C++, Python; GPU |
+| [Annoy](https://github.com/spotify/annoy) | Random projection forest | None | No | Build once, read only | No | No | C++, Python |
+| [ScaNN](https://github.com/google-research/google-research/tree/master/scann) | Partitioning plus anisotropic quantization | Anisotropic quantization | Limited | Mostly built once | No | No | Python (C++ core) |
+| [Voyager](https://github.com/spotify/voyager) | HNSW (based on hnswlib) | float8, e4m3 | No | Mark deleted | No | No | Python, Java |
+| [DiskANN](https://github.com/microsoft/DiskANN) | Vamana in memory and on SSD | PQ | Label filters | Yes (in-memory index) | No | No | C++, Python, Rust |
+| [sqlite-vec](https://github.com/asg017/sqlite-vec) | Exact scan | int8, binary | SQL | Yes (SQL) | Yes, through SQLite | Through SQLite full-text search | SQL in any language |
 
-## 5. Storage and durability
+### Vector databases
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 5.1 | **Durability:** a write-ahead log, so changes since the last save survive a crash, plus snapshots | **done**: `open_durable()`, `checkpoint()`, three modes | | |
-| 5.2 | **Memory-mapped loading:** near-instant loading of large indexes; includes the arena storing offsets instead of pointers | roadmap | Memory-mapped loading; N8 (offsets) | 3 days |
-| 5.3 | **Collections:** many named indexes in one database directory | new | | 2 days |
-| 5.4 | **Import and export:** NumPy `.npy`, `.fvecs` and `.ivecs`, metadata as JSON | new | Reading `.fvecs` exists in `bench_baseline` | 1–2 days |
+Systems with their own storage engine or server, for context: hnsw-lite gives up their servers and clustering, and keeps much of their engine.
 
-## 6. Concurrency
+| | Kind | Index types | Durability | Hybrid search | Distribution |
+|---|---|---|---|---|---|
+| [LanceDB](https://github.com/lancedb/lancedb) | Embedded database | IVF-PQ, IVF with HNSW, RaBitQ | Versioned columnar files | Full-text (BM25), hybrid, multivector | No (embedded) |
+| [Chroma](https://github.com/chroma-core/chroma) | Embedded or server | HNSW | Yes | Full-text matching | Server version |
+| [Qdrant](https://github.com/qdrant/qdrant) | Server | HNSW with payload indexes; scalar, binary, PQ | Write-ahead log | Sparse, RRF and DBSF fusion, multivector | Yes |
+| [Milvus](https://github.com/milvus-io/milvus) | Distributed server | HNSW, IVF, DiskANN, GPU indexes | Write-ahead log | Sparse, BM25 full-text, hybrid | Yes |
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 6.1 | **Searches during changes:** searches no longer wait for `add_batch` and other changes; needs storage that is stable for concurrent readers | roadmap | The deferred option of stage B (scenarios C25, C28, C29) | 1–1.5 weeks |
-| 6.2 | **Thread pool and memory limits:** a stable pool when batch thread counts alternate, and documented or capped memory per concurrent search | roadmap | N6; N7 | 1 day |
+### Where hnsw-lite stands
 
-## 7. Health and maintenance
+**Strengths.** Among embedded libraries, hnsw-lite is the one that behaves like a database engine: crash-safe durability, real deletion that keeps the graph healthy, health reports, incremental upkeep and rebuilds while in use, typed metadata with a query planner, and hybrid search, in one library with no dependencies. It is also unusually well verified: byte-identical results on every platform, all-or-nothing changes under allocation failure, and crash tests that kill real processes.
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 7.1 | **Index health report:** memory breakdown, graph reachability, share of removed slots, update churn, with advice on when to compact | **done**: `health()` on every index type (graph, recall, drift, churn) | | 1 day |
-| 7.2 | **Graph upkeep under churn:** better repair during updates, and an optional automatic `compact()` past a threshold | **done**: better removal repair, incremental `upkeep()`, `set_auto_compact()` | The update-churn finding (see [project notes](project-notes.md#limitations)); N5 | 1–2 days |
-| 7.3 | **Check and repair:** validate a loaded or running index, and repair what can be repaired | new | | 1 day |
+**Gaps.** Reach: it is C++ only, while every alternative offers at least Python. Compression: RaBitQ and half-precision storage, now common elsewhere, are missing. Scale: no GPU support and no memory-mapped loading. Retrieval: no multivector (ColBERT-style) search yet. And there are no published benchmarks against these libraries yet. The suggested order below addresses these.
 
-## 8. Performance
+## Open features
 
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 8.1 | **Search quick wins:** prefetching, batched neighbor distances, allocation-free search, smaller visited marks, a cheaper duplicate check, fewer bounds checks | roadmap | Phase 2 (O1–O4, O8); N1. Each kept only if at least 5% faster on a quiet machine | 3–4 days |
-| 8.2 | **Distance code options:** choose the kernel manually (for example AVX2 where AVX-512 lowers the clock speed), and an exact or fast matrix mode for Flat batch searches | roadmap | N4; D3 (decided: the user chooses) | 2–3 days |
-| 8.3 | **Links stored next to vectors** | roadmap | Phase 4 layout decision | 1 week, measured |
-| 8.4 | **Real-data benchmarks:** SIFT1M and GloVe, with hnswlib for comparison, and the parallel build speedup | roadmap | Phase 0 on a quiet machine; `bench_baseline --threads` | 1 day |
+**Effort** is a rough estimate for one developer, including tests and documentation.
 
-## 9. Interfaces
-
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 9.1 | **Python bindings** | roadmap | | 2–3 days |
-| 9.2 | **C API:** a stable interface that Rust, Go, C# and other languages can call | new | | 2 days |
-| 9.3 | **Command-line tool:** build, inspect, check (7.3), search, compact and convert (5.4) index files without writing code | new | Includes the user-facing parts of 5.4 and 7.3 | 1–2 days |
-| 9.4 | **HTTP server:** a small REST service around the library | new | | 3–4 days |
-
-## 10. Quality and portability
-
-| # | Feature | Status | Merges | Effort |
-|---|---|---|---|---|
-| 10.1 | **Fuzzing the file loader** (scenarios F1 to F8): millions of malformed files, under the sanitizers, with every crash kept as a regression test | roadmap | Fuzzing (roadmap); scenarios F1–F8 | 1 day |
-| 10.2 | **Nightly additions:** the AVX-512 kernel under Intel's emulator (A1–A3), and a million-vector build, save, load and search | new | AVX-512 check; large-scale nightly job | 1 day |
-| 10.3 | **Platform coverage:** Windows on ARM (needs build changes first), and rejecting 32-bit and big-endian builds with a clear message | roadmap | Windows on ARM; N10 | 1–2 days |
+| # | Feature | Notes | Effort |
+|---|---|---|---|
+| 1 | **`Collection` API:** one object for dense vectors, text or sparse vectors, and metadata, under one ID space; hybrid search by default; durable sparse side | Removes the need to keep two indexes in step by hand | 1.5 weeks |
+| 2 | **Automatic maintenance:** thresholds deciding when to run `upkeep()`, `rebuild()` and `checkpoint()`, from a background thread or a `step()` call | Durable indexes need regular checkpoints, or the log grows without limit | 1 week |
+| 3 | **Presets:** balanced, low memory and high recall settings chosen from dimension and size | | 2 days |
+| 4 | **Python bindings,** with wheels for every platform | The largest audience | 2 weeks |
+| 5 | **Packaging:** vcpkg, Conan, and a CMake package configuration | | 2–3 days |
+| 6 | **C API:** a stable interface for Rust, Go, C# and others | | 2 days |
+| 7 | **Command-line tool:** inspect, verify, report health, compact, convert and export | | 1–2 days |
+| 8 | **Import and export:** NumPy, `.fvecs` and `.ivecs`, Parquet, metadata as JSON | `bench_baseline` already reads `.fvecs` | 1–2 days |
+| 9 | **Observability:** a metrics callback (latency, log size, checkpoints) and a logging hook | | 2 days |
+| 10 | **Published benchmarks:** SIFT1M, GloVe and a modern embedding set, against hnswlib, USearch and FAISS | | 1 week |
+| 11 | **RaBitQ quantization** | Higher recall than binary codes at the same size | 2 weeks |
+| 12 | **Half-precision storage** (f16, bf16) | | 2–3 days |
+| 13 | **Memory-mapped loading** of saved indexes | | 3 days |
+| 14 | **Multivector records:** several vectors per record (named, or chunks), and late-interaction (ColBERT) scoring | | 1 week |
+| 15 | **Faster sparse search:** MaxScore pruning for long posting lists; a write-ahead log for a standalone `SparseIndex` | Covered by `Collection` for most users | 3–4 days |
+| 16 | **Filtering:** payload posting lists for exact filtered search, filter-aware graph construction, facet counts, geographic and date fields | | 1–2 weeks |
+| 17 | **Search extras:** recommendations from positive and negative examples, diversity re-ranking (MMR), automatic beam width for a target recall, Hamming and L1 metrics | | 1 week |
+| 18 | **Records:** string and UUID IDs; expiry (TTL) | | 3 days |
+| 19 | **Concurrency:** searches that do not wait for long batch changes | | 1–1.5 weeks |
+| 20 | **Quality:** fuzzing the file and log loaders; splitting the test program by group for faster builds; Windows on ARM | | 1 week |
+| 21 | **Optional HTTP server** around the library | | 3–4 days |
 
 ## Left out deliberately
 
-**Sharding, replication, encryption at rest and access control.** These belong to a database server such as Qdrant or Milvus, not to a library. The HTTP server (9.4) is as far as hnsw-lite should go in that direction.
+**Sharding, replication, encryption at rest and access control.** These belong to a database server such as Qdrant or Milvus, not to a library. The optional HTTP server (21) is as far as hnsw-lite should go in that direction.
 
 ## Suggested order
 
-| Stage | Features | Why | Total effort | Progress |
-|---|---|---|---|---|
-| **A. Complete the basics** | 1.1, 1.2, 2.1, 2.5, 7.1, 7.2, 10.1 | Small gaps any user notices, the update-churn finding, and fuzzing the code most exposed to untrusted input | About 1.5 weeks | 1.1, 1.2, 2.1, 2.5 done; 7.1, 7.2, 10.1 to do |
-| **B. Easier to adopt** | 9.1, 9.3, 5.4 | Python and a command-line tool open the library to far more people | About 1 week | Not started |
-| **C. Smaller indexes** | 4.1 (SQ8 first), 5.2 | Memory is usually the first limit users reach | About 1.5 weeks | 4.1 done (SQ8, binary, PQ); 4.2 done too; 5.2 to do |
-| **D. Better results for text** | 1.4, 2.4, 3.1 | What retrieval-augmented generation (RAG) and search applications need most | About 3 weeks | Not started |
-| **E. Scale and speed** | 3.3, 3.4, 6.1, 8.1–8.4, 4.3 | Worth doing once there is real usage to measure | Several weeks | 4.3 done |
+| Stage | Features | Why |
+|---|---|---|
+| **A. One object, no babysitting** | 1, 2, 3 | Turns the toolkit into a product: one API, maintained automatically |
+| **B. Reach** | 4, 5, 6 | Python first, then C++ packaging and other languages |
+| **C. Operating it** | 7, 8, 9 | Looking inside indexes, moving data in and out, watching them in production |
+| **D. Confidence** | 10, 20 | Published numbers, fuzzing, faster builds |
+| **E. Scale and quality of results** | 11–19 | As real usage shows which matter most |
 
-The remaining features (1.3, 1.5, 2.2, 2.3, 2.6, 2.7, 3.2, 4.4, 5.1, 5.3, 6.2, 7.3, 9.2, 9.4, 10.2, 10.3) fit in wherever a user asks for them.
+Done so far: the core (deletion, updates, saving, thread safety, parallel building), records and bulk changes, search by ID and deadlines, compression (SQ8, binary, PQ, Matryoshka), IVF, the disk-based index, health reports, upkeep and rebuilds, durability, and hybrid search.

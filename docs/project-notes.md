@@ -18,9 +18,11 @@ These are deliberate for the current stage:
 - **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
 - **Graphs made almost entirely of identical vectors keep some of them unreachable until upkeep.** Neighbor selection now keeps copies of a vector (up to the room distinct neighbors do not need) and breaks distance ties by a hash of the pair: with a dozen copies per value nothing becomes unreachable; with 600 identical vectors and M 8 about 10% do (98.5% before), and `upkeep()` reconnects them. Run it after building heavily duplicated data.
 - **HNSW build speed.** One-by-one adds are single-threaded (use `add_batch` to build on several threads), and every access is bounds-checked for safety. Unchecked accessors in the hot loops are future optimizations.
-- **Saving cannot force data onto the physical disk:** a save is atomic (temporary file, then rename), but a power cut right after `save` returns could lose that latest save. Loading is not memory-mapped, so a large index is read fully into memory.
+- **A plain `save()` does not force data onto the physical disk:** it is atomic (temporary file, then rename), but a power cut right after it returns could lose it. Durable directories (`open_durable()`) flush their log and snapshots to the disk itself.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
+- **A standalone `SparseIndex` has no write-ahead log** (save it, or rebuild it from your data), and its search is exact without pruning: very common terms make long posting lists.
+- **One process per durable directory**, enforced with a lock file; a checkpoint holds changes (not searches) while its snapshot is written.
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
 - **Dynamic metadata fields are never removed**, even when no vector uses them: field names are the schema, and removing one automatically would silently forget its type. Unused strings, by contrast, are reclaimed.
 - **The payload index keeps counts, not posting lists.** It makes the planner's estimates exact, but exact filtered search still checks every vector's metadata (a fast column read) rather than reading only the matching ones.
@@ -61,7 +63,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
 - [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
 - [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
-- [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
+- [ ] Fuzzing the file and log loaders
+- [ ] A `Collection` API, automatic maintenance, Python bindings (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe
@@ -70,20 +73,7 @@ The core capabilities (real deletion, updating vectors, saving and loading, thre
 
 ## Comparison with existing implementations
 
-| | hnsw-lite | hnswlib | Faiss | Qdrant | Milvus |
-|---|---|---|---|---|---|
-| Language | C++20 | C++11 | C++ (Python bindings) | Rust | Go and C++ |
-| Scope | Learning-focused engine | HNSW library | Vector search library | Vector database | Distributed vector database |
-| Vector layout | Separate aligned rows | Interleaved with level-0 links | Separate flat storage | Segments, memory-mapped | Via its Knowhere engine |
-| Upper-level links | One arena allocation per node | One `malloc` per node | One shared array with offsets | Own implementation | Via Knowhere |
-| SIMD selection | Runtime CPU detection | Compile-time flags with runtime checks | Separate builds per instruction set | Runtime CPU detection | Via Knowhere |
-| Deletion | Real deletion: slot reuse and graph repair | Tombstones (optional slot reuse) | Depends on index type; not for HNSW | Yes | Yes |
-| Quantization | SQ8, binary and PQ codes, IVF (and IVF-PQ), Matryoshka truncation; a disk-based index (DiskANN-style) | No | Yes (PQ, SQ, IVF) | Yes | Yes |
-| Metadata filtering | Yes, with a query planner | Limited (a filter function) | Limited (ID selectors) | Yes | Yes |
-| Persistence | Yes (versioned file format, checksums, older versions still read) | Yes | Yes | Yes | Yes |
-| Distribution across machines | No | No | No | Yes | Yes |
-
-hnsw-lite focuses on the in-memory core that these systems share, and leaves out the database features built around it.
+The comparison with hnswlib, USearch, FAISS, Annoy, ScaNN, Voyager, DiskANN, sqlite-vec and the vector databases LanceDB, Chroma, Qdrant and Milvus is in the [feature catalog](feature-catalog.md#compared-with-similar-libraries).
 
 ## References
 
@@ -92,4 +82,7 @@ hnsw-lite focuses on the in-memory core that these systems share, and leaves out
 - [Faiss](https://github.com/facebookresearch/faiss)
 - [Qdrant](https://github.com/qdrant/qdrant)
 - [Milvus](https://github.com/milvus-io/milvus)
+- [USearch](https://github.com/unum-cloud/usearch)
+- J. Subramanya et al., *DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*, NeurIPS 2019.
+- G. V. Cormack, C. L. A. Clarke and S. Buettcher, *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods*, SIGIR 2009.
 - [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks)

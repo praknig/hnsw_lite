@@ -11,7 +11,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 
 ## Features
 
-- **Two indexes:** `FlatIndex` (exact, brute force) and `HnswIndex` (approximate, about 14x faster at 99.8% recall on 50,000 vectors).
+- **Four index types:** `HnswIndex` (approximate graph search: about 14x faster than exact at 99.8% recall on 50,000 vectors), `FlatIndex` (exact, optionally an inverted file), `DiskIndex` (a DiskANN-style graph on disk, for indexes larger than memory) and `SparseIndex` (sparse vectors and BM25, for hybrid search).
 - **Three distance metrics:** squared Euclidean (L2), inner product and cosine.
 - **SIMD speed on any CPU:** AVX2, AVX-512 or ARM NEON versions are chosen automatically at runtime.
 - **Updates and real deletion:** `update` and `upsert` replace a vector without ever losing the old one on failure; removed IDs can be reused immediately, and `compact()` rebuilds a heavily changed index.
@@ -175,7 +175,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
-| [Feature catalog](docs/feature-catalog.md) | Every feature that could come next, with overlaps merged, efforts, and a suggested order |
+| [Features](docs/feature-catalog.md) | Everything hnsw-lite has, a comparison with similar libraries and databases, and what could come next, in a suggested order |
 | [Compression and index types plan](docs/compression-and-index-types-plan.md) | Quantization (SQ8, binary, PQ), Matryoshka truncation, an IVF index and a disk-based index: phases, decisions and testing |
 
 ## Project status
