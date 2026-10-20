@@ -16339,7 +16339,9 @@ TEST(wal, wl19_every_path) {
     wal_faults::fail_sync_after = 0;
     CHECK_THROWS_AS(std::runtime_error, wal::sync_path(path));
     wal_faults::disarm();
+#ifndef _WIN32  // on Windows syncing a directory does nothing (NTFS journals its entries)
     CHECK_THROWS_AS(std::runtime_error, wal::sync_directory(temp_path("wl19_no_such_dir") + "/x"));
+#endif
     CHECK_THROWS_AS(std::runtime_error, FileLock(temp_path("wl19_no_such_dir") + "/x/LOCK"));
     // Encodings of the remaining settings; metadata of an unknown type.
     UpkeepOptions u;
@@ -16441,6 +16443,8 @@ TEST(durable, du15_every_path) {
         CHECK_THROWS_AS(std::runtime_error, h->add(2, data[2]));
         (void)h->checkpoint();
         h->add(2, data[2]);
+    }
+    {  // one durable index at a time: another index's flusher could take the one-shot fault
         auto f = FlatIndex::open_durable(durable_dir("du15f"), 4, Metric::L2, Schema::dynamic(), {}, {}, g);
         wal_faults::fail_sync_after = 0;
         f->add(1, data[1]);
