@@ -452,11 +452,11 @@ void SparseIndex::save(const std::string& path) const {
         if (!out) throw std::runtime_error("cannot create " + tmp);
         try {
             save(out);
-        } catch (...) {
+        } catch (...) {  // GCOVR_EXCL_START: needs a stream failing mid-write
             out.close();
             std::remove(tmp.c_str());
             throw;
-        }
+        }  // GCOVR_EXCL_STOP
     }
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);

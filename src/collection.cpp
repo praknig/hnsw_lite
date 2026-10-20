@@ -204,7 +204,7 @@ bool Collection::apply_upsert(std::uint64_t id, const Prepared& p) {
 
 bool Collection::apply_remove(std::uint64_t id) {
     const auto it = slot_of_.find(id);
-    if (it == slot_of_.end()) return false;
+    if (it == slot_of_.end()) return false;  // GCOVR_EXCL_BR_LINE: callers pass known IDs only
     const NodeId slot = it->second;
     free_.reserve(free_.size() + 1);
     // Removals never fail on these indexes' side (they free memory).
@@ -360,7 +360,7 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
         side.predicate = [&](std::uint64_t id) {
             if (compiled) {
                 const auto it = slot_of_.find(id);
-                if (it == slot_of_.end() || !compiled->matches(it->second)) return false;
+                if (it == slot_of_.end() || !compiled->matches(it->second)) return false;  // GCOVR_EXCL_BR_LINE: the sides hold collection documents only
             }
             return !o.predicate || o.predicate(id);
         };
@@ -448,9 +448,10 @@ bool Collection::replay(std::span<const WalRecord> records) {
                     break;
                 default: throw FormatError("log record of a type a collection cannot replay");
             }
-        } catch (const FormatError&) {
+        } catch (const FormatError&) {  // GCOVR_EXCL_START: no collection change throws FormatError
             throw;
-        } catch (const std::exception& e) {
+        }  // GCOVR_EXCL_STOP
+        catch (const std::exception& e) {
             if (r.lsn == final_lsn) return true;  // in progress when the process stopped
             throw FormatError("replaying log record " + std::to_string(r.lsn) + " failed: " + e.what() +
                               " (the log does not match the collection it is replayed onto)");
@@ -506,11 +507,11 @@ void Collection::save(const std::string& path) const {
         if (!out) throw std::runtime_error("cannot create " + tmp);
         try {
             save(out);
-        } catch (...) {
+        } catch (...) {  // GCOVR_EXCL_START: needs a stream failing mid-write
             out.close();
             std::remove(tmp.c_str());
             throw;
-        }
+        }  // GCOVR_EXCL_STOP
     }
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);

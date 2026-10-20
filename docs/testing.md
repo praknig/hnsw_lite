@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 851 individually named tests** in 43 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 854 individually named tests** in 43 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -48,8 +48,8 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `rebuild` | 13 | Upkeep step 3: a quiet rebuild equals a compact; retraining a drifted codec (and keeping it when asked); changes made during a rebuild (adds, removals, updates, metadata, filters, batches) kept exactly, against the same changes applied to a copy; searches and a writer running through three rebuilds; cancellation and running out of memory at every allocation leaving the index byte for byte as it was; one rebuild at a time; codes-only indexes; flat indexes retraining drifted IVF lists and codecs, catching up changed rows, and exact with every list probed |
 | `wal` | 19 | Durability D1 and D2: log segments round trip; a torn write at every byte (recovered, then appended to); torn last records against corruption in every field; a failing disk at every byte of an append; writers that cannot recover; damaged and foreign headers; sequence gaps; every operation encoded exactly (every truncation rejected); every write path, random operations and concurrent writers replayed to identical bytes; failed operations aborted (out of memory at every point); a failing log refusing the change; replay mismatches; flat indexes; concurrent writers with rebuilds |
 | `durable` | 15 | Durability D3 and D4: reopening recovers everything; a crash after any operation (copies compared byte for byte); a torn last write at every byte; damage that is not a crash refused (each check shown necessary); falling back to an older snapshot; pruning; one writer and matching settings; crashes while creating or checkpointing; a checkpoint healing a failed log; flat indexes with concurrent checkpoints; the three modes (flushes counted); a failing sync; an operation unfinished at a crash; real process kills (SIGKILL) in every mode, every acknowledged change recovered |
-| `sparse` | 12 | Sparse search identical to a brute-force reference (same float order: IDs and scores); input rules; 6,000 random changes against a model (results, document frequencies, compaction); filters and predicates; save and load (every truncation and damage rejected, deterministic bytes, wrong index kinds); BM25 against the formula computed directly; RRF and weighted fusion by hand; hybrid search with HNSW and Flat (a keyword-only match found, filters on both sides); deadlines and statistics; concurrent searches and changes; out of memory at every allocation of an add or upsert changes nothing; dead slots from empty-document updates compacted; a search nested in a predicate; `k = 0` and non-finite fusion options |
-| `collection` | 12 | Each side's own ranking, and RRF over two and three lists computed by hand; documents with some parts, parts removed by a new version, one-side collections; invalid input of every kind changes nothing; filters, predicates and metadata changes across sides; save and load (bytes identical, free slots reused alike, damage rejected); a crash after any change, recovered byte for byte; reopening rules, an unfinished operation, a torn record; calls from inside a search (reads allowed, changes refused); out of memory at every allocation of three kinds of change; concurrent changes, searches and checkpoints; BM25 settings |
+| `sparse` | 13 | Sparse search identical to a brute-force reference (same float order: IDs and scores); input rules; 6,000 random changes against a model (results, document frequencies, compaction); filters and predicates; save and load (every truncation and damage rejected, deterministic bytes, wrong index kinds); BM25 against the formula computed directly; RRF and weighted fusion by hand; hybrid search with HNSW and Flat (a keyword-only match found, filters on both sides); deadlines and statistics; concurrent searches and changes; out of memory at every allocation of an add or upsert changes nothing; dead slots from empty-document updates compacted; a search nested in a predicate; `k = 0` and non-finite fusion options |
+| `collection` | 14 | Each side's own ranking, and RRF over two and three lists computed by hand; documents with some parts, parts removed by a new version, one-side collections; invalid input of every kind changes nothing; filters, predicates and metadata changes across sides; save and load (bytes identical, free slots reused alike, damage rejected); a crash after any change, recovered byte for byte; reopening rules, an unfinished operation, a torn record; calls from inside a search (reads allowed, changes refused); out of memory at every allocation of three kinds of change; concurrent changes, searches and checkpoints; BM25 settings; every combination of sides through every operation; files with valid checksums but invalid content |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -60,7 +60,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 851 test names
+test_comprehensive --list               # list all 854 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -74,13 +74,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 851 of 851 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 854 of 854 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-851 passed, 0 failed, 0 skipped, 0 not run, 37588 checks, 121.35 s
+854 passed, 0 failed, 0 skipped, 0 not run, 37588 checks, 121.35 s
 All selected tests passed.
 ```
 
@@ -128,7 +128,7 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 54 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 851 tests selected`: that entry's share, not tests left out. Together the 54 entries run all 851 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 54 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 854 tests selected`: that entry's share, not tests left out. Together the 54 entries run all 854 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 ```
  1/54 Test # 1: comprehensive.layer1 ...........   Passed
@@ -197,7 +197,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-  |---|---|---|
+    |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -440,4 +440,3 @@ A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every n
 **The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
 
 GitHub pauses scheduled workflows on public repositories after 60 days without activity (and emails a warning first); any commit restarts them.
-

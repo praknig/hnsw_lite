@@ -16892,6 +16892,103 @@ TEST(sparse, sp12_edges_found_on_review) {
     CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 3, bad));
 }
 
+TEST(sparse, sp13_every_path) {
+    std::mt19937 rng(3020);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 100; ++i) s.add(i, random_sparse(rng, 50, 2, 8), meta_for(i));
+    for (std::uint64_t i = 0; i < 100; i += 3) (void)s.remove(i);
+    CHECK(s.remove_where(Filter::eq("category", "tech")) > 0);  // skipping removed slots
+    CHECK(!s.update(1000, {{1}, {1.0f}}, Metadata()) && s.upsert(1000, {}, Metadata()) && s.contains(1000));  // upsert: true when it adds
+    SearchOptions o;
+    std::atomic<bool> cancel{false};
+    o.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    o.cancel = &cancel;
+    CHECK(!s.search({{1, 49, 4000}, {1.0f, 1.0f, 1.0f}}, 5, o).empty());  // a term no document has
+    CHECK(!(SparseVector{{1}, {1.0f}} == SparseVector{{1}, {2.0f}}) && !(SparseVector{{1}, {1.0f}} == SparseVector{{2}, {1.0f}}));
+    CHECK_THROWS_AS(std::runtime_error, s.save(temp_path("sp13_no_dir") + "/x/y.sparse"));
+    CHECK_THROWS_AS(std::runtime_error, (void)SparseIndex::load(temp_path("sp13_missing.sparse")));
+    // Compaction running out of memory: the removal itself still succeeds.
+    if constexpr (HNSW_ALLOC_HOOK) {
+        bool all = true;
+        for (long n = 0; n < 200; ++n) {
+            SparseIndex c;
+            for (std::uint64_t i = 0; i < 1100; ++i) c.add(i, {{std::uint32_t(i % 10)}, {1.0f}});
+            for (std::uint64_t i = 0; i < 1049; ++i) (void)c.remove(i);  // the next removal compacts
+            alloc_hook::fail_after(n);
+            const bool removed = c.remove(1049);
+            const bool fired = alloc_hook::fired;
+            alloc_hook::disarm();
+            all = all && removed && !c.contains(1049) && c.size() == 50;
+            if (!fired) break;  // the removal ran without a failure: every point was tried
+        }
+        CHECK(all);
+    }
+    // BM25 settings and tokens.
+    CHECK_THROWS_AS(std::invalid_argument, Bm25(Bm25Params{-1, 0.75, 100}));
+    CHECK_THROWS_AS(std::invalid_argument, Bm25(Bm25Params{1.2, 0.75, 0}));
+    CHECK(Bm25::tokenize("a@b[c`d{e") == std::vector<std::string>({"a", "b", "c", "d", "e"}));
+    Bm25 empty_docs;
+    const std::vector<std::string_view> blanks = {"", "!!"};
+    empty_docs.fit(blanks);
+    CHECK(empty_docs.params().avg_doc_length == 100.0);  // no tokens: unchanged
+    // Fusion options and repeated IDs in the sparse list.
+    HybridOptions inf;
+    inf.rrf_k = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 1, inf));
+    inf.rrf_k = 60;
+    inf.sparse_weight = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 1, inf));
+    const std::vector<SearchResult> rep = {{1, -2.0f}, {1, -1.0f}};
+    CHECK(fuse({}, rep, 5).size() == 1 && *fuse({}, rep, 5)[0].sparse_score == 2.0f);
+    // hybrid_search: per-side filters combined with the shared one; explicit beam width and depths.
+    auto data = random_vectors(50, 4, 3021);
+    HnswIndex h(4, Metric::L2);
+    SparseIndex sp;
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        h.add(i, data[i], meta_for(i));
+        sp.add(i, {{std::uint32_t(i % 4)}, {1.0f}}, meta_for(i));
+    }
+    HybridOptions ho;
+    ho.filter = Filter::eq("category", "tech");
+    ho.dense_options.filter = Filter::all();
+    ho.sparse_options.filter = Filter::all();
+    ho.dense_ef = 32;
+    ho.sparse_k = 10;
+    const auto r = hybrid_search(h, data[0], sp, {{0}, {1.0f}}, 5, ho);
+    CHECK(!r.empty() && std::all_of(r.begin(), r.end(), [](const HybridResult& x) { return meta_for(x.id).get("category")->s == "tech"; }));
+    // Files with valid checksums but invalid documents.
+    auto craft = [](std::vector<std::tuple<std::uint8_t, std::uint64_t, std::vector<std::uint32_t>, std::vector<float>>> docs) {
+        std::ostringstream out;
+        persist::write_header(out, persist::IndexKind::Sparse);
+        persist::write_section(out, persist::tag("SDOC"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(docs.size());
+            for (const auto& [live, id, terms, weights] : docs) {
+                w.put<std::uint8_t>(live);
+                w.put<std::uint64_t>(id);
+                w.put<std::uint64_t>(terms.size());
+                for (const std::uint32_t x : terms) w.put<std::uint32_t>(x);
+                w.put_floats(weights.data(), weights.size());
+            }
+        });
+        MetadataStore m;
+        persist::write_section(out, persist::tag("SMET"), [&](persist::Writer& w) { m.save(w); });
+        std::istringstream in(out.str());
+        try {
+            (void)SparseIndex::load(in);
+            return true;
+        } catch (const FormatError&) {
+            return false;
+        }
+    };
+    CHECK(craft({{1, 1, {1, 2}, {1.0f, 2.0f}}}));                              // the baseline is valid
+    CHECK(!craft({{1, 1, {2, 1}, {1.0f, 2.0f}}}));                             // terms out of order
+    CHECK(!craft({{1, 1, {1}, {0.0f}}}));                                      // a zero weight
+    CHECK(!craft({{1, 1, {1}, {kNaN}}}));                                      // not finite
+    CHECK(!craft({{0, 1, {1}, {1.0f}}}));                                      // a removed document with terms
+    CHECK(!craft({{1, 1, {1}, {1.0f}}, {1, 1, {2}, {1.0f}}}));                 // a duplicate ID
+    CHECK(!craft({{3, 1, {1}, {1.0f}}}));                                      // an invalid live flag
+}
+
 // ===========================================================================
 // Collections: dense, text and sparse sides under one ID space (CO1-CO12)
 // ===========================================================================
@@ -17420,6 +17517,219 @@ TEST(collection, co12_text_storage_and_bm25_settings) {
     CollectionOptions bad_hnsw = co_options();
     bad_hnsw.hnsw.M = 0;
     CHECK_THROWS_AS(std::invalid_argument, (void)Collection(bad_hnsw));
+}
+
+TEST(collection, co13_every_side_combination) {
+    auto data = random_vectors(30, 4, 4020);
+    struct Combo {
+        std::size_t dim;
+        bool text, sparse;
+    };
+    bool ok = true;
+    for (const Combo& cb : {Combo{4, false, false}, Combo{0, true, false}, Combo{0, false, true}, Combo{4, false, true}, Combo{0, true, true}, Combo{4, true, true}}) {
+        CollectionOptions o;
+        o.dim = cb.dim;
+        o.metric = Metric::L2;
+        o.text = cb.text;
+        o.sparse = cb.sparse;
+        o.store_text = cb.text && cb.dim == 0;  // with and without stored text
+        Collection c(o);
+        auto doc = [&](std::uint64_t id) {
+            Document d;
+            if (cb.dim) d.vector = data[id % 30];
+            if (cb.text) d.text = text_for(id);
+            if (cb.sparse) d.sparse = {{std::uint32_t(id % 5)}, {1.0f}};
+            d.metadata = meta_for(id);
+            return d;
+        };
+        for (std::uint64_t i = 0; i < 20; ++i) c.add(i, doc(i));
+        ok = ok && !c.upsert(3, doc(4)) && c.remove(5) && !c.remove(5) && c.get(3).has_value() && !c.get(5);
+        CollectionQuery q;
+        if (cb.dim) q.vector = data[0];
+        if (cb.text) q.text = "alpha";
+        if (cb.sparse) q.sparse = {{0}, {1.0f}};
+        CollectionSearchOptions so;
+        so.filter = Filter::eq("category", "tech");  // a filter without a predicate
+        so.candidates = 7;
+        so.ef = 16;
+        so.fusion = Fusion::Weighted;
+        const auto hits = c.search(q, 5, so);
+        for (const auto& h : hits) ok = ok && meta_for(h.id).get("category")->s == "tech";
+        std::ostringstream out;
+        c.save(out);
+        std::istringstream in(out.str());
+        auto d = Collection::load(in);
+        ok = ok && co_bytes(*d) == out.str() && d->size() == 19 && d->get(3)->text == (o.store_text ? text_for(4) : std::string());
+        if constexpr (HNSW_ALLOC_HOOK) {  // out of memory while replacing, for this combination of sides
+            const std::string before = co_documents(c, 30);
+            for (long n = 0; n < 800; ++n) {
+                alloc_hook::fail_after(n);
+                try {
+                    (void)c.upsert(7, doc(8));
+                    alloc_hook::disarm();
+                    break;
+                } catch (const std::bad_alloc&) {
+                    alloc_hook::disarm();
+                    ok = ok && co_documents(c, 30) == before;
+                }
+            }
+        }
+    }
+    CHECK(ok);
+    // Remaining input and option checks.
+    Collection c(co_options(4, true));
+    Document one;
+    one.vector = data[0];
+    c.add(1, one);  // not empty: searches reach the sides
+    Document only_values;
+    only_values.sparse.values = {1.0f};  // values without terms
+    CHECK_THROWS_AS(std::invalid_argument, c.add(2, only_values));
+    CollectionQuery bad_sparse;
+    bad_sparse.sparse.values = {1.0f};
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(bad_sparse, 3));
+    CollectionQuery v;
+    v.vector = data[0];
+    for (double w : {std::numeric_limits<double>::infinity(), -1.0}) {
+        CollectionSearchOptions so;
+        so.sparse_weight = w;
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.search(v, 3, so));
+        so.sparse_weight = 1;
+        so.text_weight = w;
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.search(v, 3, so));
+    }
+    CollectionSearchOptions weighted;
+    weighted.fusion = Fusion::Weighted;
+    weighted.predicate = [](std::uint64_t) { return true; };  // a predicate without a filter
+    CHECK(c.search(v, 3, weighted).size() == 1 && c.search(v, 3, weighted)[0].score == 1.0);  // one result scales to 1
+    CHECK_THROWS_AS(std::runtime_error, c.save(temp_path("co13_no_dir") + "/x/y.col"));
+    CHECK_THROWS_AS(std::runtime_error, (void)Collection::load(temp_path("co13_missing.col")));
+    // Replay: aborted records are skipped; a failure before the end means the log does not match.
+    Collection r(co_options(4));
+    Document dv;
+    dv.vector = data[1];
+    const std::vector<WalRecord> aborted = {{1, walop::kDocument, walop::encode_document(1, 1, dv.vector, "", {}, {})},
+                                            {2, walop::kAbort, walop::encode_abort(1)},
+                                            {3, walop::kDocument, walop::encode_document(2, 1, dv.vector, "", {}, {})}};
+    CHECK(!r.replay(aborted) && !r.contains(1) && r.contains(2));
+    const std::vector<WalRecord> mismatch = {{4, walop::kDocument, walop::encode_document(5, 1, std::vector<float>{1, 2}, "", {}, {})},
+                                             {5, walop::kDocument, walop::encode_document(6, 1, dv.vector, "", {}, {})}};
+    CHECK_THROWS_AS(FormatError, (void)r.replay(mismatch));
+    std::vector<unsigned char> parts = walop::encode_document(1, 9, {}, "", {}, {});
+    CHECK_THROWS_AS(FormatError, (void)walop::decode(walop::kDocument, parts));  // unknown parts
+    std::vector<unsigned char> terms = walop::encode_document(1, 4, {}, "", {}, {});
+    for (int i = 0; i < 8; ++i) terms[8 + 1 + 8 + 4 + i] = 0xFF;  // a huge term count
+    CHECK_THROWS_AS(FormatError, (void)walop::decode(walop::kDocument, terms));
+    // Durable: a checkpoint from inside a search, Synced mode, reopening with other sides.
+    const std::string dir = co_dir("co13");
+    {
+        CollectionOptions so = co_options(4);
+        so.durability.durability = Durability::Synced;
+        auto d = Collection::open(dir, so);
+        d->add(1, one);
+        CollectionSearchOptions inside;
+        bool refused = false;
+        inside.predicate = [&](std::uint64_t) {
+            try {
+                (void)d->checkpoint();
+            } catch (const std::logic_error&) {
+                refused = true;
+            }
+            return true;
+        };
+        (void)d->search(v, 1, inside);
+        CHECK(refused);
+    }
+    CollectionOptions no_text = co_options(4);
+    no_text.text = false;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, no_text));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co14_invalid_content_behind_valid_checksums) {
+    // Files written section by section with valid checksums, each wrong in one way.
+    auto bytes_of = [](const auto& index) {
+        std::ostringstream o;
+        index.save(o);
+        return o.str();
+    };
+    HnswIndex h4(4, Metric::L2), h8(8, Metric::L2), h_other(4, Metric::L2);
+    h4.add(7, std::vector<float>{1, 2, 3, 4});
+    h_other.add(99, std::vector<float>{1, 2, 3, 4});
+    SparseIndex t, t_other;
+    t.add(7, {{1}, {1.0f}});
+    t_other.add(99, {{1}, {1.0f}});
+    struct File {
+        std::uint64_t dim = 4;
+        std::uint32_t metric = 0;
+        std::uint8_t text = 1, sparse = 0, store = 1;
+        std::vector<std::pair<std::uint8_t, std::uint64_t>> slots = {{1, 7}, {0, 0}};
+        std::vector<std::uint32_t> free = {1};
+        std::string dense, text_side, sparse_side;
+    };
+    auto write = [&](const File& f) {
+        std::ostringstream out;
+        persist::write_header(out, persist::IndexKind::Collection);
+        persist::write_section(out, persist::tag("CCFG"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(f.dim);
+            w.put<std::uint32_t>(f.metric);
+            w.put<std::uint8_t>(f.text);
+            w.put<std::uint8_t>(f.sparse);
+            w.put<std::uint8_t>(f.store);
+            w.put<double>(1.2);
+            w.put<double>(0.75);
+            w.put<double>(6);
+        });
+        persist::write_section(out, persist::tag("CDOC"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(f.slots.size());
+            for (const auto& [live, id] : f.slots) {
+                w.put<std::uint8_t>(live);
+                w.put<std::uint64_t>(id);
+                w.put_string("");
+            }
+            w.put<std::uint64_t>(f.free.size());
+            for (const std::uint32_t n : f.free) w.put<std::uint32_t>(n);
+        });
+        MetadataStore m;
+        persist::write_section(out, persist::tag("CMET"), [&](persist::Writer& w) { m.save(w); });
+        persist::write_section(out, persist::tag("CSID"), [&](persist::Writer& w) {
+            w.put_string(f.dense);
+            w.put_string(f.text_side);
+            w.put_string(f.sparse_side);
+        });
+        return out.str();
+    };
+    auto loads = [&](const File& f) {
+        std::istringstream in(write(f));
+        try {
+            (void)Collection::load(in);
+            return true;
+        } catch (const FormatError&) {
+            return false;
+        }
+    };
+    File good;
+    good.dense = bytes_of(h4);
+    good.text_side = bytes_of(t);
+    CHECK(loads(good));  // the baseline is valid: each case below changes one thing
+    auto with = [&](auto change) {
+        File f = good;
+        change(f);
+        return loads(f);
+    };
+    CHECK(!with([](File& f) { f.metric = 7; }));
+    CHECK(!with([](File& f) { f.text = 2; }));
+    CHECK(!with([](File& f) { f.dim = 0; f.text = 0; f.dense.clear(); f.text_side.clear(); }));  // no side at all
+    CHECK(!with([](File& f) { f.slots = {{1, 7}, {1, 7}}; f.free.clear(); }));                  // a duplicate ID
+    CHECK(!with([](File& f) { f.slots.push_back({2, 0}); }));                                    // an invalid live flag
+    CHECK(!with([](File& f) { f.free = {0}; }));                                                 // a live slot as free
+    CHECK(!with([](File& f) { f.free = {5}; }));                                                 // out of range
+    CHECK(!with([](File& f) { f.slots.push_back({0, 0}); f.free = {1, 1}; }));                   // a slot free twice
+    CHECK(!with([](File& f) { f.free.clear(); }));                                               // a free slot missing
+    CHECK(!with([&](File& f) { f.sparse_side = bytes_of(t); }));                                 // data for an absent side
+    CHECK(!with([&](File& f) { f.dense = bytes_of(h8); }));                                      // another dimension
+    CHECK(!with([&](File& f) { f.text_side = bytes_of(t_other); }));                             // unknown document (text)
+    CHECK(!with([&](File& f) { f.dense = bytes_of(h_other); }));                                 // unknown document (dense)
+    CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
 }
 
 // ===========================================================================
