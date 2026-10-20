@@ -116,6 +116,7 @@ hnsw-lite/
 │   ├── wal_ops.h               # Logged operations and their encoding
 │   ├── durable.h               # Durable directories
 │   ├── sparse.h                # Sparse vectors, BM25, hybrid search
+│   ├── collection.h            # Documents over dense, text and sparse sides
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -142,10 +143,11 @@ hnsw-lite/
 │   ├── wal_replay.cpp          # Logging hooks and replay
 │   ├── durable.cpp             # Durable directories: create, recover, checkpoint
 │   ├── sparse.cpp              # Sparse index, BM25, fusion
+│   ├── collection.cpp          # Collections
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 839 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 851 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -418,6 +420,8 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Collections** (`collection.cpp`). A `Collection` owns up to three sides (an `HnswIndex` without metadata, and one `SparseIndex` each for BM25 text and learned sparse vectors), plus its own ID table (slots, a free list kept in order), texts and a `MetadataStore`. Filters compile against the collection's metadata and reach every side as a predicate. A change is validated, logged once (`kDocument`, `kDocumentRemove`, `kDocumentMetadata` records), then applied side by side under the collection's exclusive lock; the old parts are read first so that an out-of-memory failure on a later side restores the earlier ones. Searches hold the shared lock; a per-thread list of collections being searched lets predicates read without locking again and refuses changes (instead of deadlocking). Search fuses any number of ranked lists by RRF or min-max-scaled scores. Durable collections reuse the durable-directory code (kind 3) with one log; the snapshot embeds each side's own file. `SparseIndex` saves its compacted form, so saved bytes do not depend on removals awaiting compaction.
 
 **Sparse vectors and hybrid search** (`sparse.cpp`). `SparseIndex` stores each document's sorted terms and weights per slot, a posting list (slots ascending, weights) per term, and exact document frequencies. A search accumulates `query weight x document weight` into per-thread score buffers (reset only where touched; a search nested in a predicate gets its own) over the query's posting lists, skipping removed slots, then keeps the k best after filters and predicates. Removal marks the slot dead and leaves its posting entries; once dead entries outnumber live ones, posting lists and slots are rebuilt aside and swapped in. Inserts reserve every allocation before the metadata write, so they are all-or-nothing under allocation failure. The file format reuses the checksummed sections (index kind 3). `Bm25` hashes tokens (FNV-1a) and splits BM25 into document and query weights; `fuse()` combines ranked lists by RRF or min-max-scaled scores.
 

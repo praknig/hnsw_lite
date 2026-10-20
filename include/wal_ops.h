@@ -17,6 +17,7 @@
 
 #include "health.h"
 #include "metadata.h"
+#include "sparse.h"
 #include "filter.h"
 
 namespace vecdb::walop {
@@ -38,6 +39,9 @@ enum Type : std::uint8_t {
     kCreatePayloadIndex = 15,  ///< field name
     kSetPlanner = 16,          ///< PlannerParams
     kSetAutoCompact = 17,      ///< fraction
+    kDocument = 20,            ///< Collection: id, parts, vector, text, sparse vector, metadata (an upsert)
+    kDocumentRemove = 21,      ///< Collection: ids
+    kDocumentMetadata = 22,    ///< Collection: ids, metadata changes
 };
 
 /// A decoded operation; only the fields its type uses are set.
@@ -52,6 +56,9 @@ struct Op {
     std::string field;
     PlannerParams planner;
     double fraction = 0;
+    std::uint8_t parts = 0;  ///< kDocument: 1 vector, 2 text, 4 sparse vector
+    std::string text;
+    SparseVector sparse;
 };
 
 std::vector<unsigned char> encode_add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
@@ -66,6 +73,8 @@ std::vector<unsigned char> encode_rebuild(const RebuildOptions& o);
 std::vector<unsigned char> encode_field(std::string_view field);
 std::vector<unsigned char> encode_planner(const PlannerParams& p);
 std::vector<unsigned char> encode_fraction(double fraction);
+std::vector<unsigned char> encode_document(std::uint64_t id, std::uint8_t parts, std::span<const float> vector, std::string_view text,
+                                           const SparseVector& sparse, const Metadata& metadata);
 
 /// Decodes a record. Throws FormatError for an unknown type or a payload that
 /// does not match its type (a checksum guards the bytes; this guards the meaning).

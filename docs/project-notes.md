@@ -21,7 +21,7 @@ These are deliberate for the current stage:
 - **A plain `save()` does not force data onto the physical disk:** it is atomic (temporary file, then rename), but a power cut right after it returns could lose it. Durable directories (`open_durable()`) flush their log and snapshots to the disk itself.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
-- **A standalone `SparseIndex` has no write-ahead log** (save it, or rebuild it from your data), and its search is exact without pruning: very common terms make long posting lists.
+- **A standalone `SparseIndex` has no write-ahead log** (a `Collection` logs its text and sparse sides) (save it, or rebuild it from your data), and its search is exact without pruning: very common terms make long posting lists.
 - **One process per durable directory**, enforced with a lock file; a checkpoint holds changes (not searches) while its snapshot is written.
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
 - **Dynamic metadata fields are never removed**, even when no vector uses them: field names are the schema, and removing one automatically would silently forget its type. Unused strings, by contrast, are reclaimed.
@@ -64,7 +64,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
 - [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
 - [ ] Fuzzing the file and log loaders
-- [ ] A `Collection` API, automatic maintenance, Python bindings (see the [suggested order](feature-catalog.md#suggested-order))
+- [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
+- [ ] Automatic maintenance, presets, Python bindings (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe

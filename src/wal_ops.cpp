@@ -201,6 +201,20 @@ std::vector<unsigned char> encode_planner(const PlannerParams& p) {
     return std::move(o.bytes);
 }
 
+std::vector<unsigned char> encode_document(std::uint64_t id, std::uint8_t parts, std::span<const float> vector, std::string_view text,
+                                           const SparseVector& sparse, const Metadata& metadata) {
+    Out o;
+    o.put<std::uint64_t>(id);
+    o.put<std::uint8_t>(parts);
+    o.put_floats(vector);
+    o.put_string(text);
+    o.put<std::uint64_t>(sparse.size());
+    for (const std::uint32_t t : sparse.indices) o.put<std::uint32_t>(t);
+    for (const float w : sparse.values) o.put<float>(w);
+    o.put_metadata(metadata);
+    return std::move(o.bytes);
+}
+
 std::vector<unsigned char> encode_fraction(double fraction) {
     Out o;
     o.put<double>(fraction);
@@ -259,6 +273,27 @@ Op decode(std::uint8_t type, std::span<const unsigned char> payload) {
             break;
         }
         case kSetAutoCompact: op.fraction = in.get<double>(); break;
+        case kDocument: {
+            op.ids.push_back(in.get<std::uint64_t>());
+            op.parts = in.get<std::uint8_t>();
+            if (op.parts > 7) throw FormatError("log record: unknown document parts");
+            op.vectors = in.get_floats();
+            op.text = in.get_string();
+            const std::uint64_t n = in.get<std::uint64_t>();
+            if (n > (payload.size()) / 8) throw FormatError("log record: more sparse terms than bytes");
+            op.sparse.indices.resize(static_cast<std::size_t>(n));
+            op.sparse.values.resize(static_cast<std::size_t>(n));
+            for (auto& t : op.sparse.indices) t = in.get<std::uint32_t>();
+            for (auto& w : op.sparse.values) w = in.get<float>();
+            op.metadata.push_back(in.get_metadata());
+            break;
+        }
+        case kDocumentRemove: op.ids = in.get_ids(); break;
+        case kDocumentMetadata: {
+            op.ids = in.get_ids();
+            op.metadata.push_back(in.get_metadata());
+            break;
+        }
         default: throw FormatError("log record of unknown type " + std::to_string(type));
     }
     in.done();
