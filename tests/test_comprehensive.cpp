@@ -16529,7 +16529,7 @@ TEST(sparse, sp01_search_is_exact) {
 TEST(sparse, sp02_input_rules) {
     SparseIndex s(Schema::strict({{"k", FieldType::Keyword}}));
     s.add(1, {{5, 2, 9}, {0.5f, 1.0f, 0.0f}});  // unsorted, a zero weight
-    CHECK(s.get_vector(1) == SparseVector({2, 5}, {1.0f, 0.5f}) && s.terms() == 2 && s.document_frequency(9) == 0);
+    CHECK((s.get_vector(1) == SparseVector{{2, 5}, {1.0f, 0.5f}}) && s.terms() == 2 && s.document_frequency(9) == 0);
     CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{1, 2}, {1.0f}}));                 // lengths differ
     CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{3, 3}, {1.0f, 2.0f}}));            // a repeated term
     CHECK_THROWS_AS(std::invalid_argument, s.add(2, {{3}, {kNaN}}));                     // not finite
