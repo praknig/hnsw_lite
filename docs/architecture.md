@@ -111,6 +111,9 @@ hnsw-lite/
 │   ├── vamana.h                # The Vamana graph (DiskANN)
 │   ├── disk_index.h            # The disk-based index
 │   ├── health.h                # Health reports
+│   ├── wal.h                   # Write-ahead log segments
+│   ├── wal_ops.h               # Logged operations and their encoding
+│   ├── durable.h               # Durable directories
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -132,10 +135,14 @@ hnsw-lite/
 │   ├── health.cpp              # Health reports for every index type
 │   ├── upkeep.cpp              # Incremental upkeep (consolidation, reconnection)
 │   ├── rebuild.cpp             # Rebuilding while in use, with an atomic swap
+│   ├── wal.cpp                 # Log segments: writing, syncing, reading
+│   ├── wal_ops.cpp             # Encoding logged operations
+│   ├── wal_replay.cpp          # Logging hooks and replay
+│   ├── durable.cpp             # Durable directories: create, recover, checkpoint
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 793 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 825 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -405,6 +412,8 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Durability** (`wal.cpp`, `wal_ops.cpp`, `wal_replay.cpp`, `durable.cpp`). A log segment is a checksummed header (magic, version, index identity, first LSN) and records (length, CRC-32, LSN, type, payload), written with positional writes; a failed append is cut back to the last complete record, and a writer that cannot cut back or sync refuses further work. Reading tells a torn tail (an incomplete record, an invalid record ending exactly at the end, or zero-filled space) from corruption (an invalid record followed by data, an LSN out of sequence). Every public change is logged under the write lock by a scope guard that writes an abort record if the operation then throws; operations depending on state are logged as their effect (upsert as add or update, filtered removals and metadata changes as their IDs). Replay applies records through the public methods, skipping aborted ones; failed inserts restore the level generator, so replay reproduces the graph. A durable directory holds DURABLE (identity), numbered snapshots and segments, and LOCK; checkpoints rotate the segment and write the snapshot under the shared lock and a checkpoint mutex, then prune; recovery takes the newest readable snapshot, collects records across segments without gaps, accepts a torn tail only in the last segment, and drops a failing final operation (with a checkpoint). A background thread flushes in `Grouped` mode.
 
 **Rebuilding** (`rebuild.cpp`). While a rebuild runs, every write path records the IDs it is about to change (`note_change`, before anything can fail; recording an unchanged ID is harmless, missing one would revive stale data). HNSW: phase 1 copies every record under the lock and samples stored vectors to train a codec on; phase 2, without any lock, builds a new index from the copy (a new codec trained first, or the old one cloned when only codes are kept); phase 3, under the lock, removes and re-adds each recorded ID through the new index's own unlocked paths (public calls from inside an index operation are refused), upkeeps the new graph if that removed anything, and moves the new state in. Flat: phase 1 copies the stored vectors; phase 2 trains the codec and k-means centroids on a sample and computes every copied vector's code and list; phase 3 matches current rows to the copy by ID (rows move when others are removed), recomputes the recorded ones, and swaps codec, codes, centroids, lists and positions together. Everything that can fail runs before the commit, and a failure stops the tracking.
 

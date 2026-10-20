@@ -90,8 +90,10 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
     records.shrink_to_fit();
     HnswIndex& fresh = *built;
 
-    // 3. Under the lock: copy in the IDs changed meanwhile, then swap.
+    // 3. Under the lock: copy in the IDs changed meanwhile, then swap. Logged here,
+    //    where it takes effect: after the changes made meanwhile (logged by them).
     const auto guard = lock_.write("rebuild");
+    const Logged logged(this, log_begin(walop::kRebuild, [&] { return walop::encode_rebuild(rebuild_options); }));
     try {
         const IdMap& ids = storage_.ids();
         for (std::uint64_t id : *changed_) {
@@ -211,6 +213,7 @@ RebuildStats FlatIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
 
     // 3. Under the lock: rows changed meanwhile anew, then everything at once.
     const auto guard = lock_.write("rebuild");
+    const Logged logged(this, log_begin(walop::kRebuild, [&] { return walop::encode_rebuild(rebuild_options); }));
     try {
         std::unordered_map<std::uint64_t, std::size_t> at;  // ID -> snapshot position
         at.reserve(n);
@@ -271,3 +274,4 @@ RebuildStats FlatIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
 }
 
 }  // namespace vecdb
+

@@ -63,7 +63,7 @@ Every feature that could be added to hnsw-lite, in one place: the open roadmap i
 
 | # | Feature | Status | Merges | Effort |
 |---|---|---|---|---|
-| 5.1 | **Durability:** a write-ahead log, so changes since the last save survive a crash, plus snapshots | new | | 3–4 days |
+| 5.1 | **Durability:** a write-ahead log, so changes since the last save survive a crash, plus snapshots | **done**: `open_durable()`, `checkpoint()`, three modes | | |
 | 5.2 | **Memory-mapped loading:** near-instant loading of large indexes; includes the arena storing offsets instead of pointers | roadmap | Memory-mapped loading; N8 (offsets) | 3 days |
 | 5.3 | **Collections:** many named indexes in one database directory | new | | 2 days |
 | 5.4 | **Import and export:** NumPy `.npy`, `.fvecs` and `.ivecs`, metadata as JSON | new | Reading `.fvecs` exists in `bench_baseline` | 1–2 days |

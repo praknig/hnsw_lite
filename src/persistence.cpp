@@ -348,6 +348,10 @@ void FlatIndex::save(const std::string& path, const OperationOptions& options) c
 
 void FlatIndex::save(std::ostream& out, const OperationOptions& options) const {
     const auto guard = lock_.read();  // a save reads: searches continue, changes wait
+    save_unlocked(out, options);
+}
+
+void FlatIndex::save_unlocked(std::ostream& out, const OperationOptions& options) const {
     const persist::StreamErrorsThrow errors(out);
     detail::OperationControl control(options, vectors_.size());  // progress counts records written
     persist::write_header(out, IndexKind::Flat);
@@ -500,6 +504,10 @@ void HnswIndex::save(const std::string& path, const OperationOptions& options) c
 
 void HnswIndex::save(std::ostream& out, const OperationOptions& options) const {
     const auto guard = lock_.read();  // a save reads: searches continue, changes wait
+    save_unlocked(out, options);
+}
+
+void HnswIndex::save_unlocked(std::ostream& out, const OperationOptions& options) const {
     const persist::StreamErrorsThrow errors(out);
     detail::OperationControl control(options, storage_.size());  // progress counts records written
     const IdMap& ids = storage_.ids();

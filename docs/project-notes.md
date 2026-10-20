@@ -58,6 +58,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Health reports for every index type (step 1 of index upkeep)
 - [x] Index upkeep: better repair under churn, incremental `upkeep()`, automatic `compact()` (step 2)
 - [x] Rebuilds while in use, with an atomic swap, retraining codecs and IVF lists (step 3)
+- [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
