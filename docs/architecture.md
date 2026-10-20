@@ -148,7 +148,10 @@ hnsw-lite/
 │   └── test_comprehensive.cpp  # All 839 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
-    └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
+    ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
+    ├── bench_baseline.cpp      # Fixed-seed baseline, or a real dataset (.fvecs)
+    ├── bench_codecs.cpp        # Code kernels: SQ8, binary, PQ
+    └── bench_durability.cpp    # Additions per second in each durability mode
 ```
 
 Layer 1 and the Layer 3 helpers are header-only. Layer 2's kernels and Layer 3's indexes are compiled into a static library (`hnsw_lite`); the SIMD files need their own compiler flags, and the indexes contain real logic.

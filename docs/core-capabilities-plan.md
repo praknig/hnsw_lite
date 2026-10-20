@@ -1,5 +1,7 @@
 # Core capabilities: design plan
 
+> **Status: completed.** Real deletion, updating vectors, saving and loading, and concurrent inserts are all implemented. Kept as a record of the design decisions.
+
 This document plans four capabilities that hnsw-lite lacks compared with production vector databases:
 
 1. Real deletion

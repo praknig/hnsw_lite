@@ -1,5 +1,7 @@
 # Hardening and performance plan
 
+> **Status: hardening completed; performance items partly open.** The open items are tracked in the [features](feature-catalog.md#open-features). Kept as a record of the design decisions.
+
 This plan combines two pieces of work that depend on each other: closing the edge cases a design review found, and making search and build faster. It sets out what will be done, in which order, and how each step is proven. Nothing here is implemented yet.
 
 Related documents: the [core capabilities plan](core-capabilities-plan.md) (persistence and concurrency, which this plan schedules), [Performance and tuning](performance.md) (current benchmarks) and [Testing](testing.md).

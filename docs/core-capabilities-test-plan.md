@@ -1,5 +1,7 @@
 # Core capabilities: test plan
 
+> **Status: completed.** These scenarios are part of the test suite; see [testing](testing.md). Kept as a record of the test design.
+
 Test scenarios for the four features designed in [core-capabilities-plan.md](core-capabilities-plan.md): real deletion, updating vectors, saving and loading, and concurrent inserts. The last section analyzes how these features affect the existing tests.
 
 Status: **all four sections are implemented**, in the `deletion`, `update`, `persistence`, `concurrency` and `add_batch` groups, with every test named after its scenario ID (see the [testing page](testing.md) for the current suite). Each scenario has an ID so it can be traced to its test once written. All tests go into `tests/test_comprehensive.cpp`.
