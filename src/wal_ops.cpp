@@ -36,7 +36,7 @@ public:
             put<std::uint8_t>(value ? 1 : 0);  // 0: unset the field
             if (!value) continue;
             put<std::uint8_t>(static_cast<std::uint8_t>(value->type));
-            switch (value->type) {
+            switch (value->type) {  // GCOVR_EXCL_BR_LINE: every type has a case
                 case FieldType::Int: put<std::int64_t>(value->i); break;
                 case FieldType::Float: put<double>(value->f); break;
                 case FieldType::Bool: put<std::uint8_t>(value->b ? 1 : 0); break;

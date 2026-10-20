@@ -43,7 +43,7 @@ T get(const unsigned char* at) {
 bool fires(std::atomic<long>& countdown) {
     long v = countdown.load();
     while (v >= 0) {
-        if (countdown.compare_exchange_weak(v, v - 1)) return v == 0;
+        if (countdown.compare_exchange_weak(v, v - 1)) return v == 0;  // GCOVR_EXCL_BR_LINE: a retry needs a concurrent fault switch
     }
     return false;
 }
@@ -143,7 +143,7 @@ WalScan scan(const std::string& path, bool keep) {
     WalScan s;
     s.file_size = std::filesystem::file_size(path);
     unsigned char h[wal::kHeaderSize];
-    if (s.file_size < wal::kHeaderSize || !in.read(reinterpret_cast<char*>(h), wal::kHeaderSize))
+    if (s.file_size < wal::kHeaderSize || !in.read(reinterpret_cast<char*>(h), wal::kHeaderSize))  // GCOVR_EXCL_BR_LINE: a read fails only on a disk error
         throw FormatError("log segment header incomplete");
     if (std::memcmp(h, kMagic, 8) != 0) throw FormatError("not a log segment (wrong magic)");
     if (get<std::uint32_t>(h + 36) != persist::crc32(0, h, 36)) throw FormatError("log segment header checksum mismatch");
@@ -171,7 +171,7 @@ WalScan scan(const std::string& path, bool keep) {
         const std::uint32_t length = get<std::uint32_t>(r);
         const std::uint64_t end = pos + wal::kRecordHeaderSize + length;
         if (length > wal::kMaxPayload) {  // garbage length: its end is unknown
-            if (zeros_to_end(pos)) break;
+            if (zeros_to_end(pos)) break;  // GCOVR_EXCL_BR_LINE: zeros make a length of 0, never too large
             throw FormatError("log segment corrupt (invalid record length) at offset " + std::to_string(pos));
         }
         if (end > s.file_size) break;  // extends past the end: torn tail
@@ -268,7 +268,7 @@ void WalWriter::close() noexcept {
 std::uint64_t WalWriter::append(std::uint8_t type, std::span<const unsigned char> payload) {
     if (broken_) throw std::runtime_error("log segment " + path_ + " is broken: reopen it");
     if (type == 0) throw std::invalid_argument("log record type 0 is reserved");
-    if (payload.size() > wal::kMaxPayload) throw std::invalid_argument("log record payload larger than 1 GiB");
+    if (payload.size() > wal::kMaxPayload) throw std::invalid_argument("log record payload larger than 1 GiB");  // GCOVR_EXCL_BR_LINE: needs a 1 GiB payload
     std::vector<unsigned char> rec(wal::kRecordHeaderSize + payload.size());
     put<std::uint32_t>(rec.data(), static_cast<std::uint32_t>(payload.size()));
     put<std::uint64_t>(rec.data() + 8, next_lsn_);
@@ -346,4 +346,3 @@ FileLock::~FileLock() {
 }
 
 }  // namespace vecdb
-

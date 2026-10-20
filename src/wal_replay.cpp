@@ -51,9 +51,10 @@ bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own)
                 default:
                     if (!own(op)) throw FormatError("log record of a type this index cannot replay");
             }
-        } catch (const FormatError&) {
+        } catch (const FormatError&) {  // GCOVR_EXCL_START: no index operation throws FormatError
             throw;
-        } catch (const std::exception& e) {
+        }  // GCOVR_EXCL_STOP
+        catch (const std::exception& e) {
             // The final operation may have been in progress when the process stopped:
             // logged, failed, and stopped before its abort record. Anywhere else, the
             // log does not match the index.
@@ -155,7 +156,7 @@ bool FlatIndex::replay(std::span<const WalRecord> records) {
 }
 
 void HnswIndex::flush_log() noexcept {
-    if (!log_ || log_->broken()) return;
+    if (!log_ || log_->broken()) return;  // GCOVR_EXCL_BR_LINE: called only for durable indexes, which always have a log
     const std::uint64_t size = log_->size();
     if (size == log_synced_) return;  // nothing new since the last flush
     try {
@@ -166,7 +167,7 @@ void HnswIndex::flush_log() noexcept {
 }
 
 void FlatIndex::flush_log() noexcept {
-    if (!log_ || log_->broken()) return;
+    if (!log_ || log_->broken()) return;  // GCOVR_EXCL_BR_LINE: called only for durable indexes, which always have a log
     const std::uint64_t size = log_->size();
     if (size == log_synced_) return;  // nothing new since the last flush
     try {
@@ -177,4 +178,3 @@ void FlatIndex::flush_log() noexcept {
 }
 
 }  // namespace vecdb
-

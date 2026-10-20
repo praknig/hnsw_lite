@@ -16306,6 +16306,155 @@ TEST(durable, du14_real_process_kills) {
 #endif
 }
 
+TEST(wal, wl19_every_path) {
+    const std::string path = wal_path("wl19");
+    // A failing header write removes the half-created segment.
+    wal_faults::fail_write_after_bytes = 10;
+    CHECK_THROWS_AS(std::runtime_error, (void)WalWriter::create(path, 7, 1));
+    wal_faults::disarm();
+    CHECK(!std::filesystem::exists(path));
+    {
+        WalWriter w = WalWriter::create(path, 7, 1);
+        w.append(1, wal_payload(5, 1));
+        WalWriter& same = w;
+        w = std::move(same);  // self-assignment keeps the writer
+        CHECK(w.append(1, {}) == 2);
+    }
+    // A record with a valid checksum but type 0 (reserved), at the end: a torn tail.
+    std::string bytes = read_file(path);
+    std::string rec(wal::kRecordHeaderSize, '\0');
+    unsigned char lsn[8];
+    persist::to_little_endian(std::uint64_t(3), lsn);
+    rec.replace(8, 8, reinterpret_cast<const char*>(lsn), 8);
+    unsigned char crc[4];
+    persist::to_little_endian(persist::crc32(0, rec.data() + 8, 9), crc);
+    rec.replace(4, 4, reinterpret_cast<const char*>(crc), 4);
+    write_file(path, bytes + rec);
+    CHECK(wal::read_segment(path).records.size() == 2 && wal::read_segment(path).torn_tail());
+    // Reopening cannot cut that tail off: an error, and nothing appended.
+    wal_faults::fail_truncate_after = 0;
+    CHECK_THROWS_AS(std::runtime_error, (void)WalWriter::open(path, 7));
+    wal_faults::disarm();
+    // Syncing a file, a directory, and locking, where they cannot be opened.
+    wal_faults::fail_sync_after = 0;
+    CHECK_THROWS_AS(std::runtime_error, wal::sync_path(path));
+    wal_faults::disarm();
+    CHECK_THROWS_AS(std::runtime_error, wal::sync_directory(temp_path("wl19_no_such_dir") + "/x"));
+    CHECK_THROWS_AS(std::runtime_error, FileLock(temp_path("wl19_no_such_dir") + "/x/LOCK"));
+    // Encodings of the remaining settings; metadata of an unknown type.
+    UpkeepOptions u;
+    u.reconnect = false;
+    RebuildOptions r;
+    r.retrain = false;
+    CHECK(!walop::decode(walop::kUpkeep, walop::encode_upkeep(u)).upkeep.reconnect && !walop::decode(walop::kRebuild, walop::encode_rebuild(r)).rebuild.retrain);
+    std::vector<unsigned char> add = walop::encode_add(1, std::vector<float>{1}, Metadata().set("k", std::int64_t(1)));
+    add[8 + 8 + 4 + 4 + 4 + 1 + 1 - 1 + 1] = 9;  // the value's type byte (after id, vector, count, name, present)
+    CHECK_THROWS_AS(FormatError, (void)walop::decode(walop::kAdd, add));
+    // Records a given index type cannot replay.
+    const std::vector<WalRecord> lists = {{1, walop::kTrainLists, {}}}, upkeep = {{1, walop::kUpkeep, walop::encode_upkeep({})}};
+    CHECK_THROWS_AS(FormatError, HnswIndex(4, Metric::L2).replay(lists));
+    CHECK_THROWS_AS(FormatError, FlatIndex(4, Metric::L2).replay(upkeep));
+    // Flat: attaching and detaching rules, replay with a log attached, a failed abort.
+    FlatIndex f(4, Metric::L2);
+    CHECK_THROWS_AS(std::invalid_argument, f.attach_log(new_log(temp_path("wl19b"), 0)));
+    f.attach_log(new_log(temp_path("wl19b")));
+    CHECK_THROWS_AS(std::logic_error, f.replay({}));
+    f.add(1, std::vector<float>{1, 2, 3, 4});
+    wal_faults::fail_write_after_bytes = static_cast<long long>(wal::kRecordHeaderSize + walop::encode_add(1, std::vector<float>{1, 2, 3, 4}, {}).size()) + 3;
+    CHECK_THROWS_AS(std::invalid_argument, f.add(1, std::vector<float>{1, 2, 3, 4}));  // logged, fails, its abort cannot be written
+    wal_faults::disarm();
+    CHECK_THROWS_AS(std::runtime_error, f.add(2, std::vector<float>{1, 2, 3, 4}));
+    (void)f.detach_log();
+    std::filesystem::remove(path);
+    std::filesystem::remove(temp_path("wl19b"));
+}
+
+TEST(durable, du15_every_path) {
+    auto data = random_vectors(40, 4, 2420);
+    const std::string dir = durable_dir("du15");
+    {
+        auto f = FlatIndex::open_durable(dir, 4, Metric::L2);
+        CHECK_THROWS_AS(std::logic_error, f->attach_log(new_log(temp_path("du15l"))));
+        CHECK_THROWS_AS(std::logic_error, (void)f->detach_log());
+        for (std::uint64_t i = 0; i < 10; ++i) f->add(i, data[i]);
+        // A checkpoint whose snapshot cannot be created (its temporary name is taken by a directory).
+        std::filesystem::create_directories(std::filesystem::path(dir) / "snapshot-00000000000000000011.idx.tmp" / "x");
+        CHECK_THROWS_AS(std::runtime_error, (void)f->checkpoint());
+        std::filesystem::remove_all(std::filesystem::path(dir) / "snapshot-00000000000000000011.idx.tmp");
+        f->add(10, data[10]);
+    }
+    FlatIndex plain(4, Metric::L2);
+    CHECK_THROWS_AS(std::logic_error, (void)plain.checkpoint());
+    CHECK_THROWS_AS(std::invalid_argument, (void)FlatIndex::open_durable(dir, 5, Metric::L2));
+    CHECK_THROWS_AS(std::invalid_argument, (void)FlatIndex::open_durable(dir, 4, Metric::Cosine));
+    // Unrelated and misnamed files are ignored.
+    for (const char* name : {"notes.txt", "wal-abc.log", "snapshot-0000000000000000000x.idx", "wal-000000000000000000001.log",
+                             "xal-00000000000000000001.log", "wal-00000000000000000001.lgx", "wal-0000000000000000000x.log"})
+        write_file((std::filesystem::path(dir) / name).string(), "x");
+    CHECK(FlatIndex::open_durable(dir, 4, Metric::L2)->size() == 11);
+    // A segment renamed to another LSN is refused.
+    const std::string copy = crash_copy(dir, "du15c");
+    const auto seg = files_of(copy, "wal-0").back();
+    std::filesystem::rename(std::filesystem::path(copy) / seg, std::filesystem::path(copy) / "wal-00000000000000000002.log");
+    CHECK_THROWS_AS(FormatError, (void)FlatIndex::open_durable(copy, 4, Metric::L2));
+    std::filesystem::remove_all(copy);
+    // No segment at all: recovery starts one.
+    const std::string bare = crash_copy(dir, "du15b");
+    for (const auto& s : files_of(bare, "wal-0")) std::filesystem::remove(std::filesystem::path(bare) / s);
+    {
+        auto f = FlatIndex::open_durable(bare, 4, Metric::L2);
+        CHECK(f->size() == 0);  // the only snapshot is the empty one: the changes were in the segments
+        f->add(20, data[20]);
+    }
+    CHECK(FlatIndex::open_durable(bare, 4, Metric::L2)->contains(20));
+    std::filesystem::remove_all(bare);
+    // DURABLE cut short; a creation cut short that had left a segment too.
+    const std::string shortmeta = crash_copy(dir, "du15m");
+    write_file((std::filesystem::path(shortmeta) / "DURABLE").string(), "HNSWDUR1");
+    CHECK_THROWS_AS(FormatError, (void)FlatIndex::open_durable(shortmeta, 4, Metric::L2));
+    write_file((std::filesystem::path(shortmeta) / "DURABLE").string(), std::string(32, 'z'));  // full length, wrong magic
+    CHECK_THROWS_AS(FormatError, (void)FlatIndex::open_durable(shortmeta, 4, Metric::L2));
+    std::filesystem::remove(std::filesystem::path(shortmeta) / "DURABLE");
+    RecoveryStats st;
+    CHECK(FlatIndex::open_durable(shortmeta, 4, Metric::L2, Schema::dynamic(), {}, {}, {}, &st)->size() == 0 && st.created && files_of(shortmeta, "wal-00000000000000000001.log").size() == 1);
+    std::filesystem::remove_all(shortmeta);
+    // Flat: an operation unfinished at a crash is dropped, and a checkpoint taken.
+    {
+        const std::string s = (std::filesystem::path(dir) / files_of(dir, "wal-0").back()).string();
+        WalWriter w = WalWriter::open(s, wal::read_segment(s).identity);
+        (void)w.append(walop::kAdd, walop::encode_add(3, data[3], {}));  // a duplicate
+    }
+    {
+        auto f = FlatIndex::open_durable(dir, 4, Metric::L2, Schema::dynamic(), {}, {}, {}, &st);
+        CHECK(st.dropped_unfinished && f->size() == 11);
+    }
+    // Grouped mode with a failing background flush: changes are refused until a checkpoint.
+    DurableOptions g;
+    g.group_interval = std::chrono::milliseconds(1);
+    {
+        auto h = HnswIndex::open_durable(durable_dir("du15g"), 4, Metric::L2, {}, Schema::dynamic(), g);
+        wal_faults::fail_sync_after = 0;  // armed first: the next background flush has something new
+        h->add(1, data[1]);
+        for (int i = 0; i < 200 && wal_faults::fail_sync_after.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        wal_faults::disarm();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));  // the broken writer is skipped from now on
+        CHECK_THROWS_AS(std::runtime_error, h->add(2, data[2]));
+        (void)h->checkpoint();
+        h->add(2, data[2]);
+        auto f = FlatIndex::open_durable(durable_dir("du15f"), 4, Metric::L2, Schema::dynamic(), {}, {}, g);
+        wal_faults::fail_sync_after = 0;
+        f->add(1, data[1]);
+        for (int i = 0; i < 200 && wal_faults::fail_sync_after.load() == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        wal_faults::disarm();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK_THROWS_AS(std::runtime_error, f->add(2, data[2]));
+    }
+    std::filesystem::remove_all(durable_dir("du15g"));
+    std::filesystem::remove_all(durable_dir("du15f"));
+    std::filesystem::remove_all(dir);
+    std::filesystem::remove(temp_path("du15l"));
+}
+
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================

@@ -140,7 +140,7 @@ Opened<Index> open_dir(const std::string& dir, Kind kind, Create&& create, Load&
             try {
                 o.index = load(join(dir, snapshot_name(*it)));
                 st.snapshot_lsn = *it;
-            } catch (const FormatError&) {
+            } catch (const FormatError&) {  // GCOVR_EXCL_BR_LINE: other errors (a snapshot that cannot be opened) propagate
                 ++st.fallbacks;
             }
         }
@@ -155,14 +155,14 @@ Opened<Index> open_dir(const std::string& dir, Kind kind, Create&& create, Load&
             if (s.identity != identity) throw FormatError("log segment from another index in " + dir);
             if (s.first_lsn != segs[i]) throw FormatError("log segment named for another LSN in " + dir);
             const std::uint64_t end = s.first_lsn + s.records.size();
-            if (end <= expected && !(end == expected && i + 1 == segs.size())) continue;  // before the snapshot
+            if (end <= expected && !(end == expected && i + 1 == segs.size())) continue;  // before the snapshot  // GCOVR_EXCL_BR_LINE: checkpoints leave no empty segment before another
             if (s.first_lsn > expected) throw FormatError("log records missing before LSN " + std::to_string(s.first_lsn) + " in " + dir);
             if (s.torn_tail() && i + 1 != segs.size())
                 throw FormatError("a torn record in an earlier log segment (history lost) in " + dir);
             st.torn_bytes = s.file_size - s.valid_end;
             ++st.segments;
             for (WalRecord& r : s.records)
-                if (r.lsn >= expected) records.push_back(std::move(r));
+                if (r.lsn >= expected) records.push_back(std::move(r));  // GCOVR_EXCL_BR_LINE: checkpoints start segments at snapshots, so no segment straddles one
             expected = end;
             last = join(dir, segment_name(segs[i]));
         }
