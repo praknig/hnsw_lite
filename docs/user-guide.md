@@ -23,6 +23,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - [Changing many vectors by filter](#changing-many-vectors-by-filter)
 - [Compressing vectors (SQ8)](#compressing-vectors-sq8)
 - [Binary quantization](#binary-quantization)
+- [Sparse vectors and hybrid search](#sparse-vectors-and-hybrid-search)
 - [Durability](#durability)
 - [Health reports](#health-reports)
 - [Upkeep](#upkeep)
@@ -405,6 +406,26 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
 - Training, saving, truncation and everything else work as for SQ8.
 - Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
+
+## Sparse vectors and hybrid search
+
+```cpp
+SparseIndex sparse;                                   // same IDs as the dense index
+Bm25 bm25;
+bm25.fit(texts);                                      // average document length
+for (std::size_t i = 0; i < texts.size(); ++i) {
+    dense.add(i, embeddings[i], metadata[i]);
+    sparse.add(i, bm25.encode_document(texts[i]), metadata[i]);   // or SPLADE weights
+}
+auto results = hybrid_search(dense, query_embedding, sparse, bm25.encode_query(query_text, sparse), 10);
+for (const HybridResult& r : results) { /* r.id, r.score, r.dense_rank, r.sparse_rank */ }
+```
+
+A `SparseVector` is a set of (term, weight) pairs (`indices`, `values`; any order, distinct terms, finite weights; zero weights are dropped). `SparseIndex` keeps a posting list per term and searches exactly: it sums the query's products over its terms' posting lists, so a search costs the total length of those lists, not the index size, and returns only documents sharing a term with the query (distance = minus the dot product). It has the dense indexes' interface for records: `add`, `remove`, `remove_batch`, `remove_where`, `update`, `upsert`, `set_metadata`, `get_vector`, `get_metadata`, filters, predicates, deadlines and statistics in `SearchOptions`, thread safety, and checksummed `save` and `load`. Removal is lazy; posting lists and slots are rebuilt once dead entries or dead slots outnumber live ones (or by `compact()`). Searches reuse per-thread score buffers, so their cost does not grow with the index size.
+
+- **BM25:** `Bm25` turns text into sparse vectors whose dot product is the BM25 score: documents carry the term-frequency part (with `k1`, `b` and the average document length, set by `fit()`), queries the IDF part, computed from the index's document frequencies when the query is encoded. Tokens are lowercase runs of letters and digits (UTF-8 bytes count as letters), hashed to 32-bit term IDs; two tokens with the same hash merge, which is rare. Stemming and stop words are left to you: tokenize your way and build `SparseVector`s directly, or use a learned model such as SPLADE.
+- **Fusion:** `hybrid_search(dense_index, dense_query, sparse_index, sparse_query, k, options)` takes `max(4k, 20)` candidates from each side (`dense_k`, `sparse_k`) and fuses them by ID. Reciprocal Rank Fusion (default) scores each document `dense_weight / (rrf_k + dense rank) + sparse_weight / (rrf_k + sparse rank)` with `rrf_k = 60`: robust, since it uses ranks only. `Fusion::Weighted` scales each list's scores to [0, 1] and adds them with the weights instead, keeping how much better one result is than the next. `options.filter` applies to both sides. `fuse()` fuses any two result lists you already have.
+- **Limits:** a `SparseIndex` has no write-ahead log yet (save it, or rebuild it from your data), and search is exact without pruning: very common terms make long posting lists, so drop stop words for large collections.
 
 ## Durability
 

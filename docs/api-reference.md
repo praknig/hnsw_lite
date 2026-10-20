@@ -324,3 +324,15 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `attach_log(WalWriter)`, `detach_log()`, `replay(records)` | Lower level: log a non-durable index's changes yourself; replay returns whether an unfinished final operation was dropped |
 | `WalWriter`, `wal::read_segment`, `WalScan`, `WalRecord` | Log segments: appending, syncing, reading with torn-tail detection |
 
+## Sparse vectors and hybrid search
+
+| Name | Description |
+|---|---|
+| `SparseVector` | `indices` (terms), `values` (weights); `sparse_dot(a, b)` |
+| `SparseIndex(schema)` | `add`, `remove`, `remove_batch`, `remove_where`, `update`, `upsert`, `set_metadata`, `contains`, `size`, `get_vector`, `get_metadata`, `records`, `search(query, k, options)`, `document_frequency(term)`, `terms`, `postings`, `dead_postings`, `slots`, `compact`, `save`, `load` |
+| `Bm25(Bm25Params)` | `k1` (1.2), `b` (0.75), `avg_doc_length` (100); `fit(documents)`, `encode_document(text)`, `encode_query(text, index)`, `tokenize`, `term_id` |
+| `hybrid_search(dense, dense_query, sparse, sparse_query, k, options)` | Dense and sparse searches fused by ID; the dense index is any `HnswIndex` or `FlatIndex` |
+| `fuse(dense_results, sparse_results, k, options)` | Fuses two ranked lists |
+| `HybridOptions` | `fusion` (`Rrf`, `Weighted`), `rrf_k` (60), `dense_weight`, `sparse_weight` (1), `dense_k`, `sparse_k` (0: max(4k, 20)), `dense_ef` (0: max(dense_k, 64)), `filter`, `dense_options`, `sparse_options` |
+| `HybridResult` | `id`, `score` (higher is better), `dense_rank`, `sparse_rank` (1-based), `dense_distance`, `sparse_score` |
+

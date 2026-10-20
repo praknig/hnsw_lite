@@ -19,6 +19,7 @@
 #include "filter.h"
 #include "health.h"
 #include "wal_ops.h"
+#include "change_log.h"
 #include "durable.h"
 #include "wal.h"
 #include "metadata.h"
@@ -382,7 +383,7 @@ public:
     /// planner can count matches instead of sampling. Throws std::invalid_argument otherwise.
     void create_payload_index(std::string_view field) {
         const auto guard = lock_.write("create_payload_index");
-        const Logged logged(this, log_begin(walop::kCreatePayloadIndex, [&] { return walop::encode_field(field); }));
+        const ChangeLog::Scope logged(log_, log_.begin(walop::kCreatePayloadIndex, [&] { return walop::encode_field(field); }));
         metadata_.index_field(field);
     }
 
@@ -390,7 +391,7 @@ public:
     void set_planner_params(const PlannerParams& p) {
         const auto guard = lock_.write("set_planner_params");
         validate(p);
-        const Logged logged(this, log_begin(walop::kSetPlanner, [&] { return walop::encode_planner(p); }));
+        const ChangeLog::Scope logged(log_, log_.begin(walop::kSetPlanner, [&] { return walop::encode_planner(p); }));
         planner_ = p;
     }
     /// A copy, so it is safe to call while other threads change the settings.
@@ -630,22 +631,8 @@ private:
     std::size_t updates_since_upkeep_ = 0;
     double auto_compact_ = 0;  // see set_auto_compact
     std::optional<std::unordered_set<std::uint64_t>> changed_;  // while rebuild() runs: IDs changed since its snapshot
-    std::optional<WalWriter> log_;   // write-ahead log, if attached
+    ChangeLog log_;  // write-ahead log hook (change_log.h)
     std::shared_ptr<detail::DurableState> durable_;  // the directory, if opened with open_durable
-    bool log_broken_ = false;
-    bool log_sync_each_ = false;     // Durability::Synced
-    std::uint64_t log_synced_ = 0;   // log size at the last background flush (under the checkpoint mutex)
-    void flush_log() noexcept;       // makes the log durable if it grew (flusher, closing)        // an abort record could not be written: changes refused
-    /// Appends an operation to the log (0 if none is attached). Caller holds the write lock.
-    template <class Encode>
-    std::uint64_t log_begin(std::uint8_t type, Encode&& encode) {
-        if (!log_) return 0;
-        if (log_broken_) throw std::runtime_error("index changes refused: its write-ahead log failed (attach a new one)");
-        const std::uint64_t lsn = log_->append(type, encode());
-        if (log_sync_each_) log_->sync();  // Durability::Synced: on disk before the change is made
-        return lsn;  // throws if it cannot write: the change is then not made
-    }
-    void log_abort(std::uint64_t lsn) noexcept;
     void save_unlocked(std::ostream& out, const OperationOptions& options) const;  // caller holds a lock
     /// Restores the level generator if an operation leaves by an exception: a
     /// failed change must leave the index exactly as it was, generator included,
@@ -658,16 +645,6 @@ private:
         explicit RngGuard(SplitMix64& r) : rng(r), saved(r), exceptions(std::uncaught_exceptions()) {}
         ~RngGuard() {
             if (std::uncaught_exceptions() > exceptions) rng = saved;
-        }
-    };
-    /// Appends an abort record if the logged operation leaves by an exception.
-    struct Logged {
-        HnswIndex* index;
-        std::uint64_t lsn;
-        int exceptions;
-        Logged(HnswIndex* i, std::uint64_t l) : index(i), lsn(l), exceptions(std::uncaught_exceptions()) {}
-        ~Logged() {
-            if (lsn != 0 && std::uncaught_exceptions() > exceptions) index->log_abort(lsn);
         }
     };
     void note_change(std::uint64_t id) {  // caller holds the write lock; call before changing anything

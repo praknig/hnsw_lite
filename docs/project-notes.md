@@ -59,6 +59,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Index upkeep: better repair under churn, incremental `upkeep()`, automatic `compact()` (step 2)
 - [x] Rebuilds while in use, with an atomic swap, retraining codecs and IVF lists (step 3)
 - [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
+- [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
+- [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
 - [ ] Index health report, graph upkeep under update churn, fuzzing the file loader
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

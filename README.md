@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 827 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 839 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -20,6 +20,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
 - **Bulk changes by filter:** `remove_where`, `set_metadata_where` and `count_where`, like SQL's DELETE and UPDATE with a WHERE clause.
 - **Reading records back:** `get_vector` (exactly as given), `get`, and `scan` to page through records by ID, optionally filtered.
+- **Hybrid search:** sparse vectors (BM25, SPLADE) in an exact inverted index, fused with dense results by Reciprocal Rank Fusion.
 - **Durability:** a write-ahead log with snapshots: `open_durable()` recovers every acknowledged change after a crash, with three flush modes.
 - **Health reports and upkeep:** reachability, degrees, estimated recall and drift on every index type; incremental `upkeep()` (like a database's vacuum), `rebuild()` retraining compression and IVF lists while the index stays in use, and optional automatic compaction.
 - **Disk-based index (DiskANN-style):** indexes larger than memory, built within a memory budget and searched with a few disk reads per query (concurrently), with filters.
@@ -170,7 +171,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 827 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 839 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |

@@ -111,9 +111,11 @@ hnsw-lite/
 │   ├── vamana.h                # The Vamana graph (DiskANN)
 │   ├── disk_index.h            # The disk-based index
 │   ├── health.h                # Health reports
+│   ├── change_log.h            # An index's write-ahead log hook
 │   ├── wal.h                   # Write-ahead log segments
 │   ├── wal_ops.h               # Logged operations and their encoding
 │   ├── durable.h               # Durable directories
+│   ├── sparse.h                # Sparse vectors, BM25, hybrid search
 │   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
@@ -139,10 +141,11 @@ hnsw-lite/
 │   ├── wal_ops.cpp             # Encoding logged operations
 │   ├── wal_replay.cpp          # Logging hooks and replay
 │   ├── durable.cpp             # Durable directories: create, recover, checkpoint
+│   ├── sparse.cpp              # Sparse index, BM25, fusion
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 827 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 839 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     └── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -413,7 +416,9 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 
 ### Compressed indexes
 
-**Durability** (`wal.cpp`, `wal_ops.cpp`, `wal_replay.cpp`, `durable.cpp`). A log segment is a checksummed header (magic, version, index identity, first LSN) and records (length, CRC-32, LSN, type, payload), written with positional writes; a failed append is cut back to the last complete record, and a writer that cannot cut back or sync refuses further work. Reading tells a torn tail (an incomplete record, an invalid record ending exactly at the end, or zero-filled space) from corruption (an invalid record followed by data, an LSN out of sequence). Every public change is logged under the write lock by a scope guard that writes an abort record if the operation then throws; operations depending on state are logged as their effect (upsert as add or update, filtered removals and metadata changes as their IDs). Replay applies records through the public methods, skipping aborted ones; failed inserts restore the level generator, so replay reproduces the graph. A durable directory holds DURABLE (identity), numbered snapshots and segments, and LOCK; checkpoints rotate the segment and write the snapshot under the shared lock and a checkpoint mutex, then prune; recovery takes the newest readable snapshot, collects records across segments without gaps, accepts a torn tail only in the last segment, and drops a failing final operation (with a checkpoint). A background thread flushes in `Grouped` mode.
+**Sparse vectors and hybrid search** (`sparse.cpp`). `SparseIndex` stores each document's sorted terms and weights per slot, a posting list (slots ascending, weights) per term, and exact document frequencies. A search accumulates `query weight x document weight` into per-thread score buffers (reset only where touched; a search nested in a predicate gets its own) over the query's posting lists, skipping removed slots, then keeps the k best after filters and predicates. Removal marks the slot dead and leaves its posting entries; once dead entries outnumber live ones, posting lists and slots are rebuilt aside and swapped in. Inserts reserve every allocation before the metadata write, so they are all-or-nothing under allocation failure. The file format reuses the checksummed sections (index kind 3). `Bm25` hashes tokens (FNV-1a) and splits BM25 into document and query weights; `fuse()` combines ranked lists by RRF or min-max-scaled scores.
+
+**Durability** (`wal.cpp`, `wal_ops.cpp`, `wal_replay.cpp`, `durable.cpp`). A log segment is a checksummed header (magic, version, index identity, first LSN) and records (length, CRC-32, LSN, type, payload), written with positional writes; a failed append is cut back to the last complete record, and a writer that cannot cut back or sync refuses further work. Reading tells a torn tail (an incomplete record, an invalid record ending exactly at the end, or zero-filled space) from corruption (an invalid record followed by data, an LSN out of sequence). Every public change is logged under the write lock through `ChangeLog` (`change_log.h`, shared by both in-memory indexes), whose scope guard writes an abort record if the operation then throws; operations depending on state are logged as their effect (upsert as add or update, filtered removals and metadata changes as their IDs). Replay applies records through the public methods, skipping aborted ones; failed inserts restore the level generator, so replay reproduces the graph. A durable directory holds DURABLE (identity), numbered snapshots and segments, and LOCK; checkpoints rotate the segment and write the snapshot under the shared lock and a checkpoint mutex, then prune; recovery takes the newest readable snapshot, collects records across segments without gaps, accepts a torn tail only in the last segment, and drops a failing final operation (with a checkpoint). A background thread flushes in `Grouped` mode.
 
 **Rebuilding** (`rebuild.cpp`). While a rebuild runs, every write path records the IDs it is about to change (`note_change`, before anything can fail; recording an unchanged ID is harmless, missing one would revive stale data). HNSW: phase 1 copies every record under the lock and samples stored vectors to train a codec on; phase 2, without any lock, builds a new index from the copy (a new codec trained first, or the old one cloned when only codes are kept); phase 3, under the lock, removes and re-adds each recorded ID through the new index's own unlocked paths (public calls from inside an index operation are refused), upkeeps the new graph if that removed anything, and moves the new state in. Flat: phase 1 copies the stored vectors; phase 2 trains the codec and k-means centroids on a sample and computes every copied vector's code and list; phase 3 matches current rows to the copy by ID (rows move when others are removed), recomputes the recorded ones, and swaps codec, codes, centroids, lists and positions together. Everything that can fail runs before the commit, and a failure stops the tracking.
 

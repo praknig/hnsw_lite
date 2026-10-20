@@ -73,36 +73,19 @@ bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own)
 void HnswIndex::attach_log(WalWriter log) {
     const auto guard = lock_.write("attach_log");
     if (durable_) throw std::logic_error("attach_log: a durable index keeps its own log");
-    if (log.next_lsn() == 0) throw std::invalid_argument("attach_log: LSN 0 is reserved (means not logged)");
-    log_ = std::move(log);
-    log_broken_ = false;
+    log_.attach(std::move(log));
 }
 
 std::optional<WalWriter> HnswIndex::detach_log() {
     const auto guard = lock_.write("detach_log");
     if (durable_) throw std::logic_error("detach_log: a durable index keeps its own log");
-    std::optional<WalWriter> out = std::move(log_);
-    log_.reset();
-    log_broken_ = false;
-    return out;
-}
-
-void HnswIndex::log_abort(std::uint64_t lsn) noexcept {
-    try {
-        (void)log_->append(walop::kAbort, walop::encode_abort(lsn));
-        log_->sync();  // aborts are rare: on disk at once, in every mode, so no operation record outlives its abort
-    } catch (...) {
-        // The log now holds an operation that failed, without its abort record:
-        // replaying it would apply a change never made. Refuse further changes
-        // until a new log is attached.
-        log_broken_ = true;
-    }
+    return log_.detach();
 }
 
 bool HnswIndex::replay(std::span<const WalRecord> records) {
     {
         const auto guard = lock_.read();
-        if (log_) throw std::logic_error("replay: detach the log first (replayed changes must not be logged again)");
+        if (log_.attached()) throw std::logic_error("replay: detach the log first (replayed changes must not be logged again)");
     }
     return replay_records(*this, records, [&](const walop::Op& op) {
         switch (op.type) {
@@ -120,33 +103,19 @@ bool HnswIndex::replay(std::span<const WalRecord> records) {
 void FlatIndex::attach_log(WalWriter log) {
     const auto guard = lock_.write("attach_log");
     if (durable_) throw std::logic_error("attach_log: a durable index keeps its own log");
-    if (log.next_lsn() == 0) throw std::invalid_argument("attach_log: LSN 0 is reserved (means not logged)");
-    log_ = std::move(log);
-    log_broken_ = false;
+    log_.attach(std::move(log));
 }
 
 std::optional<WalWriter> FlatIndex::detach_log() {
     const auto guard = lock_.write("detach_log");
     if (durable_) throw std::logic_error("detach_log: a durable index keeps its own log");
-    std::optional<WalWriter> out = std::move(log_);
-    log_.reset();
-    log_broken_ = false;
-    return out;
-}
-
-void FlatIndex::log_abort(std::uint64_t lsn) noexcept {
-    try {
-        (void)log_->append(walop::kAbort, walop::encode_abort(lsn));
-        log_->sync();  // aborts are rare: on disk at once, in every mode, so no operation record outlives its abort
-    } catch (...) {
-        log_broken_ = true;  // see HnswIndex::log_abort
-    }
+    return log_.detach();
 }
 
 bool FlatIndex::replay(std::span<const WalRecord> records) {
     {
         const auto guard = lock_.read();
-        if (log_) throw std::logic_error("replay: detach the log first (replayed changes must not be logged again)");
+        if (log_.attached()) throw std::logic_error("replay: detach the log first (replayed changes must not be logged again)");
     }
     return replay_records(*this, records, [&](const walop::Op& op) {
         if (op.type != walop::kTrainLists) return false;
@@ -155,26 +124,5 @@ bool FlatIndex::replay(std::span<const WalRecord> records) {
     });
 }
 
-void HnswIndex::flush_log() noexcept {
-    if (!log_ || log_->broken()) return;  // GCOVR_EXCL_BR_LINE: called only for durable indexes, which always have a log
-    const std::uint64_t size = log_->size();
-    if (size == log_synced_) return;  // nothing new since the last flush
-    try {
-        log_->sync();
-        log_synced_ = size;
-    } catch (...) {  // the writer is now broken: further changes are refused until a checkpoint
-    }
-}
-
-void FlatIndex::flush_log() noexcept {
-    if (!log_ || log_->broken()) return;  // GCOVR_EXCL_BR_LINE: called only for durable indexes, which always have a log
-    const std::uint64_t size = log_->size();
-    if (size == log_synced_) return;  // nothing new since the last flush
-    try {
-        log_->sync();
-        log_synced_ = size;
-    } catch (...) {  // the writer is now broken: further changes are refused until a checkpoint
-    }
-}
-
 }  // namespace vecdb
+
