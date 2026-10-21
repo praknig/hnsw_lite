@@ -23,6 +23,9 @@
  * (or weighted scores).
  */
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -31,6 +34,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -42,6 +46,53 @@
 
 namespace vecdb {
 
+/// How maintenance runs: only when maintain() is called, or also on a background thread.
+enum class Maintenance { Manual, Background };
+
+/// When maintenance work is due. Churn is dense vectors replaced or removed
+/// since that work last ran, over the live ones (additions do not damage the graph).
+struct MaintenancePolicy {
+    Maintenance mode = Maintenance::Manual;
+    std::chrono::milliseconds interval{1000};  ///< Background: how often to look for due work
+    std::chrono::milliseconds budget{250};     ///< Background: time per round for health checks and upkeep
+    // Checkpoints (durable collections): the log since the last snapshot.
+    std::uint64_t checkpoint_bytes = 64ull << 20;
+    std::uint64_t checkpoint_records = 100000;
+    std::chrono::seconds checkpoint_age{600};  ///< and any record waiting longer than this
+    // The dense side.
+    double health_check_churn = 0.05;  ///< check reachability past this; upkeep if anything is wrong
+    double upkeep_churn = 0.2;         ///< upkeep past this, whatever the health
+    std::size_t upkeep_nodes = 0;      ///< nodes per upkeep call (0: no limit; the budget still applies)
+    double rebuild_check_churn = 0.5;  ///< with a codec: check its drift past this
+    double rebuild_drift = 4.0;        ///< rebuild when its error exceeds this many times a retrained one's
+};
+
+/// What a maintenance round did, and why.
+struct MaintenanceReport {
+    std::chrono::system_clock::time_point when{};
+    std::chrono::microseconds elapsed{0};
+    std::optional<HealthReport> health;  ///< if a health check ran
+    bool upkept = false;
+    UpkeepStats upkeep;
+    bool rebuilt = false;
+    RebuildStats rebuild;
+    bool checkpointed = false;
+    std::uint64_t checkpoint_lsn = 0;
+    bool budget_exhausted = false;   ///< due work was left for the next round
+    std::vector<std::string> notes;  ///< each decision, in words
+    std::string error;               ///< background rounds: what stopped this one
+};
+
+/// The counters maintenance decides from.
+struct MaintenanceStatus {
+    std::uint64_t log_bytes = 0;       ///< log since the last snapshot (durable collections)
+    std::uint64_t log_records = 0;
+    std::chrono::seconds since_checkpoint{0};
+    double churn_since_upkeep = 0;
+    double churn_since_rebuild = 0;
+    std::size_t rounds = 0;            ///< maintenance rounds run
+};
+
 struct CollectionOptions {
     std::size_t dim = 0;             ///< dense vector length; 0: no dense side
     Metric metric = Metric::Cosine;
@@ -52,6 +103,7 @@ struct CollectionOptions {
     bool sparse = false;             ///< a side for learned sparse vectors (SPLADE)
     bool store_text = true;          ///< keep the text, for get() and search results
     DurableOptions durability;       ///< for open()
+    MaintenancePolicy maintenance;   ///< not stored: load() starts with Manual
 };
 
 /// A document. Every part is optional; a part the collection was not created
@@ -147,13 +199,26 @@ public:
     /// final operation was dropped (see HnswIndex::replay).
     bool replay(std::span<const WalRecord> records);
 
+    /// Runs the maintenance that is due (see MaintenancePolicy): a health check and
+    /// upkeep of the dense side within `budget` (0: no limit), a rebuild if its
+    /// codec drifted (once started, a rebuild runs to the end), then a checkpoint if
+    /// the log has grown. Searches and changes continue meanwhile. Maintenance is not
+    /// logged: the next snapshot keeps its effect. Refused from inside a search
+    /// (std::logic_error).
+    MaintenanceReport maintain(std::chrono::milliseconds budget = std::chrono::milliseconds(0));
+    /// Changes the policy; starts or stops the background thread as needed.
+    /// Throws std::invalid_argument for intervals under 1 ms or negative thresholds.
+    void set_maintenance(const MaintenancePolicy& policy);
+    std::optional<MaintenanceReport> last_maintenance() const;
+    MaintenanceStatus maintenance_status() const;
+
     /// Read-only access to the sides (null if absent), e.g. for health reports.
     const HnswIndex* dense_index() const { return dense_.get(); }
     const SparseIndex* text_index() const { return text_.get(); }
     const SparseIndex* sparse_index() const { return sparse_.get(); }
 
 private:
-    struct Prepared;  // a validated document
+    struct Prepared;  // a checked document (its metadata is checked under the lock)
     Prepared prepare(const Document& d) const;
     bool apply_upsert(std::uint64_t id, const Prepared& p);
     bool apply_remove(std::uint64_t id);
@@ -176,6 +241,19 @@ private:
     mutable std::shared_mutex mutex_;
     ChangeLog log_;
     std::shared_ptr<detail::DurableState> durable_;
+    // Maintenance.
+    void stop_maintenance();
+    std::atomic<std::uint64_t> changed_since_upkeep_{0}, changed_since_rebuild_{0};
+    std::atomic<std::uint64_t> checkpoint_lsn_{1};      // the last snapshot's LSN
+    std::atomic<std::int64_t> checkpoint_time_{0};      // and when it was taken (steady clock, ns)
+    std::mutex maintenance_mutex_;                      // one round at a time
+    mutable std::mutex report_mutex_;
+    std::optional<MaintenanceReport> last_report_;
+    std::size_t rounds_ = 0;
+    std::thread maintainer_;
+    std::mutex wake_mutex_;
+    std::condition_variable wake_;
+    bool stopping_ = false;
 };
 
 }  // namespace vecdb

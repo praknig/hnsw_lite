@@ -340,7 +340,7 @@ jobs:
 
       - name: Test threaded groups
         # The threaded groups (14), four at a time.
-        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk|health|upkeep|rebuild|wal|durable|sparse)(\..*)?$'
+        run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk|health|upkeep|rebuild|wal|durable|sparse|collection|maintenance)(\..*)?$'
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).

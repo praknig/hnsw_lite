@@ -23,7 +23,10 @@ UpkeepStats HnswIndex::upkeep_unlocked(const UpkeepOptions& upkeep_options, cons
     auto stop = [&] {
         if (upkeep_options.max_nodes > 0 && st.nodes_repaired + st.reconnected >= upkeep_options.max_nodes) return true;
         if (options.cancel && options.cancel->load()) return true;
-        return options.deadline && std::chrono::steady_clock::now() >= *options.deadline;
+        // A deadline stops it only after one repair in this call: reaching the first
+        // repair can take longer than a small budget, and without this guarantee
+        // repeated calls would never finish (found with 1 ms budgets in a slow build).
+        return options.deadline && std::chrono::steady_clock::now() >= *options.deadline && st.nodes_repaired + st.reconnected > 0;
     };
     if (live_ == 0) {
         st.complete = true;

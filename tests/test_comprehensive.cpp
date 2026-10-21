@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -14514,7 +14514,8 @@ TEST(upkeep, uk05_deadlines_and_cancellation_stop_it_cleanly) {
     OperationOptions cancelled;
     cancelled.cancel = &cancel;
     const UpkeepStats b = h.upkeep({}, cancelled);
-    CHECK(!a.complete && !b.complete && a.nodes_repaired == 0 && b.nodes_repaired == 0 && quick_health(h).removals > 0);
+    // An expired deadline still makes progress (one repair, so repeated calls finish); a cancel does nothing.
+    CHECK(!a.complete && !b.complete && a.nodes_repaired + a.reconnected == 1 && b.nodes_repaired == 0 && quick_health(h).removals > 0);
     check_graph(h, 0.0);  // untouched and valid
     CHECK(h.upkeep().complete && quick_health(h).links_to_removed == 0);
 }
@@ -17718,6 +17719,8 @@ TEST(collection, co14_invalid_content_behind_valid_checksums) {
     };
     CHECK(!with([](File& f) { f.metric = 7; }));
     CHECK(!with([](File& f) { f.text = 2; }));
+    CHECK(!with([](File& f) { f.sparse = 2; }));
+    CHECK(!with([](File& f) { f.store = 2; }));
     CHECK(!with([](File& f) { f.dim = 0; f.text = 0; f.dense.clear(); f.text_side.clear(); }));  // no side at all
     CHECK(!with([](File& f) { f.slots = {{1, 7}, {1, 7}}; f.free.clear(); }));                  // a duplicate ID
     CHECK(!with([](File& f) { f.slots.push_back({2, 0}); }));                                    // an invalid live flag
@@ -17730,6 +17733,310 @@ TEST(collection, co14_invalid_content_behind_valid_checksums) {
     CHECK(!with([&](File& f) { f.text_side = bytes_of(t_other); }));                             // unknown document (text)
     CHECK(!with([&](File& f) { f.dense = bytes_of(h_other); }));                                 // unknown document (dense)
     CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
+}
+
+// ===========================================================================
+// Automatic maintenance of collections (MT1-MT7)
+// ===========================================================================
+
+TEST(maintenance, mt01_manual_rounds_do_what_is_due) {
+    auto data = clustered(800, 8, 6, 4100);
+    Collection c(co_options());
+    for (std::uint64_t i = 0; i < 400; ++i) c.add(i, co_doc(data, i));
+    // Building is not churn: nothing is due.
+    MaintenanceReport r = c.maintain();
+    CHECK(!r.upkept && !r.health && !r.checkpointed && r.notes.empty() && c.maintenance_status().churn_since_upkeep == 0);
+    // Some churn: below the health-check threshold, a note only.
+    for (std::uint64_t i = 0; i < 10; ++i) (void)c.upsert(i, co_doc(data, 400 + i));
+    r = c.maintain();
+    CHECK(!r.health && !r.upkept && r.notes.size() == 1 && r.notes[0].rfind("no upkeep", 0) == 0);
+    // Past it: a health check; upkeep only if it finds damage.
+    for (std::uint64_t i = 10; i < 40; ++i) (void)c.remove(i);
+    r = c.maintain();
+    CHECK(r.health.has_value() && (r.upkept == (r.health->unreachable + r.health->links_to_removed + r.health->stale_links > 0)));
+    CHECK(c.maintenance_status().churn_since_upkeep == 0);  // handled: the counter starts again
+    // Past the upkeep threshold: upkeep whatever the health.
+    for (std::uint64_t i = 40; i < 140; ++i) (void)c.upsert(i, co_doc(data, 500 + i));
+    const MaintenanceStatus before = c.maintenance_status();
+    r = c.maintain();
+    CHECK(before.churn_since_upkeep >= 0.2 && r.upkept && r.upkeep.complete && r.notes[0].rfind("upkeep due: churn", 0) == 0);
+    CHECK(c.last_maintenance() && c.last_maintenance()->upkept && c.maintenance_status().rounds == 4 && r.elapsed.count() >= 0);
+}
+
+TEST(maintenance, mt02_checkpoints_by_records_bytes_and_age) {
+    auto data = random_vectors(300, 8, 4101);
+    const std::string dir = co_dir("mt02");
+    CollectionOptions o = co_options();
+    o.maintenance.checkpoint_records = 50;
+    std::string expected;
+    {
+        auto c = Collection::open(dir, o);
+        for (std::uint64_t i = 0; i < 40; ++i) c->add(i, co_doc(data, i));
+        CHECK(!c->maintain().checkpointed && c->maintenance_status().log_records == 40 && c->maintenance_status().log_bytes > 0);
+        for (std::uint64_t i = 40; i < 60; ++i) c->add(i, co_doc(data, i));
+        MaintenanceReport r = c->maintain();
+        CHECK(r.checkpointed && r.checkpoint_lsn == 61 && c->maintenance_status().log_records == 0 && c->maintenance_status().log_bytes == 0);
+        MaintenancePolicy bytes = o.maintenance;
+        bytes.checkpoint_records = 1000000;
+        bytes.checkpoint_bytes = 500;
+        c->set_maintenance(bytes);
+        c->add(100, co_doc(data, 100));
+        CHECK(!c->maintain().checkpointed);
+        for (std::uint64_t i = 101; i < 110; ++i) c->add(i, co_doc(data, i));
+        r = c->maintain();
+        CHECK(r.checkpointed && r.notes.back().find("bytes") != std::string::npos);
+        MaintenancePolicy age = bytes;
+        age.checkpoint_bytes = 1ull << 40;
+        age.checkpoint_age = std::chrono::seconds(0);
+        c->set_maintenance(age);
+        CHECK(!c->maintain().checkpointed);  // nothing waiting: no checkpoint however old the last one
+        c->add(200, co_doc(data, 200));
+        r = c->maintain();
+        CHECK(r.checkpointed && r.notes.back().find("waited") != std::string::npos);
+        expected = co_bytes(*c);
+    }
+    RecoveryStats st;
+    CHECK(co_bytes(*Collection::open(dir, o, &st)) == expected && st.replayed == 0);  // everything was in the snapshot
+    std::filesystem::remove_all(dir);
+}
+
+TEST(maintenance, mt03_a_drifted_codec_is_rebuilt) {
+    CollectionOptions o = co_options(8);
+    o.text = false;
+    o.hnsw.quantization.codec = CodecKind::SQ8;
+    o.hnsw.quantization.train_after = 100;
+    Collection c(o);
+    std::mt19937 rng(4102);
+    std::uniform_real_distribution<float> near(0.0f, 1.0f), far(50.0f, 100.0f);
+    auto vec = [&](auto& dist) {
+        Document d;
+        d.vector.resize(8);
+        for (float& x : d.vector) x = dist(rng);
+        return d;
+    };
+    for (std::uint64_t i = 0; i < 300; ++i) c.add(i, vec(near));  // the codec learns [0, 1]
+    for (std::uint64_t i = 0; i < 300; ++i) (void)c.upsert(i, vec(far));  // everything moves to [50, 100]
+    MaintenancePolicy p;
+    p.upkeep_churn = 1e9;  // isolate the rebuild
+    p.health_check_churn = 1e9;
+    c.set_maintenance(p);
+    const MaintenanceReport r = c.maintain();
+    HealthOptions ho;
+    ho.recall_sample = 0;
+    ho.codec_sample = 300;
+    ho.retrain_sample = 300;
+    const HealthReport after = c.dense_index()->health(ho);
+    std::printf("    codec error %.3g before, %.3g after the rebuild\n", r.health ? *r.health->codec_error : -1.0, *after.codec_error);
+    CHECK(r.rebuilt && r.rebuild.codec_retrained && *after.codec_error < *r.health->codec_error / 4);
+    CHECK(c.maintenance_status().churn_since_rebuild == 0 && !c.maintain().rebuilt);  // done: not again
+    // Churn that stays in the trained range: checked, within the limit, no rebuild.
+    for (std::uint64_t i = 0; i < 300; ++i) (void)c.upsert(i, vec(far));
+    const MaintenanceReport same = c.maintain();
+    CHECK(!same.rebuilt && same.health && !same.notes.empty() && same.notes.back() == "codec drift check: within the limit");
+    // A document without a vector, removed: not churn of the dense side.
+    Document no_vector;
+    c.add(5000, no_vector);
+    const double churn = c.maintenance_status().churn_since_upkeep;
+    CHECK(c.remove(5000) && c.maintenance_status().churn_since_upkeep == churn);
+}
+
+TEST(maintenance, mt04_budgets_and_node_limits) {
+    auto data = clustered(3000, 8, 6, 4103);
+    Collection c(co_options());
+    for (std::uint64_t i = 0; i < 2000; ++i) c.add(i, co_doc(data, i));
+    for (std::uint64_t i = 0; i < 1500; ++i) (void)c.remove(i);  // heavy damage
+    MaintenancePolicy p;
+    p.upkeep_nodes = 5;
+    c.set_maintenance(p);
+    MaintenanceReport r = c.maintain();
+    CHECK(r.upkept && !r.upkeep.complete && r.budget_exhausted && c.maintenance_status().churn_since_upkeep > 0);
+    p.upkeep_nodes = 0;
+    c.set_maintenance(p);
+    int rounds = 0;
+    do {
+        r = c.maintain(std::chrono::milliseconds(1));
+        ++rounds;
+    } while (r.budget_exhausted && rounds < 100000);  // each round repairs at least one vector, so this ends
+    CHECK(!r.budget_exhausted && c.maintenance_status().churn_since_upkeep == 0 && rounds >= 1);
+    HealthOptions ho;
+    ho.recall_sample = 0;
+    CHECK(c.dense_index()->health(ho).unreachable == 0);
+}
+
+TEST(maintenance, mt05_the_background_thread) {
+    auto data = random_vectors(400, 8, 4104);
+    const std::string dir = co_dir("mt05");
+    CollectionOptions o = co_options();
+    o.maintenance.mode = Maintenance::Background;
+    o.maintenance.interval = std::chrono::milliseconds(2);
+    o.maintenance.checkpoint_records = 20;
+    {
+        auto c = Collection::open(dir, o);
+        for (std::uint64_t i = 0; i < 100; ++i) c->add(i, co_doc(data, i));
+        bool checkpointed = false;
+        for (int i = 0; i < 2000 && !checkpointed; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            const auto last = c->last_maintenance();
+            checkpointed = c->maintenance_status().log_records < 20 && last.has_value();
+        }
+        CHECK(checkpointed && c->maintenance_status().rounds > 0);
+        // Switched off: no more rounds.
+        c->set_maintenance(MaintenancePolicy{});
+        const std::size_t rounds = c->maintenance_status().rounds;
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        CHECK(c->maintenance_status().rounds == rounds);
+        c->set_maintenance(o.maintenance);  // and on again; closing stops it
+    }
+    CHECK(Collection::open(dir, co_options())->size() == 100);
+    // A failing round records its error; once the cause is gone, the next round succeeds.
+    const std::string dir2 = co_dir("mt05b");
+    {
+        CollectionOptions manual = co_options();
+        manual.maintenance.checkpoint_records = 20;
+        auto c = Collection::open(dir2, manual);
+        for (std::uint64_t i = 0; i < 40; ++i) c->add(i, co_doc(data, i));  // the next snapshot is number 41
+        const auto block = std::filesystem::path(dir2) / "snapshot-00000000000000000041.idx.tmp";
+        std::filesystem::create_directories(block / "x");  // so it cannot be written
+        MaintenancePolicy bg = manual.maintenance;
+        bg.mode = Maintenance::Background;
+        bg.interval = std::chrono::milliseconds(2);
+        c->set_maintenance(bg);
+        bool failed = false;
+        for (int i = 0; i < 5000 && !failed; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            const auto last = c->last_maintenance();
+            failed = last && !last->error.empty();
+        }
+        std::filesystem::remove_all(block);
+        bool recovered = false;
+        for (int i = 0; i < 5000 && !recovered; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            recovered = c->maintenance_status().log_records == 0;
+        }
+        CHECK(failed && recovered);
+    }
+    std::filesystem::remove_all(dir2);
+    // In memory: the background thread does upkeep only.
+    CollectionOptions m = co_options();
+    m.maintenance.mode = Maintenance::Background;
+    m.maintenance.interval = std::chrono::milliseconds(1);
+    m.maintenance.health_check_churn = 0;
+    Collection mem(m);
+    for (std::uint64_t i = 0; i < 50; ++i) mem.add(i, co_doc(data, i));
+    for (std::uint64_t i = 0; i < 25; ++i) (void)mem.remove(i);
+    bool done = false;
+    for (int i = 0; i < 2000 && !done; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        done = mem.maintenance_status().churn_since_upkeep == 0;
+    }
+    CHECK(done && !mem.last_maintenance()->checkpointed);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(maintenance, mt06_rules) {
+    auto data = random_vectors(50, 8, 4105);
+    Collection c(co_options());
+    for (std::uint64_t i = 0; i < 30; ++i) c.add(i, co_doc(data, i));
+    for (auto bad : std::vector<std::function<void(MaintenancePolicy&)>>{
+             [](MaintenancePolicy& p) { p.interval = std::chrono::milliseconds(0); },
+             [](MaintenancePolicy& p) { p.budget = std::chrono::milliseconds(-1); },
+             [](MaintenancePolicy& p) { p.checkpoint_age = std::chrono::seconds(-1); },
+             [](MaintenancePolicy& p) { p.upkeep_churn = -1; },
+             [](MaintenancePolicy& p) { p.health_check_churn = kNaN; },
+             [](MaintenancePolicy& p) { p.rebuild_check_churn = std::numeric_limits<double>::infinity(); },
+             [](MaintenancePolicy& p) { p.rebuild_drift = -2; }}) {
+        MaintenancePolicy p;
+        bad(p);
+        CHECK_THROWS_AS(std::invalid_argument, c.set_maintenance(p));
+        CollectionOptions o = co_options();
+        o.maintenance = p;
+        CHECK_THROWS_AS(std::invalid_argument, (void)Collection(o));
+    }
+    CollectionQuery q;
+    q.vector = data[0];
+    bool maintain_refused = false, policy_refused = false;
+    CollectionSearchOptions so;
+    so.predicate = [&](std::uint64_t) {
+        try {
+            (void)c.maintain();
+        } catch (const std::logic_error&) {
+            maintain_refused = true;
+        }
+        try {
+            c.set_maintenance({});
+        } catch (const std::logic_error&) {
+            policy_refused = true;
+        }
+        return true;
+    };
+    (void)c.search(q, 3, so);
+    CHECK(maintain_refused && policy_refused);
+    const MaintenanceStatus st = c.maintenance_status();
+    CHECK(st.log_bytes == 0 && st.log_records == 0 && st.rounds == 0 && !c.last_maintenance());
+    // Loading starts with manual maintenance; text- or sparse-only collections have no dense work.
+    CollectionOptions bg = co_options();
+    bg.maintenance.mode = Maintenance::Background;
+    Collection b(bg);
+    b.add(1, co_doc(data, 1));
+    std::ostringstream out;
+    b.save(out);
+    std::istringstream in(out.str());
+    auto loaded = Collection::load(in);
+    CHECK(loaded->options().maintenance.mode == Maintenance::Manual);
+    CollectionOptions text_only;
+    text_only.dim = 0;
+    Collection t(text_only);
+    Document d;
+    d.text = "words";
+    t.add(1, d);
+    CHECK(t.maintain().notes.empty() && t.maintenance_status().churn_since_upkeep == 0);
+}
+
+TEST(maintenance, mt07_background_maintenance_during_changes_and_searches) {
+    auto data = clustered(1500, 8, 6, 4106);
+    const std::string dir = co_dir("mt07");
+    CollectionOptions o = co_options(8, true);
+    o.maintenance.mode = Maintenance::Background;
+    o.maintenance.interval = std::chrono::milliseconds(1);
+    o.maintenance.checkpoint_records = 100;
+    o.maintenance.health_check_churn = 0.01;
+    o.maintenance.upkeep_churn = 0.05;
+    std::map<std::uint64_t, std::string> expected;
+    {
+        auto c = Collection::open(dir, o);
+        std::atomic<bool> stop{false};
+        std::atomic<long> searches{0};
+        with_watchdog(60, "mt07", [&] {
+            std::thread searcher([&] {
+                CollectionQuery q;
+                q.text = "alpha";
+                while (!stop) {
+                    q.vector = data[std::size_t(searches.load()) % 1500];
+                    (void)c->search(q, 5);
+                    ++searches;
+                }
+            });
+            run_threads(3, [&](std::size_t t) {
+                while (searches.load() == 0) std::this_thread::yield();
+                for (std::uint64_t i = t; i < 900; i += 3) {
+                    (void)c->upsert(i, co_doc(data, i, true));  // upsert: another thread may have added i already
+                    if (i % 3 == 0) (void)c->remove(i / 2);
+                    if (i % 5 == 0) (void)c->upsert(i / 4, co_doc(data, 1000 + i, true));
+                }
+            });
+            stop = true;
+            searcher.join();
+        });
+        CHECK(c->maintenance_status().rounds > 0);
+        for (std::uint64_t id = 0; id < 900; ++id)
+            if (const auto r = c->get(id)) expected[id] = r->text;
+    }
+    auto c = Collection::open(dir, co_options(8, true));
+    bool same = c->size() == expected.size();
+    for (const auto& [id, text] : expected) same = same && c->get(id) && c->get(id)->text == text;
+    CHECK(same);
+    c.reset();  // close it first: Windows cannot delete the locked LOCK file of an open collection
+    std::filesystem::remove_all(dir);
 }
 
 // ===========================================================================
@@ -18079,7 +18386,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

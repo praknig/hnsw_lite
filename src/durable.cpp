@@ -186,10 +186,15 @@ std::uint64_t checkpoint_dir(detail::DurableState& d, ChangeLog& log, Save&& sav
     const std::uint64_t lsn = log.writer().next_lsn();
     const std::string snap = join(d.dir, snapshot_name(lsn));
     if (fs::exists(snap)) return lsn;  // nothing logged since the last one
-    // 1. A new segment, so that the snapshot covers exactly what precedes it.
-    if (!log.writer().broken()) log.writer().sync();
-    log.rotate(WalWriter::create(join(d.dir, segment_name(lsn)), d.identity, lsn));  // heals a failed log: the snapshot holds the true state
-    wal::sync_directory(d.dir);
+    // 1. A new segment, so that the snapshot covers exactly what precedes it. If an
+    //    earlier attempt rotated already and then failed to write its snapshot, the
+    //    log is still that segment, with nothing in it: retry the snapshot alone.
+    const std::string segment = join(d.dir, segment_name(lsn));
+    if (log.writer().path() != segment) {
+        if (!log.writer().broken()) log.writer().sync();
+        log.rotate(WalWriter::create(segment, d.identity, lsn));  // heals a failed log: the snapshot holds the true state
+        wal::sync_directory(d.dir);
+    }
     // 2. The snapshot.
     write_durably(d.dir, snap, save);
     // 3. Prune: keep the newest snapshots, and the segments the oldest kept one needs.
@@ -260,9 +265,13 @@ std::uint64_t FlatIndex::checkpoint() {
 
 std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionOptions options, RecoveryStats* stats) {
     const DurableOptions durability = options.durability;
+    const MaintenancePolicy maintenance = options.maintenance;
+    options.maintenance.mode = Maintenance::Manual;  // no background work until the collection is set up
+    RecoveryStats local;
+    RecoveryStats* st = stats ? stats : &local;
     Opened<Collection> o = open_dir<Collection>(
         dir, kCollection, [&] { return std::make_unique<Collection>(options); },
-        [](const std::string& path) { return Collection::load(path); }, durability, stats);
+        [](const std::string& path) { return Collection::load(path); }, durability, st);
     const CollectionOptions& got = o.index->options_;
     if (got.dim != options.dim || got.metric != options.metric || got.text != options.text || got.sparse != options.sparse)
         throw std::invalid_argument("Collection::open: the directory holds a collection with another dimension, metric or sides");
@@ -271,7 +280,9 @@ std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionO
     o.index->log_.attach(std::move(*o.log));
     o.index->durable_ = std::move(o.state);
     o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
+    o.index->checkpoint_lsn_ = st->snapshot_lsn;
     if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
+    o.index->set_maintenance(maintenance);
     return std::move(o.index);
 }
 
@@ -280,7 +291,10 @@ std::uint64_t Collection::checkpoint() {
     if (searching_here()) throw std::logic_error("checkpoint: refused from inside a search of this collection");
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
     const std::shared_lock<std::shared_mutex> lock(mutex_);  // no change can run until the snapshot is written
-    return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out); });
+    const std::uint64_t lsn = checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out); });
+    checkpoint_lsn_ = lsn;
+    checkpoint_time_ = std::chrono::steady_clock::now().time_since_epoch().count();
+    return lsn;
 }
 
 }  // namespace vecdb
