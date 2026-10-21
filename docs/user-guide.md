@@ -7,6 +7,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 ## Contents
 
 - [Core ideas](#core-ideas)
+- [Collections](#collections)
 - [Creating an index](#creating-an-index)
 - [Adding vectors](#adding-vectors)
   - [Adding many vectors at once](#adding-many-vectors-at-once)
@@ -46,6 +47,40 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 - **Two indexes:**
   - `FlatIndex` compares the query with every stored vector. Results are **exact**, but the time grows in proportion to the number of vectors.
   - `HnswIndex` builds a multi-level graph and walks it towards the query. It is **approximate** (it can occasionally miss a true neighbor) but far faster on large collections. How often it finds the true neighbors is called **recall**.
+
+## Collections
+
+For most applications, start here: a `Collection` holds documents, each with any of a dense vector, text and a learned sparse vector, plus metadata, under one ID space, and searches them together.
+
+```cpp
+CollectionOptions options;
+options.dim = 768;                        // 0: no vectors
+options.metric = Metric::Cosine;
+options.text = true;                      // BM25 over the documents' text
+options.bm25.avg_doc_length = 200;        // near your corpus' mean token count
+auto docs = Collection::open("docs.db", options);   // durable; or Collection docs(options) in memory
+
+Document d;
+d.vector = embedding;
+d.text = "the document text";
+d.metadata = Metadata().set("lang", "en");
+docs->upsert(42, d);
+
+CollectionQuery q;
+q.vector = query_embedding;
+q.text = "query text";
+CollectionSearchOptions so;
+so.filter = Filter::eq("lang", "en");
+so.with_text = true;
+for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vector_rank, h.text_rank, h.text */ }
+docs->checkpoint();                       // from time to time
+```
+
+- **Sides:** a dense side (`dim > 0`, an HNSW index), a text side (`text`, BM25), and a learned sparse side (`sparse`, for SPLADE vectors; kept apart from text because their term numbers mean different things). Each document goes into the sides for the parts it has; a document with no parts at all keeps its metadata and is found by filters only. Giving a part the collection does not have is an error.
+- **Changes** (`add`, `upsert`, `remove`, `remove_batch`, `remove_where`, `set_metadata`, `set_metadata_where`) are all or nothing: everything is checked before anything changes, and if a later side runs out of memory, the earlier ones are restored. `upsert` replaces the whole document: a part left out is removed from its side.
+- **Search** takes any combination of a vector, text and a sparse vector. One part gives that side's ranking; several are fused by Reciprocal Rank Fusion (`rrf_k = 60`) or, with `Fusion::Weighted`, by scores scaled to [0, 1], with a weight per side. Filters and predicates run on the collection's metadata and apply to every side. Each hit tells which sides found it, at what rank and distance or score, and can carry its metadata and text.
+- **Durability:** `Collection::open(dir, options)` creates or recovers a durable directory with one write-ahead log for the whole collection, so text and sparse vectors are as safe as the dense side (see [Durability](#durability) for modes and checkpoints). Reopening requires the same dimension, metric and sides; other settings come from the directory. In memory, `save` and `load` write and read one file.
+- **Limits:** changes run one at a time; searches run in parallel. A predicate may read the collection (`get`, `contains`, even a nested search) but not change it or any other index. BM25 document weights use `bm25.avg_doc_length` as set at creation: set it near your corpus' mean. `dense_index()`, `text_index()` and `sparse_index()` give read-only access to the sides, for example for `health()`.
 
 ## Creating an index
 

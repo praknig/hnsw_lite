@@ -362,8 +362,13 @@ void SparseIndex::maybe_compact() {
     // Dead posting entries slow searches; dead slots (every update leaves one, and
     // empty documents leave no entries) cost memory and could exhaust 32-bit slots.
     const std::size_t dead_slots = id_of_.size() - live_count_;
-    if ((dead_entries_ > 1024 && dead_entries_ > posting_entries_ - dead_entries_) || (dead_slots > 1024 && dead_slots > live_count_))
-        compact_unlocked();
+    if ((dead_entries_ > 1024 && dead_entries_ > posting_entries_ - dead_entries_) || (dead_slots > 1024 && dead_slots > live_count_)) {
+        try {
+            compact_unlocked();  // all or nothing
+        } catch (const std::bad_alloc&) {
+            // Optional: the change before it is done, and the next one retries.
+        }
+    }
 }
 
 void SparseIndex::compact() {
@@ -416,9 +421,12 @@ void SparseIndex::save(std::ostream& out) const {
     const auto guard = lock_.read();
     persist::StreamErrorsThrow errors(out);
     persist::write_header(out, persist::IndexKind::Sparse);
+    // Live documents only, in slot order: what loading produces (a compacted
+    // index), so the bytes do not depend on how many removals await compaction.
     persist::write_section(out, kDocs, [&](persist::Writer& w) {
-        w.put<std::uint64_t>(id_of_.size());
+        w.put<std::uint64_t>(live_count_);
         for (NodeId n = 0; n < id_of_.size(); ++n) {
+            if (!live_[n]) continue;
             w.put<std::uint8_t>(live_[n]);
             w.put<std::uint64_t>(id_of_[n]);
             w.put<std::uint64_t>(docs_[n].size());
@@ -426,7 +434,15 @@ void SparseIndex::save(std::ostream& out) const {
             w.put_floats(docs_[n].values.data(), docs_[n].values.size());
         }
     });
-    persist::write_section(out, kMeta, [&](persist::Writer& w) { metadata_.save(w); });
+    // Metadata rows in the same order: a copy compacted like the documents.
+    MetadataStore rows = metadata_;
+    NodeId to = 0;
+    for (NodeId n = 0; n < id_of_.size(); ++n)
+        if (live_[n]) {
+            if (n != to) rows.move_row(n, to);
+            ++to;
+        }
+    persist::write_section(out, kMeta, [&](persist::Writer& w) { rows.save(w); });
 }
 
 void SparseIndex::save(const std::string& path) const {
@@ -436,11 +452,11 @@ void SparseIndex::save(const std::string& path) const {
         if (!out) throw std::runtime_error("cannot create " + tmp);
         try {
             save(out);
-        } catch (...) {
+        } catch (...) {  // GCOVR_EXCL_START: needs a stream failing mid-write
             out.close();
             std::remove(tmp.c_str());
             throw;
-        }
+        }  // GCOVR_EXCL_STOP
     }
     std::error_code ec;
     std::filesystem::rename(tmp, path, ec);

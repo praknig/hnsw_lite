@@ -348,3 +348,18 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `Fusion` | `Rrf` or `Weighted`, in `HybridOptions` |
 | `DiskIndex::max_degree()`, `id_of(node)`, `node_of(id)` | The graph's maximum degree, and conversions between internal node numbers and user IDs |
 
+## Collections (`collection.h`)
+
+| Name | Description |
+|---|---|
+| `Collection(options)`, `Collection::open(dir, options, stats)` | In memory, or a durable directory (created or recovered) |
+| `add`, `upsert`, `remove`, `remove_batch`, `remove_where`, `set_metadata`, `set_metadata_where` | Changes, each all or nothing; `upsert` replaces the whole document |
+| `contains`, `size`, `count_where`, `get(id)` | Reading; `get` returns a `DocumentRecord` (`vector`, `text`, `sparse`, `metadata`) |
+| `search(query, k, options)` | Any combination of `CollectionQuery::vector`, `text` and `sparse`; returns `CollectionHit`s |
+| `checkpoint()`, `durable()`, `save`, `load`, `replay` | Durability and files |
+| `dense_index()`, `text_index()`, `sparse_index()` | Read-only access to the sides (null if absent) |
+| `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability` |
+| `Document` | `vector`, `text`, `sparse`, `metadata`, each optional |
+| `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text` |
+| `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |
+

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <random>
 
+#include "collection.h"
 #include "flat_index.h"
 #include "hnsw_index.h"
 #include "serialize.h"
@@ -30,7 +31,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr char kMetaMagic[8] = {'H', 'N', 'S', 'W', 'D', 'U', 'R', '1'};
-enum Kind : std::uint32_t { kHnsw = 1, kFlat = 2 };
+enum Kind : std::uint32_t { kHnsw = 1, kFlat = 2, kCollection = 3 };
 
 std::string join(const std::string& dir, const std::string& name) { return (fs::path(dir) / name).string(); }
 
@@ -253,6 +254,33 @@ std::uint64_t FlatIndex::checkpoint() {
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
     const auto guard = lock_.read();
     return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out, {}); });
+}
+
+// ---------------------------------------------------------------- Collection
+
+std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionOptions options, RecoveryStats* stats) {
+    const DurableOptions durability = options.durability;
+    Opened<Collection> o = open_dir<Collection>(
+        dir, kCollection, [&] { return std::make_unique<Collection>(options); },
+        [](const std::string& path) { return Collection::load(path); }, durability, stats);
+    const CollectionOptions& got = o.index->options_;
+    if (got.dim != options.dim || got.metric != options.metric || got.text != options.text || got.sparse != options.sparse)
+        throw std::invalid_argument("Collection::open: the directory holds a collection with another dimension, metric or sides");
+    o.index->options_.durability = durability;
+    o.index->log_.set_sync_each(durability.durability == Durability::Synced);
+    o.index->log_.attach(std::move(*o.log));
+    o.index->durable_ = std::move(o.state);
+    o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
+    if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
+    return std::move(o.index);
+}
+
+std::uint64_t Collection::checkpoint() {
+    if (!durable_) throw std::logic_error("checkpoint: not a durable collection (open it with Collection::open)");
+    if (searching_here()) throw std::logic_error("checkpoint: refused from inside a search of this collection");
+    const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
+    const std::shared_lock<std::shared_mutex> lock(mutex_);  // no change can run until the snapshot is written
+    return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out); });
 }
 
 }  // namespace vecdb

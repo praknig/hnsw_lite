@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -73,6 +73,7 @@
 #include "disk_index.h"
 #include "kmeans.h"
 #include "vamana.h"
+#include "collection.h"
 #include "sparse.h"
 #include "wal.h"
 #include "wal_ops.h"
@@ -16891,6 +16892,846 @@ TEST(sparse, sp12_edges_found_on_review) {
     CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 3, bad));
 }
 
+TEST(sparse, sp13_every_path) {
+    std::mt19937 rng(3020);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 100; ++i) s.add(i, random_sparse(rng, 50, 2, 8), meta_for(i));
+    for (std::uint64_t i = 0; i < 100; i += 3) (void)s.remove(i);
+    CHECK(s.remove_where(Filter::eq("category", "tech")) > 0);  // skipping removed slots
+    CHECK(!s.update(1000, {{1}, {1.0f}}, Metadata()) && s.upsert(1000, {}, Metadata()) && s.contains(1000));  // upsert: true when it adds
+    SearchOptions o;
+    std::atomic<bool> cancel{false};
+    o.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    o.cancel = &cancel;
+    CHECK(!s.search({{1, 49, 4000}, {1.0f, 1.0f, 1.0f}}, 5, o).empty());  // a term no document has
+    CHECK(!(SparseVector{{1}, {1.0f}} == SparseVector{{1}, {2.0f}}) && !(SparseVector{{1}, {1.0f}} == SparseVector{{2}, {1.0f}}));
+    CHECK_THROWS_AS(std::runtime_error, s.save(temp_path("sp13_no_dir") + "/x/y.sparse"));
+    CHECK_THROWS_AS(std::runtime_error, (void)SparseIndex::load(temp_path("sp13_missing.sparse")));
+    // Compaction running out of memory: the removal itself still succeeds.
+    if constexpr (HNSW_ALLOC_HOOK) {
+        bool all = true;
+        for (long n = 0; n < 200; ++n) {
+            SparseIndex c;
+            for (std::uint64_t i = 0; i < 1100; ++i) c.add(i, {{std::uint32_t(i % 10)}, {1.0f}});
+            for (std::uint64_t i = 0; i < 1049; ++i) (void)c.remove(i);  // the next removal compacts
+            alloc_hook::fail_after(n);
+            const bool removed = c.remove(1049);
+            const bool fired = alloc_hook::fired;
+            alloc_hook::disarm();
+            all = all && removed && !c.contains(1049) && c.size() == 50;
+            if (!fired) break;  // the removal ran without a failure: every point was tried
+        }
+        CHECK(all);
+    }
+    // BM25 settings and tokens.
+    CHECK_THROWS_AS(std::invalid_argument, Bm25(Bm25Params{-1, 0.75, 100}));
+    CHECK_THROWS_AS(std::invalid_argument, Bm25(Bm25Params{1.2, 0.75, 0}));
+    CHECK(Bm25::tokenize("a@b[c`d{e") == std::vector<std::string>({"a", "b", "c", "d", "e"}));
+    Bm25 empty_docs;
+    const std::vector<std::string_view> blanks = {"", "!!"};
+    empty_docs.fit(blanks);
+    CHECK(empty_docs.params().avg_doc_length == 100.0);  // no tokens: unchanged
+    // Fusion options and repeated IDs in the sparse list.
+    HybridOptions inf;
+    inf.rrf_k = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 1, inf));
+    inf.rrf_k = 60;
+    inf.sparse_weight = std::numeric_limits<double>::infinity();
+    CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 1, inf));
+    const std::vector<SearchResult> rep = {{1, -2.0f}, {1, -1.0f}};
+    CHECK(fuse({}, rep, 5).size() == 1 && *fuse({}, rep, 5)[0].sparse_score == 2.0f);
+    // hybrid_search: per-side filters combined with the shared one; explicit beam width and depths.
+    auto data = random_vectors(50, 4, 3021);
+    HnswIndex h(4, Metric::L2);
+    SparseIndex sp;
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        h.add(i, data[i], meta_for(i));
+        sp.add(i, {{std::uint32_t(i % 4)}, {1.0f}}, meta_for(i));
+    }
+    HybridOptions ho;
+    ho.filter = Filter::eq("category", "tech");
+    ho.dense_options.filter = Filter::all();
+    ho.sparse_options.filter = Filter::all();
+    ho.dense_ef = 32;
+    ho.sparse_k = 10;
+    const auto r = hybrid_search(h, data[0], sp, {{0}, {1.0f}}, 5, ho);
+    CHECK(!r.empty() && std::all_of(r.begin(), r.end(), [](const HybridResult& x) { return meta_for(x.id).get("category")->s == "tech"; }));
+    // Files with valid checksums but invalid documents.
+    auto craft = [](std::vector<std::tuple<std::uint8_t, std::uint64_t, std::vector<std::uint32_t>, std::vector<float>>> docs) {
+        std::ostringstream out;
+        persist::write_header(out, persist::IndexKind::Sparse);
+        persist::write_section(out, persist::tag("SDOC"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(docs.size());
+            for (const auto& [live, id, terms, weights] : docs) {
+                w.put<std::uint8_t>(live);
+                w.put<std::uint64_t>(id);
+                w.put<std::uint64_t>(terms.size());
+                for (const std::uint32_t x : terms) w.put<std::uint32_t>(x);
+                w.put_floats(weights.data(), weights.size());
+            }
+        });
+        MetadataStore m;
+        persist::write_section(out, persist::tag("SMET"), [&](persist::Writer& w) { m.save(w); });
+        std::istringstream in(out.str());
+        try {
+            (void)SparseIndex::load(in);
+            return true;
+        } catch (const FormatError&) {
+            return false;
+        }
+    };
+    CHECK(craft({{1, 1, {1, 2}, {1.0f, 2.0f}}}));                              // the baseline is valid
+    CHECK(!craft({{1, 1, {2, 1}, {1.0f, 2.0f}}}));                             // terms out of order
+    CHECK(!craft({{1, 1, {1}, {0.0f}}}));                                      // a zero weight
+    CHECK(!craft({{1, 1, {1}, {kNaN}}}));                                      // not finite
+    CHECK(!craft({{0, 1, {1}, {1.0f}}}));                                      // a removed document with terms
+    CHECK(!craft({{1, 1, {1}, {1.0f}}, {1, 1, {2}, {1.0f}}}));                 // a duplicate ID
+    CHECK(!craft({{3, 1, {1}, {1.0f}}}));                                      // an invalid live flag
+}
+
+// ===========================================================================
+// Collections: dense, text and sparse sides under one ID space (CO1-CO12)
+// ===========================================================================
+
+namespace {
+
+const char* const kWords[] = {"alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta", "iota", "kappa", "lambda", "mu"};
+
+std::string text_for(std::uint64_t id) {
+    std::string t = "document " + std::to_string(id);
+    for (std::uint64_t i = 0; i < 4; ++i) t += std::string(" ") + kWords[(id * 7 + i * 3) % 12];
+    if (id % 50 == 7) t += " rareword";
+    return t;
+}
+
+CollectionOptions co_options(std::size_t dim = 8, bool sparse = false) {
+    CollectionOptions o;
+    o.dim = dim;
+    o.metric = Metric::L2;
+    o.sparse = sparse;
+    o.bm25.avg_doc_length = 6;
+    return o;
+}
+
+Document co_doc(const Vectors& data, std::uint64_t id, bool sparse = false) {
+    Document d;
+    d.vector = data[id % data.size()];
+    d.text = text_for(id);
+    if (sparse) d.sparse = {{std::uint32_t(id % 30), std::uint32_t(30 + id % 7)}, {1.0f, 0.5f}};
+    d.metadata = meta_for(id);
+    return d;
+}
+
+std::string co_bytes(const Collection& c) {
+    std::ostringstream out;
+    c.save(out);
+    return std::move(out).str();
+}
+
+/// Every document, as get() returns it: what a rollback must restore.
+std::string co_documents(const Collection& c, std::uint64_t max_id = 200) {
+    std::ostringstream out;
+    for (std::uint64_t id = 0; id < max_id; ++id) {
+        const auto r = c.get(id);
+        if (!r) continue;
+        out << id << '|' << r->text << '|';
+        if (r->vector) for (const float x : *r->vector) out << x << ',';
+        out << '|';
+        if (r->sparse) for (std::size_t i = 0; i < r->sparse->size(); ++i) out << r->sparse->indices[i] << ':' << r->sparse->values[i] << ',';
+        out << '|' << (r->metadata == meta_for(id) ? "m" : "other") << '\n';
+    }
+    out << c.size();
+    return std::move(out).str();
+}
+
+std::string co_dir(const std::string& name) {
+    const std::string d = temp_path(name) + ".dir";
+    std::filesystem::remove_all(d);
+    return d;
+}
+
+}  // namespace
+
+TEST(collection, co01_each_side_and_hybrid_fusion) {
+    auto data = clustered(600, 8, 6, 4000);
+    Collection c(co_options());
+    for (std::uint64_t i = 0; i < 600; ++i) c.add(i, co_doc(data, i));
+    CHECK(c.size() == 600 && c.contains(5) && !c.contains(9999) && c.dense_index() && c.text_index() && !c.sparse_index());
+    // One side: that side's own ranking.
+    CollectionQuery v;
+    v.vector = data[10];
+    const auto vh = c.search(v, 10);
+    const auto dense = c.dense_index()->search(data[10], 40, 64, SearchOptions{});
+    bool same = vh.size() == 10;
+    for (std::size_t i = 0; i < vh.size() && same; ++i) same = vh[i].id == dense[i].id && vh[i].vector_rank == i + 1 && *vh[i].vector_distance == dense[i].distance;
+    CHECK(same);
+    CollectionQuery t;
+    t.text = "rareword gamma";
+    Bm25Params bp;
+    bp.avg_doc_length = 6;
+    const auto th = c.search(t, 5);
+    const auto text = c.text_index()->search(Bm25(bp).encode_query("rareword gamma", *c.text_index()), 20);
+    CHECK(!th.empty() && th[0].id == text[0].id && th[0].id % 50 == 7 && *th[0].text_score == -text[0].distance);
+    // Both: Reciprocal Rank Fusion of the two lists, exactly as fuse() computes it.
+    CollectionQuery both;
+    both.vector = data[10];
+    both.text = "rareword gamma";
+    const auto hh = c.search(both, 10);
+    const auto ft = c.text_index()->search(Bm25(bp).encode_query("rareword gamma", *c.text_index()), 40);
+    const auto fused = fuse(dense, ft, 10);
+    bool fusion = hh.size() == fused.size();
+    for (std::size_t i = 0; i < hh.size() && fusion; ++i) fusion = hh[i].id == fused[i].id && std::abs(hh[i].score - fused[i].score) < 1e-12;
+    CHECK(fusion);
+    CollectionSearchOptions w;
+    w.fusion = Fusion::Weighted;
+    w.text_weight = 0;
+    const auto weighted = c.search(both, 3, w);  // text weighted 0: the dense order decides
+    CHECK(weighted.size() == 3 && weighted[0].id == dense[0].id);
+}
+
+TEST(collection, co02_three_sides) {
+    auto data = clustered(300, 8, 4, 4001);
+    Collection c(co_options(8, true));
+    for (std::uint64_t i = 0; i < 300; ++i) c.add(i, co_doc(data, i, true));
+    CollectionQuery q;
+    q.vector = data[3];
+    q.text = "alpha";
+    q.sparse = {{3, 33}, {1.0f, 1.0f}};
+    const auto hits = c.search(q, 300);
+    // RRF over three lists, by hand.
+    const auto d = c.dense_index()->search(data[3], 1200, 1200, SearchOptions{});  // the default depth: max(4k, 20)
+    Bm25Params bp;
+    bp.avg_doc_length = 6;
+    const auto t = c.text_index()->search(Bm25(bp).encode_query("alpha", *c.text_index()), 1200);
+    const auto s = c.sparse_index()->search(q.sparse, 1200);
+    std::map<std::uint64_t, double> score;
+    for (const auto* l : {&d, &t, &s})
+        for (std::size_t i = 0; i < l->size(); ++i) score[(*l)[i].id] += 1.0 / (60.0 + double(i + 1));
+    bool ok = hits.size() == std::min<std::size_t>(300, score.size());
+    for (const auto& h : hits) ok = ok && std::abs(h.score - score[h.id]) < 1e-12;
+    CHECK(ok && !hits.empty());
+    const auto r = c.get(3);
+    CHECK(r && r->vector == data[3] && r->text == text_for(3) && r->sparse && r->metadata == meta_for(3));
+}
+
+TEST(collection, co03_documents_with_some_parts) {
+    auto data = random_vectors(20, 4, 4002);
+    Collection c(co_options(4, true));
+    Document only_vector;
+    only_vector.vector = data[0];
+    Document only_text;
+    only_text.text = "lonely words";
+    Document nothing;
+    nothing.metadata = Metadata().set("k", "v");
+    c.add(1, only_vector);
+    c.add(2, only_text);
+    c.add(3, nothing);  // metadata only: stored, found by filters, never by search
+    CHECK(c.size() == 3 && c.dense_index()->size() == 1 && c.text_index()->size() == 1 && c.sparse_index()->size() == 0);
+    CHECK(c.get(3)->metadata == Metadata().set("k", "v") && !c.get(3)->vector && c.count_where(Filter::eq("k", "v")) == 1);
+    // A new version without a part removes it from that side.
+    Document both;
+    both.vector = data[1];
+    both.text = "now with words";
+    CHECK(!c.upsert(2, both) && c.dense_index()->contains(2) && c.text_index()->contains(2));
+    CHECK(!c.upsert(2, only_vector) && !c.text_index()->contains(2) && c.get(2)->text.empty());
+    Document punctuation;
+    punctuation.text = "!!! ???";  // text without tokens: kept, matches no query
+    c.upsert(4, punctuation);
+    CHECK(c.get(4)->text == "!!! ???" && c.text_index()->contains(4));
+    CHECK(c.remove(1) && !c.remove(1) && !c.dense_index()->contains(1) && c.size() == 3);
+    // Collections with one side only.
+    CollectionOptions text_only;
+    text_only.dim = 0;
+    Collection t(text_only);
+    t.add(1, only_text);
+    CollectionQuery q;
+    q.text = "lonely";
+    CHECK(!t.dense_index() && t.search(q, 3).size() == 1);
+    CollectionOptions sparse_only;
+    sparse_only.dim = 0;
+    sparse_only.text = false;
+    sparse_only.sparse = true;
+    Collection s(sparse_only);
+    Document sp;
+    sp.sparse = {{5}, {2.0f}};
+    s.add(9, sp);
+    CollectionQuery sq;
+    sq.sparse = {{5}, {1.0f}};
+    CHECK(s.search(sq, 3).size() == 1 && *s.search(sq, 3)[0].sparse_score == 2.0f);
+    CollectionOptions dense_only = co_options(4);
+    dense_only.text = false;
+    Collection dn(dense_only);
+    dn.add(1, only_vector);
+    CHECK(!dn.text_index() && dn.size() == 1);
+    CollectionOptions none;
+    none.text = false;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(none));
+}
+
+TEST(collection, co04_invalid_input_changes_nothing) {
+    auto data = random_vectors(10, 4, 4003);
+    CollectionOptions o = co_options(4, true);
+    o.schema = Schema::strict({{"category", FieldType::Keyword}});
+    Collection c(o);
+    Document good;
+    good.vector = data[0];
+    good.text = "words";
+    good.metadata = Metadata().set("category", "a");
+    c.add(1, good);
+    const std::string before = co_bytes(c);
+    auto bad = [&](auto change) {
+        Document d = good;
+        change(d);
+        bool threw = false;
+        try {
+            (void)c.upsert(2, d);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        return threw && co_bytes(c) == before;
+    };
+    CHECK(bad([](Document& d) { d.vector = {1, 2}; }));
+    CHECK(bad([](Document& d) { d.vector[1] = kNaN; }));
+    CHECK(bad([](Document& d) { d.sparse = {{1, 1}, {1.0f, 2.0f}}; }));
+    CHECK(bad([](Document& d) { d.sparse = {{1}, {1.0f, 2.0f}}; }));
+    CHECK(bad([](Document& d) { d.sparse = {{1}, {kInf}}; }));
+    CHECK(bad([](Document& d) { d.metadata = Metadata().set("other", 1); }));
+    CHECK_THROWS_AS(std::invalid_argument, c.add(1, good));  // duplicate
+    CHECK(co_bytes(c) == before);
+    Collection no_sparse(co_options(4));
+    Document with_sparse = good;
+    with_sparse.sparse = {{1}, {1.0f}};
+    CHECK_THROWS_AS(std::invalid_argument, no_sparse.add(1, with_sparse));
+    CollectionOptions text_only;
+    text_only.dim = 0;
+    CHECK_THROWS_AS(std::invalid_argument, Collection(text_only).add(1, good));  // a vector, but no dense side
+    CollectionOptions no_text = co_options(4);
+    no_text.text = false;
+    CHECK_THROWS_AS(std::invalid_argument, Collection(no_text).add(1, good));
+    // Queries.
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search({}, 3));
+    CollectionQuery wrong;
+    wrong.vector = {1, 2};
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(wrong, 3));
+    CollectionQuery sq;
+    sq.sparse = {{1}, {1.0f}};
+    CHECK_THROWS_AS(std::invalid_argument, (void)no_sparse.search(sq, 3));
+    CollectionQuery vq;
+    vq.vector = data[0];
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(text_only).search(vq, 3));
+    CollectionQuery tq;
+    tq.text = "x";
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(no_text).search(tq, 3));
+    CollectionSearchOptions badw;
+    badw.text_weight = -1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(vq, 3, badw));
+    badw.text_weight = 1;
+    badw.rrf_k = kNaN;
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(vq, 3, badw));
+    CHECK(c.search(vq, 0).empty() && Collection(co_options(4)).search(vq, 3).empty());
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.set_metadata(1, Metadata().set("other", 1)));
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.set_metadata_where(Filter::eq("category", "a"), Metadata().set("other", 1)));
+}
+
+TEST(collection, co05_filters_metadata_and_results) {
+    auto data = clustered(400, 8, 5, 4004);
+    CollectionOptions o = co_options();
+    o.store_text = false;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 400; ++i) c.add(i, co_doc(data, i));
+    CollectionQuery q;
+    q.vector = data[0];
+    q.text = "alpha beta";
+    CollectionSearchOptions so;
+    so.filter = Filter::eq("category", "tech");
+    so.predicate = [](std::uint64_t id) { return id % 2 == 0; };
+    so.with_metadata = true;
+    so.with_text = true;
+    const auto hits = c.search(q, 20, so);
+    bool ok = !hits.empty();
+    for (const auto& h : hits) ok = ok && h.metadata && h.metadata->get("category")->s == "tech" && h.id % 2 == 0 && h.text && h.text->empty();
+    CHECK(ok);
+    const std::size_t tech = c.count_where(Filter::eq("category", "tech"));
+    CHECK(c.set_metadata_where(Filter::eq("category", "tech"), Metadata().set("flag", true)) == tech && c.count_where(Filter::eq("flag", true)) == tech);
+    CHECK(c.set_metadata(1, Metadata().set("category", "zzz")) && !c.set_metadata(9999, Metadata()) && c.get(1)->metadata.get("category")->s == "zzz");
+    CHECK(c.set_metadata_where(Filter::eq("category", "nothing"), Metadata().set("x", 1)) == 0);
+    const std::size_t music = c.count_where(Filter::eq("category", "music"));
+    CHECK(c.remove_where(Filter::eq("category", "music")) == music && c.size() == 400 - music && c.count_where(Filter::eq("category", "music")) == 0);
+    CHECK(c.remove_batch(std::vector<std::uint64_t>{9999}) == 0);
+    // Removed slots are reused, and a reused slot carries no old metadata.
+    Document fresh;
+    fresh.vector = data[1];
+    c.add(5000, fresh);
+    CHECK(c.get(5000)->metadata == Metadata() && c.size() == 401 - music);
+}
+
+TEST(collection, co06_save_and_load) {
+    auto data = clustered(300, 8, 4, 4005);
+    Collection c(co_options(8, true));
+    for (std::uint64_t i = 0; i < 300; ++i) c.add(i, co_doc(data, i, true));
+    for (std::uint64_t i = 0; i < 300; i += 7) (void)c.remove(i);
+    const std::string path = temp_path("co06");
+    c.save(path);
+    auto d = Collection::load(path);
+    CHECK(co_bytes(*d) == co_bytes(c) && d->size() == c.size() && d->get(10)->text == text_for(10));
+    // The reused slot order survives too: the same change gives the same bytes.
+    c.add(7777, co_doc(data, 3, true));
+    d->add(7777, co_doc(data, 3, true));
+    CHECK(co_bytes(*d) == co_bytes(c));
+    const std::string bytes = read_file(path);
+    bool rejected = true;
+    for (std::size_t cut = 0; cut < bytes.size(); cut += 97) {
+        std::istringstream in(bytes.substr(0, cut));
+        try { (void)Collection::load(in); rejected = false; } catch (const FormatError&) {}
+    }
+    for (std::size_t at = 24; at < bytes.size(); at += 211) {
+        std::string x = bytes;
+        x[at] = char(x[at] ^ 0x41);
+        std::istringstream in(x);
+        try { (void)Collection::load(in); rejected = false; } catch (const FormatError&) {}
+    }
+    CHECK(rejected);
+    HnswIndex h(4, Metric::L2);
+    h.save(path);
+    CHECK_THROWS_AS(FormatError, (void)Collection::load(path));
+    c.save(path);
+    try {
+        (void)HnswIndex::load(path);
+        CHECK(false);
+    } catch (const FormatError& e) {
+        CHECK(std::string(e.what()) == "the file holds a collection");
+    }
+    std::filesystem::remove(path);
+}
+
+TEST(collection, co07_durable_and_a_crash_after_any_change) {
+    auto data = clustered(300, 8, 4, 4006);
+    const std::string dir = co_dir("co07");
+    std::vector<std::pair<std::string, std::string>> moments;
+    {
+        RecoveryStats st;
+        auto c = Collection::open(dir, co_options(8, true), &st);
+        CHECK(st.created && c->durable());
+        std::mt19937 rng(11);
+        for (int step = 0; step < 150; ++step) {
+            const std::uint64_t id = rng() % 60;
+            switch (rng() % 5) {
+                case 0: case 1: (void)c->upsert(id, co_doc(data, id + std::uint64_t(step), true)); break;
+                case 2: (void)c->remove(id); break;
+                case 3: (void)c->set_metadata(id, Metadata().set("s", std::int64_t(step))); break;
+                default: (void)c->set_metadata_where(Filter::eq("category", "tech"), Metadata().set("t", std::int64_t(step))); break;
+            }
+            if (step % 41 == 40) (void)c->checkpoint();
+            if (step % 10 == 0) moments.push_back({crash_copy(dir, "co07_" + std::to_string(step)), co_bytes(*c)});
+        }
+    }
+    bool all = true;
+    for (const auto& [copy, bytes] : moments) {
+        all = all && co_bytes(*Collection::open(copy, co_options(8, true))) == bytes;
+        std::filesystem::remove_all(copy);
+    }
+    CHECK(all && moments.size() == 15);
+    Collection plain(co_options());
+    CHECK(!plain.durable());
+    CHECK_THROWS_AS(std::logic_error, (void)plain.checkpoint());
+    std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co08_reopening_rules) {
+    auto data = random_vectors(30, 8, 4007);
+    const std::string dir = co_dir("co08");
+    std::string expected;
+    {
+        auto c = Collection::open(dir, co_options());
+        for (std::uint64_t i = 0; i < 10; ++i) c->add(i, co_doc(data, i));
+        CHECK_THROWS_AS(std::runtime_error, (void)Collection::open(dir, co_options()));  // locked
+        expected = co_bytes(*c);
+    }
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, co_options(9)));
+    CollectionOptions other = co_options();
+    other.metric = Metric::Cosine;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, other));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, co_options(8, true)));
+    CHECK_THROWS_AS(std::invalid_argument, (void)HnswIndex::open_durable(dir, 8, Metric::L2));  // another kind
+    // An operation unfinished at a crash: dropped, and a checkpoint taken.
+    const std::string seg = (std::filesystem::path(dir) / files_of(dir, "wal-0").back()).string();
+    {
+        WalWriter w = WalWriter::open(seg, wal::read_segment(seg).identity);
+        Document d = co_doc(data, 3);
+        d.vector = {1, 2};  // invalid: fails on replay
+        (void)w.append(walop::kDocument, walop::encode_document(3, 1, d.vector, "", {}, {}));
+    }
+    RecoveryStats st;
+    {
+        auto c = Collection::open(dir, co_options(), &st);
+        CHECK(st.dropped_unfinished && co_bytes(*c) == expected);
+        c->add(20, co_doc(data, 20));
+    }
+    CHECK(Collection::open(dir, co_options())->contains(20));
+    // A torn last record is discarded.
+    {
+        auto c = Collection::open(dir, co_options());
+        c->add(21, co_doc(data, 21));
+        expected = co_bytes(*c);
+        c->add(22, co_doc(data, 22));
+    }
+    const std::string last = (std::filesystem::path(dir) / files_of(dir, "wal-0").back()).string();
+    write_file(last, read_file(last).substr(0, read_file(last).size() - 5));
+    CHECK(co_bytes(*Collection::open(dir, co_options())) == expected);
+    // Records a collection cannot replay; replay with the log attached.
+    const std::vector<WalRecord> foreign = {{1, walop::kTrainLists, {}}};
+    CHECK_THROWS_AS(FormatError, Collection(co_options()).replay(foreign));
+    CHECK_THROWS_AS(std::logic_error, (void)Collection::open(dir, co_options())->replay({}));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co09_calls_from_inside_a_search) {
+    auto data = random_vectors(50, 4, 4008);
+    Collection c(co_options(4)), other(co_options(4));
+    for (std::uint64_t i = 0; i < 50; ++i) c.add(i, co_doc(data, i));
+    CollectionQuery q;
+    q.vector = data[0];
+    q.text = "alpha";
+    bool refused = false, read = true, nested = true, elsewhere = true;
+    CollectionSearchOptions o;
+    o.predicate = [&](std::uint64_t id) {
+        if (id == 1) {
+            try {
+                (void)c.remove(2);
+            } catch (const std::logic_error&) {
+                refused = true;
+            }
+            read = read && c.get(1).has_value() && c.contains(1) && c.size() == 50;
+            nested = nested && c.search(q, 3).size() == 3;
+            Document d;
+            d.vector = data[1];
+            try {  // another collection: refused by its indexes (no index changes inside any search)
+                other.upsert(id, d);
+                elsewhere = false;
+            } catch (const std::logic_error&) {
+            }
+            elsewhere = elsewhere && !other.contains(1) && other.size() == 0;
+        }
+        return true;
+    };
+    (void)c.search(q, 50, o);
+    CHECK(refused && read && nested && elsewhere && c.contains(2));
+}
+
+TEST(collection, co10_out_of_memory_changes_nothing) {
+    if constexpr (!HNSW_ALLOC_HOOK) SKIP("needs the allocation hook");
+    auto data = random_vectors(40, 4, 4009);
+    Collection c(co_options(4, true));
+    for (std::uint64_t i = 0; i < 30; ++i) c.add(i, co_doc(data, i, true));
+    std::string before = co_documents(c);
+    bool ok = true;
+    long failed = 0;
+    for (int which = 0; which < 3; ++which) {
+        for (long n = 0; n < 3000; ++n) {
+            alloc_hook::fail_after(n);
+            try {
+                if (which == 0) c.add(100, co_doc(data, 35, true));
+                else if (which == 1) (void)c.upsert(5, co_doc(data, 36, true));  // replacing
+                else {
+                    Document fewer;
+                    fewer.text = "fewer parts now";
+                    (void)c.upsert(6, fewer);  // replacing, and dropping two parts
+                }
+                alloc_hook::disarm();
+                break;
+            } catch (const std::bad_alloc&) {
+                alloc_hook::disarm();
+                ++failed;
+                ok = ok && co_documents(c) == before;
+            }
+        }
+        before = co_documents(c);
+    }
+    CHECK(ok && failed > 30 && c.contains(100) && c.get(6)->text == "fewer parts now" && !c.get(6)->vector);
+}
+
+TEST(collection, co11_concurrent_changes_searches_and_checkpoints) {
+    auto data = clustered(1200, 8, 6, 4010);
+    const std::string dir = co_dir("co11");
+    std::string expected;
+    {
+        auto c = Collection::open(dir, co_options(8, true));
+        std::atomic<bool> stop{false};
+        std::atomic<long> searches{0};
+        with_watchdog(60, "co11", [&] {
+            std::thread checkpointer([&] {
+                while (!stop) {
+                    (void)c->checkpoint();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            });
+            std::thread searcher([&] {
+                CollectionQuery q;
+                q.text = "alpha gamma";
+                while (!stop) {
+                    q.vector = data[std::size_t(searches.load()) % 1200];
+                    (void)c->search(q, 5);
+                    ++searches;
+                }
+            });
+            run_threads(3, [&](std::size_t t) {
+                while (searches.load() == 0) std::this_thread::yield();
+                for (std::uint64_t i = t; i < 900; i += 3) {
+                    c->add(i, co_doc(data, i, true));
+                    if (i % 4 == 0) (void)c->remove(i / 2);
+                    if (i % 9 == 0) (void)c->set_metadata(i / 3, Metadata().set("n", std::int64_t(i)));
+                }
+            });
+            stop = true;
+            checkpointer.join();
+            searcher.join();
+        });
+        expected = co_bytes(*c);
+    }
+    CHECK(co_bytes(*Collection::open(dir, co_options(8, true))) == expected);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co12_text_storage_and_bm25_settings) {
+    CollectionOptions o;
+    o.dim = 0;
+    o.bm25.avg_doc_length = 3;
+    o.bm25.b = 0;
+    Collection c(o);
+    Document a, b;
+    a.text = "apple apple banana";
+    b.text = "apple";
+    c.add(1, a);
+    c.add(2, b);
+    CollectionQuery q;
+    q.text = "apple";
+    const auto hits = c.search(q, 2);
+    CHECK(hits.size() == 2 && hits[0].id == 1 && hits[0].text_rank == 1u);  // b = 0: frequency decides
+    const std::string path = temp_path("co12");
+    c.save(path);
+    auto d = Collection::load(path);
+    CHECK(d->options().bm25.b == 0 && d->options().bm25.avg_doc_length == 3 && d->search(q, 2)[0].id == 1);
+    std::filesystem::remove(path);
+    o.bm25.b = 2;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(o));
+    CollectionOptions bad_hnsw = co_options();
+    bad_hnsw.hnsw.M = 0;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(bad_hnsw));
+}
+
+TEST(collection, co13_every_side_combination) {
+    auto data = random_vectors(30, 4, 4020);
+    struct Combo {
+        std::size_t dim;
+        bool text, sparse;
+    };
+    bool ok = true;
+    for (const Combo& cb : {Combo{4, false, false}, Combo{0, true, false}, Combo{0, false, true}, Combo{4, false, true}, Combo{0, true, true}, Combo{4, true, true}}) {
+        CollectionOptions o;
+        o.dim = cb.dim;
+        o.metric = Metric::L2;
+        o.text = cb.text;
+        o.sparse = cb.sparse;
+        o.store_text = cb.text && cb.dim == 0;  // with and without stored text
+        Collection c(o);
+        auto doc = [&](std::uint64_t id) {
+            Document d;
+            if (cb.dim) d.vector = data[id % 30];
+            if (cb.text) d.text = text_for(id);
+            if (cb.sparse) d.sparse = {{std::uint32_t(id % 5)}, {1.0f}};
+            d.metadata = meta_for(id);
+            return d;
+        };
+        for (std::uint64_t i = 0; i < 20; ++i) c.add(i, doc(i));
+        ok = ok && !c.upsert(3, doc(4)) && c.remove(5) && !c.remove(5) && c.get(3).has_value() && !c.get(5);
+        CollectionQuery q;
+        if (cb.dim) q.vector = data[0];
+        if (cb.text) q.text = "alpha";
+        if (cb.sparse) q.sparse = {{0}, {1.0f}};
+        CollectionSearchOptions so;
+        so.filter = Filter::eq("category", "tech");  // a filter without a predicate
+        so.candidates = 7;
+        so.ef = 16;
+        so.fusion = Fusion::Weighted;
+        const auto hits = c.search(q, 5, so);
+        for (const auto& h : hits) ok = ok && meta_for(h.id).get("category")->s == "tech";
+        std::ostringstream out;
+        c.save(out);
+        std::istringstream in(out.str());
+        auto d = Collection::load(in);
+        ok = ok && co_bytes(*d) == out.str() && d->size() == 19 && d->get(3)->text == (o.store_text ? text_for(4) : std::string());
+        if constexpr (HNSW_ALLOC_HOOK) {  // out of memory while replacing, for this combination of sides
+            const std::string before = co_documents(c, 30);
+            for (long n = 0; n < 800; ++n) {
+                alloc_hook::fail_after(n);
+                try {
+                    (void)c.upsert(7, doc(8));
+                    alloc_hook::disarm();
+                    break;
+                } catch (const std::bad_alloc&) {
+                    alloc_hook::disarm();
+                    ok = ok && co_documents(c, 30) == before;
+                }
+            }
+        }
+    }
+    CHECK(ok);
+    // Remaining input and option checks.
+    Collection c(co_options(4, true));
+    Document one;
+    one.vector = data[0];
+    c.add(1, one);  // not empty: searches reach the sides
+    Document only_values;
+    only_values.sparse.values = {1.0f};  // values without terms
+    CHECK_THROWS_AS(std::invalid_argument, c.add(2, only_values));
+    CollectionQuery bad_sparse;
+    bad_sparse.sparse.values = {1.0f};
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(bad_sparse, 3));
+    CollectionQuery v;
+    v.vector = data[0];
+    for (double w : {std::numeric_limits<double>::infinity(), -1.0}) {
+        CollectionSearchOptions so;
+        so.sparse_weight = w;
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.search(v, 3, so));
+        so.sparse_weight = 1;
+        so.text_weight = w;
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.search(v, 3, so));
+    }
+    CollectionSearchOptions weighted;
+    weighted.fusion = Fusion::Weighted;
+    weighted.predicate = [](std::uint64_t) { return true; };  // a predicate without a filter
+    CHECK(c.search(v, 3, weighted).size() == 1 && c.search(v, 3, weighted)[0].score == 1.0);  // one result scales to 1
+    CHECK_THROWS_AS(std::runtime_error, c.save(temp_path("co13_no_dir") + "/x/y.col"));
+    CHECK_THROWS_AS(std::runtime_error, (void)Collection::load(temp_path("co13_missing.col")));
+    // Replay: aborted records are skipped; a failure before the end means the log does not match.
+    Collection r(co_options(4));
+    Document dv;
+    dv.vector = data[1];
+    const std::vector<WalRecord> aborted = {{1, walop::kDocument, walop::encode_document(1, 1, dv.vector, "", {}, {})},
+                                            {2, walop::kAbort, walop::encode_abort(1)},
+                                            {3, walop::kDocument, walop::encode_document(2, 1, dv.vector, "", {}, {})}};
+    CHECK(!r.replay(aborted) && !r.contains(1) && r.contains(2));
+    const std::vector<WalRecord> mismatch = {{4, walop::kDocument, walop::encode_document(5, 1, std::vector<float>{1, 2}, "", {}, {})},
+                                             {5, walop::kDocument, walop::encode_document(6, 1, dv.vector, "", {}, {})}};
+    CHECK_THROWS_AS(FormatError, (void)r.replay(mismatch));
+    std::vector<unsigned char> parts = walop::encode_document(1, 9, {}, "", {}, {});
+    CHECK_THROWS_AS(FormatError, (void)walop::decode(walop::kDocument, parts));  // unknown parts
+    std::vector<unsigned char> terms = walop::encode_document(1, 4, {}, "", {}, {});
+    for (int i = 0; i < 8; ++i) terms[8 + 1 + 8 + 4 + i] = 0xFF;  // a huge term count
+    CHECK_THROWS_AS(FormatError, (void)walop::decode(walop::kDocument, terms));
+    // Durable: a checkpoint from inside a search, Synced mode, reopening with other sides.
+    const std::string dir = co_dir("co13");
+    {
+        CollectionOptions so = co_options(4);
+        so.durability.durability = Durability::Synced;
+        auto d = Collection::open(dir, so);
+        d->add(1, one);
+        CollectionSearchOptions inside;
+        bool refused = false;
+        inside.predicate = [&](std::uint64_t) {
+            try {
+                (void)d->checkpoint();
+            } catch (const std::logic_error&) {
+                refused = true;
+            }
+            return true;
+        };
+        (void)d->search(v, 1, inside);
+        CHECK(refused);
+    }
+    CollectionOptions no_text = co_options(4);
+    no_text.text = false;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, no_text));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co14_invalid_content_behind_valid_checksums) {
+    // Files written section by section with valid checksums, each wrong in one way.
+    auto bytes_of = [](const auto& index) {
+        std::ostringstream o;
+        index.save(o);
+        return o.str();
+    };
+    HnswIndex h4(4, Metric::L2), h8(8, Metric::L2), h_other(4, Metric::L2);
+    h4.add(7, std::vector<float>{1, 2, 3, 4});
+    h_other.add(99, std::vector<float>{1, 2, 3, 4});
+    SparseIndex t, t_other;
+    t.add(7, {{1}, {1.0f}});
+    t_other.add(99, {{1}, {1.0f}});
+    struct File {
+        std::uint64_t dim = 4;
+        std::uint32_t metric = 0;
+        std::uint8_t text = 1, sparse = 0, store = 1;
+        std::vector<std::pair<std::uint8_t, std::uint64_t>> slots = {{1, 7}, {0, 0}};
+        std::vector<std::uint32_t> free = {1};
+        std::string dense, text_side, sparse_side;
+    };
+    auto write = [&](const File& f) {
+        std::ostringstream out;
+        persist::write_header(out, persist::IndexKind::Collection);
+        persist::write_section(out, persist::tag("CCFG"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(f.dim);
+            w.put<std::uint32_t>(f.metric);
+            w.put<std::uint8_t>(f.text);
+            w.put<std::uint8_t>(f.sparse);
+            w.put<std::uint8_t>(f.store);
+            w.put<double>(1.2);
+            w.put<double>(0.75);
+            w.put<double>(6);
+        });
+        persist::write_section(out, persist::tag("CDOC"), [&](persist::Writer& w) {
+            w.put<std::uint64_t>(f.slots.size());
+            for (const auto& [live, id] : f.slots) {
+                w.put<std::uint8_t>(live);
+                w.put<std::uint64_t>(id);
+                w.put_string("");
+            }
+            w.put<std::uint64_t>(f.free.size());
+            for (const std::uint32_t n : f.free) w.put<std::uint32_t>(n);
+        });
+        MetadataStore m;
+        persist::write_section(out, persist::tag("CMET"), [&](persist::Writer& w) { m.save(w); });
+        persist::write_section(out, persist::tag("CSID"), [&](persist::Writer& w) {
+            w.put_string(f.dense);
+            w.put_string(f.text_side);
+            w.put_string(f.sparse_side);
+        });
+        return out.str();
+    };
+    auto loads = [&](const File& f) {
+        std::istringstream in(write(f));
+        try {
+            (void)Collection::load(in);
+            return true;
+        } catch (const FormatError&) {
+            return false;
+        }
+    };
+    File good;
+    good.dense = bytes_of(h4);
+    good.text_side = bytes_of(t);
+    CHECK(loads(good));  // the baseline is valid: each case below changes one thing
+    auto with = [&](auto change) {
+        File f = good;
+        change(f);
+        return loads(f);
+    };
+    CHECK(!with([](File& f) { f.metric = 7; }));
+    CHECK(!with([](File& f) { f.text = 2; }));
+    CHECK(!with([](File& f) { f.dim = 0; f.text = 0; f.dense.clear(); f.text_side.clear(); }));  // no side at all
+    CHECK(!with([](File& f) { f.slots = {{1, 7}, {1, 7}}; f.free.clear(); }));                  // a duplicate ID
+    CHECK(!with([](File& f) { f.slots.push_back({2, 0}); }));                                    // an invalid live flag
+    CHECK(!with([](File& f) { f.free = {0}; }));                                                 // a live slot as free
+    CHECK(!with([](File& f) { f.free = {5}; }));                                                 // out of range
+    CHECK(!with([](File& f) { f.slots.push_back({0, 0}); f.free = {1, 1}; }));                   // a slot free twice
+    CHECK(!with([](File& f) { f.free.clear(); }));                                               // a free slot missing
+    CHECK(!with([&](File& f) { f.sparse_side = bytes_of(t); }));                                 // data for an absent side
+    CHECK(!with([&](File& f) { f.dense = bytes_of(h8); }));                                      // another dimension
+    CHECK(!with([&](File& f) { f.text_side = bytes_of(t_other); }));                             // unknown document (text)
+    CHECK(!with([&](File& f) { f.dense = bytes_of(h_other); }));                                 // unknown document (dense)
+    CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
+}
+
 // ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
@@ -17238,7 +18079,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

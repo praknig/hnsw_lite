@@ -52,7 +52,7 @@ inline constexpr std::uint32_t kVersion = 3;
 inline constexpr std::uint32_t kOldestVersion = 1;
 inline constexpr std::uint32_t kByteOrderMark = 0x01020304u;
 
-enum class IndexKind : std::uint32_t { Flat = 1, Hnsw = 2, Sparse = 3 };
+enum class IndexKind : std::uint32_t { Flat = 1, Hnsw = 2, Sparse = 3, Collection = 4 };
 
 /// Section tag from 4 ASCII characters.
 constexpr std::uint32_t tag(const char (&s)[5]) {
@@ -245,6 +245,7 @@ public:
             throw FormatError(kind == 1 ? "the file holds a Flat index, not " + std::string(expected == IndexKind::Hnsw ? "an HNSW" : "a sparse") + " index"
                               : kind == 2 ? "the file holds an HNSW index, not " + std::string(expected == IndexKind::Flat ? "a Flat" : "a sparse") + " index"
                               : kind == 3 ? std::string("the file holds a sparse index")
+                              : kind == 4 ? std::string("the file holds a collection")
                                           : std::string("unknown index kind"));
         if (from_little_endian<std::uint32_t>(buf + 20) != 0) throw FormatError("reserved header field is not zero");
     }
