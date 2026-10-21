@@ -169,11 +169,12 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 |---|---|
 | [Getting started](docs/getting-started.md) | Building on every platform, build options, using hnsw-lite in your project, troubleshooting |
 | [User guide](docs/user-guide.md) | Everything the library does and how to use it: indexes, metrics, metadata, filters, batch and range search, threads, errors |
+| [Developer reference](docs/developer-reference.md) | Every method and parameter in detail: what it does, what it expects, what can go wrong, and its limits |
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
 | [Testing](docs/testing.md) | The 864 tests, code coverage, continuous integration, and bugs found by testing |
-| [Project notes](docs/project-notes.md) | Limitations, roadmap, comparison with hnswlib, Faiss, Qdrant and Milvus, references |
+| [Project notes](docs/project-notes.md) | Limitations, the roadmap, and references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
 | [Features](docs/feature-catalog.md) | Everything hnsw-lite has, a comparison with similar libraries and databases, and what could come next, in a suggested order |

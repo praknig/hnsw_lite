@@ -4,6 +4,8 @@ How to use everything hnsw-lite offers. For building and setup, see [Getting sta
 
 All names below are in the `vecdb` namespace. Code examples assume `using namespace vecdb;`.
 
+
+For every method and parameter in detail, with its limits, see the [developer reference](developer-reference.md).
 ## Contents
 
 - [Core ideas](#core-ideas)
@@ -76,7 +78,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-  |---|---|---|---|---|---|
+    |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |

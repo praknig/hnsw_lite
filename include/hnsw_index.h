@@ -179,7 +179,9 @@ public:
     /// vectors and reconnects unreachable ones (see UpkeepOptions). Takes the lock
     /// alone; use max_nodes to keep each call short, so searches run in between.
     /// A deadline or cancellation (options) stops it early without error: what was
-    /// repaired stays repaired. When complete, the churn counters are reset.
+    /// repaired stays repaired. A deadline stops it only after at least one repair
+    /// in the call, so repeated calls always finish; a cancellation stops it at
+    /// once. When complete, the churn counters are reset.
     UpkeepStats upkeep(const UpkeepOptions& upkeep_options = {}, const OperationOptions& options = {});
 
     /// Automatic compact() once removed vectors' free slots exceed `fraction` of

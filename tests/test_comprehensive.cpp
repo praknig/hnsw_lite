@@ -9808,6 +9808,9 @@ TEST(control, s06_atomic_while_the_record_changes) {
             }
         });
         run_threads(3, [&](std::size_t) {
+            // The writer must be running first: on a fast machine the readers could
+            // finish all their checks before it was scheduled (found on Linux ARM).
+            while (updates.load() == 0) std::this_thread::yield();
             for (int i = 0; i < 300; ++i) {
                 const auto r = *f.search_by_id(7, 1, {}, true);
                 wrong += long(r.empty() || r[0].id != 7 || r[0].distance > 1e-6f);

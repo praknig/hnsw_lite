@@ -6,6 +6,8 @@ Most programs need only `FlatIndex` or `HnswIndex` with `SearchOptions`, `Filter
 
 All code is in the `vecdb` namespace. Invalid input throws `std::invalid_argument`, `std::out_of_range` or `std::length_error`.
 
+
+This is a compact list. The [developer reference](developer-reference.md) explains each method and parameter in detail, with its errors and limits.
 ## `common.h`
 
 | Name | Description |
@@ -373,4 +375,3 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `MaintenancePolicy` | `mode` (`Manual`, `Background`), `interval` (1 s), `budget` (250 ms), `checkpoint_bytes` (64 MiB), `checkpoint_records` (100,000), `checkpoint_age` (600 s), `health_check_churn` (0.05), `upkeep_churn` (0.2), `upkeep_nodes` (0: no limit), `rebuild_check_churn` (0.5), `rebuild_drift` (4) |
 | `MaintenanceReport` | `when`, `elapsed`, `health`, `upkept`, `upkeep`, `rebuilt`, `rebuild`, `checkpointed`, `checkpoint_lsn`, `budget_exhausted`, `notes`, `error` |
 | `MaintenanceStatus` | `log_bytes`, `log_records`, `since_checkpoint`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds` |
-
