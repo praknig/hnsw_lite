@@ -63,7 +63,9 @@ function(hnsw_lite_setup target)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   if(HNSW_LITE_SANITIZE AND NOT MSVC)
-    target_compile_options(${target} PRIVATE -fsanitize=address,undefined)
+    # -O1 as the sanitizers' documentation recommends: the same checks, many times
+    # faster than an unoptimized build (frame pointers keep the reports' stacks).
+    target_compile_options(${target} PRIVATE -fsanitize=address,undefined -O1 -g -fno-omit-frame-pointer)
     target_link_options(${target} PRIVATE -fsanitize=address,undefined)
   endif()
 endfunction()
@@ -81,7 +83,7 @@ if(HNSW_LITE_BUILD_TESTS)
   target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
   hnsw_lite_setup(test_comprehensive)
   foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-                metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance stress e2e)
+                metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance presets stress e2e)
     # The heaviest groups run as several CTest entries (shards), so that a
     # parallel run (ctest -j) is not held up by one long group; they start first.
     set(shards 1)

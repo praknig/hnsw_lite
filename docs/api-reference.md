@@ -358,7 +358,8 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `search(query, k, options)` | Any combination of `CollectionQuery::vector`, `text` and `sparse`; returns `CollectionHit`s |
 | `checkpoint()`, `durable()`, `save`, `load`, `replay` | Durability and files |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only access to the sides (null if absent) |
-| `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability` |
+| `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability`, `maintenance`, `ef` (default search beam; 0: max(candidates, 64)) |
+| `CollectionOptions::preset(dim, preset, expected_size)`, `Preset` | Ready-made settings: `Balanced`, `HighRecall`, `LowMemory` (see the user guide) |
 | `Document` | `vector`, `text`, `sparse`, `metadata`, each optional |
 | `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text` |
 | `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |

@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -18040,6 +18040,101 @@ TEST(maintenance, mt07_background_maintenance_during_changes_and_searches) {
 }
 
 // ===========================================================================
+// Presets (PR1-PR3)
+// ===========================================================================
+
+TEST(presets, pr01_settings) {
+    const CollectionOptions b = CollectionOptions::preset(768), bl = CollectionOptions::preset(768, Preset::Balanced, 5000000);
+    CHECK(b.dim == 768 && b.metric == Metric::Cosine && b.text && b.maintenance.mode == Maintenance::Background && b.hnsw.M == 16 &&
+          b.hnsw.ef_construction == 200 && b.hnsw.quantization.codec == CodecKind::None && b.ef == 128);
+    CHECK(bl.hnsw.M == 24 && bl.hnsw.ef_construction == 300);
+    const CollectionOptions h = CollectionOptions::preset(384, Preset::HighRecall), hl = CollectionOptions::preset(384, Preset::HighRecall, 1000000);
+    CHECK(h.hnsw.M == 32 && h.hnsw.ef_construction == 400 && h.ef == 256 && hl.hnsw.M == 48 && hl.hnsw.ef_construction == 500);
+    const CollectionOptions l = CollectionOptions::preset(1536, Preset::LowMemory, 10000000);
+    CHECK(l.hnsw.M == 12 && l.hnsw.quantization.codec == CodecKind::SQ8 && !l.hnsw.quantization.keep_full_vectors && !l.hnsw.quantization.rerank && l.ef == 128);
+    CHECK_THROWS_AS(std::invalid_argument, (void)CollectionOptions::preset(8, static_cast<Preset>(9)));
+    CollectionOptions text = CollectionOptions::preset(0);  // text only
+    text.maintenance.mode = Maintenance::Manual;
+    Collection t(text);
+    Document d;
+    d.text = "presets work for text too";
+    t.add(1, d);
+    CollectionQuery q;
+    q.text = "presets";
+    CHECK(t.search(q, 1).size() == 1);
+}
+
+TEST(presets, pr02_recall_and_size_targets) {
+    auto data = clustered(4000, 64, 20, 4200);
+    auto queries = clustered(60, 64, 20, 4201);
+    FlatIndex exact(64, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 4000; ++i) exact.add(i, data[i]);
+    struct Result {
+        double recall;
+        std::size_t dense_bytes;
+    };
+    auto measure = [&](Preset p) {
+        CollectionOptions o = CollectionOptions::preset(64, p, 4000);
+        o.text = false;
+        o.maintenance.mode = Maintenance::Manual;
+        Collection c(o);
+        for (std::uint64_t i = 0; i < 4000; ++i) {
+            Document d;
+            d.vector = data[i];
+            c.add(i, d);
+        }
+        double hits = 0;
+        for (const auto& qv : queries) {
+            CollectionQuery q;
+            q.vector = qv;
+            const auto got = c.search(q, 10);
+            const auto want = exact.search(qv, 10);
+            for (const auto& w : want)
+                hits += std::any_of(got.begin(), got.end(), [&](const CollectionHit& h) { return h.id == w.id; });
+        }
+        std::ostringstream out;
+        c.dense_index()->save(out);
+        return Result{hits / (60.0 * 10), out.str().size()};
+    };
+    const Result b = measure(Preset::Balanced), h = measure(Preset::HighRecall), l = measure(Preset::LowMemory);
+    std::printf("    recall@10 / dense bytes: balanced %.3f / %zu, high recall %.3f / %zu, low memory %.3f / %zu\n", b.recall, b.dense_bytes,
+                h.recall, h.dense_bytes, l.recall, l.dense_bytes);
+    CHECK(b.recall >= 0.95 && h.recall >= 0.98 && h.recall >= b.recall && l.recall >= 0.85);
+    CHECK(l.dense_bytes * 2 < b.dense_bytes && h.dense_bytes > b.dense_bytes);
+}
+
+TEST(presets, pr03_the_default_beam) {
+    auto data = clustered(1500, 16, 8, 4202);
+    CollectionOptions o = CollectionOptions::preset(16, Preset::HighRecall);
+    o.maintenance.mode = Maintenance::Manual;
+    o.text = false;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 1500; ++i) {
+        Document d;
+        d.vector = data[i];
+        c.add(i, d);
+    }
+    CollectionQuery q;
+    q.vector = data[3];
+    CollectionSearchOptions explicit_ef;
+    explicit_ef.ef = 256;
+    const auto a = c.search(q, 10), e = c.search(q, 10, explicit_ef);
+    bool same = a.size() == e.size();
+    for (std::size_t i = 0; i < a.size() && same; ++i) same = a[i].id == e[i].id && a[i].vector_distance == e[i].vector_distance;
+    CHECK(same);
+    // A durable collection takes the beam (a runtime setting) from the caller.
+    const std::string dir = co_dir("pr03");
+    {
+        auto d = Collection::open(dir, o);
+        CHECK(d->options().ef == 256 && d->options().maintenance.mode == Maintenance::Manual);
+    }
+    CollectionOptions other = o;
+    other.ef = 40;
+    CHECK(Collection::open(dir, other)->options().ef == 40);
+    std::filesystem::remove_all(dir);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -18386,7 +18481,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
@@ -18450,6 +18545,31 @@ int main(int argc, char** argv) {
             return 2;
         } else {
             patterns.push_back(arg);
+        }
+    }
+
+    // Exclusions from the environment too (space- or comma-separated), for runs
+    // through CTest, which cannot pass arguments: CI's sanitizer job uses it.
+    {
+        std::string env;
+#ifdef _MSC_VER
+        char* value = nullptr;
+        std::size_t length = 0;
+        if (_dupenv_s(&value, &length, "HNSW_LITE_TEST_EXCLUDE") == 0 && value) {
+            env = value;
+            std::free(value);
+        }
+#else
+        if (const char* value = std::getenv("HNSW_LITE_TEST_EXCLUDE")) env = value;
+#endif
+        std::string word;
+        for (const char ch : env + " ") {
+            if (ch == ' ' || ch == ',') {
+                if (!word.empty()) excludes.push_back(word);
+                word.clear();
+            } else {
+                word += ch;
+            }
         }
     }
 

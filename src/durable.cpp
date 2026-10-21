@@ -276,6 +276,7 @@ std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionO
     if (got.dim != options.dim || got.metric != options.metric || got.text != options.text || got.sparse != options.sparse)
         throw std::invalid_argument("Collection::open: the directory holds a collection with another dimension, metric or sides");
     o.index->options_.durability = durability;
+    o.index->options_.ef = options.ef;  // runtime settings come from the caller
     o.index->log_.set_sync_each(durability.durability == Durability::Synced);
     o.index->log_.attach(std::move(*o.log));
     o.index->durable_ = std::move(o.state);
