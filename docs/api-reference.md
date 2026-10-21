@@ -363,3 +363,13 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text` |
 | `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |
 
+### Maintenance of collections
+
+| Name | Description |
+|---|---|
+| `maintain(budget)` | Does the maintenance that is due, within `budget` (0: no limit); returns a `MaintenanceReport` |
+| `set_maintenance(policy)`, `last_maintenance()`, `maintenance_status()` | Change the policy (starts or stops the background thread); the last round's report; the counters |
+| `MaintenancePolicy` | `mode` (`Manual`, `Background`), `interval` (1 s), `budget` (250 ms), `checkpoint_bytes` (64 MiB), `checkpoint_records` (100,000), `checkpoint_age` (600 s), `health_check_churn` (0.05), `upkeep_churn` (0.2), `upkeep_nodes` (0: no limit), `rebuild_check_churn` (0.5), `rebuild_drift` (4) |
+| `MaintenanceReport` | `when`, `elapsed`, `health`, `upkept`, `upkeep`, `rebuilt`, `rebuild`, `checkpointed`, `checkpoint_lsn`, `budget_exhausted`, `notes`, `error` |
+| `MaintenanceStatus` | `log_bytes`, `log_records`, `since_checkpoint`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds` |
+

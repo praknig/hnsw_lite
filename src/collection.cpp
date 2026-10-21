@@ -86,9 +86,13 @@ Collection::Collection(CollectionOptions options) : options_(std::move(options))
     if (options_.dim > 0) dense_ = std::make_unique<HnswIndex>(options_.dim, options_.metric, options_.hnsw);
     if (options_.text) text_ = std::make_unique<SparseIndex>();
     if (options_.sparse) sparse_ = std::make_unique<SparseIndex>();
+    checkpoint_time_ = std::chrono::steady_clock::now().time_since_epoch().count();
+    const MaintenancePolicy policy = options_.maintenance;
+    options_.maintenance = MaintenancePolicy{};
+    set_maintenance(policy);  // validates it, and starts the background thread if asked
 }
 
-Collection::~Collection() = default;
+Collection::~Collection() { stop_maintenance(); }  // before any member goes
 
 bool Collection::searching_here() const { return inside(this); }
 
@@ -123,8 +127,7 @@ Collection::Prepared Collection::prepare(const Document& d) const {
         p.parts |= kPartSparse;
         p.sparse = d.sparse;
     }
-    metadata_.validate(d.metadata);
-    p.metadata = d.metadata;
+    p.metadata = d.metadata;  // checked under the lock: the field table changes with dynamic schemas
     return p;
 }
 
@@ -185,6 +188,10 @@ bool Collection::apply_upsert(std::uint64_t id, const Prepared& p) {
             }
         }
         texts_[slot].swap(text);
+        if (old_vector) {  // churn: a dense vector replaced or dropped (additions do not damage the graph)
+            ++changed_since_upkeep_;
+            ++changed_since_rebuild_;
+        }
     } catch (...) {
         try {  // restore the sides already changed, newest first
             if (sides_done >= 2 && text_) restore(*text_, id, old_text);
@@ -208,7 +215,10 @@ bool Collection::apply_remove(std::uint64_t id) {
     const NodeId slot = it->second;
     free_.reserve(free_.size() + 1);
     // Removals never fail on these indexes' side (they free memory).
-    if (dense_) (void)dense_->remove(id);
+    if (dense_ && dense_->remove(id)) {
+        ++changed_since_upkeep_;
+        ++changed_since_rebuild_;
+    }
     if (text_) (void)text_->remove(id);
     if (sparse_) (void)sparse_->remove(id);
     metadata_.clear(slot);
@@ -224,6 +234,7 @@ void Collection::add(std::uint64_t id, const Document& document) {
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (slot_of_.count(id)) throw std::invalid_argument("Collection: duplicate id " + std::to_string(id));
+    metadata_.validate(p.metadata);
     const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
         return walop::encode_document(id, p.parts, p.vector, p.text, p.sparse, p.metadata);
     }));
@@ -234,6 +245,7 @@ bool Collection::upsert(std::uint64_t id, const Document& document) {
     Prepared p = prepare(document);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
+    metadata_.validate(p.metadata);
     const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
         return walop::encode_document(id, p.parts, p.vector, p.text, p.sparse, p.metadata);
     }));
@@ -616,4 +628,203 @@ std::unique_ptr<Collection> Collection::load(const std::string& path) {
     return load(in);
 }
 
+// ---------------------------------------------------------------- maintenance
+
+namespace {
+
+std::string fmt(const char* f, double a, double b) {
+    char buf[160];
+    std::snprintf(buf, sizeof buf, f, a, b);
+    return buf;
+}
+
+}  // namespace
+
+void Collection::set_maintenance(const MaintenancePolicy& policy) {
+    const auto non_negative = [](double x) { return std::isfinite(x) && x >= 0; };
+    if (policy.interval.count() < 1 || policy.budget.count() < 0 || policy.checkpoint_age.count() < 0 || !non_negative(policy.health_check_churn) ||
+        !non_negative(policy.upkeep_churn) || !non_negative(policy.rebuild_check_churn) || !non_negative(policy.rebuild_drift))
+        throw std::invalid_argument("MaintenancePolicy: interval of at least 1 ms, and non-negative budget, age and thresholds required");
+    if (searching_here()) throw std::logic_error("set_maintenance: refused from inside a search of this collection");
+    stop_maintenance();
+    {
+        const std::lock_guard<std::mutex> one(maintenance_mutex_);
+        options_.maintenance = policy;
+    }
+    if (policy.mode != Maintenance::Background) return;
+    stopping_ = false;
+    maintainer_ = std::thread([this, interval = policy.interval, budget = policy.budget] {
+        std::unique_lock<std::mutex> l(wake_mutex_);
+        while (!stopping_) {
+            wake_.wait_for(l, interval, [this] { return stopping_; });
+            if (stopping_) break;
+            l.unlock();
+            try {
+                (void)maintain(budget);
+            } catch (const std::exception& e) {  // recorded; the next round tries again
+                MaintenanceReport r;
+                r.when = std::chrono::system_clock::now();
+                r.error = e.what();
+                const std::lock_guard<std::mutex> rl(report_mutex_);
+                last_report_ = std::move(r);
+                ++rounds_;
+            }
+            l.lock();
+        }
+    });
+}
+
+void Collection::stop_maintenance() {
+    {
+        const std::lock_guard<std::mutex> l(wake_mutex_);
+        stopping_ = true;
+    }
+    wake_.notify_all();
+    if (maintainer_.joinable()) maintainer_.join();
+}
+
+std::optional<MaintenanceReport> Collection::last_maintenance() const {
+    const std::lock_guard<std::mutex> l(report_mutex_);
+    return last_report_;
+}
+
+MaintenanceStatus Collection::maintenance_status() const {
+    MaintenanceStatus st;
+    const auto lock = read_lock(mutex_, this);
+    if (durable_) {
+        st.log_bytes = log_.writer().size() - wal::kHeaderSize;
+        st.log_records = log_.writer().next_lsn() - checkpoint_lsn_.load();
+    }
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    st.since_checkpoint = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::nanoseconds(now - checkpoint_time_.load()));
+    const double live = double(std::max<std::size_t>(dense_ ? dense_->size() : 0, 1));
+    st.churn_since_upkeep = double(changed_since_upkeep_.load()) / live;
+    st.churn_since_rebuild = double(changed_since_rebuild_.load()) / live;
+    {
+        const std::lock_guard<std::mutex> l(report_mutex_);
+        st.rounds = rounds_;
+    }
+    return st;
+}
+
+MaintenanceReport Collection::maintain(std::chrono::milliseconds budget) {
+    if (searching_here()) throw std::logic_error("maintain: refused from inside a search of this collection");
+    const std::lock_guard<std::mutex> one(maintenance_mutex_);
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    std::optional<clock::time_point> deadline;
+    if (budget.count() > 0) deadline = start + budget;
+    const auto out_of_time = [&] { return deadline && clock::now() >= *deadline; };
+    const MaintenancePolicy p = options_.maintenance;
+    MaintenanceReport r;
+    r.when = std::chrono::system_clock::now();
+    if (dense_) {
+        const double live = double(std::max<std::size_t>(dense_->size(), 1));
+        // Upkeep: past one threshold always; past a lower one if a health check finds damage.
+        const std::uint64_t seen = changed_since_upkeep_.load();
+        const double churn = double(seen) / live;
+        bool upkeep = false;
+        if (seen > 0 && churn >= p.upkeep_churn) {
+            upkeep = true;
+            r.notes.push_back(fmt("upkeep due: churn %.3f reached %.3f", churn, p.upkeep_churn));
+        } else if (seen > 0 && churn >= p.health_check_churn) {
+            if (out_of_time()) {  // GCOVR_EXCL_BR_LINE: nothing runs before it; only with a budget of microseconds
+                r.budget_exhausted = true;  // GCOVR_EXCL_LINE: as above
+                r.notes.push_back("health check due, but the budget is spent");  // GCOVR_EXCL_LINE: as above
+            } else {
+                HealthOptions ho;
+                ho.recall_sample = 0;
+                ho.codec_sample = 0;
+                r.health = dense_->health(ho);
+                const std::size_t damage = r.health->unreachable + r.health->links_to_removed + r.health->stale_links;
+                if (damage > 0) {
+                    upkeep = true;
+                    r.notes.push_back("upkeep due: health check found " + std::to_string(r.health->unreachable) + " unreachable vectors, " +
+                                      std::to_string(r.health->links_to_removed) + " links to removed vectors, " +
+                                      std::to_string(r.health->stale_links) + " stale links");
+                } else {
+                    changed_since_upkeep_ -= seen;
+                    r.notes.push_back(fmt("health check at churn %.3f: nothing to repair", churn, 0));
+                }
+            }
+        } else if (seen > 0) {
+            r.notes.push_back(fmt("no upkeep: churn %.3f below %.3f", churn, p.health_check_churn));
+        }
+        if (upkeep) {
+            if (out_of_time()) {
+                r.budget_exhausted = true;
+                r.notes.push_back("upkeep due, but the budget is spent");
+            } else {
+                UpkeepOptions uo;
+                uo.max_nodes = p.upkeep_nodes;
+                OperationOptions oo;
+                oo.deadline = deadline;
+                r.upkeep = dense_->upkeep(uo, oo);
+                r.upkept = true;
+                if (r.upkeep.complete) {
+                    changed_since_upkeep_ -= seen;
+                    r.notes.push_back("upkeep: " + std::to_string(r.upkeep.nodes_repaired) + " vectors repaired, " +
+                                      std::to_string(r.upkeep.reconnected) + " reconnected");
+                } else {
+                    r.budget_exhausted = true;
+                    r.notes.push_back("upkeep stopped by the budget or node limit; the next round continues");
+                }
+            }
+        }
+        // Rebuild: only with a codec, once enough changed for it to drift.
+        if (options_.hnsw.quantization.codec != CodecKind::None) {
+            const std::uint64_t seen_r = changed_since_rebuild_.load();
+            const double churn_r = double(seen_r) / live;
+            if (seen_r > 0 && churn_r >= p.rebuild_check_churn) {
+                if (out_of_time()) {  // GCOVR_EXCL_BR_LINE: timing (only when upkeep just used the whole budget)
+                    r.budget_exhausted = true;  // GCOVR_EXCL_LINE: as above
+                    r.notes.push_back("codec drift check due, but the budget is spent");  // GCOVR_EXCL_LINE: as above
+                } else {
+                    HealthOptions ho;
+                    ho.recall_sample = 0;
+                    ho.codec_sample = 500;
+                    ho.retrain_sample = 500;
+                    const HealthReport h = dense_->health(ho);
+                    r.health = h;
+                    const bool drifted = h.codec_error && h.codec_error_retrained && *h.codec_error_retrained > 0 &&
+                                         *h.codec_error > p.rebuild_drift * *h.codec_error_retrained;
+                    if (drifted) {
+                        r.notes.push_back(fmt("rebuild due: codec error %.3g is over the drift limit (retrained: %.3g)", *h.codec_error,
+                                              *h.codec_error_retrained));
+                        r.rebuild = dense_->rebuild();
+                        r.rebuilt = true;
+                    } else {
+                        r.notes.push_back("codec drift check: within the limit");
+                    }
+                    changed_since_rebuild_ -= seen_r;
+                }
+            }
+        }
+    }
+    if (durable_) {
+        std::uint64_t bytes = 0, records = 0;
+        {
+            const auto lock = read_lock(mutex_, this);
+            bytes = log_.writer().size() - wal::kHeaderSize;
+            records = log_.writer().next_lsn() - checkpoint_lsn_.load();
+        }
+        const auto age = std::chrono::nanoseconds(clock::now().time_since_epoch().count() - checkpoint_time_.load());
+        std::string why;
+        if (bytes >= p.checkpoint_bytes && bytes > 0) why = "the log reached " + std::to_string(bytes) + " bytes";
+        else if (records >= p.checkpoint_records && records > 0) why = "the log reached " + std::to_string(records) + " records";
+        else if (records > 0 && age >= p.checkpoint_age) why = "records have waited " + std::to_string(std::chrono::duration_cast<std::chrono::seconds>(age).count()) + " s";
+        if (!why.empty()) {
+            r.checkpoint_lsn = checkpoint();
+            r.checkpointed = true;
+            r.notes.push_back("checkpoint: " + why);
+        }
+    }
+    r.elapsed = std::chrono::duration_cast<std::chrono::microseconds>(clock::now() - start);
+    const std::lock_guard<std::mutex> l(report_mutex_);
+    last_report_ = r;
+    ++rounds_;
+    return r;
+}
+
 }  // namespace vecdb
+

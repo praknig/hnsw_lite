@@ -65,7 +65,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
 - [ ] Fuzzing the file and log loaders
 - [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
-- [ ] Automatic maintenance, presets, Python bindings (see the [suggested order](feature-catalog.md#suggested-order))
+- [x] Automatic maintenance of collections (`MaintenancePolicy`, `maintain()`, a background thread)
+- [ ] Presets, Python bindings (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe

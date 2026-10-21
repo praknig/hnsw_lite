@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 854 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 861 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -420,6 +420,8 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Maintenance** (`collection.cpp`). Counters of dense vectors replaced or removed since the last upkeep and rebuild (atomics, updated under the collection's exclusive lock), and the last snapshot's LSN and time, drive `maintain()`: a reachability-only health check, `upkeep()` with the round's deadline, a drift check with a retrained sample, `rebuild()`, then `checkpoint()`, one round at a time under a maintenance mutex, never holding the collection's lock while the sides work (they lock themselves). A background thread waits on a condition variable between rounds, records errors in the round's report, and is joined before any member is destroyed. Upkeep stops at a deadline only after one repair in the call, so budgeted rounds always progress; a checkpoint whose snapshot failed retries only the snapshot (the log already writes to the new segment).
 
 **Collections** (`collection.cpp`). A `Collection` owns up to three sides (an `HnswIndex` without metadata, and one `SparseIndex` each for BM25 text and learned sparse vectors), plus its own ID table (slots, a free list kept in order), texts and a `MetadataStore`. Filters compile against the collection's metadata and reach every side as a predicate. A change is validated, logged once (`kDocument`, `kDocumentRemove`, `kDocumentMetadata` records), then applied side by side under the collection's exclusive lock; the old parts are read first so that an out-of-memory failure on a later side restores the earlier ones. Searches hold the shared lock; a per-thread list of collections being searched lets predicates read without locking again and refuses changes (instead of deadlocking). Search fuses any number of ranked lists by RRF or min-max-scaled scores. Durable collections reuse the durable-directory code (kind 3) with one log; the snapshot embeds each side's own file. `SparseIndex` saves its compacted form, so saved bytes do not depend on removals awaiting compaction.
 
