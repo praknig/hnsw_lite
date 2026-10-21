@@ -17915,6 +17915,7 @@ TEST(maintenance, mt05_the_background_thread) {
         }
         CHECK(failed && recovered);
     }
+    std::filesystem::remove_all(dir2);
     // In memory: the background thread does upkeep only.
     CollectionOptions m = co_options();
     m.maintenance.mode = Maintenance::Background;
@@ -18034,6 +18035,7 @@ TEST(maintenance, mt07_background_maintenance_during_changes_and_searches) {
     bool same = c->size() == expected.size();
     for (const auto& [id, text] : expected) same = same && c->get(id) && c->get(id)->text == text;
     CHECK(same);
+    c.reset();  // close it first: Windows cannot delete the locked LOCK file of an open collection
     std::filesystem::remove_all(dir);
 }
 
