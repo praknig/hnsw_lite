@@ -6,7 +6,7 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 864 individually named tests** in 45 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 870 individually named tests** in 46 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -49,9 +49,10 @@ How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pi
 | `wal` | 19 | Durability D1 and D2: log segments round trip; a torn write at every byte (recovered, then appended to); torn last records against corruption in every field; a failing disk at every byte of an append; writers that cannot recover; damaged and foreign headers; sequence gaps; every operation encoded exactly (every truncation rejected); every write path, random operations and concurrent writers replayed to identical bytes; failed operations aborted (out of memory at every point); a failing log refusing the change; replay mismatches; flat indexes; concurrent writers with rebuilds |
 | `durable` | 15 | Durability D3 and D4: reopening recovers everything; a crash after any operation (copies compared byte for byte); a torn last write at every byte; damage that is not a crash refused (each check shown necessary); falling back to an older snapshot; pruning; one writer and matching settings; crashes while creating or checkpointing; a checkpoint healing a failed log; flat indexes with concurrent checkpoints; the three modes (flushes counted); a failing sync; an operation unfinished at a crash; real process kills (SIGKILL) in every mode, every acknowledged change recovered |
 | `sparse` | 13 | Sparse search identical to a brute-force reference (same float order: IDs and scores); input rules; 6,000 random changes against a model (results, document frequencies, compaction); filters and predicates; save and load (every truncation and damage rejected, deterministic bytes, wrong index kinds); BM25 against the formula computed directly; RRF and weighted fusion by hand; hybrid search with HNSW and Flat (a keyword-only match found, filters on both sides); deadlines and statistics; concurrent searches and changes; out of memory at every allocation of an add or upsert changes nothing; dead slots from empty-document updates compacted; a search nested in a predicate; `k = 0` and non-finite fusion options |
-| `collection` | 14 | Each side's own ranking, and RRF over two and three lists computed by hand; documents with some parts, parts removed by a new version, one-side collections; invalid input of every kind changes nothing; filters, predicates and metadata changes across sides; save and load (bytes identical, free slots reused alike, damage rejected); a crash after any change, recovered byte for byte; reopening rules, an unfinished operation, a torn record; calls from inside a search (reads allowed, changes refused); out of memory at every allocation of three kinds of change; concurrent changes, searches and checkpoints; BM25 settings; every combination of sides through every operation; files with valid checksums but invalid content |
+| `collection` | 15 | Each side's own ranking, and RRF over two and three lists computed by hand; documents with some parts, parts removed by a new version, one-side collections; invalid input of every kind changes nothing; filters, predicates and metadata changes across sides; save and load (bytes identical, free slots reused alike, damage rejected); a crash after any change, recovered byte for byte; reopening rules, an unfinished operation, a torn record; calls from inside a search (reads allowed, changes refused); out of memory at every allocation of three kinds of change; concurrent changes, searches and checkpoints; BM25 settings; every combination of sides through every operation; files with valid checksums but invalid content |
 | `maintenance` | 7 | Manual rounds doing only what is due (nothing, a health check, upkeep), counters reset after; checkpoints by records, bytes and age, then recovery from the snapshot alone; a drifted codec rebuilt (its error from 0.975 to 5e-7), and one that did not drift left alone; budgets and node limits, continued round after round to the end; the background thread (rounds, an error recorded and recovered from, switched off and on, stopped on close; in memory, upkeep only); invalid policies and calls from inside a search; background maintenance during changes and searches |
 | `presets` | 3 | Each preset's settings below and above a million vectors; recall@10 and size measured against exact search (balanced 0.982, high recall 1.000, low memory 0.933 at a quarter of the size); the default search beam, identical to passing it, and taken from the caller when reopening |
+| `acorn` | 5 | The planner choosing exact scans, ACORN and the plain graph by selectivity, and settings that turn it off or change its beam; recall and distance computations against the plain graph search for matches spread evenly and clustered (42 times fewer at 5% spread, recall 1.000; recall at least 0.98 clustered), which fails without looking through rejected neighbors (recall 0.935); every result matching filter and predicate, sorted, unique and live after removals; the fallback when fewer than k match; compression with and without full vectors; deadlines, batches and search by ID; collections, whose filters reach HNSW as predicates |
 | `stress` | 12 | Limits and long-run memory: a filter chained 200,000 times stops cleanly at the depth limit; a balanced 4,096-condition filter; the string dictionary bounded under 100,000 inserts of unique strings; dictionary compaction keeping filters and payload counts correct; thread counts capped; upper-level link blocks recycled over 30,000 churn steps; `compact()` releasing visited lists; unsigned values beyond `int64` rejected; a 10,000-value `in()` list; 60,000 mixed operations with bounded slots, dictionary and link memory; out-of-memory sweeps of dictionary compaction and block recycling |
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
@@ -62,7 +63,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 864 test names
+test_comprehensive --list               # list all 870 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -76,13 +77,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 864 of 864 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 870 of 870 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-864 passed, 0 failed, 0 skipped, 0 not run, 37699 checks, 141.55 s
+870 passed, 0 failed, 0 skipped, 0 not run, 37732 checks, 146.20 s
 All selected tests passed.
 ```
 
@@ -130,68 +131,69 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 56 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 864 tests selected`: that entry's share, not tests left out. Together the 56 entries run all 864 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 57 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 870 tests selected`: that entry's share, not tests left out. Together the 57 entries run all 870 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 The environment variable `HNSW_LITE_TEST_EXCLUDE` adds exclusions (space- or comma-separated, like `--exclude`) to every run, including runs through CTest, which cannot pass arguments: CI's sanitizer job uses it to skip the seven heavy measurement tests, which run natively on every platform.
 
 ```
- 1/56 Test # 1: comprehensive.layer1 ...........   Passed
- 2/56 Test # 2: comprehensive.layer2 ...........   Passed
- 3/56 Test # 3: comprehensive.helpers ..........   Passed
- 4/56 Test # 4: comprehensive.flat .............   Passed
- 5/56 Test # 5: comprehensive.hnsw .............   Passed
- 6/56 Test # 6: comprehensive.robustness .......   Passed
- 7/56 Test # 7: comprehensive.deletion.1of2 ....   Passed
- 8/56 Test # 8: comprehensive.deletion.2of2 ....   Passed
- 9/56 Test # 9: comprehensive.concurrency ......   Passed
-10/56 Test #10: comprehensive.metadata .........   Passed
-11/56 Test #11: comprehensive.filter ...........   Passed
-12/56 Test #12: comprehensive.planner ..........   Passed
-13/56 Test #13: comprehensive.payload ..........   Passed
-14/56 Test #14: comprehensive.batch ............   Passed
-15/56 Test #15: comprehensive.range ............   Passed
-16/56 Test #16: comprehensive.search_e2e .......   Passed
-17/56 Test #17: comprehensive.update ...........   Passed
-18/56 Test #18: comprehensive.hardening ........   Passed
-19/56 Test #19: comprehensive.persistence ......   Passed
-20/56 Test #20: comprehensive.add_batch.1of2 ...   Passed
-21/56 Test #21: comprehensive.add_batch.2of2 ...   Passed
-22/56 Test #22: comprehensive.bulk .............   Passed
-23/56 Test #23: comprehensive.records ..........   Passed
-24/56 Test #24: comprehensive.control.1of2 .....   Passed
-25/56 Test #25: comprehensive.control.2of2 .....   Passed
-26/56 Test #26: comprehensive.codec ............   Passed
-27/56 Test #27: comprehensive.sq8.1of2 .........   Passed
-28/56 Test #28: comprehensive.sq8.2of2 .........   Passed
-29/56 Test #29: comprehensive.matryoshka .......   Passed
-30/56 Test #30: comprehensive.lean .............   Passed
-31/56 Test #31: comprehensive.review ...........   Passed
-32/56 Test #32: comprehensive.codes_only.1of2 ..   Passed
-33/56 Test #33: comprehensive.codes_only.2of2 ..   Passed
-34/56 Test #34: comprehensive.binary.1of2 ......   Passed
-35/56 Test #35: comprehensive.binary.2of2 ......   Passed
-36/56 Test #36: comprehensive.pq.1of2 ..........   Passed
-37/56 Test #37: comprehensive.pq.2of2 ..........   Passed
-38/56 Test #38: comprehensive.ivf ..............   Passed
-39/56 Test #39: comprehensive.edges ............   Passed
-40/56 Test #40: comprehensive.vamana ...........   Passed
-41/56 Test #41: comprehensive.disk.1of4 ........   Passed
-42/56 Test #42: comprehensive.disk.2of4 ........   Passed
-43/56 Test #43: comprehensive.disk.3of4 ........   Passed
-44/56 Test #44: comprehensive.disk.4of4 ........   Passed
-45/56 Test #45: comprehensive.health ...........   Passed
-46/56 Test #46: comprehensive.upkeep.1of2 ......   Passed
-47/56 Test #47: comprehensive.upkeep.2of2 ......   Passed
-48/56 Test #48: comprehensive.rebuild ..........   Passed
-49/56 Test #49: comprehensive.wal ..............   Passed
-50/56 Test #50: comprehensive.durable ..........   Passed
-51/56 Test #51: comprehensive.sparse ...........   Passed
-52/56 Test #52: comprehensive.collection .......   Passed
-53/56 Test #53: comprehensive.maintenance ......   Passed
-54/56 Test #54: comprehensive.presets ..........   Passed
-55/56 Test #55: comprehensive.stress ...........   Passed
-56/56 Test #56: comprehensive.e2e ..............   Passed
-100% tests passed, 0 tests failed out of 56
+ 1/57 Test # 1: comprehensive.layer1 ...........   Passed
+ 2/57 Test # 2: comprehensive.layer2 ...........   Passed
+ 3/57 Test # 3: comprehensive.helpers ..........   Passed
+ 4/57 Test # 4: comprehensive.flat .............   Passed
+ 5/57 Test # 5: comprehensive.hnsw .............   Passed
+ 6/57 Test # 6: comprehensive.robustness .......   Passed
+ 7/57 Test # 7: comprehensive.deletion.1of2 ....   Passed
+ 8/57 Test # 8: comprehensive.deletion.2of2 ....   Passed
+ 9/57 Test # 9: comprehensive.concurrency ......   Passed
+10/57 Test #10: comprehensive.metadata .........   Passed
+11/57 Test #11: comprehensive.filter ...........   Passed
+12/57 Test #12: comprehensive.planner ..........   Passed
+13/57 Test #13: comprehensive.payload ..........   Passed
+14/57 Test #14: comprehensive.batch ............   Passed
+15/57 Test #15: comprehensive.range ............   Passed
+16/57 Test #16: comprehensive.search_e2e .......   Passed
+17/57 Test #17: comprehensive.update ...........   Passed
+18/57 Test #18: comprehensive.hardening ........   Passed
+19/57 Test #19: comprehensive.persistence ......   Passed
+20/57 Test #20: comprehensive.add_batch.1of2 ...   Passed
+21/57 Test #21: comprehensive.add_batch.2of2 ...   Passed
+22/57 Test #22: comprehensive.bulk .............   Passed
+23/57 Test #23: comprehensive.records ..........   Passed
+24/57 Test #24: comprehensive.control.1of2 .....   Passed
+25/57 Test #25: comprehensive.control.2of2 .....   Passed
+26/57 Test #26: comprehensive.codec ............   Passed
+27/57 Test #27: comprehensive.sq8.1of2 .........   Passed
+28/57 Test #28: comprehensive.sq8.2of2 .........   Passed
+29/57 Test #29: comprehensive.matryoshka .......   Passed
+30/57 Test #30: comprehensive.lean .............   Passed
+31/57 Test #31: comprehensive.review ...........   Passed
+32/57 Test #32: comprehensive.codes_only.1of2 ..   Passed
+33/57 Test #33: comprehensive.codes_only.2of2 ..   Passed
+34/57 Test #34: comprehensive.binary.1of2 ......   Passed
+35/57 Test #35: comprehensive.binary.2of2 ......   Passed
+36/57 Test #36: comprehensive.pq.1of2 ..........   Passed
+37/57 Test #37: comprehensive.pq.2of2 ..........   Passed
+38/57 Test #38: comprehensive.ivf ..............   Passed
+39/57 Test #39: comprehensive.edges ............   Passed
+40/57 Test #40: comprehensive.vamana ...........   Passed
+41/57 Test #41: comprehensive.disk.1of4 ........   Passed
+42/57 Test #42: comprehensive.disk.2of4 ........   Passed
+43/57 Test #43: comprehensive.disk.3of4 ........   Passed
+44/57 Test #44: comprehensive.disk.4of4 ........   Passed
+45/57 Test #45: comprehensive.health ...........   Passed
+46/57 Test #46: comprehensive.upkeep.1of2 ......   Passed
+47/57 Test #47: comprehensive.upkeep.2of2 ......   Passed
+48/57 Test #48: comprehensive.rebuild ..........   Passed
+49/57 Test #49: comprehensive.wal ..............   Passed
+50/57 Test #50: comprehensive.durable ..........   Passed
+51/57 Test #51: comprehensive.sparse ...........   Passed
+52/57 Test #52: comprehensive.collection .......   Passed
+53/57 Test #53: comprehensive.maintenance ......   Passed
+54/57 Test #54: comprehensive.presets ..........   Passed
+55/57 Test #55: comprehensive.acorn ............   Passed
+56/57 Test #56: comprehensive.stress ...........   Passed
+57/57 Test #57: comprehensive.e2e ..............   Passed
+100% tests passed, 0 tests failed out of 57
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
@@ -400,6 +402,10 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 **Found while building presets:**
 
 100. **The library's default search beam was too narrow for a "balanced" promise.** With a beam of 64, the balanced settings measured 0.920 recall@10 on clustered 64-dimensional data, below the compressed low-memory preset (0.933, beam 128). The balanced preset now sets 128 (0.982); the library default is unchanged.
+
+**Found by auditing the tests against the API:**
+
+101. **Collection searches could not be bounded.** Every index supports deadlines and cancellation, but `CollectionSearchOptions` did not pass them on, so a long hybrid search could not be stopped; it now has `deadline`, `cancel` and `stopped_early` (`co15`). The audit checked every one of the 232 public methods and functions (from the compiler-generated signatures) for a call in the tests: all are called but two trivial ones, now called directly too. It also built a matrix of standard edge cases (empty index, `k = 0`, `k` beyond the size, wrong dimension, NaN, duplicate and unknown IDs, out of memory, concurrency, saving and loading, damaged files, deadlines, filters, removal) against every component: every applicable cell has tests.
 
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 

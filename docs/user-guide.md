@@ -78,7 +78,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-    |---|---|---|---|---|---|
+  |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -288,14 +288,25 @@ A predicate may **search** the index it filters, including a batch search, but m
 A filtered HNSW search either scans the matching vectors exactly, or walks the graph while skipping vectors that fail the filter. A **query planner** chooses per query by estimating how many vectors match:
 
 - **Few matches:** exact scan. This is the default when at most 2,000 vectors, or at most 1%, match.
+- **A middle range** (by default up to 20% matching): **ACORN** graph search. Only matching vectors are scored; when a neighbor fails the filter, the search looks through it to its own neighbors (two hops) without computing its distance, which keeps the graph connected as the filter sees it. Its beam is 4 times the requested `ef`.
 - **Many matches:** graph search, automatically searching wider (a larger `ef`) because some of the vectors it visits do not count.
+
+Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact search, ACORN against the widened graph search:
+
+| Matching | Matches spread evenly | Matches clustered (ACORN's hard case) |
+|---|---|---|
+| 5% | 42× fewer distance computations, recall 1.000 | 1.7× fewer, recall 0.980 (graph: 1.000) |
+| 10% | 17× fewer, recall 1.000 | 1.6× fewer, recall 0.997 |
+| 20% | 3.8× fewer, recall 1.000 | 1.4× fewer, recall 0.997 |
+
+Where the matches cluster away from the query, ACORN can miss a few (recall 0.98 at 5% above); set `PlannerParams::acorn_below = 0` to turn it off, or `acorn_ef_multiplier` higher for more recall.
 
 You can see and steer the decision:
 
 ```cpp
 SearchStats stats;
 options.stats = &stats;                       // filled in by the search
-options.strategy = Strategy::ForceExact;      // or ForceGraph; Auto (default) lets the planner choose
+options.strategy = Strategy::ForceExact;      // or ForceGraph, ForceAcorn; Auto (default) lets the planner choose
 options.planner = PlannerParams{5000, 0.05};  // thresholds for this query: max matches, max fraction
 
 index.set_planner_params(PlannerParams{5000, 0.05});  // or for every query on this index

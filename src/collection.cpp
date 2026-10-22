@@ -397,6 +397,7 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
         throw std::invalid_argument("CollectionSearchOptions: weights must be finite and non-negative");
     const auto lock = read_lock(mutex_, this);
     const Searching guard(this);
+    if (o.stopped_early) *o.stopped_early = false;
     if (k == 0 || slot_of_.empty()) return {};
     // The filter runs on the collection's metadata, for every side, as a predicate.
     std::optional<CompiledFilter> compiled;
@@ -411,6 +412,8 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
             return !o.predicate || o.predicate(id);
         };
     }
+    side.deadline = o.deadline;
+    side.cancel = o.cancel;
     const std::size_t depth = o.candidates ? o.candidates : std::max<std::size_t>(4 * k, 20);
     struct List {
         std::vector<SearchResult> results;
@@ -419,9 +422,19 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     };
     std::vector<List> lists;
     const std::size_t ef = o.ef ? o.ef : options_.ef ? std::max(options_.ef, depth) : std::max<std::size_t>(depth, 64);
-    if (use_vector) lists.push_back({dense_->search(q.vector, depth, ef, side), o.vector_weight, 0});
-    if (use_text) lists.push_back({text_->search(bm25_.encode_query(q.text, *text_), depth, side), o.text_weight, 1});
-    if (use_sparse) lists.push_back({sparse_->search(q.sparse, depth, side), o.sparse_weight, 2});
+    bool stopped = false;
+    auto run = [&](auto&& search_side) {  // each side reports whether a deadline or cancel stopped it
+        SearchStats st;
+        SearchOptions with_stats = side;
+        with_stats.stats = &st;
+        auto results = search_side(with_stats);
+        stopped = stopped || st.stopped_early;
+        return results;
+    };
+    if (use_vector) lists.push_back({run([&](const SearchOptions& so) { return dense_->search(q.vector, depth, ef, so); }), o.vector_weight, 0});
+    if (use_text) lists.push_back({run([&](const SearchOptions& so) { return text_->search(bm25_.encode_query(q.text, *text_), depth, so); }), o.text_weight, 1});
+    if (use_sparse) lists.push_back({run([&](const SearchOptions& so) { return sparse_->search(q.sparse, depth, so); }), o.sparse_weight, 2});
+    if (o.stopped_early) *o.stopped_early = stopped;
     // Fusion over any number of lists, as fuse() does for two.
     std::unordered_map<std::uint64_t, CollectionHit> by_id;
     for (const List& l : lists) {

@@ -197,7 +197,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
 | `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |
 | `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
-| `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32 }` | Planner settings |
+| `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32, acorn_below = 0.2, acorn_ef_multiplier = 4 }` | Planner settings; `Strategy` is `Auto`, `ForceExact`, `ForceGraph` or `ForceAcorn` |
 | `SearchStats` | Strategy, reason, selectivity, estimated matches, `ef`, nodes visited, distances computed |
 
 ## New index methods (`FlatIndex` and `HnswIndex`)
@@ -363,7 +363,7 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability`, `maintenance`, `ef` (default search beam; 0: max(candidates, 64)) |
 | `CollectionOptions::preset(dim, preset, expected_size)`, `Preset` | Ready-made settings: `Balanced`, `HighRecall`, `LowMemory` (see the user guide) |
 | `Document` | `vector`, `text`, `sparse`, `metadata`, each optional |
-| `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text` |
+| `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text`, `deadline`, `cancel`, `stopped_early` |
 | `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |
 
 ### Maintenance of collections
@@ -375,3 +375,4 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `MaintenancePolicy` | `mode` (`Manual`, `Background`), `interval` (1 s), `budget` (250 ms), `checkpoint_bytes` (64 MiB), `checkpoint_records` (100,000), `checkpoint_age` (600 s), `health_check_churn` (0.05), `upkeep_churn` (0.2), `upkeep_nodes` (0: no limit), `rebuild_check_churn` (0.5), `rebuild_drift` (4) |
 | `MaintenanceReport` | `when`, `elapsed`, `health`, `upkept`, `upkeep`, `rebuilt`, `rebuild`, `checkpointed`, `checkpoint_lsn`, `budget_exhausted`, `notes`, `error` |
 | `MaintenanceStatus` | `log_bytes`, `log_records`, `since_checkpoint`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds` |
+

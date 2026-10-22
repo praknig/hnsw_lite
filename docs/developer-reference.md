@@ -261,6 +261,9 @@ struct CollectionSearchOptions {
     std::size_t ef = 0;
     bool with_metadata = false;
     bool with_text = false;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool* stopped_early = nullptr;
 };
 ```
 
@@ -274,6 +277,8 @@ struct CollectionSearchOptions {
 | `candidates` | How many candidates each side contributes before fusion; 0 means max(4·k, 20). More candidates give fusion more to work with, at the cost of more work per side. |
 | `ef` | Beam width of the dense search. 0 uses `CollectionOptions::ef`, or the library default max(candidates, 64). |
 | `with_metadata`, `with_text` | Fill `metadata` and `text` in each hit (copying them costs time; off by default). |
+| `deadline`, `cancel` | Stop every side when this moment passes, or when another thread sets the flag to `true`. The hits found so far are returned, fused and sorted; nothing is thrown. |
+| `stopped_early` | If set, receives `true` when a deadline or cancellation stopped any side (results may then be incomplete), `false` otherwise. |
 
 ```cpp
 struct CollectionHit {
@@ -568,7 +573,7 @@ struct SearchOptions {
 |---|---|
 | `filter` | Only vectors whose metadata matches are returned. **You get k results if at least k match** (the search widens as needed). |
 | `predicate` | Any condition on the ID, for data outside the index (permissions, say). With a filter, both must pass (the filter is checked first). Must be safe to call from several threads (batch searches call it concurrently), and must not change any index. |
-| `strategy` | `Auto` (default): the **query planner** chooses. `ForceExact`: scan every matching vector (exact answers). `ForceGraph`: always search the graph. |
+| `strategy` | `Auto` (default): the **query planner** chooses. `ForceExact`: scan every matching vector (exact answers). `ForceGraph`: the graph search that scores every vector it visits. `ForceAcorn`: the ACORN graph search (below; without a filter it is the ordinary graph search). |
 | `planner` | Planner settings for this query only (otherwise the index's: see `set_planner_params`). |
 | `stats` | If set, filled with what the search did (`SearchStats`, below). |
 | `range_expand_outside` | Range searches only: how many hops the search may take through vectors *outside* the radius to reach more of the region (more finds more, at more cost). |
@@ -577,7 +582,18 @@ struct SearchOptions {
 **How filtered searches are planned.** A filter that matches few vectors would make a graph search walk through many non-matching ones. So the planner estimates how many vectors match (exactly, from a [payload index](#46-searching), or from a sample of `sample_size` vectors) and:
 
 - **scans exactly** when at most `max_exact_matches` vectors (2000) **or** at most `max_exact_fraction` of them (1%) are expected to match;
-- otherwise **searches the graph** with `ef` multiplied by 1/selectivity, up to `max_ef_multiplier` (32) times.
+- otherwise, below `acorn_below` (20%) matching, searches the graph **the ACORN way**: only matching vectors are scored and enter the beam, and a neighbor that fails the filter is looked through to its own neighbors (two hops) without computing its distance, which keeps the graph connected as the filter sees it. Its beam is `ef` × `acorn_ef_multiplier` (4). If it finds fewer than k matches (they lie beyond two hops of where it went), it falls back to the next strategy, so results are never worse than without it;
+- otherwise **searches the graph**, scoring every vector it visits, with `ef` multiplied by 1/selectivity, up to `max_ef_multiplier` (32) times.
+
+Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact search, ACORN against the widened graph search:
+
+| Matching | Matches spread evenly | Matches clustered (ACORN's hard case) |
+|---|---|---|
+| 5% | 42× fewer distance computations, recall 1.000 | 1.7× fewer, recall 0.980 (graph: 1.000) |
+| 10% | 17× fewer, recall 1.000 | 1.6× fewer, recall 0.997 |
+| 20% | 3.8× fewer, recall 1.000 | 1.4× fewer, recall 0.997 |
+
+ACORN applies by default only where the exact scan would cost more than 2,000 distances and between 1% and 20% match, so on indexes of about 10,000 vectors or more.
 
 ```cpp
 struct PlannerParams {
@@ -585,6 +601,8 @@ struct PlannerParams {
     double max_exact_fraction = 0.01;
     std::size_t sample_size = 256;
     double max_ef_multiplier = 32.0;
+    double acorn_below = 0.2;          // 0: never ACORN (the graph search, as before)
+    double acorn_ef_multiplier = 4.0;  // at least 1
 };
 ```
 
@@ -594,8 +612,8 @@ Advanced: `plan_search(capacity, live, eligible, exact_matches, ef, forced, para
 
 ```cpp
 struct SearchStats {
-    Strategy strategy;              // ForceExact or ForceGraph: what actually ran
-    PlanReason reason;              // NoFilter, Forced, MatchCount, MatchFraction, Graph or FlatIndex
+    Strategy strategy;              // ForceExact, ForceAcorn or ForceGraph: what actually ran (ForceGraph after an ACORN fallback)
+    PlanReason reason;              // NoFilter, Forced, MatchCount, MatchFraction, Acorn, Graph or FlatIndex
     double selectivity;             // estimated fraction of vectors matching
     std::size_t estimated_matches;
     bool exact_count;               // the estimate came from a payload index
@@ -615,7 +633,7 @@ Other searches:
 | `void create_payload_index(std::string_view field)` | Keeps exact value counts for a **keyword, boolean or tag-set** field, so the planner counts matches exactly instead of sampling. Worth it for fields you filter on often. Other field types throw `std::invalid_argument`. |
 | `void set_planner_params(const PlannerParams& p)`, `PlannerParams planner_params() const` | The index's default planner settings. |
 
-**Limitations:** HNSW is approximate: a true neighbor can be missed (raise `ef`, or `M` at build time). Range search is approximate as well. Filters on a field without a payload index are estimated by sampling, so a rare value can be misjudged; the planner then still returns correct results, only more slowly.
+**Limitations:** HNSW is approximate: a true neighbor can be missed (raise `ef`, or `M` at build time). ACORN can miss a few matches when they cluster away from the query (recall 0.98 at 5% matching above): raise `acorn_ef_multiplier`, or set `acorn_below = 0`. Range search is approximate as well. Filters on a field without a payload index are estimated by sampling, so a rare value can be misjudged; the planner then still returns correct results, only more slowly.
 
 ### 4.7 Health, upkeep, compaction and rebuilds
 
@@ -1202,6 +1220,9 @@ struct CollectionSearchOptions {
     std::size_t ef = 0;
     bool with_metadata = false;
     bool with_text = false;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool* stopped_early = nullptr;
 };
 ```
 
@@ -1364,13 +1385,13 @@ class Filter {
 **`Strategy`** (enumeration)
 
 ```cpp
-enum class Strategy { Auto, ForceExact, ForceGraph };
+enum class Strategy { Auto, ForceExact, ForceGraph, ForceAcorn };
 ```
 
 **`PlanReason`** (enumeration)
 
 ```cpp
-enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex };
+enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn };
 ```
 
 **`PlannerParams`**
@@ -1381,6 +1402,8 @@ struct PlannerParams {
     double max_exact_fraction = 0.01;
     std::size_t sample_size = 256;
     double max_ef_multiplier = 32.0;
+    double acorn_below = 0.2;
+    double acorn_ef_multiplier = 4.0;
 };
 ```
 

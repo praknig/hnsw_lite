@@ -554,6 +554,10 @@ private:
     /// HNSW heuristic: from `sorted` (closest first) keeps a candidate only if it
     /// is closer to the base node than to every already-kept neighbor and is not
     /// an exact copy of one, up to `max`.
+    /// Level 0 the ACORN way (filtered searches): only eligible nodes are scored
+    /// and kept; an ineligible neighbor is looked through to its own neighbors.
+    std::vector<Candidate> acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
+                                        const Eligibility& eligible, SearchStats* stats) const;
     std::vector<NodeId> select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
 
