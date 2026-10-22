@@ -154,6 +154,12 @@ struct CollectionSearchOptions {
     std::size_t ef = 0;          ///< dense beam width; 0: max(candidates, 64)
     bool with_metadata = false;
     bool with_text = false;
+    /// Stop every side when this moment passes, or when another thread sets the
+    /// flag: the hits found so far are returned (fused and sorted), and
+    /// *stopped_early, if given, is set to true.
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool* stopped_early = nullptr;
 };
 
 struct CollectionHit {

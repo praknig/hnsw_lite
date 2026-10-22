@@ -261,6 +261,9 @@ struct CollectionSearchOptions {
     std::size_t ef = 0;
     bool with_metadata = false;
     bool with_text = false;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool* stopped_early = nullptr;
 };
 ```
 
@@ -274,6 +277,8 @@ struct CollectionSearchOptions {
 | `candidates` | How many candidates each side contributes before fusion; 0 means max(4·k, 20). More candidates give fusion more to work with, at the cost of more work per side. |
 | `ef` | Beam width of the dense search. 0 uses `CollectionOptions::ef`, or the library default max(candidates, 64). |
 | `with_metadata`, `with_text` | Fill `metadata` and `text` in each hit (copying them costs time; off by default). |
+| `deadline`, `cancel` | Stop every side when this moment passes, or when another thread sets the flag to `true`. The hits found so far are returned, fused and sorted; nothing is thrown. |
+| `stopped_early` | If set, receives `true` when a deadline or cancellation stopped any side (results may then be incomplete), `false` otherwise. |
 
 ```cpp
 struct CollectionHit {
@@ -1202,6 +1207,9 @@ struct CollectionSearchOptions {
     std::size_t ef = 0;
     bool with_metadata = false;
     bool with_text = false;
+    std::optional<std::chrono::steady_clock::time_point> deadline;
+    const std::atomic<bool>* cancel = nullptr;
+    bool* stopped_early = nullptr;
 };
 ```
 

@@ -17738,6 +17738,53 @@ TEST(collection, co14_invalid_content_behind_valid_checksums) {
     CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
 }
 
+TEST(collection, co15_deadlines_and_cancellation) {
+    // Found by the test audit: collection searches could not be bounded, though
+    // every side supports it. Every side now stops, and the caller is told.
+    auto data = clustered(2000, 8, 6, 4030);
+    Collection c(co_options(8, true));
+    for (std::uint64_t i = 0; i < 2000; ++i) c.add(i, co_doc(data, i, true));
+    CollectionQuery q;
+    q.vector = data[0];
+    q.text = "alpha gamma";
+    q.sparse = {{1, 31}, {1.0f, 1.0f}};
+    bool stopped = true;
+    CollectionSearchOptions o;
+    o.stopped_early = &stopped;
+    const auto full = c.search(q, 10, o);
+    CHECK(!stopped && full.size() == 10);  // no deadline: not stopped
+    o.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    CHECK(c.search(q, 10, o).size() == 10 && !stopped);  // a deadline in the future
+    o.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    const auto late = c.search(q, 10, o);
+    bool sorted = true;
+    for (std::size_t i = 1; i < late.size(); ++i) sorted = sorted && late[i - 1].score >= late[i].score;
+    CHECK(stopped && sorted && late.size() <= 10);  // stopped: the hits so far, still fused and sorted
+    std::atomic<bool> cancel{true};
+    CollectionSearchOptions co;
+    co.cancel = &cancel;
+    co.stopped_early = &stopped;
+    stopped = false;
+    (void)c.search(q, 10, co);
+    CHECK(stopped);
+    Collection empty(co_options(8));
+    CollectionQuery vq;
+    vq.vector = data[0];
+    stopped = true;
+    CHECK(empty.search(vq, 10, co).empty() && !stopped);  // nothing searched: nothing stopped
+    // Two calls the audit found no test making directly.
+    CHECK(Filter().is_all() && Filter::all().is_all() && !Filter::eq("a", 1).is_all() && !(Filter::eq("a", 1) || Filter::all()).is_all());
+    const std::string path = temp_path("co15.bin");
+    write_file(path, std::string(8192, 'x'));
+    BlockFile file(path);
+    file.set_simulated_latency(std::chrono::microseconds(2000));
+    const auto t0 = std::chrono::steady_clock::now();
+    char buf[16];
+    file.read(4096, buf, sizeof buf);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(2000) && file.size() == 8192 && buf[0] == 'x');
+    std::filesystem::remove(path);
+}
+
 // ===========================================================================
 // Automatic maintenance of collections (MT1-MT7)
 // ===========================================================================
