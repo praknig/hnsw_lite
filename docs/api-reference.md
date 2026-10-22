@@ -6,6 +6,8 @@ Most programs need only `FlatIndex` or `HnswIndex` with `SearchOptions`, `Filter
 
 All code is in the `vecdb` namespace. Invalid input throws `std::invalid_argument`, `std::out_of_range` or `std::length_error`.
 
+
+This is a compact list. The [developer reference](developer-reference.md) explains each method and parameter in detail, with its errors and limits.
 ## `common.h`
 
 | Name | Description |
@@ -358,7 +360,8 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `search(query, k, options)` | Any combination of `CollectionQuery::vector`, `text` and `sparse`; returns `CollectionHit`s |
 | `checkpoint()`, `durable()`, `save`, `load`, `replay` | Durability and files |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only access to the sides (null if absent) |
-| `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability` |
+| `CollectionOptions` | `dim` (0: no dense side), `metric` (cosine), `hnsw`, `schema`, `text` (true), `bm25`, `sparse` (false), `store_text` (true), `durability`, `maintenance`, `ef` (default search beam; 0: max(candidates, 64)) |
+| `CollectionOptions::preset(dim, preset, expected_size)`, `Preset` | Ready-made settings: `Balanced`, `HighRecall`, `LowMemory` (see the user guide) |
 | `Document` | `vector`, `text`, `sparse`, `metadata`, each optional |
 | `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text` |
 | `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |
@@ -372,4 +375,3 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `MaintenancePolicy` | `mode` (`Manual`, `Background`), `interval` (1 s), `budget` (250 ms), `checkpoint_bytes` (64 MiB), `checkpoint_records` (100,000), `checkpoint_age` (600 s), `health_check_churn` (0.05), `upkeep_churn` (0.2), `upkeep_nodes` (0: no limit), `rebuild_check_churn` (0.5), `rebuild_drift` (4) |
 | `MaintenanceReport` | `when`, `elapsed`, `health`, `upkept`, `upkeep`, `rebuilt`, `rebuild`, `checkpointed`, `checkpoint_lsn`, `budget_exhausted`, `notes`, `error` |
 | `MaintenanceStatus` | `log_bytes`, `log_records`, `since_checkpoint`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds` |
-

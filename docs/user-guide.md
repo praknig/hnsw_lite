@@ -4,6 +4,8 @@ How to use everything hnsw-lite offers. For building and setup, see [Getting sta
 
 All names below are in the `vecdb` namespace. Code examples assume `using namespace vecdb;`.
 
+
+For every method and parameter in detail, with its limits, see the [developer reference](developer-reference.md).
 ## Contents
 
 - [Core ideas](#core-ideas)
@@ -53,10 +55,7 @@ All names below are in the `vecdb` namespace. Code examples assume `using namesp
 For most applications, start here: a `Collection` holds documents, each with any of a dense vector, text and a learned sparse vector, plus metadata, under one ID space, and searches them together.
 
 ```cpp
-CollectionOptions options;
-options.dim = 768;                        // 0: no vectors
-options.metric = Metric::Cosine;
-options.text = true;                      // BM25 over the documents' text
+CollectionOptions options = CollectionOptions::preset(768, Preset::Balanced, 1'000'000);  // see Presets below
 options.bm25.avg_doc_length = 200;        // near your corpus' mean token count
 auto docs = Collection::open("docs.db", options);   // durable; or Collection docs(options) in memory
 
@@ -73,9 +72,18 @@ CollectionSearchOptions so;
 so.filter = Filter::eq("lang", "en");
 so.with_text = true;
 for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vector_rank, h.text_rank, h.text */ }
-docs->maintain();                         // or options.maintenance.mode = Maintenance::Background
+// Presets turn on background maintenance; with Maintenance::Manual, call docs->maintain() from time to time.
 ```
 
+- **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
+
+  | Preset | Graph | Compression | Search beam | Recall@10 | Size |
+    |---|---|---|---|---|---|
+  | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
+  | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
+  | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
+
+  `LowMemory` keeps one byte per dimension and no full vectors (product quantization is not used: without full vectors to re-rank against, its recall measured 0.3 to 0.4). `CollectionOptions::ef` is the default search beam (a runtime setting, not stored; `CollectionSearchOptions::ef` overrides it per search).
 - **Sides:** a dense side (`dim > 0`, an HNSW index), a text side (`text`, BM25), and a learned sparse side (`sparse`, for SPLADE vectors; kept apart from text because their term numbers mean different things). Each document goes into the sides for the parts it has; a document with no parts at all keeps its metadata and is found by filters only. Giving a part the collection does not have is an error.
 - **Changes** (`add`, `upsert`, `remove`, `remove_batch`, `remove_where`, `set_metadata`, `set_metadata_where`) are all or nothing: everything is checked before anything changes, and if a later side runs out of memory, the earlier ones are restored. `upsert` replaces the whole document: a part left out is removed from its side.
 - **Search** takes any combination of a vector, text and a sparse vector. One part gives that side's ranking; several are fused by Reciprocal Rank Fusion (`rrf_k = 60`) or, with `Fusion::Weighted`, by scores scaled to [0, 1], with a weight per side. Filters and predicates run on the collection's metadata and apply to every side. Each hit tells which sides found it, at what rank and distance or score, and can carry its metadata and text.

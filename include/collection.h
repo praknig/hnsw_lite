@@ -93,6 +93,13 @@ struct MaintenanceStatus {
     std::size_t rounds = 0;            ///< maintenance rounds run
 };
 
+/// Ready-made settings (CollectionOptions::preset).
+enum class Preset {
+    Balanced,    ///< M 16, ef_construction 200 (24 and 300 from a million vectors); full precision; search beam 128
+    HighRecall,  ///< M 32, ef_construction 400 (48 and 500 from a million); full precision; search beam 256
+    LowMemory,   ///< M 12, ef_construction 150; SQ8 codes only (vectors about 4x smaller); search beam 128
+};
+
 struct CollectionOptions {
     std::size_t dim = 0;             ///< dense vector length; 0: no dense side
     Metric metric = Metric::Cosine;
@@ -104,6 +111,13 @@ struct CollectionOptions {
     bool store_text = true;          ///< keep the text, for get() and search results
     DurableOptions durability;       ///< for open()
     MaintenancePolicy maintenance;   ///< not stored: load() starts with Manual
+    std::size_t ef = 0;              ///< default dense search beam (0: max(candidates, 64)); not stored
+
+    /// Settings for `dim`-dimensional vectors (0: text or sparse only) and about
+    /// `expected_size` documents: graph, compression and search beam as the preset
+    /// says, cosine distance, BM25 text, and background maintenance. Adjust any
+    /// field afterwards. Throws std::invalid_argument for an unknown preset.
+    static CollectionOptions preset(std::size_t dim, Preset preset = Preset::Balanced, std::size_t expected_size = 100000);
 };
 
 /// A document. Every part is optional; a part the collection was not created

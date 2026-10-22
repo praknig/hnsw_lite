@@ -16,7 +16,7 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 
 | Area | Features |
 |---|---|
-| **Collections** | `Collection`: documents with any of a dense vector, text (BM25) and a learned sparse vector, plus metadata, under one ID space; hybrid search by default; durable as a whole; automatic maintenance (upkeep, rebuilds, checkpoints) on a background thread or on request |
+| **Collections** | `Collection`: documents with any of a dense vector, text (BM25) and a learned sparse vector, plus metadata, under one ID space; hybrid search by default; durable as a whole; automatic maintenance (upkeep, rebuilds, checkpoints) on a background thread or on request; presets (balanced, high recall, low memory) |
 | **Index types** | `HnswIndex` (graph, approximate); `FlatIndex` (exact), optionally an **inverted file (IVF, IVF-PQ)**; `DiskIndex` (DiskANN-style Vamana graph on disk, read-only, built within a memory budget); `SparseIndex` (inverted index for sparse vectors, exact) |
 | **Metrics and speed** | Squared L2, inner product, cosine; SIMD kernels (AVX2, AVX-512, NEON, scalar) chosen at run time, with identical results on every CPU |
 | **Search** | k-nearest search with per-query beam width; batch search on a thread pool; range search; search by stored ID; deadlines, cancellation and progress reports; search statistics |
@@ -28,7 +28,7 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 | **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
 | **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
 | **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
-| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 861 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 864 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
 ## Compared with similar libraries
 
@@ -75,7 +75,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 |---|---|---|---|
 | 1 | **`Collection` API:** one object for dense vectors, text or sparse vectors, and metadata, under one ID space; hybrid search by default; durable sparse side | **done** | |
 | 2 | **Automatic maintenance:** thresholds deciding when to run `upkeep()`, `rebuild()` and `checkpoint()`, from a background thread or a `maintain()` call | **done** for collections (`MaintenancePolicy`) | |
-| 3 | **Presets:** balanced, low memory and high recall settings chosen from dimension and size | | 2 days |
+| 3 | **Presets:** balanced, low memory and high recall settings chosen from dimension and size | **done** (`CollectionOptions::preset`) | |
 | 4 | **Python bindings,** with wheels for every platform | The largest audience | 2 weeks |
 | 5 | **Packaging:** vcpkg, Conan, and a CMake package configuration | | 2–3 days |
 | 6 | **C API:** a stable interface for Rust, Go, C# and others | | 2 days |
@@ -103,10 +103,10 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 
 | Stage | Features | Why |
 |---|---|---|
-| **A. One object, no babysitting** | ~~1, 2~~ (done), 3 | Turns the toolkit into a product: one API, maintained automatically |
+| **A. One object, no babysitting** | ~~1, 2, 3~~ (done) | Turns the toolkit into a product: one API, maintained automatically |
 | **B. Reach** | 4, 5, 6 | Python first, then C++ packaging and other languages |
 | **C. Operating it** | 7, 8, 9 | Looking inside indexes, moving data in and out, watching them in production |
 | **D. Confidence** | 10, 20 | Published numbers, fuzzing, faster builds |
 | **E. Scale and quality of results** | 11–19 | As real usage shows which matter most |
 
-Done so far: collections and their automatic maintenance, the core (deletion, updates, saving, thread safety, parallel building), records and bulk changes, search by ID and deadlines, compression (SQ8, binary, PQ, Matryoshka), IVF, the disk-based index, health reports, upkeep and rebuilds, durability, and hybrid search.
+Done so far: stage A (collections, their automatic maintenance, presets), the core (deletion, updates, saving, thread safety, parallel building), records and bulk changes, search by ID and deadlines, compression (SQ8, binary, PQ, Matryoshka), IVF, the disk-based index, health reports, upkeep and rebuilds, durability, and hybrid search.

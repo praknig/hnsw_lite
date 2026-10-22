@@ -78,6 +78,40 @@ struct Collection::Prepared {
     Metadata metadata;
 };
 
+// ---------------------------------------------------------------- presets
+
+CollectionOptions CollectionOptions::preset(std::size_t dim, Preset preset, std::size_t expected_size) {
+    CollectionOptions o;
+    o.dim = dim;
+    o.metric = Metric::Cosine;
+    o.maintenance.mode = Maintenance::Background;
+    const bool large = expected_size >= 1000000;  // more links keep recall up in big graphs
+    switch (preset) {
+        case Preset::Balanced:
+            o.hnsw.M = large ? 24 : 16;
+            o.hnsw.ef_construction = large ? 300 : 200;
+            o.ef = 128;  // the library default (64) measured 0.92 recall@10 on clustered data; 128 reaches 0.95+
+            break;
+        case Preset::HighRecall:
+            o.hnsw.M = large ? 48 : 32;
+            o.hnsw.ef_construction = large ? 500 : 400;
+            o.ef = 256;
+            break;
+        case Preset::LowMemory:
+            // SQ8 codes only: no full vectors kept, one byte per dimension. (PQ codes
+            // alone recall too little without full vectors to re-rank against.)
+            o.hnsw.M = 12;
+            o.hnsw.ef_construction = 150;
+            o.hnsw.quantization.codec = CodecKind::SQ8;
+            o.hnsw.quantization.keep_full_vectors = false;
+            o.hnsw.quantization.rerank = false;
+            o.ef = 128;
+            break;
+        default: throw std::invalid_argument("CollectionOptions::preset: unknown preset");
+    }
+    return o;
+}
+
 // ---------------------------------------------------------------- construction
 
 Collection::Collection(CollectionOptions options) : options_(std::move(options)), bm25_(options_.bm25), metadata_(options_.schema) {
@@ -384,7 +418,8 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
         int which;  // 0 vector, 1 text, 2 sparse
     };
     std::vector<List> lists;
-    if (use_vector) lists.push_back({dense_->search(q.vector, depth, o.ef ? o.ef : std::max<std::size_t>(depth, 64), side), o.vector_weight, 0});
+    const std::size_t ef = o.ef ? o.ef : options_.ef ? std::max(options_.ef, depth) : std::max<std::size_t>(depth, 64);
+    if (use_vector) lists.push_back({dense_->search(q.vector, depth, ef, side), o.vector_weight, 0});
     if (use_text) lists.push_back({text_->search(bm25_.encode_query(q.text, *text_), depth, side), o.text_weight, 1});
     if (use_sparse) lists.push_back({sparse_->search(q.sparse, depth, side), o.sparse_weight, 2});
     // Fusion over any number of lists, as fuse() does for two.
