@@ -217,6 +217,55 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
     return results.take_sorted();
 }
 
+std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
+                                               const Eligibility& eligible, SearchStats* stats) const {
+    // ACORN-1 (Patel et al., SIGMOD 2024), on the existing graph: the beam holds
+    // eligible nodes only, so no distance is spent on vectors a filter rejects; a
+    // rejected neighbor is looked through to its own neighbors, which keeps the
+    // graph connected as the filter sees it. The start (the descent's end) is only
+    // traversed if it is rejected.
+    auto visited = visited_pool_.acquire(storage_.size());
+    visited->reset(storage_.size());
+    const GraphStorage& graph = storage_.graph();
+    std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> candidates;
+    TopK results(ef);
+    visited->visit(entry.id);
+    candidates.push(entry);
+    if (eligible(entry.id)) results.push(entry);
+    std::size_t expanded = 0, computed = 0, steps = 0;
+    const auto consider = [&](NodeId n) {
+        if (!visited->visit(n)) return;
+        const float d = distance_to(query, n);
+        ++computed;
+        if (results.full() && d >= results.worst_distance()) return;
+        candidates.push({d, n});
+        results.push({d, n});
+    };
+    while (!candidates.empty()) {
+        if ((++steps & 31) == 0 && detail::search_should_stop()) break;  // deadline or cancel: best so far
+        const Candidate current = candidates.top();
+        if (results.full() && current.distance > results.worst_distance()) break;
+        candidates.pop();
+        ++expanded;
+        for (const NodeId neighbor : graph.links(current.id, 0)) {
+            if (neighbor == kEmpty) break;
+            if (eligible(neighbor)) {
+                consider(neighbor);
+            } else if (visited->visit(neighbor)) {  // look through it once, unscored
+                for (const NodeId second : graph.links(neighbor, 0)) {
+                    if (second == kEmpty) break;
+                    if (eligible(second)) consider(second);
+                }
+            }
+        }
+    }
+    if (stats) {
+        stats->nodes_visited += expanded;
+        stats->distance_computations += computed;
+    }
+    return results.take_sorted();
+}
+
 std::vector<NodeId> HnswIndex::select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                                 std::size_t max) const {
     // Equal distances (identical vectors) in an order that differs for every base
@@ -1130,6 +1179,7 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
         stats.exact_count = d.exact_count;
         ef = std::max(ef, d.ef);
     }
+    if (run == Strategy::ForceAcorn && !eligible.filtered()) run = Strategy::ForceGraph;  // nothing to filter
     stats.strategy = run;
 
     // With a trained codec, distances come from codes while the search runs
@@ -1148,12 +1198,28 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
     if (run == Strategy::ForceExact) {
         const std::size_t wanted = rerank ? std::min(live_, saturating_mul(k, params_.quantization.rerank_factor)) : k;
         found = exact_scan(query, wanted, eligible, stats);
-    } else {
-        stats.ef = ef;
-        // Greedy descent from the entry point to level 1.
+    }
+    // Greedy descent from the entry point to level 1 (graph and ACORN searches).
+    const auto descend = [&] {
         Candidate current{distance_to(query, entry_), entry_};
         for (int l = max_level_; l > 0; --l) current = greedy_closest(query, current, l, kEmpty);
-
+        return current;
+    };
+    std::optional<Candidate> start;
+    if (run == Strategy::ForceAcorn) {
+        stats.ef = ef;
+        start = descend();
+        found = acorn_level0(query, *start, ef, eligible, &stats);
+        if (found.size() < k) {
+            // The matches are scattered beyond two hops of where the search went:
+            // fall back to the ordinary filtered search, with a widened beam.
+            stats.strategy = run = Strategy::ForceGraph;
+            ef = std::min(storage_.size(), static_cast<std::size_t>(double(ef) * params.max_ef_multiplier));
+        }
+    }
+    if (run == Strategy::ForceGraph) {
+        stats.ef = ef;
+        const Candidate current = start ? *start : descend();
         // Beam search on level 0, returning only eligible nodes.
         auto visited = visited_pool_.acquire(storage_.size());
         found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats);

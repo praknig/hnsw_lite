@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -4699,7 +4699,7 @@ TEST(planner, pl07_per_query_overrides_index_settings) {
     SearchOptions o = with_filter(Filter::eq("b", 1));
     o.stats = &st;
     h.search(data[0], 10, 64, o);
-    CHECK(st.strategy == Strategy::ForceGraph);
+    CHECK(st.strategy == Strategy::ForceAcorn && st.reason == PlanReason::Acorn);  // a graph search: ACORN at 10% matching
     o.planner = PlannerParams{5000, 0.5, 256, 32.0};  // query: always exact here
     h.search(data[0], 10, 64, o);
     CHECK(st.strategy == Strategy::ForceExact);
@@ -17738,6 +17738,53 @@ TEST(collection, co14_invalid_content_behind_valid_checksums) {
     CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
 }
 
+TEST(collection, co15_deadlines_and_cancellation) {
+    // Found by the test audit: collection searches could not be bounded, though
+    // every side supports it. Every side now stops, and the caller is told.
+    auto data = clustered(2000, 8, 6, 4030);
+    Collection c(co_options(8, true));
+    for (std::uint64_t i = 0; i < 2000; ++i) c.add(i, co_doc(data, i, true));
+    CollectionQuery q;
+    q.vector = data[0];
+    q.text = "alpha gamma";
+    q.sparse = {{1, 31}, {1.0f, 1.0f}};
+    bool stopped = true;
+    CollectionSearchOptions o;
+    o.stopped_early = &stopped;
+    const auto full = c.search(q, 10, o);
+    CHECK(!stopped && full.size() == 10);  // no deadline: not stopped
+    o.deadline = std::chrono::steady_clock::now() + std::chrono::hours(1);
+    CHECK(c.search(q, 10, o).size() == 10 && !stopped);  // a deadline in the future
+    o.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    const auto late = c.search(q, 10, o);
+    bool sorted = true;
+    for (std::size_t i = 1; i < late.size(); ++i) sorted = sorted && late[i - 1].score >= late[i].score;
+    CHECK(stopped && sorted && late.size() <= 10);  // stopped: the hits so far, still fused and sorted
+    std::atomic<bool> cancel{true};
+    CollectionSearchOptions co;
+    co.cancel = &cancel;
+    co.stopped_early = &stopped;
+    stopped = false;
+    (void)c.search(q, 10, co);
+    CHECK(stopped);
+    Collection empty(co_options(8));
+    CollectionQuery vq;
+    vq.vector = data[0];
+    stopped = true;
+    CHECK(empty.search(vq, 10, co).empty() && !stopped);  // nothing searched: nothing stopped
+    // Two calls the audit found no test making directly.
+    CHECK(Filter().is_all() && Filter::all().is_all() && !Filter::eq("a", 1).is_all() && !(Filter::eq("a", 1) || Filter::all()).is_all());
+    const std::string path = temp_path("co15.bin");
+    write_file(path, std::string(8192, 'x'));
+    BlockFile file(path);
+    file.set_simulated_latency(std::chrono::microseconds(2000));
+    const auto t0 = std::chrono::steady_clock::now();
+    char buf[16];
+    file.read(4096, buf, sizeof buf);
+    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::microseconds(2000) && file.size() == 8192 && buf[0] == 'x');
+    std::filesystem::remove(path);
+}
+
 // ===========================================================================
 // Automatic maintenance of collections (MT1-MT7)
 // ===========================================================================
@@ -18138,6 +18185,226 @@ TEST(presets, pr03_the_default_beam) {
 }
 
 // ===========================================================================
+// ACORN filtered graph search (AC1-AC5)
+// ===========================================================================
+
+namespace {
+
+/// 20,000 vectors around 50 centers; "spread" is uncorrelated with position,
+/// "cluster" follows the clusters (ACORN's hard case).
+struct AcornData {
+    std::vector<std::vector<float>> data, queries;
+    HnswIndex index{32, Metric::L2};
+    AcornData(std::size_t n = 20000, std::uint64_t seed = 7) {
+        std::mt19937 rng(static_cast<unsigned>(seed));
+        std::normal_distribution<float> nd(0, 1);
+        std::vector<std::vector<float>> centers(50, std::vector<float>(32));
+        for (auto& c : centers)
+            for (float& x : c) x = nd(rng) * 4;
+        for (std::size_t i = 0; i < n; ++i) {
+            const std::size_t c = rng() % 50;
+            std::vector<float> v(32);
+            for (std::size_t d = 0; d < 32; ++d) v[d] = centers[c][d] + nd(rng);
+            data.push_back(v);
+            index.add(i, v, Metadata().set("spread", std::int64_t(i % 100)).set("cluster", std::int64_t(c * 2)));
+        }
+        for (int q = 0; q < 60; ++q) {
+            std::vector<float> v(32);
+            const auto& c = centers[rng() % 50];
+            for (std::size_t d = 0; d < 32; ++d) v[d] = c[d] + nd(rng);
+            queries.push_back(v);
+        }
+    }
+};
+
+/// Recall@10 against exact search, and mean distance computations, for one strategy.
+std::pair<double, double> acorn_measure(const AcornData& a, const Filter& f, Strategy s) {
+    double hits = 0, dist = 0;
+    for (const auto& q : a.queries) {
+        SearchOptions ex;
+        ex.filter = f;
+        ex.strategy = Strategy::ForceExact;
+        const auto truth = a.index.search(q, 10, 64, ex);
+        SearchStats st;
+        SearchOptions o;
+        o.filter = f;
+        o.strategy = s;
+        o.stats = &st;
+        const auto got = a.index.search(q, 10, 64, o);
+        for (const auto& t : truth)
+            hits += std::any_of(got.begin(), got.end(), [&](const SearchResult& g) { return g.id == t.id; });
+        dist += double(st.distance_computations);
+    }
+    return {hits / (10.0 * double(a.queries.size())), dist / double(a.queries.size())};
+}
+
+}  // namespace
+
+TEST(acorn, ac01_the_planner_chooses_it_between_exact_and_graph) {
+    AcornData a(5000);
+    auto plan = [&](const Filter& f, std::optional<PlannerParams> p = std::nullopt, Strategy s = Strategy::Auto) {
+        SearchStats st;
+        SearchOptions o;
+        o.filter = f;
+        o.planner = p;
+        o.strategy = s;
+        o.stats = &st;
+        (void)a.index.search(a.queries[0], 10, 64, o);
+        return st;
+    };
+    // 10% of 5,000 is 500 matches: under the default exact limit (2,000), an exact scan.
+    CHECK(plan(Filter::lt("spread", std::int64_t(10))).strategy == Strategy::ForceExact);
+    PlannerParams few;  // the exact scan only by fraction (1%), so that ACORN's range shows at this size
+    few.max_exact_matches = 0;
+    PlannerParams fraction = few;  // 1% matching, well inside an exact fraction of 5% (a sample may estimate 1% a little above 1%)
+    fraction.max_exact_fraction = 0.05;
+    CHECK(plan(Filter::lt("spread", std::int64_t(1)), fraction).strategy == Strategy::ForceExact);
+    const SearchStats mid = plan(Filter::lt("spread", std::int64_t(10)), few);                  // 10%: ACORN, its beam widened 4x
+    CHECK(mid.strategy == Strategy::ForceAcorn && mid.reason == PlanReason::Acorn && mid.ef == 256);
+    CHECK(plan(Filter::lt("spread", std::int64_t(50)), few).strategy == Strategy::ForceGraph);  // 50%: the graph
+    PlannerParams off = few;
+    off.acorn_below = 0;  // off: the graph search, as before
+    CHECK(plan(Filter::lt("spread", std::int64_t(10)), off).strategy == Strategy::ForceGraph);
+    PlannerParams wide = few;
+    wide.acorn_ef_multiplier = 1;
+    CHECK(plan(Filter::lt("spread", std::int64_t(10)), wide).ef == 64);
+    CHECK(plan(Filter::lt("spread", std::int64_t(60)), std::nullopt, Strategy::ForceAcorn).strategy == Strategy::ForceAcorn);
+    SearchStats st;
+    SearchOptions none;
+    none.strategy = Strategy::ForceAcorn;  // no filter: nothing to filter, the plain graph
+    none.stats = &st;
+    CHECK(a.index.search(a.queries[0], 10, 64, none).size() == 10 && st.strategy == Strategy::ForceGraph);
+    for (auto bad : std::vector<std::function<void(PlannerParams&)>>{[](PlannerParams& p) { p.acorn_below = 1.5; },
+                                                                     [](PlannerParams& p) { p.acorn_below = -0.1; },
+                                                                     [](PlannerParams& p) { p.acorn_ef_multiplier = 0.5; },
+                                                                     [](PlannerParams& p) { p.acorn_ef_multiplier = kInf; }}) {
+        PlannerParams p;
+        bad(p);
+        CHECK_THROWS_AS(std::invalid_argument, a.index.set_planner_params(p));
+    }
+}
+
+TEST(acorn, ac02_recall_and_work_against_the_graph_search) {
+    AcornData a;
+    for (const char* field : {"spread", "cluster"}) {
+        for (std::int64_t pct : {5, 10, 20}) {
+            const Filter f = Filter::lt(field, pct);
+            const auto [graph_recall, graph_dist] = acorn_measure(a, f, Strategy::ForceGraph);
+            const auto [acorn_recall, acorn_dist] = acorn_measure(a, f, Strategy::ForceAcorn);  // with the planner's 4x beam
+            std::printf("    %-7s %2lld%%: graph recall %.3f, %6.0f distances; acorn recall %.3f, %6.0f distances\n", field, (long long)pct,
+                        graph_recall, graph_dist, acorn_recall, acorn_dist);
+            const bool spread = std::string(field) == "spread";
+            CHECK(acorn_recall >= (spread ? 0.99 : 0.97) && acorn_dist < graph_dist * (spread && pct <= 10 ? 0.5 : 1.2));
+        }
+    }
+}
+
+TEST(acorn, ac03_every_result_is_valid_and_few_matches_fall_back) {
+    AcornData a(4000);
+    std::set<std::uint64_t> removed;
+    for (std::uint64_t i = 0; i < 4000; i += 9) {
+        (void)a.index.remove(i);
+        removed.insert(i);
+    }
+    SearchOptions o;
+    o.filter = Filter::lt("spread", std::int64_t(15));
+    o.predicate = [](std::uint64_t id) { return id % 3 != 0; };
+    o.strategy = Strategy::ForceAcorn;
+    bool ok = true;
+    for (const auto& q : a.queries) {
+        const auto r = a.index.search(q, 20, 64, o);
+        ok = ok && r.size() == 20;
+        for (std::size_t i = 0; i < r.size(); ++i) {
+            ok = ok && r[i].id % 100 < 15 && r[i].id % 3 != 0 && !removed.count(r[i].id) && (i == 0 || r[i - 1].distance <= r[i].distance);
+            for (std::size_t j = 0; j < i; ++j) ok = ok && r[j].id != r[i].id;
+        }
+    }
+    CHECK(ok);
+    // Three matches in all, scattered: ACORN finds fewer than k and falls back; all three come back.
+    HnswIndex h(8, Metric::L2);
+    auto data = random_vectors(3000, 8, 4300);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i], Metadata().set("rare", i == 5 || i == 1500 || i == 2999));
+    SearchStats st;
+    SearchOptions few;
+    few.filter = Filter::eq("rare", true);
+    few.strategy = Strategy::ForceAcorn;
+    few.stats = &st;
+    const auto r = h.search(data[0], 10, 16, few);
+    std::set<std::uint64_t> got;
+    for (const auto& x : r) got.insert(x.id);
+    CHECK(got == std::set<std::uint64_t>({5, 1500, 2999}) && st.strategy == Strategy::ForceGraph);
+}
+
+TEST(acorn, ac04_with_compression_deadlines_batches_and_search_by_id) {
+    auto data = clustered(4000, 16, 8, 4301);
+    for (bool keep : {true, false}) {
+        HnswParams p;
+        p.quantization.codec = CodecKind::SQ8;
+        p.quantization.train_after = 500;
+        p.quantization.keep_full_vectors = keep;
+        p.quantization.rerank = keep;
+        HnswIndex h(16, Metric::L2, p);
+        for (std::uint64_t i = 0; i < 4000; ++i) h.add(i, data[i], Metadata().set("b", std::int64_t(i % 20)));
+        SearchOptions o;
+        o.filter = Filter::eq("b", std::int64_t(3));  // 5%: 200 matches, so the exact limit is lowered
+        PlannerParams few;
+        few.max_exact_matches = 0;
+        o.planner = few;
+        SearchStats st;
+        o.stats = &st;
+        const auto r = h.search(data[3], 10, 64, o);
+        CHECK(r.size() == 10 && st.strategy == Strategy::ForceAcorn && std::all_of(r.begin(), r.end(), [](const SearchResult& x) { return x.id % 20 == 3; }));
+    }
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 4000; ++i) h.add(i, data[i], Metadata().set("b", std::int64_t(i % 20)));
+    SearchOptions o;
+    o.filter = Filter::eq("b", std::int64_t(3));
+    SearchStats st;
+    o.stats = &st;
+    o.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    (void)h.search(data[0], 10, 64, o);
+    CHECK(st.stopped_early);
+    o.deadline.reset();
+    o.stats = nullptr;
+    const auto queries = flatten(Vectors(data.begin(), data.begin() + 30));
+    const auto batch = h.search_batch(queries, 10, 64, 4, o);
+    bool same = batch.size() == 30;
+    for (std::size_t i = 0; i < 30 && same; ++i) same = same_results(batch[i], h.search(data[i], 10, 64, o));
+    CHECK(same);
+    const auto by_id = h.search_by_id(3, 10, 64, o);
+    CHECK(by_id && by_id->size() == 10 && std::none_of(by_id->begin(), by_id->end(), [](const SearchResult& x) { return x.id == 3; }));
+}
+
+TEST(acorn, ac05_collections_use_it_through_their_filters) {
+    // A collection's filter reaches its HNSW side as a predicate: planned the same way.
+    auto data = clustered(5000, 16, 10, 4302);
+    CollectionOptions opt = co_options(16);
+    opt.text = false;
+    Collection c(opt);
+    for (std::uint64_t i = 0; i < 5000; ++i) {
+        Document d;
+        d.vector = data[i];
+        d.metadata = Metadata().set("b", std::int64_t(i % 20));
+        c.add(i, d);
+    }
+    FlatIndex exact(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) exact.add(i, data[i], Metadata().set("b", std::int64_t(i % 20)));
+    double hits = 0;
+    for (std::size_t q = 0; q < 30; ++q) {
+        CollectionQuery cq;
+        cq.vector = data[q * 7];
+        CollectionSearchOptions so;
+        so.filter = Filter::eq("b", std::int64_t(4));
+        const auto got = c.search(cq, 10, so);
+        SearchOptions eo;
+        eo.filter = Filter::eq("b", std::int64_t(4));
+        for (const auto& t : exact.search(data[q * 7], 10, eo))
+            hits += std::any_of(got.begin(), got.end(), [&](const CollectionHit& h) { return h.id == t.id; });
+    }
+    CHECK(hits / 300.0 >= 0.97);
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -18484,7 +18751,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

@@ -219,10 +219,10 @@ private:
 };
 
 /// How a filtered search is carried out.
-enum class Strategy { Auto, ForceExact, ForceGraph };
+enum class Strategy { Auto, ForceExact, ForceGraph, ForceAcorn };
 
 /// Why the planner chose what it chose (reported in SearchStats).
-enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex };
+enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn };
 
 /**
  * @brief Settings of the query planner.
@@ -239,6 +239,16 @@ struct PlannerParams {
     double max_exact_fraction = 0.01;
     std::size_t sample_size = 256;
     double max_ef_multiplier = 32.0;
+    /// HnswIndex: below this selectivity (and above the exact-scan limits), search
+    /// the graph the ACORN way: only matching vectors are scored, and the search
+    /// looks through non-matching neighbors to theirs (two hops) to stay connected.
+    /// Measured on 20,000 clustered vectors: 1.4 to 24 times fewer distances than the
+    /// widened graph search below 20% of matches, with recall 0.984 to 1.000. 0
+    /// turns it off (the graph search, as before). See Strategy::ForceAcorn.
+    double acorn_below = 0.2;
+    /// ACORN's beam: the requested ef times this (at least 1). Matches clustered
+    /// away from the query need it (4: recall at least 0.984 where 1 gave 0.966).
+    double acorn_ef_multiplier = 4.0;
 };
 
 /// Throws std::invalid_argument for settings outside their valid range.

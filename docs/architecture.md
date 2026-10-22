@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 864 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 870 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -504,9 +504,11 @@ Filters are checked against each index's schema when used (type errors throw `st
 A filtered HNSW search can either scan the matching vectors exactly, or search the graph while treating non-matching vectors like removed ones (traveled through, never returned). The planner chooses per query:
 
 1. **Estimate the number of matches:** exactly from the payload index when the filter allows it (and there is no predicate), exactly by checking every slot when the index is smaller than the sample size, otherwise from a deterministic sample of 256 live vectors.
-2. **Choose:** exact search if the expected matches are at most `max_exact_matches` (default 2,000) **or** their fraction is at most `max_exact_fraction` (default 1%); otherwise graph search, with `ef` widened by 1 / selectivity, up to `max_ef_multiplier` (32) times.
+2. **Choose:** exact search if the expected matches are at most `max_exact_matches` (default 2,000) **or** their fraction is at most `max_exact_fraction` (default 1%); otherwise **ACORN** below `acorn_below` (20%), with the beam multiplied by `acorn_ef_multiplier` (4); otherwise graph search, with `ef` widened by 1 / selectivity, up to `max_ef_multiplier` (32) times.
 
-Settings live in `PlannerParams`, per index (`set_planner_params`) or per query (`SearchOptions::planner`). `Strategy::ForceExact` and `Strategy::ForceGraph` override the choice. `SearchStats` reports the strategy, the reason, the estimate, the beam width, and the work done. On very large indexes lower `max_exact_fraction`: 1% of 100 million vectors is a million exact distance computations.
+**ACORN** (`acorn_level0`, after Patel et al., SIGMOD 2024, the variant needing no extra links): the upper levels are descended greedily, ignoring the filter; on level 0 only eligible nodes are scored and enter the beam, and an ineligible neighbor is looked through once (its own neighbors are considered, unscored). The starting node is only traversed if it is ineligible. If fewer than k eligible nodes are found (the matches lie beyond two hops of where the search went), the search falls back to the ordinary filtered search with the beam widened by `max_ef_multiplier`, so results are never worse than without ACORN.
+
+Settings live in `PlannerParams`, per index (`set_planner_params`) or per query (`SearchOptions::planner`). `Strategy::ForceExact`, `Strategy::ForceGraph` and `Strategy::ForceAcorn` override the choice. `SearchStats` reports the strategy, the reason, the estimate, the beam width, and the work done. On very large indexes lower `max_exact_fraction`: 1% of 100 million vectors is a million exact distance computations.
 
 **Payload index.** `create_payload_index(field)` keeps exact per-value counts for a keyword, boolean or tag-set field, which the planner uses instead of sampling. This first version keeps counts only; posting lists (letting exact search read only the matching vectors) are a later step.
 

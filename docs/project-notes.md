@@ -67,6 +67,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
 - [x] Automatic maintenance of collections (`MaintenancePolicy`, `maintain()`, a background thread)
 - [x] Presets for collections (`CollectionOptions::preset`)
+- [x] ACORN filtered graph search, chosen by the query planner
+- [ ] RaBitQ compression
 - [ ] Python bindings, packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction

@@ -305,6 +305,9 @@ void validate(const PlannerParams& p) {
     if (p.sample_size < 1) throw std::invalid_argument("PlannerParams::sample_size must be at least 1");
     if (!(p.max_ef_multiplier >= 1.0) || !std::isfinite(p.max_ef_multiplier))
         throw std::invalid_argument("PlannerParams::max_ef_multiplier must be a finite number >= 1");
+    if (!(p.acorn_below >= 0.0 && p.acorn_below <= 1.0)) throw std::invalid_argument("PlannerParams::acorn_below must be in [0, 1]");
+    if (!(p.acorn_ef_multiplier >= 1.0) || !std::isfinite(p.acorn_ef_multiplier))
+        throw std::invalid_argument("PlannerParams::acorn_ef_multiplier must be a finite number >= 1");
 }
 
 PlanDecision plan_search(std::size_t capacity, std::size_t live, const Eligibility& eligible,
@@ -352,12 +355,20 @@ PlanDecision plan_search(std::size_t capacity, std::size_t live, const Eligibili
     } else if (d.selectivity <= params.max_exact_fraction) {
         d.strategy = Strategy::ForceExact;
         d.reason = PlanReason::MatchFraction;
+    } else if (d.selectivity < params.acorn_below) {
+        d.strategy = Strategy::ForceAcorn;
+        d.reason = PlanReason::Acorn;
     } else {
         d.strategy = Strategy::ForceGraph;
         d.reason = PlanReason::Graph;
     }
 
     // 3. A graph search visits about 1 / selectivity nodes per useful one: widen the beam.
+    //    ACORN scores matching nodes only: its beam widens by a fixed factor instead.
+    if (d.strategy == Strategy::ForceAcorn) {
+        d.ef = std::min(capacity, std::max(ef, static_cast<std::size_t>(double(ef) * params.acorn_ef_multiplier)));
+        return d;
+    }
     const double cap = double(ef) * params.max_ef_multiplier;
     const double wanted = d.selectivity > 0.0 ? std::ceil(double(ef) / d.selectivity) : cap;
     d.ef = std::min(capacity, std::max(ef, static_cast<std::size_t>(std::min(wanted, cap))));
