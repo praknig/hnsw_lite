@@ -31,7 +31,6 @@ jobs:
         include:
           - { name: Linux x86-64, os: ubuntu-24.04 }
           - { name: Linux ARM64, os: ubuntu-24.04-arm }
-          - { name: macOS Intel, os: macos-13 }
           - { name: macOS Apple Silicon, os: macos-14 }
           - { name: Windows x86-64, os: windows-2022 }
     steps:
@@ -47,7 +46,7 @@ jobs:
           CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
           CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
           # macOS: std::filesystem needs 10.15; Apple Silicon starts at 11.
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-13' && '10.15' || '11.0' }}
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
           # Each wheel is installed in a clean environment and the test suite run against it.
           CIBW_TEST_REQUIRES: pytest pandas
           CIBW_TEST_COMMAND: python -m pytest {project}/python/tests -q -p no:cacheprovider
