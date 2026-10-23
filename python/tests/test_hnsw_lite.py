@@ -149,7 +149,12 @@ def test_changes_save_load_and_durability(tmp_path):
     ids, _ = idx.search_by_id(10, k=5)
     assert 10 not in ids and idx.search_by_id(99999) is None
     h = idx.health(recall_sample=20)
-    assert h["live"] == len(idx) and h["unreachable"] == 0 and 0 <= h["recall"] <= 1 and set(idx.upkeep()) == {"nodes_repaired", "reconnected", "complete"}
+    assert h["live"] == len(idx) and 0 <= h["recall"] <= 1
+    # Removals can leave a vector unreachable (found on a CI runner whose SIMD kernel
+    # built a slightly different graph): upkeep's guarantee is that none stays so.
+    up = idx.upkeep()
+    assert set(up) == {"nodes_repaired", "reconnected", "complete"} and up["complete"]
+    assert idx.health(recall_sample=0)["unreachable"] == 0
     path = str(tmp_path / "i.idx")
     idx.save(path)
     loaded = hl.HnswIndex.load(path)
