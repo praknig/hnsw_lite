@@ -1,0 +1,9 @@
+# The benchmark's libraries: pip install -r bench/python/requirements.txt
+hnsw-lite-lib
+hnswlib
+faiss-cpu
+usearch
+h5py
+matplotlib
+psutil
+numpy
