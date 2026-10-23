@@ -1,0 +1,46 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "hnsw-lite-lib"
+dynamic = ["version"]  # from python/hnsw_lite_lib/__init__.py: one place to change
+description = "Vector search with metadata filters, hybrid (dense + BM25) search, durability and automatic maintenance"
+readme = "python/README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.22"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.5"]
+test = ["pytest>=7", "pandas>=1.5"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+wheel.packages = ["python/hnsw_lite_lib"]
+# The source distribution: what building the Python module needs (CMake skips the
+# C++ tests, benchmarks and examples when it builds the module).
+sdist.exclude = [".github", "docs", "bench", "examples", "tests", "build*"]
+cmake.build-type = "Release"
+build.verbose = false
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "python/hnsw_lite_lib/__init__.py"
+
+[tool.scikit-build.cmake.define]
+HNSW_LITE_BUILD_PYTHON = "ON"
+HNSW_LITE_BUILD_TESTS = "OFF"
+HNSW_LITE_BUILD_BENCHMARKS = "OFF"
+HNSW_LITE_BUILD_EXAMPLES = "OFF"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]

@@ -2,6 +2,12 @@
 
 How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pipeline, and the bugs testing has found.
 
+
+The Python package has its own pytest suite in `python/tests` (13 tests: conversions of every NumPy dtype and layout, ID checks, metadata types, every filter, both indexes against brute force, saving, loading, durability, parallel searches from Python threads, collections, and pandas loading and results). CI's `python` job builds the package and runs it on Linux, macOS and Windows, with Python 3.9 and 3.13: `pip install ".[test]"` and `python -m pytest`. The `Wheels` workflow builds all 25 wheels (Linux x86-64 and ARM64, macOS Intel and Apple Silicon, Windows; CPython 3.9 to 3.13) with cibuildwheel and runs the same suite against each one installed in a clean environment, on pull requests touching the library or the package.
+
+## Fuzzing
+
+`bash .github/scripts/fuzz.sh [seconds]` fuzzes every file loader with libFuzzer, AddressSanitizer and UBSan (needs clang): HNSW and Flat indexes, sparse indexes, collections, log segments and disk indexes (`fuzz/fuzz_load.cpp`), starting from valid files of each kind (`fuzz/make_seeds.cpp`). A loaded input must also work: it is searched, saved, loaded again and saved again, and the two saves must be identical. Fuzzing builds skip checksum comparisons (`FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION`, so `persist::kVerifyChecksums` is false), letting mutated inputs reach the validation behind them; every other build verifies them. Crashing inputs are kept in `fuzz-out/artifacts/` (or under `FUZZ_OUT`); reproduce one with `fuzz-out/fuzz<N> <file>`. CI's `fuzz` job runs each loader for a minute on every code change; the audit that introduced it ran about 1.8 million inputs.
 ## Testing
 
 ### The comprehensive suite
@@ -205,7 +211,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-  |---|---|---|
+    |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -407,6 +413,13 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 
 101. **Collection searches could not be bounded.** Every index supports deadlines and cancellation, but `CollectionSearchOptions` did not pass them on, so a long hybrid search could not be stopped; it now has `deadline`, `cancel` and `stopped_early` (`co15`). The audit checked every one of the 232 public methods and functions (from the compiler-generated signatures) for a call in the tests: all are called but two trivial ones, now called directly too. It also built a matrix of standard edge cases (empty index, `k = 0`, `k` beyond the size, wrong dimension, NaN, duplicate and unknown IDs, out of memory, concurrency, saving and loading, damaged files, deadlines, filters, removal) against every component: every applicable cell has tests.
 
+**Found by fuzzing, static analysis and adversarial input (an audit of the whole library):**
+
+102. **`Collection::load` trusted the stored dimension.** A file claiming a dimension near 2⁶³ made it allocate exabytes (`std::bad_alloc` instead of `FormatError`); a claim like 2³⁰ could allocate gigabytes first. It now checks the same limit as every other loader (`co14`).
+103. **Index constructors checked the dimension after allocating.** `PreparedVector` allocated in its initializer list, before the check in its body, and for a dimension near 2⁶⁴ the rounded size wrapped around to a tiny buffer; `VectorStore` computed its stride the same way. `checked_dim()` now rejects 0 and anything above 2²⁴ before any size is computed (`co14`).
+104. **Python: `Filter.in_` took NumPy booleans for numbers,** so `in_("flag", np.array([True]))` failed; NumPy scalars are now converted first.
+105. **Python: negative sparse terms wrapped around.** In an `(indices, values)` pair, NumPy's cast turned −1 into term 4294967295; terms are now range-checked before any conversion, on both forms.
+
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 
 A test also looped over `*f.search_by_id(...)` directly and read freed memory, failing at random (about 60% of runs): a range-based `for` destroys the temporary optional before the loop body. The test stores the result first now, and the [user guide](user-guide.md#searching-by-stored-id) warns about this trap.
@@ -463,4 +476,3 @@ A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every n
 **The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
 
 GitHub pauses scheduled workflows on public repositories after 60 days without activity (and emails a warning first); any commit restarts them.
-

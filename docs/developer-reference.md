@@ -2,6 +2,8 @@
 
 Every public class, method and parameter of hnsw-lite: what it does, what it expects, what it returns, what can go wrong, and its limits. It is written for developers using the library; for how it works inside, see [Architecture and design](architecture.md), and for a guided tour, the [user guide](user-guide.md).
 
+From Python, see the [Python guide](python.md), which maps every call below to its Python form.
+
 Everything lives in the namespace `vecdb`. Headers are in `include/`; one `#include "collection.h"` brings in what most applications need.
 
 ## Contents
@@ -504,7 +506,7 @@ Compression ("quantization") stores each vector as a compact **code** and search
 HnswIndex(std::size_t dim, Metric metric, HnswParams params = {}, Schema schema = Schema::dynamic());
 ```
 
-Creates an empty index for `dim`-dimensional vectors. Throws `std::invalid_argument` for `dim` 0 or invalid parameters. For crash-safe use, see [`open_durable`](#49-saving-loading-and-durability); to load a saved index, [`load`](#49-saving-loading-and-durability).
+Creates an empty index for `dim`-dimensional vectors. Throws `std::invalid_argument` for `dim` 0 or above 16,777,216 (2²⁴), or invalid parameters. For crash-safe use, see [`open_durable`](#49-saving-loading-and-durability); to load a saved index, [`load`](#49-saving-loading-and-durability).
 
 ### 4.4 Adding, changing and removing vectors
 
@@ -1069,7 +1071,7 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 | Area | Limit |
 |---|---|
 | IDs | 64-bit unsigned integers only (no strings or UUIDs) |
-| Vectors | `float` only (no half precision or integers); one dimension per index; finite values only |
+| Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; no dates or geographic types; a field keeps its first type |

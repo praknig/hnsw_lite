@@ -1,0 +1,111 @@
+# Python wheels: built and tested for every platform with cibuildwheel, and
+# published to PyPI when a version tag (v1.2.3) is pushed.
+#
+# Publishing uses PyPI's trusted publishing: no token is stored here. Once, on
+# PyPI: Account settings > Publishing > Add a pending publisher: project
+# hnsw-lite-lib, this repository, workflow wheels.yml, environment pypi.
+name: Wheels
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: ["python/**", "pyproject.toml", "CMakeLists.txt", "include/**", "src/**", ".github/workflows/wheels.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: Wheels / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x86-64, os: ubuntu-24.04 }
+          - { name: Linux ARM64, os: ubuntu-24.04-arm }
+          - { name: macOS Apple Silicon, os: macos-14 }
+          - { name: Windows x86-64, os: windows-2022 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test the wheels
+        uses: pypa/cibuildwheel@v2.23.3
+        env:
+          # CPython 3.9 to 3.13, 64-bit only. musllinux (Alpine) and PyPy can come later.
+          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
+          CIBW_SKIP: "*-musllinux_* *-win32 *_i686"
+          # The library needs C++20: manylinux_2_28 has GCC 12 (manylinux2014's is too old).
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          # macOS: std::filesystem needs 10.15; Apple Silicon starts at 11.
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+          # Each wheel is installed in a clean environment and the test suite run against it.
+          CIBW_TEST_REQUIRES: pytest pandas
+          CIBW_TEST_COMMAND: python -m pytest {project}/python/tests -q -p no:cacheprovider
+          # Building uses every core; one wheel at a time keeps memory in check.
+          CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: wheelhouse/*.whl
+
+  sdist:
+    name: Source distribution
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the source distribution
+        run: pipx run build --sdist
+
+      - name: Check it builds and installs
+        run: |
+          python -m pip install dist/*.tar.gz
+          python -c "import hnsw_lite_lib as hl; print(hl.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI
+    needs: [wheels, sdist]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          version=$(python3 -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('python/hnsw_lite_lib/__init__.py').read()).group(1))")
+          echo "tag $tag, package version $version"
+          if [ "$tag" != "$version" ]; then
+            echo "::error::Tag v$tag does not match __version__ in python/hnsw_lite_lib/__init__.py ($version)"
+            exit 1
+          fi
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Check the files
+        run: |
+          ls -l dist
+          pipx run twine check --strict dist/*
+
+      - uses: pypa/gh-action-pypi-publish@release/v1

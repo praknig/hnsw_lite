@@ -759,7 +759,7 @@ std::unique_ptr<DiskIndex> DiskIndex::open(const std::string& path, const DiskOp
     if (load_le<std::uint32_t>(&h[8]) != kDiskVersion) throw FormatError("unsupported disk index version");
     if (load_le<std::uint32_t>(&h[12]) != kByteOrder) throw FormatError("wrong byte order mark");
     const std::size_t header_size = 8 + 4 + 4 + 8 + 4 + 4 + 8 * 7 + kSections * 20;
-    if (load_le<std::uint32_t>(&h[header_size]) != persist::crc32(0, h.data(), header_size)) throw FormatError("header checksum mismatch");
+    if (persist::kVerifyChecksums && load_le<std::uint32_t>(&h[header_size]) != persist::crc32(0, h.data(), header_size)) throw FormatError("header checksum mismatch");
     const auto dim = load_le<std::uint64_t>(&h[16]);
     const auto metric = load_le<std::uint32_t>(&h[24]);
     const auto n = load_le<std::uint64_t>(&h[32]);
@@ -789,7 +789,7 @@ std::unique_ptr<DiskIndex> DiskIndex::open(const std::string& path, const DiskOp
         if (offset != expected || size > f.size() || offset > f.size() - size) throw FormatError("invalid section offsets");
         sec[s].resize(static_cast<std::size_t>(size));
         f.read(offset, sec[s].data(), sec[s].size());
-        if (persist::crc32(0, sec[s].data(), sec[s].size()) != load_le<std::uint32_t>(e + 16)) throw FormatError("section checksum mismatch");
+        if (persist::kVerifyChecksums && persist::crc32(0, sec[s].data(), sec[s].size()) != load_le<std::uint32_t>(e + 16)) throw FormatError("section checksum mismatch");
         expected = offset + size;
     }
     if (expected != f.size()) throw FormatError("unexpected data at the end of the file");
@@ -866,7 +866,7 @@ DiskIndex::Node DiskIndex::read_node(NodeId node) const {
     file_->read(kBlock * (1 + first), buf.data(), buf.size());
     blocks_read_.fetch_add(blocks_per_node_, std::memory_order_relaxed);
     for (std::size_t b = 0; b < blocks_per_node_; ++b)
-        if (persist::crc32(0, buf.data() + b * kBlock, kBlock) != block_crc_[first + b]) throw FormatError("node block checksum mismatch");
+        if (persist::kVerifyChecksums && persist::crc32(0, buf.data() + b * kBlock, kBlock) != block_crc_[first + b]) throw FormatError("node block checksum mismatch");
     const unsigned char* r = buf.data() + (node_offset(node) - kBlock * (1 + first));
     Node out;
     out.vector.resize(dim_);

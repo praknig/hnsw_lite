@@ -17736,6 +17736,18 @@ TEST(collection, co14_invalid_content_behind_valid_checksums) {
     CHECK(!with([&](File& f) { f.text_side = bytes_of(t_other); }));                             // unknown document (text)
     CHECK(!with([&](File& f) { f.dense = bytes_of(h_other); }));                                 // unknown document (dense)
     CHECK(!with([&](File& f) { f.metric = 2; }));                                                // the dense side's metric differs
+    // Found by fuzzing: a claimed dimension near 2**63 made loading allocate exabytes.
+    CHECK(!with([](File& f) { f.dim = (std::uint64_t(1) << 63) + 7; }));
+    CHECK(!with([](File& f) { f.dim = kMaxDim + 1; }));
+    // And in code: dimensions beyond the limit are rejected before anything is
+    // allocated or computed from them (near 2**64, the row size would wrap around).
+    for (std::size_t dim : {kMaxDim + 1, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max() - 3}) {
+        CHECK_THROWS_AS(std::invalid_argument, HnswIndex(dim, Metric::L2));
+        CHECK_THROWS_AS(std::invalid_argument, FlatIndex(dim, Metric::L2));
+        CollectionOptions big;
+        big.dim = dim;
+        CHECK_THROWS_AS(std::invalid_argument, (void)Collection(big));
+    }
 }
 
 TEST(collection, co15_deadlines_and_cancellation) {
