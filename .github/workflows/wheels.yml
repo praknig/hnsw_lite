@@ -17,6 +17,9 @@ concurrency:
   group: wheels-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   wheels:
     name: Wheels / ${{ matrix.name }}
