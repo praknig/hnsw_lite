@@ -1072,6 +1072,7 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 |---|---|
 | IDs | 64-bit unsigned integers only (no strings or UUIDs) |
 | Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
+| Memory | About 300 to 360 bytes per vector at 32 dimensions with M 16 (the vector, its links and its ID); in general about 4 × dim + 8 × M + 40 bytes, plus metadata. Storage grows in blocks of up to 65,536 rows, but unused rows cost no resident memory |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; no dates or geographic types; a field keeps its first type |

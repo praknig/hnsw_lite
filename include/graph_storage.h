@@ -23,7 +23,7 @@ namespace vecdb {
  *
  * Empty slots:
  *  - Unused slots hold kEmpty; count() returns the slots before the first kEmpty.
- *  - Level-0 blocks are filled with byte 0xFF, which makes every slot kEmpty.
+ *  - Level-0 blocks are left untouched until used; each node's slots are set to kEmpty when it is added.
  *
  * Rules:
  *  - Nodes are added in order; node N here matches vector N in VectorStore.
@@ -46,8 +46,8 @@ public:
         if (level < 0 || level > 255) throw std::invalid_argument("bad level");
         auto id = static_cast<NodeId>(levels_.size());
         // Everything that can throw happens first, so a failure changes nothing.
-        if ((std::size_t(id) >> shelf_bits_) >= layer0_.size())  // new shelf: 0xFF bytes = kEmpty slots
-            layer0_.emplace_back((mask_ + 1) * M0_ * sizeof(NodeId), 0xFF);
+        if ((std::size_t(id) >> shelf_bits_) >= layer0_.size())  // new shelf: untouched until nodes are added
+            layer0_.emplace_back((mask_ + 1) * M0_ * sizeof(NodeId), AlignedBlock::Uninitialized{});
         reserve_one_more(levels_);
         reserve_one_more(upper_);
         reserve_one_more(upper_cap_);
@@ -57,6 +57,8 @@ public:
             upper = take_upper(level, cap);
             std::fill_n(upper, std::size_t(level) * M_, kEmpty);
         }
+        // This node's level-0 slots: all kEmpty (each node's, as it is added).
+        std::fill_n(reinterpret_cast<NodeId*>(layer0_[std::size_t(id) >> shelf_bits_].data()) + (std::size_t(id) & mask_) * M0_, M0_, kEmpty);
         levels_.push_back(static_cast<std::uint8_t>(level));  // cannot throw: reserved
         upper_.push_back(upper);
         upper_cap_.push_back(cap);

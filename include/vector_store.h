@@ -55,9 +55,11 @@ public:
         if (v.size() != dim_) throw std::invalid_argument("vector has wrong dimension");
         if (count_ >= kEmpty) throw std::length_error("too many vectors");  // GCOVR_EXCL_BR_LINE: needs 4 billion vectors
         if (!values_) return static_cast<NodeId>(count_++);  // slots only: counted, not stored
-        if ((count_ >> shelf_bits_) >= shelves_.size())  // row lies past the last shelf
-            shelves_.emplace_back((mask_ + 1) * stride_ * sizeof(float));
-        std::copy(v.begin(), v.end(), row(count_));  // padding stays zero
+        if ((count_ >> shelf_bits_) >= shelves_.size())  // row lies past the last shelf: untouched until rows are written
+            shelves_.emplace_back((mask_ + 1) * stride_ * sizeof(float), AlignedBlock::Uninitialized{});
+        float* r = row(count_);
+        std::copy(v.begin(), v.end(), r);
+        std::fill(r + dim_, r + stride_, 0.0f);  // the padding the SIMD kernels read: zero
         return static_cast<NodeId>(count_++);
     }
 

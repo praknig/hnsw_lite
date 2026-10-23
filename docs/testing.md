@@ -12,7 +12,7 @@ The Python package has its own pytest suite in `python/tests` (13 tests: convers
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 870 individually named tests** in 46 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 871 individually named tests** in 46 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -40,7 +40,7 @@ The Python package has its own pytest suite in `python/tests` (13 tests: convers
 | `codec` | 16 | Phase Q0: k-means finding separated clusters; bit-identical results across runs and thread counts; a fixed answer every platform must reproduce; k equal to the number of points, k of 1, identical points, duplicates with many centroids; invalid input; out of memory. SQ8: round-trip error at most half a level; constant dimensions stored exactly and values outside the range clamped; distances matching the decoded vectors for every metric; ranking close to full precision; fixed-answer codes (expected values computed independently with NumPy float32); misuse rejected; restoring a trained range; the codec factory. The SIMD code kernels: every instruction set the CPU supports against plain C++, at every length from 0 to 130 and unaligned addresses, and the binary bit order one bit at a time (a reversed order was shown to be caught) |
 | `sq8` | 12 | Phase Q1: untrained means full precision (identical results); automatic training at the threshold (single adds and batches) and explicit training (with its errors); recall for every metric with and without re-ranking, HNSW and Flat; codes following every path (removals, reuse, updates, upserts, batches, a cancelled batch, compaction); saving and loading byte for byte, trained or not; every truncation and flipped bit of SQ8 files, and seven invalid values behind valid checksums (each confirmed to be rejected by its own rule); batch, filtered and exact searches with codes, range searches at full precision; out of memory in training and adding; searching while another thread trains; older files without a codec; invalid settings |
 | `matryoshka` | 11 | Phase Q2: identical results (IDs and distances) to an ordinary index of the first N values, for every metric, HNSW and Flat (confirmed to fail if the wrong dimensions are kept); vectors read back in full by `get_vector`, `get`, `scan` and `search_by_id`; inputs checked in full (wrong sizes, NaN in the part cut off); settings (the full dimension means off, a larger truncation is rejected, a single dimension works); with SQ8; saving and loading byte for byte; every slot path keeping full vectors; every truncation and flipped bit of a file, and a truncation larger than the dimension; batch and range searches; truncation without a codec; out of memory |
-| `lean` | 8 | `keep_full_vectors = false`: truncating indexes give identical results to keeping full vectors and return the stored first N values (every metric, HNSW and Flat); cosine indexes return normalized vectors; every slot path, with `search_by_id` and `compact` rebuilding inputs from stored vectors; saving and loading byte for byte, with smaller files; damaged files and an invalid flag; a flipped flag detected; with SQ8; the default keeps everything |
+| `lean` | 9 | Resident memory of unused storage (Linux: 100 vectors in an HNSW and a flat index take about 1 MB, where filled blocks took 17.5 MB; fails if blocks are filled again); `keep_full_vectors = false`: truncating indexes give identical results to keeping full vectors and return the stored first N values (every metric, HNSW and Flat); cosine indexes return normalized vectors; every slot path, with `search_by_id` and `compact` rebuilding inputs from stored vectors; saving and loading byte for byte, with smaller files; damaged files and an invalid flag; a flipped flag detected; with SQ8; the default keeps everything |
 | `review` | 4 | A review of phases Q0 to Q2 and `keep_full_vectors`: a range search inside a coded search's predicate (checked on every call); a huge `rerank_factor`; a **model-based test**: 24 random configurations (metric, dimension, truncation, SQ8 trained automatically or explicitly, re-ranking, keeping full vectors), 300 random operations each (adds with duplicate and very large vectors, removals, updates, upserts, batches including refused ones, `remove_batch`, `compact`, training, `search_by_id`, saving and reloading), every one followed by a full check against a simple model (sizes, every vector read back, exact HNSW against Flat up to the order of ties, codes, byte-identical saving); and compaction never changing stored vectors |
 | `codes_only` | 8 | SQ8 keeping only codes: floats kept until training and dropped after it, with recall for every metric (HNSW and Flat) and vectors read back within half a step; every slot path (removals, reuse, updates, upserts, batches, a cancelled batch, `compact`) and every kind of search from codes; saving and loading byte for byte, with a much smaller file; training again refused; every truncation and flipped bit of a file, and three inconsistent files behind valid checksums (each confirmed rejected by its own rule); searching while another thread trains and drops the floats; out of memory (training all or nothing, floats kept on failure); with truncation and cosine |
 | `binary` | 12 | Phase Q3: code sizes and bit order; a fixed answer every CPU must reproduce (expected values computed independently with NumPy float32); distances matching decoded vectors for every metric; decode then encode exact (constant dimensions included); misuse rejected; recall with and without re-ranking, by `rerank_factor` and `ef`, and with codes only; every slot path, keeping full vectors or not; saving and loading byte for byte; every truncation and flipped bit of a file, and a negative spread; with truncation; training final with codes only; out of memory. A golden file with binary codes (`golden_hnsw_binary_v3.bin`) must be reproduced on every platform |
@@ -69,7 +69,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 870 test names
+test_comprehensive --list               # list all 871 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -83,13 +83,13 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 870 of 870 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 871 of 871 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-870 passed, 0 failed, 0 skipped, 0 not run, 37732 checks, 146.20 s
+871 passed, 0 failed, 0 skipped, 0 not run, 37745 checks, 129.33 s
 All selected tests passed.
 ```
 
@@ -137,7 +137,7 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 57 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 870 tests selected`: that entry's share, not tests left out. Together the 57 entries run all 870 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 57 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 871 tests selected`: that entry's share, not tests left out. Together the 57 entries run all 871 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 The environment variable `HNSW_LITE_TEST_EXCLUDE` adds exclusions (space- or comma-separated, like `--exclude`) to every run, including runs through CTest, which cannot pass arguments: CI's sanitizer job uses it to skip the seven heavy measurement tests, which run natively on every platform.
 
@@ -211,7 +211,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-    |---|---|---|
+  |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -420,6 +420,10 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 104. **Python: `Filter.in_` took NumPy booleans for numbers,** so `in_("flag", np.array([True]))` failed; NumPy scalars are now converted first.
 105. **Python: negative sparse terms wrapped around.** In an `(indices, values)` pair, NumPy's cast turned −1 into term 4294967295; terms are now range-checked before any conversion, on both forms.
 
+**Found by benchmarking against other libraries:**
+
+106. **Storage blocks were filled when allocated.** Vectors and links are stored in blocks of up to 65,536 rows, and each block was filled at once (zeros for vectors, `0xFF` for empty links), making every page resident: an index of 100 vectors held 17.5 MB, and at 20,000 vectors hnsw-lite used about three times hnswlib's memory in the benchmark. Blocks are now left untouched and each row is written when used; the search path is unchanged. Resident memory: 1.6 MB at 100 vectors (was 17.5), 8.2 MB at 20,000 (was 19.2), 362 bytes per vector at 200,000 (was 420); in the benchmark, 12 MB against hnswlib's 10 MB (was 29). Valgrind confirmed no uninitialized memory is read (`l09`).
+
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 
 A test also looped over `*f.search_by_id(...)` directly and read freed memory, failing at random (about 60% of runs): a range-based `for` destroys the temporary optional before the loop body. The test stores the result first now, and the [user guide](user-guide.md#searching-by-stored-id) warns about this trap.
@@ -476,3 +480,4 @@ A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every n
 **The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
 
 GitHub pauses scheduled workflows on public repositories after 60 days without activity (and emails a warning first); any commit restarts them.
+
