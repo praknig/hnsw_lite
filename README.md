@@ -20,6 +20,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
 - **Bulk changes by filter:** `remove_where`, `set_metadata_where` and `count_where`, like SQL's DELETE and UPDATE with a WHERE clause.
 - **Reading records back:** `get_vector` (exactly as given), `get`, and `scan` to page through records by ID, optionally filtered.
+- **Python bindings:** `pip install .`, with NumPy arrays in and out, pandas DataFrames for loading and results, and searches that release the GIL.
 - **Collections:** one object for documents with any of a dense vector, text (BM25) and a learned sparse vector, plus metadata, searched together, durable as a whole, and maintained automatically (upkeep, rebuilds, checkpoints); presets choose the settings.
 - **Hybrid search:** sparse vectors (BM25, SPLADE) in an exact inverted index, fused with dense results by Reciprocal Rank Fusion.
 - **Durability:** a write-ahead log with snapshots: `open_durable()` recovers every acknowledged change after a crash, with three flush modes.
@@ -92,6 +93,29 @@ Output:
 id 100  distance 0.0020
 id 101  distance 0.0071
 ```
+
+## Python
+
+```bash
+pip install hnsw-lite-lib   # or "pip install ." from the repository; import hnsw_lite_lib
+```
+
+```python
+import numpy as np
+import hnsw_lite_lib as hl
+
+with hl.Collection(dim=384, path="docs.db") as docs:                 # durable; omit path for in memory
+    docs.upsert(1, vector=embedding, text="The quick brown fox", metadata={"lang": "en"})
+    hits = docs.search(vector=query, text="fox", k=10, filter={"lang": "en"})
+    docs.upsert_dataframe(df, id_column="id", vector_column="embedding", text_column="body")   # pandas
+    table = docs.search(text="fox", k=10, as_dataframe=True)
+
+index = hl.HnswIndex(dim=128, metric=hl.Metric.L2)
+index.add(np.arange(10_000), vectors)
+ids, distances = index.search_batch(queries, k=10)                  # NumPy arrays of shape (n, 10)
+```
+
+NumPy arrays of any float type go in and come out; searches release the GIL, so Python threads search in parallel. See the [Python guide](docs/python.md).
 
 ## Examples
 
@@ -170,6 +194,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 | [Getting started](docs/getting-started.md) | Building on every platform, build options, using hnsw-lite in your project, troubleshooting |
 | [User guide](docs/user-guide.md) | Everything the library does and how to use it: indexes, metrics, metadata, filters, batch and range search, threads, errors |
 | [Developer reference](docs/developer-reference.md) | Every method and parameter in detail: what it does, what it expects, what can go wrong, and its limits |
+| [Python](docs/python.md) | The Python package: installing, collections, indexes, filters, NumPy and pandas, threads and errors |
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |

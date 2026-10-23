@@ -2,6 +2,8 @@
 
 Every public class, method and parameter of hnsw-lite: what it does, what it expects, what it returns, what can go wrong, and its limits. It is written for developers using the library; for how it works inside, see [Architecture and design](architecture.md), and for a guided tour, the [user guide](user-guide.md).
 
+From Python, see the [Python guide](python.md), which maps every call below to its Python form.
+
 Everything lives in the namespace `vecdb`. Headers are in `include/`; one `#include "collection.h"` brings in what most applications need.
 
 ## Contents

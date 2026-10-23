@@ -1,0 +1,226 @@
+# Python
+
+> The package is called **hnsw-lite-lib** on PyPI and **hnsw_lite_lib** in Python: the name `hnsw-lite` belongs to an unrelated project.
+
+hnsw-lite's Python package: `pip install hnsw-lite-lib`, then `import hnsw_lite_lib`. It is the C++ library with NumPy and pandas integration. Searches and writes run in C++ without holding Python's GIL, so several Python threads can search at once.
+
+## Contents
+
+- [Installing](#installing)
+- [Quick start](#quick-start)
+- [Collection](#collection)
+- [pandas](#pandas)
+- [HnswIndex and FlatIndex](#hnswindex-and-flatindex)
+- [Filters](#filters)
+- [How Python values are converted](#how-python-values-are-converted)
+- [Threads, errors and limits](#threads-errors-and-limits)
+- [Releasing](#releasing)
+
+## Installing
+
+```bash
+pip install hnsw-lite-lib                # or: pip install "hnsw-lite-lib[pandas]"
+```
+
+Prebuilt wheels cover CPython 3.9 to 3.13 on Linux (x86-64 and ARM64, glibc 2.28 or later: RHEL 8, Ubuntu 18.10, Debian 10 and newer), macOS (Intel from 10.15, Apple Silicon from 11) and Windows (x86-64). Each wheel picks the fastest SIMD instructions the CPU has (AVX2, AVX-512 or NEON) when it loads. Elsewhere (Alpine Linux, 32-bit systems, PyPy), pip builds from the source distribution, which needs a C++20 compiler and CMake 3.20 or later.
+
+From the repository: `pip install .` (or `pip install ".[test]"`, then `python -m pytest`, for the tests). NumPy is required; pandas is optional (only `upsert_dataframe` and `as_dataframe=True` use it).
+
+## Quick start
+
+```python
+import numpy as np
+import hnsw_lite_lib as hl
+
+docs = hl.Collection(dim=384, path="docs.db")      # durable: created, or recovered after a crash
+docs.upsert(1, vector=embedding, text="The quick brown fox", metadata={"lang": "en", "year": 2024, "tags": ["animals"]})
+
+hits = docs.search(vector=query_embedding, text="fox", k=10, filter={"lang": "en"})
+for hit in hits:
+    print(hit["id"], hit["score"], hit["vector_rank"], hit["text_rank"])
+
+docs.close()                                        # or use: with hl.Collection(...) as docs:
+```
+
+## Collection
+
+The recommended object: documents with any of a dense vector, text (scored with BM25) and a learned sparse vector, plus metadata, under one ID space. It is the C++ [`Collection`](developer-reference.md#2-collection-the-recommended-starting-point); every rule and limit described there applies.
+
+### Creating
+
+```python
+hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_size=100_000, text=True, sparse=False,
+              store_text=True, schema=None, strict=False, durability="grouped", maintenance=None, ef=None,
+              bm25_avg_doc_length=None, options=None)
+```
+
+| Argument | Type | What it does |
+|---|---|---|
+| `dim` | `int` | Vector length; 0 for a collection without vectors (text and/or sparse only). |
+| `path` | `str` or `None` | A directory: the collection is **durable** (created, or recovered after a crash). `None`: in memory. |
+| `metric` | `"cosine"`, `"l2"` (or `"euclidean"`), `"ip"` (or `"inner_product"`, `"dot"`), or `hl.Metric` | Distance of the vectors. |
+| `preset` | `"balanced"`, `"high_recall"`, `"low_memory"`, or `hl.Preset` | Graph, compression and search settings (see [presets](developer-reference.md#22-presets)). Presets turn on background maintenance. |
+| `expected_size` | `int` | About how many documents; from a million the presets use more links. |
+| `text`, `sparse` | `bool` | Whether the collection has a BM25 text side and a learned sparse side. |
+| `store_text` | `bool` | Keep each document's text, for `get()` and search results. |
+| `schema` | `dict` or `None` | Field types: `{"year": int, "lang": "keyword", "tags": "tags"}`. Types: `int`, `float`, `bool`, `str` (or `"keyword"`), `list` (or `"tags"`), or `hl.FieldType`. |
+| `strict` | `bool` | Only the schema's fields are allowed. |
+| `durability` | `"buffered"`, `"grouped"`, `"synced"`, or `hl.Durability` | When the log reaches the disk (see [durability modes](developer-reference.md#81-durableoptions-and-durability)). |
+| `maintenance` | `"manual"`, `"background"`, or `None` (the preset's choice) | Whether a background thread maintains the collection. |
+| `ef` | `int` or `None` | Default search beam of the vectors (higher: better recall, slower). |
+| `bm25_avg_doc_length` | `float` or `None` | Average document length in words, for BM25; set it near your corpus' mean. |
+| `options` | `hl.CollectionOptions` or `None` | Every setting at once, instead of the arguments above (`hl.CollectionOptions.preset(dim, hl.Preset.BALANCED)` is a starting point). |
+
+`hl.Collection.load(path)` reads a file written by `save(path)` (maintenance starts manual).
+
+### Methods
+
+| Method | What it does |
+|---|---|
+| `add(id, vector=None, text=None, sparse=None, metadata=None)` | Adds a document; `ValueError` if the ID exists or a part is invalid. |
+| `upsert(id, vector=None, text=None, sparse=None, metadata=None)` → `bool` | Adds, or replaces the **whole** document (parts left out are removed); `True` if added. |
+| `upsert_many(ids, vectors=None, texts=None, sparse=None, metadata=None)` → `int` | Many documents: `ids` (sequence or array), `vectors` (2-D array, one row per ID), and lists of texts, sparse vectors and metadata dicts, each optional, one entry per ID. Returns how many were added. |
+| `upsert_dataframe(df, ...)` → `int` | See [pandas](#pandas). |
+| `remove(ids)` → `int` | Removes one ID or many; how many were stored. |
+| `remove_where(filter)`, `count_where(filter)` → `int` | By metadata. |
+| `set_metadata(id, metadata)` → `bool` | Changes only the given fields; `None` clears a field. |
+| `set_metadata_where(filter, changes)` → `int` | The same for every match. |
+| `get(id)` → `dict` or `None` | `{"id", "vector" (NumPy array or None), "text", "sparse" (dict or None), "metadata"}`. |
+| `search(vector=None, text=None, sparse=None, *, k=10, filter=None, ...)` | Below. |
+| `checkpoint()` → `int` | Durable collections: a snapshot. |
+| `maintain(budget_ms=0)` → `dict` | Runs the maintenance that is due; returns what it did (`upkept`, `rebuilt`, `checkpointed`, `notes`, ...). |
+| `maintenance_status()` → `dict` | `log_bytes`, `log_records`, `since_checkpoint_s`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds`. |
+| `set_maintenance(mode="background", **settings)` | Changes the policy: `interval_ms`, `budget_ms`, `checkpoint_records`, `checkpoint_bytes`, `checkpoint_age_s`, `health_check_churn`, `upkeep_churn`, `upkeep_nodes`, `rebuild_check_churn`, `rebuild_drift`. |
+| `save(path)`, `close()`, `len(c)`, `id in c`, `c.options`, `c.durable` | Files, lifetime, size, membership, settings. |
+
+**Close durable collections** with `close()` or a `with` statement: closing flushes the log and releases the directory's lock (another process, or the same one, can then open it). A closed collection raises `ValueError` when used.
+
+### Searching
+
+```python
+docs.search(vector=None, text=None, sparse=None, *, k=10, filter=None, fusion="rrf", rrf_k=60.0,
+            vector_weight=1.0, text_weight=1.0, sparse_weight=1.0, candidates=0, ef=0,
+            with_metadata=False, with_text=False, timeout=None, as_dataframe=False)
+```
+
+Give at least one of `vector`, `text` and `sparse`. With several, each side's ranking is fused: Reciprocal Rank Fusion (`fusion="rrf"`) or scores scaled to [0, 1] (`"weighted"`), with a weight per side (see [fusion](developer-reference.md#27-searching)). `filter` is a [`Filter`](#filters) or a dict. `timeout` (seconds) stops the search early: the hits found so far are returned and `docs.last_search_stopped_early` is set to `True`.
+
+Each hit is a dict: `id`, `score` (higher is better), `vector_rank`, `text_rank`, `sparse_rank` (1-based, or `None` if that side did not find it), `vector_distance`, `text_score`, `sparse_score`, and `metadata` and `text` when asked for.
+
+## pandas
+
+```python
+docs.upsert_dataframe(df, *, id_column=None, vector_column=None, text_column=None, sparse_column=None, metadata_columns=None)
+```
+
+Upserts every row of a DataFrame:
+
+- **IDs** come from `id_column`, or from the index if it is `None`. They must be non-negative integers.
+- **Vectors** come from `vector_column`, whose cells hold arrays or lists (one vector per row), as embedding pipelines usually produce.
+- **Text** comes from `text_column`; a missing value means no text.
+- **Metadata** comes from `metadata_columns`, or by default **every other column**. Missing values (`NaN`, `None`, `pd.NA`, `NaT`) are left out of that row's metadata rather than stored. NumPy scalars become Python values, and cells holding lists become tag sets.
+
+```python
+results = docs.search(vector=q, text="fox", k=20, filter={"lang": "en"}, as_dataframe=True)
+```
+
+`as_dataframe=True` returns a DataFrame: `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank` (pandas' nullable `Int64`, so missing ranks show as `<NA>`), `vector_distance`, `text_score`, `sparse_score`, optionally `text`, then **one column per metadata field**. A metadata field whose name collides with a result column (such as `score`) is renamed `metadata_score`.
+
+## HnswIndex and FlatIndex
+
+For plain vector indexes with metadata, in the style of hnswlib and FAISS:
+
+```python
+index = hl.HnswIndex(dim=128, metric=hl.Metric.L2)            # or hl.FlatIndex(dim, metric) for exact search
+index.add(np.arange(n), vectors, metadata=[{"lang": "en"}] * n, threads=0)
+ids, distances = index.search(query, k=10, ef=64, filter=hl.Filter.eq("lang", "en"))
+I, D = index.search_batch(queries, k=10, ef=64)                # shape (len(queries), 10)
+```
+
+| Method | What it does |
+|---|---|
+| `HnswIndex(dim, metric=Metric.COSINE, params=HnswParams(), schema=None, strict=False)` | `params` has `M`, `ef_construction`, `seed`, `repair_on_remove` and `quantization` (`QuantizationParams`: `codec`, `train_after`, `rerank`, `rerank_factor`, `truncate_to`, `keep_full_vectors`, `pq_subspaces`). |
+| `FlatIndex(dim, metric=Metric.COSINE, schema=None, strict=False, quantization=QuantizationParams(), ivf=IvfParams())` | `ivf` has `lists`, `probes`, `train_after`. |
+| `add(ids, vectors, metadata=None, threads=0)` | One vector (an int ID and a 1-D vector) or many (IDs and a 2-D array). Everything is checked first: on any error nothing is added. Built on `threads` threads (0: all cores). |
+| `search(query, k=10, ef=64, filter=None, strategy=Strategy.AUTO)` | `(ids, distances)`: `uint64` and `float32` arrays, closest first. `FlatIndex` has no `ef` or `strategy`. |
+| `search_batch(queries, k=10, ef=64, filter=None, threads=0)` | `(ids, distances)` of shape `(n, k)`. Where fewer than `k` results exist, rows are **padded** with `hl.MISSING_ID` (2⁶⁴−1) and `inf`. |
+| `search_by_id(id, k=10, ef=64, filter=None)` | Like `search`, with the stored vector; the record itself is left out; `None` if not stored. |
+| `upsert`, `update`, `remove`, `remove_where`, `count_where`, `set_metadata`, `set_metadata_where`, `get_vector`, `get_metadata` | As for collections. |
+| `create_payload_index(field)`, `train_codec()`, `health(recall_sample=100)`, `upkeep()`, `compact()`, `rebuild()`, `train_lists()` (flat) | See the [developer reference](developer-reference.md#4-hnswindex-the-graph-index). `health()` returns a dict. |
+| `save(path)`, `HnswIndex.load(path)`, `HnswIndex.open_durable(dir, dim, metric, options=DurableOptions())`, `checkpoint()` | Files and durability. |
+| `len(index)`, `id in index`, `index.dim`, `index.metric` | |
+
+**Distances** follow the library's convention: smaller is closer. For L2 they are **squared** distances, for inner product minus the dot product, for cosine 1 − cosine similarity.
+
+## Filters
+
+```python
+F = hl.Filter
+f = F.eq("lang", "en") & (F.ge("year", 2020) | F.has_tag("tags", "featured")) & ~F.eq("draft", True)
+```
+
+| Function | Matches |
+|---|---|
+| `Filter.eq`, `ne`, `lt`, `le`, `gt`, `ge(field, value)` | comparisons; `value` is an int, float, bool or str (NumPy scalars too) |
+| `Filter.between(field, low, high)` | low ≤ field ≤ high (numbers) |
+| `Filter.in_(field, values)` | any of the values (strings, integers, numbers or booleans) |
+| `Filter.has_tag(field, tag)`, `has_any_tag(field, tags)`, `has_all_tags(field, tags)` | tag sets |
+| `Filter.exists(field)`, `Filter.all()` | has a value; everything |
+| `a & b`, `a \| b`, `~a` | and, or, not (Python's `and`, `or` and `not` cannot be overloaded: use the operators) |
+
+Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.
+
+## How Python values are converted
+
+| Python | Library |
+|---|---|
+| Vectors: NumPy arrays of any float dtype, any memory layout, lists | `float32`, copied (non-contiguous or Fortran-ordered arrays are fine) |
+| IDs: `int`, NumPy integers, arrays of integers | unsigned 64-bit (the full range up to 2⁶⁴−1); negative IDs raise `ValueError` (never wrapped around), non-integers `TypeError` |
+| Metadata `bool` | `Bool` (checked before `int`, since `bool` is a subclass of `int` in Python) |
+| `int`, NumPy integers | `Int` (64-bit) |
+| `float`, NumPy floats | `Float` (NaN and infinity are rejected) |
+| `str` | `Keyword` |
+| `list`, `tuple`, `set` of `str` | `Tags` |
+| `None` in `set_metadata` | clears the field |
+| Sparse vectors: `{term: weight}` or `(indices, values)` | `SparseVector` |
+| Search results | NumPy arrays (indexes) or lists of dicts (collections) |
+
+## Threads, errors and limits
+
+**Threads.** Every search, batch add, save, checkpoint and maintenance round releases the GIL, so Python threads run them in parallel. Conversions from Python objects (metadata dicts, lists) happen before the GIL is released. Batch methods with a `threads` argument also parallelize inside C++.
+
+**Errors.**
+
+| Python exception | When |
+|---|---|
+| `ValueError` | Invalid input: wrong dimension, NaN, a duplicate ID, metadata not fitting the schema, invalid settings, an unknown preset or metric name, using a closed collection |
+| `TypeError` | A value of the wrong Python type (a metadata value that is not int, float, bool, str or a list of str) |
+| `hl.FormatError` (a `RuntimeError`) | A damaged or foreign file or directory |
+| `hl.Cancelled` (a `RuntimeError`) | A long operation stopped by a deadline |
+| `RuntimeError` | Files that cannot be opened or written, a directory locked by another process, misuse such as a change from inside a search |
+| `MemoryError` | Out of memory (the change is rolled back) |
+
+**Limits.** Everything in the [developer reference's limits](developer-reference.md#11-limits-at-a-glance) applies. In Python specifically:
+- Search predicates (Python functions deciding per result) are not exposed: filter with metadata instead. Python callbacks would have to reacquire the GIL for every candidate.
+- Collections have no `scan` or export to a DataFrame yet.
+- Vectors are copied into the library (no zero-copy views of its memory).
+
+## Releasing
+
+The `Wheels` workflow (`.github/workflows/wheels.yml`) builds and tests every wheel on every pull request that touches the library or the package, and publishes to PyPI when a version tag is pushed.
+
+**Once, before the first release.** On [pypi.org](https://pypi.org), under *Your account > Publishing*, add a **pending trusted publisher**: project name `hnsw-lite-lib`, the GitHub owner and repository, workflow `wheels.yml`, environment `pypi`. Then, in the GitHub repository's *Settings > Environments*, create an environment named `pypi` (optionally requiring a reviewer's approval, so every release is confirmed by a person). No password or token is stored anywhere: PyPI trusts this workflow directly.
+
+**Each release.**
+
+1. Change `__version__` in `python/hnsw_lite_lib/__init__.py` (the only place the version is written: `pyproject.toml` reads it), and merge.
+2. Tag the merged commit and push the tag:
+
+   ```bash
+   git tag v0.2.0
+   git push origin v0.2.0
+   ```
+
+3. The workflow builds the 25 wheels and the source distribution, tests each wheel in a clean environment, checks that the tag matches `__version__` (refusing to publish otherwise), checks the files with `twine`, and uploads them.
+
+PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.

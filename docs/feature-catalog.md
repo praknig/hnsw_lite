@@ -40,7 +40,7 @@ Libraries linked into your program, like hnsw-lite.
 
 | | Index types | Compression | Filtering | Updates and deletes | Crash-safe log | Sparse and hybrid | Languages |
 |---|---|---|---|---|---|---|---|
-| **hnsw-lite** | HNSW, flat, IVF, disk graph (Vamana), sparse | SQ8, binary, PQ, Matryoshka | Typed metadata, query planner, ACORN, payload indexes | Real deletion with graph repair; upkeep and rebuilds | **Yes** | **Yes** (BM25, SPLADE, RRF) | C++ |
+| **hnsw-lite** | HNSW, flat, IVF, disk graph (Vamana), sparse | SQ8, binary, PQ, Matryoshka | Typed metadata, query planner, ACORN, payload indexes | Real deletion with graph repair; upkeep and rebuilds | **Yes** | **Yes** (BM25, SPLADE, RRF) | C++, Python |
 | [hnswlib](https://github.com/nmslib/hnswlib) | HNSW | None | Filter callback | Mark deleted; replace deleted slots | No | No | C++, Python |
 | [USearch](https://github.com/unum-cloud/usearch) | HNSW | f16, bf16, i8, binary | Filter callback | Yes | No | No | C++ and 10+ bindings |
 | [FAISS](https://github.com/facebookresearch/faiss) | Flat, IVF, HNSW, NSG and many more | SQ, PQ, OPQ, RaBitQ, and more | ID selectors | Depends on the index type | No | No | C++, Python; GPU |
@@ -65,7 +65,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 
 **Strengths.** Among embedded libraries, hnsw-lite is the one that behaves like a database engine: crash-safe durability, real deletion that keeps the graph healthy, health reports, incremental upkeep and rebuilds while in use, typed metadata with a query planner, and hybrid search, in one library with no dependencies. It is also unusually well verified: byte-identical results on every platform, all-or-nothing changes under allocation failure, and crash tests that kill real processes.
 
-**Gaps.** Reach: it is C++ only, while every alternative offers at least Python. Compression: RaBitQ and half-precision storage, now common elsewhere, are missing. Scale: no GPU support and no memory-mapped loading. Retrieval: no multivector (ColBERT-style) search yet. And there are no published benchmarks against these libraries yet. The suggested order below addresses these.
+**Gaps.** Reach: Python and C++ only, with no other language bindings yet. Compression: RaBitQ and half-precision storage, now common elsewhere, are missing. Scale: no GPU support and no memory-mapped loading. Retrieval: no multivector (ColBERT-style) search yet. And there are no published benchmarks against these libraries yet. The suggested order below addresses these.
 
 ## Open features
 
@@ -76,7 +76,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | 1 | **`Collection` API:** one object for dense vectors, text or sparse vectors, and metadata, under one ID space; hybrid search by default; durable sparse side | **done** | |
 | 2 | **Automatic maintenance:** thresholds deciding when to run `upkeep()`, `rebuild()` and `checkpoint()`, from a background thread or a `maintain()` call | **done** for collections (`MaintenancePolicy`) | |
 | 3 | **Presets:** balanced, low memory and high recall settings chosen from dimension and size | **done** (`CollectionOptions::preset`) | |
-| 4 | **Python bindings,** with wheels for every platform | The largest audience | 2 weeks |
+| 4 | **Python bindings,** with wheels for every platform | **done**: `pip install hnsw-lite-lib` (collections, indexes, filters, NumPy, pandas); wheels for Linux, macOS and Windows built and tested by CI, published on version tags | |
 | 5 | **Packaging:** vcpkg, Conan, and a CMake package configuration | | 2–3 days |
 | 6 | **C API:** a stable interface for Rust, Go, C# and others | | 2 days |
 | 7 | **Command-line tool:** inspect, verify, report health, compact, convert and export | | 1–2 days |
@@ -104,7 +104,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | Stage | Features | Why |
 |---|---|---|
 | **A. One object, no babysitting** | ~~1, 2, 3~~ (done) | Turns the toolkit into a product: one API, maintained automatically |
-| **B. Reach** | 4, 5, 6 | Python first, then C++ packaging and other languages |
+| **B. Reach** | ~~4~~ (done), 5, 6 | Python first, then C++ packaging and other languages |
 | **C. Operating it** | 7, 8, 9 | Looking inside indexes, moving data in and out, watching them in production |
 | **D. Confidence** | 10, 20 | Published numbers, fuzzing, faster builds |
 | **E. Scale and quality of results** | 11–19 | As real usage shows which matter most |

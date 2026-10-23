@@ -356,10 +356,37 @@ jobs:
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).
+  # The Python package: built from source with pip (scikit-build-core and
+  # pybind11), then tested with pytest, on every platform, with the oldest and
+  # newest supported Python.
+  python:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-14, windows-2022]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build and install the package
+        run: python -m pip install ".[test]"
+
+      - name: Test
+        run: python -m pytest -q
+
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer]
+    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python]
     runs-on: ubuntu-24.04
     steps:
       - name: Every job that ran succeeded

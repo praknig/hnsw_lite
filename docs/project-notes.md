@@ -69,7 +69,9 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Presets for collections (`CollectionOptions::preset`)
 - [x] ACORN filtered graph search, chosen by the query planner
 - [ ] RaBitQ compression
-- [ ] Python bindings, packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
+- [x] Python bindings with NumPy and pandas integration (`hnsw_lite_lib`)
+- [x] Python wheels for Linux, macOS and Windows (`pip install hnsw-lite-lib`)
+- [ ] C++ packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [ ] Benchmarks on SIFT1M and GloVe

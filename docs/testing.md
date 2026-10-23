@@ -2,6 +2,8 @@
 
 How hnsw-lite is tested: the test suite and its runner, code coverage, the CI pipeline, and the bugs testing has found.
 
+
+The Python package has its own pytest suite in `python/tests` (13 tests: conversions of every NumPy dtype and layout, ID checks, metadata types, every filter, both indexes against brute force, saving, loading, durability, parallel searches from Python threads, collections, and pandas loading and results). CI's `python` job builds the package and runs it on Linux, macOS and Windows, with Python 3.9 and 3.13: `pip install ".[test]"` and `python -m pytest`. The `Wheels` workflow builds all 25 wheels (Linux x86-64 and ARM64, macOS Intel and Apple Silicon, Windows; CPython 3.9 to 3.13) with cibuildwheel and runs the same suite against each one installed in a clean environment, on pull requests touching the library or the package.
 ## Testing
 
 ### The comprehensive suite

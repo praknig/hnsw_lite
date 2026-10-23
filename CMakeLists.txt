@@ -16,6 +16,7 @@ option(HNSW_LITE_BUILD_TESTS "Build the test suite" ${HNSW_LITE_IS_MAIN_PROJECT}
 option(HNSW_LITE_BUILD_BENCHMARKS "Build the benchmarks" ${HNSW_LITE_IS_MAIN_PROJECT})
 option(HNSW_LITE_BUILD_EXAMPLES "Build the example programs" ${HNSW_LITE_IS_MAIN_PROJECT})
 option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux/macOS)" OFF)
+option(HNSW_LITE_BUILD_PYTHON "Build the Python extension module (hnsw_lite_lib._core)" OFF)
 
 find_package(Threads REQUIRED)  # batch search runs on a thread pool
 
@@ -117,4 +118,15 @@ if(HNSW_LITE_BUILD_EXAMPLES)
     target_link_libraries(${name} PRIVATE hnsw_lite)
     hnsw_lite_setup(${name})
   endforeach()
+endif()
+
+# The Python extension module, built by scikit-build-core (pip install .): the
+# library compiled position-independent and linked into hnsw_lite_lib._core.
+if(HNSW_LITE_BUILD_PYTHON)
+  set_target_properties(hnsw_lite PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  find_package(Python 3.9 REQUIRED COMPONENTS Interpreter Development.Module)
+  find_package(pybind11 CONFIG REQUIRED)
+  pybind11_add_module(_core python/src/bindings.cpp)
+  target_link_libraries(_core PRIVATE hnsw_lite)
+  install(TARGETS _core LIBRARY DESTINATION hnsw_lite_lib)
 endif()

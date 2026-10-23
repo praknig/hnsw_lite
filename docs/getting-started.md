@@ -14,6 +14,10 @@ This guide covers building hnsw-lite, running its tests and examples, and using 
 
 Any 64-bit x86 or ARM processor works. The fastest distance code for your CPU (AVX2, AVX-512 or NEON) is chosen automatically when the program starts, so the same build runs everywhere.
 
+
+## Python
+
+`pip install hnsw-lite-lib` installs a prebuilt wheel. `pip install .` from the repository root builds the library into the Python package `hnsw_lite_lib` (pip fetches pybind11 and scikit-build-core; a C++20 compiler and CMake are needed). `pip install ".[test]"` and `python -m pytest` run its tests. See the [Python guide](python.md).
 ## Get the code
 
 ```bash
@@ -55,7 +59,7 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### CLion
 
-1. Open the `hnsw_lite` folder.
+1. Open the `hnsw_lite_lib` folder.
 2. Add a **Release** profile under Settings → Build, Execution, Deployment → CMake, and select it.
 3. Choose **All CTest** in the run configuration list and click **Run**.
 
@@ -100,7 +104,7 @@ Pass these to the first `cmake` command, for example `-DHNSW_LITE_BUILD_TESTS=OF
 
 ## Use hnsw-lite in your own project
 
-hnsw-lite is a static library named `hnsw_lite` (also available as `hnsw_lite::hnsw_lite`). Linking it gives your program the include paths and the thread library it needs.
+hnsw-lite is a static library named `hnsw_lite_lib` (also available as `hnsw_lite::hnsw_lite`). Linking it gives your program the include paths and the thread library it needs.
 
 ### Option 1: FetchContent (downloads it for you)
 
