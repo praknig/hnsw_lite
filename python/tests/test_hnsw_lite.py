@@ -103,6 +103,9 @@ def test_filters():
     assert count(F.exists("n")) == 100 and count(F.all()) == 100 and F.all().is_all()
     assert count(F.eq("even", True) & F.lt("n", 10)) == 5 and count(F.eq("n", 1) | F.eq("n", 2)) == 2 and count(~F.lt("n", 90)) == 10
     assert count(hl.as_filter({"c": "a", "n": [0, 3, 4]})) == 2 and hl.as_filter(None) is None
+    # NumPy arrays as value lists, NumPy booleans included (a NumPy bool_ was taken for a number)
+    assert count(F.in_("even", np.array([True]))) == 50 and count(F.in_("n", np.array([1, 2], dtype=np.int32))) == 2
+    assert count(F.in_("c", np.array(["a"]))) == 34 and count(F.in_("x", np.array([0.5]))) == 1
     with pytest.raises(TypeError):
         F.eq("n", [1, 2])
     with pytest.raises(TypeError):
@@ -214,6 +217,14 @@ def test_collection_parts_search_and_fusion():
     assert all(h["id"] % 10 == 4 for h in by_sparse)
     hybrid = c.search(vector=data[42], text="rare", k=5, filter={"g": 0}, with_metadata=True, with_text=True)
     assert hybrid[0]["id"] == 42 and hybrid[0]["metadata"] == {"g": 0} and "rare" in hybrid[0]["text"]
+    # Sparse terms are checked, never wrapped around (a NumPy cast turned -1 into 4294967295).
+    for bad in ({-1: 1.0}, {2**32: 1.0}, (np.array([-1]), [1.0]), (np.array([2**32], dtype=np.uint64), [1.0])):
+        with pytest.raises(ValueError, match=r"\[0, 2\*\*32\)"):
+            c.upsert(900, sparse=bad)
+    for bad in ({1.5: 1.0}, (np.array([1.0]), [1.0])):
+        with pytest.raises(TypeError):
+            c.upsert(900, sparse=bad)
+    assert 900 not in c and c.upsert(900, sparse=(np.array([2**32 - 1], dtype=np.uint64), [1.0])) and c.upsert(901, sparse={np.int64(3): 0.5})
     weighted = c.search(vector=data[1], text="rare", k=3, fusion="weighted", text_weight=0)
     assert weighted[0]["id"] == 1
     with pytest.raises(ValueError):

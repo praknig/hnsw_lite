@@ -19,6 +19,7 @@
  */
 #pragma once
 #include <array>
+#include "common.h"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -42,6 +43,19 @@ public:
 };
 
 namespace persist {
+
+/// Checksums are verified in every normal build. Fuzzing builds (the standard
+/// macro libFuzzer and OSS-Fuzz define) skip the comparison, so that mutated
+/// inputs reach the validation behind it instead of stopping at a checksum.
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+inline constexpr bool kVerifyChecksums = false;
+#else
+inline constexpr bool kVerifyChecksums = true;
+#endif
+
+/// The largest dimension a file may claim (16.7 million): checked before anything
+/// is allocated from it, by every loader.
+inline constexpr std::uint64_t kMaxDim = vecdb::kMaxDim;
 
 inline constexpr char kMagic[8] = {'H', 'N', 'S', 'W', 'L', 'I', 'T', 'E'};
 /// The version this library writes. Version 2 added, for cosine indexes, each
@@ -267,7 +281,7 @@ public:
         if (section_left_ != 0) throw FormatError(std::string("unexpected data at the end of section ") + name_);
         unsigned char buf[4];
         raw(buf, sizeof buf, name_);
-        if (from_little_endian<std::uint32_t>(buf) != crc_)
+        if (kVerifyChecksums && from_little_endian<std::uint32_t>(buf) != crc_)
             throw FormatError(std::string("checksum mismatch in section ") + name_ + " (the file is damaged)");
     }
 

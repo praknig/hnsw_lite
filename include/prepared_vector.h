@@ -35,10 +35,8 @@ class PreparedVector {
 public:
     /// Creates a buffer for vectors of `dim` floats.
     explicit PreparedVector(std::size_t dim)
-        : dim_(dim), stride_(round_up(dim, kFloatsPerLine)),
-          block_(round_up(dim, kFloatsPerLine) * sizeof(float)) {
-        if (dim == 0) throw std::invalid_argument("dim must be > 0");
-    }
+        : dim_(checked_dim(dim)), stride_(round_up(checked_dim(dim), kFloatsPerLine)),
+          block_(round_up(checked_dim(dim), kFloatsPerLine) * sizeof(float)) {}  // checked before the allocation
 
     /// Copies `v` in and normalizes it if `metric` is Cosine.
     /// Throws std::invalid_argument if `v` does not have `dim` values or contains

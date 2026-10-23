@@ -356,6 +356,28 @@ jobs:
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).
+  # Fuzzing every file loader (indexes, collections, sparse indexes, logs, disk
+  # indexes) for a minute each, with AddressSanitizer and UBSan. A crashing
+  # input is uploaded; reproduce it with fuzz-out/fuzz<N> <file>.
+  fuzz:
+    name: Fuzz the loaders
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fuzz
+        run: bash .github/scripts/fuzz.sh 60
+
+      - name: Keep the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: fuzz-out/artifacts
+
   # The Python package: built from source with pip (scikit-build-core and
   # pybind11), then tested with pytest, on every platform, with the oldest and
   # newest supported Python.
@@ -386,7 +408,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python]
+    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python, fuzz]
     runs-on: ubuntu-24.04
     steps:
       - name: Every job that ran succeeded

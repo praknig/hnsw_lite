@@ -586,7 +586,11 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     r.read_header(persist::IndexKind::Collection);
     CollectionOptions o;
     r.begin_section(kConf, "configuration");
-    o.dim = static_cast<std::size_t>(r.get<std::uint64_t>());
+    const std::uint64_t dim = r.get<std::uint64_t>();
+    // Checked before the dense side allocates from it (found by fuzzing: a claimed
+    // dimension near 2**63 made the constructor allocate exabytes).
+    if (dim > persist::kMaxDim) throw FormatError("collection: invalid dimension");
+    o.dim = static_cast<std::size_t>(dim);
     const std::uint32_t metric = r.get<std::uint32_t>();
     if (metric > 2) throw FormatError("collection: unknown metric");
     o.metric = static_cast<Metric>(metric);
@@ -875,4 +879,3 @@ MaintenanceReport Collection::maintain(std::chrono::milliseconds budget) {
 }
 
 }  // namespace vecdb
-

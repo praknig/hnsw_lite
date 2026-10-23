@@ -126,23 +126,45 @@ py::dict from_metadata(const Metadata& m) {
     return d;
 }
 
+/// A sparse term: an integer in [0, 2**32), checked before conversion (a cast
+/// would wrap -1 around to 4294967295 without a word).
+std::uint32_t to_term(const py::handle& t) {
+    py::object x = py::reinterpret_borrow<py::object>(t);
+    if (!py::isinstance<py::int_>(x) && py::hasattr(x, "item")) x = x.attr("item")();  // NumPy integers
+    if (!py::isinstance<py::int_>(x) || py::isinstance<py::bool_>(x)) throw py::type_error("sparse: terms must be integers");
+    if (x.cast<py::int_>() < py::int_(0) || x.cast<py::int_>() > py::int_(0xFFFFFFFFull))
+        throw py::value_error("sparse: terms must be in [0, 2**32)");
+    return x.cast<std::uint32_t>();
+}
+
 SparseVector to_sparse(const py::handle& obj) {
     SparseVector v;
     if (obj.is_none()) return v;
     if (py::isinstance<py::dict>(obj)) {
         for (auto item : py::reinterpret_borrow<py::dict>(obj)) {
-            v.indices.push_back(item.first.cast<std::uint32_t>());
+            v.indices.push_back(to_term(item.first));
             v.values.push_back(item.second.cast<float>());
         }
         return v;
     }
     if (py::isinstance<py::tuple>(obj) && py::len(obj) == 2) {
         const auto t = py::reinterpret_borrow<py::tuple>(obj);
-        auto idx = py::array_t<std::uint32_t, py::array::c_style | py::array::forcecast>::ensure(t[0]);
-        const std::vector<float> val = to_vector(t[1], "sparse values");
+        py::array idx = py::array::ensure(t[0]);
         if (!idx || idx.ndim() != 1) throw py::type_error("sparse: indices must be a 1-D sequence of integers");
-        v.indices.assign(idx.data(), idx.data() + idx.size());
-        v.values = val;
+        const char kind = idx.dtype().kind();
+        if (idx.size() > 0 && kind != 'i' && kind != 'u') throw py::type_error("sparse: terms must be integers");
+        auto add = [&](auto term, bool negative) {
+            if (negative || term > 0xFFFFFFFFu) throw py::value_error("sparse: terms must be in [0, 2**32)");
+            v.indices.push_back(static_cast<std::uint32_t>(term));
+        };
+        if (kind == 'u') {
+            const auto u = py::array_t<std::uint64_t, py::array::c_style | py::array::forcecast>::ensure(idx);
+            for (py::ssize_t i = 0; i < u.size(); ++i) add(u.data()[i], false);
+        } else {
+            const auto w = py::array_t<std::int64_t, py::array::c_style | py::array::forcecast>::ensure(idx);
+            for (py::ssize_t i = 0; i < w.size(); ++i) add(static_cast<std::uint64_t>(w.data()[i]), w.data()[i] < 0);
+        }
+        v.values = to_vector(t[1], "sparse values");
         return v;
     }
     throw py::type_error("sparse: expected a dict {term: weight} or a pair (indices, values)");
@@ -172,7 +194,13 @@ Filter with_value(const py::handle& v, Make&& make) {
     throw py::type_error("filter value: expected int, float, bool or str");
 }
 
-Filter filter_in(const std::string& field, const py::sequence& values) {
+Filter filter_in(const std::string& field, const py::sequence& raw) {
+    // NumPy scalars (np.bool_, np.int64, ...) as the Python values they stand for.
+    py::list values;
+    for (auto v : raw) {
+        const bool plain = py::isinstance<py::bool_>(v) || py::isinstance<py::int_>(v) || py::isinstance<py::float_>(v) || py::isinstance<py::str>(v);
+        values.append(!plain && py::hasattr(v, "item") ? v.attr("item")() : py::reinterpret_borrow<py::object>(v));
+    }
     bool all_str = true, all_int = true, all_bool = true;
     for (auto v : values) {
         all_str = all_str && py::isinstance<py::str>(v);

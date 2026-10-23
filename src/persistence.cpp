@@ -130,7 +130,6 @@ LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t sl
 constexpr std::uint32_t kEnd = persist::tag("END ");
 
 /// Largest dimension accepted from a file (16 million floats per vector).
-constexpr std::uint64_t kMaxDim = std::uint64_t(1) << 24;
 
 /// A temporary file name next to `path`, unique to this save, so several saves
 /// to the same path at once (from threads or processes) never write into one
@@ -202,7 +201,7 @@ Metric read_metric(Reader& r) {
 
 std::size_t read_dim(Reader& r) {
     const auto dim = r.get<std::uint64_t>();
-    if (dim == 0 || dim > kMaxDim) throw FormatError("invalid dimension");
+    if (dim == 0 || dim > persist::kMaxDim) throw FormatError("invalid dimension");
     return static_cast<std::size_t>(dim);
 }
 

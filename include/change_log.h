@@ -44,8 +44,14 @@ public:
     }
     /// Durability::Synced: each record is flushed before its change is applied.
     void set_sync_each(bool on) { sync_each_ = on; }
-    WalWriter& writer() { return *log_; }
-    const WalWriter& writer() const { return *log_; }
+    WalWriter& writer() {
+        if (!log_) throw std::logic_error("ChangeLog: no log attached");  // a contract error, never undefined behavior
+        return *log_;
+    }
+    const WalWriter& writer() const {
+        if (!log_) throw std::logic_error("ChangeLog: no log attached");
+        return *log_;
+    }
 
     /// Logs an operation (0 if no log is attached). Caller holds the write lock.
     template <class Encode>

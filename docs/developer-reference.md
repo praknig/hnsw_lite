@@ -506,7 +506,7 @@ Compression ("quantization") stores each vector as a compact **code** and search
 HnswIndex(std::size_t dim, Metric metric, HnswParams params = {}, Schema schema = Schema::dynamic());
 ```
 
-Creates an empty index for `dim`-dimensional vectors. Throws `std::invalid_argument` for `dim` 0 or invalid parameters. For crash-safe use, see [`open_durable`](#49-saving-loading-and-durability); to load a saved index, [`load`](#49-saving-loading-and-durability).
+Creates an empty index for `dim`-dimensional vectors. Throws `std::invalid_argument` for `dim` 0 or above 16,777,216 (2²⁴), or invalid parameters. For crash-safe use, see [`open_durable`](#49-saving-loading-and-durability); to load a saved index, [`load`](#49-saving-loading-and-durability).
 
 ### 4.4 Adding, changing and removing vectors
 
@@ -1071,7 +1071,7 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 | Area | Limit |
 |---|---|
 | IDs | 64-bit unsigned integers only (no strings or UUIDs) |
-| Vectors | `float` only (no half precision or integers); one dimension per index; finite values only |
+| Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; no dates or geographic types; a field keeps its first type |

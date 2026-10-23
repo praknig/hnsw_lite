@@ -38,11 +38,9 @@ public:
     /// Creates a store for vectors of `dim` floats. `shelf_bits` sets the rows
     /// per block (2^shelf_bits); by default it is chosen from the vector size.
     explicit VectorStore(std::size_t dim, unsigned shelf_bits = kAutoShelfBits)
-        : dim_(dim), stride_(round_up(dim, kFloatsPerLine)),
+        : dim_(checked_dim(dim)), stride_(round_up(checked_dim(dim), kFloatsPerLine)),
           shelf_bits_(shelf_bits == kAutoShelfBits ? auto_shelf_bits(stride_) : shelf_bits),
-          mask_((std::size_t{1} << shelf_bits_) - 1) {
-        if (dim == 0) throw std::invalid_argument("dim must be > 0");
-    }
+          mask_((std::size_t{1} << shelf_bits_) - 1) {}  // checked before the stride is computed
 
     /// Rows per block: up to 65,536, but at most 8 MiB per block.
     static unsigned auto_shelf_bits(std::size_t stride) {

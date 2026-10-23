@@ -146,7 +146,7 @@ WalScan scan(const std::string& path, bool keep) {
     if (s.file_size < wal::kHeaderSize || !in.read(reinterpret_cast<char*>(h), wal::kHeaderSize))  // GCOVR_EXCL_BR_LINE: a read fails only on a disk error
         throw FormatError("log segment header incomplete");
     if (std::memcmp(h, kMagic, 8) != 0) throw FormatError("not a log segment (wrong magic)");
-    if (get<std::uint32_t>(h + 36) != persist::crc32(0, h, 36)) throw FormatError("log segment header checksum mismatch");
+    if (persist::kVerifyChecksums && get<std::uint32_t>(h + 36) != persist::crc32(0, h, 36)) throw FormatError("log segment header checksum mismatch");
     if (get<std::uint32_t>(h + 8) != kVersion) throw FormatError("unsupported log segment version");
     s.identity = get<std::uint64_t>(h + 16);
     s.first_lsn = get<std::uint64_t>(h + 24);
@@ -181,7 +181,7 @@ WalScan scan(const std::string& path, bool keep) {
         if (length > 0) crc = persist::crc32(crc, payload.data(), length);
         const std::uint64_t lsn = get<std::uint64_t>(r + 8);
         const std::uint8_t type = r[16];
-        const bool valid = crc == get<std::uint32_t>(r + 4) && lsn == expected && type != 0;
+        const bool valid = (!persist::kVerifyChecksums || crc == get<std::uint32_t>(r + 4)) && lsn == expected && type != 0;
         if (!valid) {
             if (end == s.file_size || zeros_to_end(pos)) break;  // a torn last record, or zero-filled space
             throw FormatError(std::string("log segment corrupt (") + (crc != get<std::uint32_t>(r + 4) ? "checksum" : "sequence") +
