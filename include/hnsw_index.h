@@ -413,6 +413,20 @@ public:
     /// compaction leaves the index untouched and throws Cancelled.
     CompactStats compact(const OperationOptions& options = {});
 
+    /// Renumbers the nodes so that the graph is stored in the order a search walks
+    /// it (breadth-first from the entry point on level 0; nodes it cannot reach
+    /// follow): nodes expanded one after another then sit in neighboring memory,
+    /// and fetching one brings in data the next will need. The graph itself is
+    /// unchanged: every node keeps its vector, level, links, code and metadata, so
+    /// searches return the same results (in the same order, except among exactly
+    /// equal distances, which are ordered by internal number). Removed slots are
+    /// dropped on the way, as by compact(). Built completely before replacing the
+    /// old storage: running out of memory, a deadline or a cancellation (options)
+    /// leaves the index untouched (the last two throw Cancelled). Blocks searches and
+    /// changes while it runs. Logged for durable indexes. Returns the nodes kept and
+    /// the slots reclaimed.
+    CompactStats reorder(const OperationOptions& options = {});
+
     /// Number of live vectors.
     /// Saves the whole index (vectors, graph, metadata, settings) to `path`. It is
     /// written to a temporary file next to it ("<path>.tmp-" and a unique
@@ -684,6 +698,7 @@ private:
         if (changed_) changed_->insert(id);
     }
     CompactStats compact_unlocked(const OperationOptions& options);  // caller holds the write lock
+    CompactStats reorder_unlocked(const OperationOptions& options);  // caller holds the write lock
     void maybe_auto_compact() noexcept;                             // caller holds the write lock
     UpkeepStats upkeep_unlocked(const UpkeepOptions& upkeep_options, const OperationOptions& options);  // likewise
     MetadataStore metadata_;

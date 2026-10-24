@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 871 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 886 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -498,6 +498,10 @@ Available conditions: `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `between` (inclusive),
 Filters are checked against each index's schema when used (type errors throw `std::invalid_argument`) and compiled to a flat form: field names become column numbers, strings become dictionary IDs. A compiled filter evaluates a slot with a few column reads and no memory allocation.
 
 **Custom predicates.** `SearchOptions::predicate` accepts any `bool(user_id)` function, for conditions that live outside the index, such as permissions. Combined with a filter, both must pass, with the filter checked first. In batch search a predicate may be called from several threads at once, so it must be safe to call concurrently.
+
+### Reordering for locality
+
+`reorder()` renumbers the nodes of the existing graph without changing it. The order: breadth-first over level 0 from the entry point (unreachable live nodes after it), then grouped by each node's nearest of n/1,024 k-means centroids (trained on up to 10,000 sampled vectors, seed fixed, assignment on all cores), breadth-first within a group. A node's neighbors are near it in space, so mostly in its group, so near it in memory: on 4,000 clustered vectors the share of level-0 neighbors stored within 128 positions rose from 8% to 17%, within 1,024 from 52% to 69%. (Breadth-first order alone barely helps at this degree: its frontier grows about 2M-fold per step. An average gap misleads, being dominated by HNSW's deliberately long links.) The copy is built completely before the commit; codes are copied byte for byte. Small (under 1,024 vectors) and codes-only indexes keep the breadth-first order.
 
 ### Distances in the hot loops
 

@@ -308,3 +308,113 @@ def test_collection_timeout_and_presets():
     with pytest.raises(ValueError):
         text_only.add(3, vector=[1.0])                         # no dense side
     assert text_only.search(text="hello")[0]["id"] == 1
+
+
+# ---------------------------------------------------------------- scoring and dates
+
+def test_dates_in_metadata_and_filters():
+    import datetime as dt
+    assert hl.to_ms("2024-05-17T09:30:00+02:00") == hl.to_ms(dt.datetime(2024, 5, 17, 7, 30, tzinfo=dt.timezone.utc))
+    assert hl.to_ms(dt.date(2024, 5, 17)) == hl.parse_date("2024-05-17") == hl.to_ms(dt.datetime(2024, 5, 17))  # naive: UTC
+    assert hl.to_ms(np.datetime64("2024-05-17T00:00:00")) == hl.parse_date("2024-05-17") == hl.to_ms(pd.Timestamp("2024-05-17"))
+    assert hl.format_date(hl.parse_date("2024-05-17T09:30:15.250Z")) == "2024-05-17T09:30:15.250Z" and hl.now_ms() > hl.parse_date("2024-01-01")
+    with pytest.raises(ValueError):
+        hl.parse_date("2024-02-30")
+    with pytest.raises(TypeError):
+        hl.to_ms(True)
+    c = hl.Collection(dim=2, metric="l2", maintenance="manual")
+    for i in range(10):
+        c.add(i, vector=[i, 0], metadata={"published": dt.date(2024, 1, 1 + i)})
+    assert c.get(3)["metadata"]["published"] == hl.parse_date("2024-01-04")
+    assert c.count_where({"published": dt.date(2024, 1, 5)}) == 1
+    assert c.count_where(hl.Filter.between("published", hl.to_ms("2024-01-03"), hl.to_ms(dt.date(2024, 1, 6)))) == 4
+
+
+def test_score_modifiers():
+    day = 86_400_000
+    now = hl.parse_date("2024-06-01")
+    rng2 = np.random.default_rng(5)
+    data = rng2.random((300, 8)).astype(np.float32)
+    idx = hl.HnswIndex(8, hl.Metric.L2)
+    idx.add(np.arange(300), data, metadata=[{"t": now - i * day, "conf": (i % 10) / 10, "kind": "gold" if i == 250 else "x"} for i in range(300)])
+    ids, dist = idx.search(data[0], k=5)
+    assert 250 not in ids
+    ids, dist, scores = idx.search(data[0], k=5, modifiers={"boost": ({"kind": "gold"}, 10.0), "pool": 300})
+    assert ids[0] == 250 and scores[0] > 10 and np.all(np.diff(scores) <= 0)
+    ids, dist, scores = idx.search(data[0], k=5, modifiers={"decay": {"field": "t", "half_life_days": 1, "origin": now}, "pool": 300})
+    assert ids[0] in (0, 1, 2)  # one day halves the score: the newest win
+    ids, dist, scores = idx.search(data[0], k=10, modifiers={"multiply": "conf"})
+    assert np.allclose(scores, (1 / (1 + dist)) * (ids % 10) / 10, atol=1e-5)
+    flat = hl.FlatIndex(8, hl.Metric.L2)
+    flat.add(np.arange(300), data, metadata=[{"kind": "gold" if i == 250 else "x"} for i in range(300)])
+    assert flat.search(data[0], k=3, modifiers={"boost": [{"when": {"kind": "gold"}, "bonus": 5}], "pool": 300})[0][0] == 250
+    c = hl.Collection(dim=8, metric="l2", maintenance="manual")
+    c.upsert_many(np.arange(300), data, texts=["word"] * 300, metadata=[{"conf": 1.0 if i == 200 else 0.1} for i in range(300)])
+    hits = c.search(vector=data[0], text="word", k=5, modifiers={"multiply": {"field": "conf"}, "pool": 300})
+    assert hits[0]["id"] == 200 and all(abs(h["score"] - h["base_score"] * (1.0 if h["id"] == 200 else 0.1)) < 1e-9 for h in hits)
+    assert "base_score" not in c.search(vector=data[0], k=3)[0]
+    table = c.search(vector=data[0], k=3, as_dataframe=True, modifiers={"multiply": "conf", "pool": 300})
+    assert table["id"].iloc[0] == 200
+    for bad in ({"decay": {"field": "t"}}, {"decay": {"field": "t", "half_life": 1, "half_life_days": 1}}, {"nonsense": 1},
+                {"decay": {"field": "t", "half_life": 1, "shape": "cubic"}}, {"multiply": {"field": "c", "weight": 2}},
+                {"decay": {"field": "t", "half_life": -1}}):
+        with pytest.raises(ValueError):
+            idx.search(data[0], k=3, modifiers=bad)
+
+
+# ---------------------------------------------------------------- expiry, string keys, diversity
+
+def test_expiry_keys_and_diversity(tmp_path):
+    import datetime as dt
+    import time
+    data = rng.random((40, 8)).astype(np.float32)
+    c = hl.Collection(dim=8, metric="l2", maintenance="manual", ttl=True)
+    c.add(1, vector=data[1], expires_at=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=5))
+    c.add(2, vector=data[2], expires_at="2999-01-01")
+    c.add(3, vector=data[3])
+    assert 1 not in c and c.get(1) is None and c.get(2)["expires_at"] == hl.parse_date("2999-01-01") and "expires_at" not in c.get(3)
+    assert c.count_where(hl.Filter.all()) == 2 and len(c) == 3 and c.remove_expired() == 1 and len(c) == 2
+    assert all(h["id"] != 1 for h in c.search(vector=data[1], k=5))
+    short = hl.Collection(dim=8, metric="l2", maintenance="manual", default_ttl=dt.timedelta(milliseconds=40))
+    short.add(1, vector=data[0])
+    assert 1 in short
+    time.sleep(0.08)
+    assert 1 not in short
+    with pytest.raises(ValueError):
+        hl.Collection(dim=8, metric="l2", maintenance="manual").add(9, vector=data[0], expires_at="2999-01-01")
+    with pytest.raises(ValueError):
+        c.add(9, vector=data[0], metadata={"_key": "x"})
+    keys = hl.Collection(dim=8, metric="l2", maintenance="manual", string_ids=True, path=str(tmp_path / "k.db"))
+    keys.add("doc-a", vector=data[0], metadata={"n": 1})
+    assert keys.upsert_many(["doc-b", "123e4567-e89b-12d3-a456-426614174000"], data[1:3]) == 2
+    assert "doc-a" in keys and keys.get("doc-b")["key"] == "doc-b" and keys.get("doc-a")["metadata"] == {"n": 1}
+    hits = keys.search(vector=data[0], k=3)
+    assert hits[0]["key"] == "doc-a" and hits[0]["id"] == hl.Collection.id_of("doc-a")
+    assert keys.search(vector=data[0], k=3, as_dataframe=True)["key"].iloc[0] == "doc-a"
+    with pytest.raises(ValueError):
+        keys.add("doc-a", vector=data[0])
+    assert keys.remove("doc-b") == 1 and "doc-b" not in keys and keys.remove(["doc-a", "nope"]) == 1
+    keys.close()
+    again = hl.Collection(dim=8, metric="l2", maintenance="manual", string_ids=True, path=str(tmp_path / "k.db"))
+    assert "123e4567-e89b-12d3-a456-426614174000" in again
+    again.close()
+    with pytest.raises(RuntimeError):
+        hl.Collection(dim=8, metric="l2", maintenance="manual").add("x", vector=data[0])
+    # Diversity: near-duplicate groups; a plain search returns one group.
+    groups = []
+    for g in range(10):
+        for i in range(6):
+            v = np.zeros(16, dtype=np.float32)
+            v[0], v[1 + g] = 1.0, 0.6
+            groups.append(v + rng.normal(0, 0.005, 16).astype(np.float32))
+    groups = np.array(groups)
+    idx = hl.HnswIndex(16, hl.Metric.COSINE)
+    idx.add(np.arange(60), groups)
+    plain, _ = idx.search(groups[0], k=5)
+    mixed, _, _ = idx.search(groups[0], k=5, diversity=0.3)
+    assert len({int(i) // 6 for i in plain}) == 1 and len({int(i) // 6 for i in mixed}) >= 3
+    col = hl.Collection(dim=16, metric="cosine", maintenance="manual", text=False)
+    col.upsert_many(np.arange(60), groups)
+    assert len({h["id"] // 6 for h in col.search(vector=groups[0], k=5, diversity=0.3)}) >= 3
+    with pytest.raises(ValueError):
+        idx.search(groups[0], k=5, diversity=2)

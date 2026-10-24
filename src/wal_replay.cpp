@@ -90,6 +90,7 @@ bool HnswIndex::replay(std::span<const WalRecord> records) {
     return replay_records(*this, records, [&](const walop::Op& op) {
         switch (op.type) {
             case walop::kCompact: (void)compact(); return true;
+            case walop::kReorder: (void)reorder(); return true;
             case walop::kUpkeep: (void)upkeep(op.upkeep); return true;
             case walop::kSetPlanner: set_planner_params(op.planner); return true;
             case walop::kSetAutoCompact: set_auto_compact(op.fraction); return true;
@@ -125,4 +126,3 @@ bool FlatIndex::replay(std::span<const WalRecord> records) {
 }
 
 }  // namespace vecdb
-

@@ -255,6 +255,7 @@ Op decode(std::uint8_t type, std::span<const unsigned char> payload) {
         }
         case kAbort: op.lsn = in.get<std::uint64_t>(); break;
         case kCompact:
+        case kReorder:
         case kTrainCodec:
         case kTrainLists: break;
         case kUpkeep: {

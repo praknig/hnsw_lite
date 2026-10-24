@@ -28,7 +28,7 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 | **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
 | **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
 | **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
-| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 871 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 886 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
 ## Compared with similar libraries
 
@@ -88,7 +88,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | 13 | **Memory-mapped loading** of saved indexes | | 3 days |
 | 14 | **Multivector records:** several vectors per record (named, or chunks), and late-interaction (ColBERT) scoring | | 1 week |
 | 15 | **Faster sparse search:** MaxScore pruning for long posting lists; a write-ahead log for a standalone `SparseIndex` | Covered by `Collection` for most users | 3–4 days |
-| 16 | **Filtering:** ~~ACORN filtered graph search~~ (**done**); payload posting lists for exact filtered search, facet counts, geographic and date fields | | 1–2 weeks |
+| 16 | **Filtering:** ~~ACORN filtered graph search~~, ~~date fields~~ (**done**: dates as epoch milliseconds, `parse_date`); payload posting lists for exact filtered search, facet counts, geographic fields | | 1–2 weeks |
 | 17 | **Search extras:** recommendations from positive and negative examples, diversity re-ranking (MMR), automatic beam width for a target recall, Hamming and L1 metrics | | 1 week |
 | 18 | **Records:** string and UUID IDs; expiry (TTL) | | 3 days |
 | 19 | **Concurrency:** searches that do not wait for long batch changes | | 1–1.5 weeks |

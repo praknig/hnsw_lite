@@ -37,7 +37,7 @@ docs.upsert(1, vector=embedding, text="The quick brown fox", metadata={"lang": "
 
 hits = docs.search(vector=query_embedding, text="fox", k=10, filter={"lang": "en"})
 for hit in hits:
-    print(hit["id"], hit["score"], hit["vector_rank"], hit["text_rank"])
+   print(hit["id"], hit["score"], hit["vector_rank"], hit["text_rank"])
 
 docs.close()                                        # or use: with hl.Collection(...) as docs:
 ```
@@ -69,6 +69,8 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `maintenance` | `"manual"`, `"background"`, or `None` (the preset's choice) | Whether a background thread maintains the collection. |
 | `ef` | `int` or `None` | Default search beam of the vectors (higher: better recall, slower). |
 | `bm25_avg_doc_length` | `float` or `None` | Average document length in words, for BM25; set it near your corpus' mean. |
+| `ttl`, `default_ttl` | `bool`; seconds or a `timedelta` | Opt-in expiry: documents expire at their `expires_at` (or after `default_ttl`); expired ones disappear from results at once. |
+| `string_ids` | `bool` | Opt-in string keys (names, UUIDs) wherever an id is accepted. |
 | `options` | `hl.CollectionOptions` or `None` | Every setting at once, instead of the arguments above (`hl.CollectionOptions.preset(dim, hl.Preset.BALANCED)` is a starting point). |
 
 `hl.Collection.load(path)` reads a file written by `save(path)` (maintenance starts manual).
@@ -106,6 +108,52 @@ docs.search(vector=None, text=None, sparse=None, *, k=10, filter=None, fusion="r
 Give at least one of `vector`, `text` and `sparse`. With several, each side's ranking is fused: Reciprocal Rank Fusion (`fusion="rrf"`) or scores scaled to [0, 1] (`"weighted"`), with a weight per side (see [fusion](developer-reference.md#27-searching)). `filter` is a [`Filter`](#filters) or a dict. `timeout` (seconds) stops the search early: the hits found so far are returned and `docs.last_search_stopped_early` is set to `True`.
 
 Each hit is a dict: `id`, `score` (higher is better), `vector_rank`, `text_rank`, `sparse_rank` (1-based, or `None` if that side did not find it), `vector_distance`, `text_score`, `sparse_score`, and `metadata` and `text` when asked for.
+
+## Dates and score modifiers
+
+Dates are stored as milliseconds since 1970 (UTC). In metadata and dict filters, `datetime`, `date`, pandas `Timestamp` and NumPy `datetime64` values convert automatically (naive datetimes are taken as UTC); `hl.to_ms(x)` converts explicitly (for `hl.Filter` functions), and `hl.parse_date`, `hl.format_date` and `hl.now_ms` are there too:
+
+```python
+docs.upsert(1, vector=v, metadata={"published": datetime.date(2024, 5, 17)})
+docs.count_where({"published": datetime.date(2024, 5, 17)})
+docs.count_where(hl.Filter.ge("published", hl.to_ms("2024-01-01")))
+```
+
+**Score modifiers (opt-in)** re-rank results by metadata, in C++ (no Python callback per result). Pass `modifiers=` to `Collection.search`, `HnswIndex.search` or `FlatIndex.search`:
+
+```python
+hits = docs.search(vector=q, text="pricing", k=10, modifiers={
+    "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
+    "multiply": "provenance_confidence",                           # times a field (0 to 1)
+    "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
+              ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
+    "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
+})
+```
+
+| Key | Value |
+|---|---|
+| `decay` | A dict, or a list: `field`, a half-life (`half_life` in the field's units, or `half_life_seconds`, `_minutes`, `_hours`, `_days` for dates), `origin` (default now; a date, ISO string or number), `shape` (`"exponential"` or `"linear"`), `missing` (1.0), `floor` (0.0) |
+| `multiply` | A field name, a dict (`field`, `missing`, `min`, `max`), or a list |
+| `boost` | `(filter, bonus)` pairs or `{"when": filter, "bonus": x}` dicts (filters as `Filter` or dict), one or a list |
+| `pool` | Candidates re-scored before the best k are kept |
+
+The score is (base × decays × multipliers) + bonuses. Collection hits then carry `base_score` and `score`; index searches return `(ids, distances, scores)`, ordered by score. See the [developer reference](developer-reference.md#46-searching) for the exact formulas.
+
+## Expiry, string keys and diversity
+
+All opt-in:
+
+```python
+docs = hl.Collection(dim=384, ttl=True, string_ids=True)             # or default_ttl=3600 (seconds) / a timedelta
+docs.upsert("doc-42", vector=v, expires_at="2025-01-01")             # any date form; a string key
+docs.get("doc-42")                                                    # {..., "key": "doc-42", "expires_at": ...}
+docs.remove_expired()                                                 # frees expired documents (already hidden)
+hits = docs.search(vector=q, k=10, diversity=0.5)                     # MMR: 1 keeps the ranking, lower = more varied
+ids, distances, scores = index.search(q, k=10, diversity=0.5)         # indexes too
+```
+
+`upsert_many` and `upsert_dataframe` take string keys (an `object` id column) and expiry times (`expires_at=` a list, `expires_column=`). Hits carry `key`; `hl.Collection.id_of(key)` gives a key's numeric id. The metadata names `_expires_at` and `_key` are reserved. `ttl` and `string_ids` are not stored: pass them on every open.
 
 ## pandas
 
@@ -146,6 +194,7 @@ I, D = index.search_batch(queries, k=10, ef=64)                # shape (len(quer
 | `search_batch(queries, k=10, ef=64, filter=None, threads=0)` | `(ids, distances)` of shape `(n, k)`. Where fewer than `k` results exist, rows are **padded** with `hl.MISSING_ID` (2⁶⁴−1) and `inf`. |
 | `search_by_id(id, k=10, ef=64, filter=None)` | Like `search`, with the stored vector; the record itself is left out; `None` if not stored. |
 | `upsert`, `update`, `remove`, `remove_where`, `count_where`, `set_metadata`, `set_metadata_where`, `get_vector`, `get_metadata` | As for collections. |
+| `reorder()` (HnswIndex) | Opt-in: renumbers the graph so neighbors are stored together; same results, about 24% faster searches on clustered data. Call it after building or bulk loading (it blocks while it runs). |
 | `create_payload_index(field)`, `train_codec()`, `health(recall_sample=100)`, `upkeep()`, `compact()`, `rebuild()`, `train_lists()` (flat) | See the [developer reference](developer-reference.md#4-hnswindex-the-graph-index). `health()` returns a dict. |
 | `save(path)`, `HnswIndex.load(path)`, `HnswIndex.open_durable(dir, dim, metric, options=DurableOptions())`, `checkpoint()` | Files and durability. |
 | `len(index)`, `id in index`, `index.dim`, `index.metric` | |

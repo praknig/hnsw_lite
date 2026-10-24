@@ -39,6 +39,7 @@ enum Type : std::uint8_t {
     kCreatePayloadIndex = 15,  ///< field name
     kSetPlanner = 16,          ///< PlannerParams
     kSetAutoCompact = 17,      ///< fraction
+    kReorder = 18,
     kDocument = 20,            ///< Collection: id, parts, vector, text, sparse vector, metadata (an upsert)
     kDocumentRemove = 21,      ///< Collection: ids
     kDocumentMetadata = 22,    ///< Collection: ids, metadata changes
