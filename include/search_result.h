@@ -110,9 +110,20 @@ public:
             return true;
         }
         if (!(c < heap_.front())) return false;  // not better than the worst kept
-        std::pop_heap(heap_.begin(), heap_.end());  // moves the worst to the back
-        heap_.back() = c;
-        std::push_heap(heap_.begin(), heap_.end());
+        // Replace the worst and sift down once: half the work of pop_heap followed
+        // by push_heap (found by profiling: about a tenth of search time was here).
+        // Candidate's order is total, so the results never depend on the layout.
+        const std::size_t n = heap_.size();
+        std::size_t i = 0;
+        for (;;) {
+            std::size_t child = 2 * i + 1;
+            if (child >= n) break;
+            if (child + 1 < n && heap_[child] < heap_[child + 1]) ++child;  // the larger child
+            if (!(c < heap_[child])) break;
+            heap_[i] = heap_[child];
+            i = child;
+        }
+        heap_[i] = c;
         return true;
     }
 
