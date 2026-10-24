@@ -11297,8 +11297,20 @@ TEST(lean, l09_unused_storage_is_not_resident) {
     FlatIndex f(32, Metric::L2);
     for (std::uint64_t i = 0; i < 100; ++i) f.add(i, data[i]);
     const double grown = resident_mb() - before;
-    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (were 17.5 MB for HNSW alone)\n", grown);
-    CHECK(grown < 6.0);
+    std::string huge_pages = "unknown";
+    {
+        std::ifstream thp("/sys/kernel/mm/transparent_hugepage/enabled");
+        std::string line;
+        if (std::getline(thp, line)) {
+            const auto a = line.find('['), b = line.find(']');
+            if (a != std::string::npos && b != std::string::npos && b > a) huge_pages = line.substr(a + 1, b - a - 1);
+        }
+    }
+    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s)\n", grown, huge_pages.c_str());
+    // Without huge pages this takes about 1 MB. With transparent huge pages set to
+    // "always" (as on GitHub's runners), the first write into each of the three
+    // blocks brings in a whole 2 MB page: about 7 MB. Filled blocks took 25 MB.
+    CHECK(grown < 12.0);
     // The vectors and links written row by row read back exactly, padding included.
     bool same = true;
     for (std::uint64_t i = 0; i < 100; ++i) same = same && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i];
