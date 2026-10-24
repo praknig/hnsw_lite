@@ -7,6 +7,7 @@
  * posting lists are rebuilt and slots renumbered. Document frequencies are kept
  * exact at every step.
  */
+#include "scoring.h"
 #include "sparse.h"
 
 #include <algorithm>
@@ -275,6 +276,15 @@ std::size_t SparseIndex::slots() const {
 }
 
 std::vector<SearchResult> SparseIndex::search(const SparseVector& query, std::size_t k, const SearchOptions& options) const {
+    if (options.diversity) throw std::invalid_argument("SearchOptions::diversity: dense indexes only (it compares the documents' vectors)");
+    if (options.modifiers && !options.modifiers->empty()) {  // opt-in: base score is the dot product
+        const ScoreModifiers& m = *options.modifiers;
+        m.validate();
+        SearchOptions plain = options;
+        plain.modifiers.reset();
+        return rescored(search(query, m.pool_for(k), plain), k, m, [&](std::uint64_t id) { return get_metadata(id); },
+                        [](float d) { return -double(d); });
+    }
     const SparseVector q = normalized(query);
     const auto guard = lock_.read();
     std::optional<CompiledFilter> compiled;

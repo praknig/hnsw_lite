@@ -678,7 +678,13 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
         const std::size_t pool = modify ? options.modifiers->pool_for(k) : std::max<std::size_t>(4 * k, 20);
         std::vector<SearchResult> found = search(query, pool, plain);
         const auto relevance = [&](float d) { return relevance_from_distance(d, metric_); };
-        if (modify) found = rescored(std::move(found), found.size(), *options.modifiers, [&](std::uint64_t id) { return get_metadata(id); }, relevance);
+        if (modify) {
+            // The size first: function arguments are evaluated in no fixed order, and
+            // moving `found` before reading its size kept nothing (found by CI: Clang
+            // evaluates left to right, GCC right to left).
+            const std::size_t all = found.size();
+            found = rescored(std::move(found), all, *options.modifiers, [&](std::uint64_t id) { return get_metadata(id); }, relevance);
+        }
         else for (SearchResult& r : found) r.score = static_cast<float>(relevance(r.distance));
         if (!options.diversity) {
             if (found.size() > k) found.resize(k);
