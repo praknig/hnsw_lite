@@ -715,6 +715,7 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     r.end_section();
     r.begin_section(kMeta, "metadata");
     c->metadata_ = MetadataStore::load(r, static_cast<std::size_t>(slots), [&](NodeId n) { return c->live_[n] != 0; });
+    c->options_.schema = c->metadata_.current_schema();  // the schema in force, as stored (options() reported it as dynamic before)
     r.end_section();
     r.begin_section(kSide, "sides");
     const std::string dense = r.get_string(), text_bytes = r.get_string(), sparse_bytes = r.get_string();
@@ -811,8 +812,10 @@ void Collection::add(std::string_view key, const Document& document) {
     check_changeable();
     if (slot_of_.count(id)) {
         const auto v = metadata_.read(slot_of_.at(id)).get(kKeyField);
+        // GCOVR_EXCL_BR_START: the first branch needs two different keys with the same 64-bit hash, which no test can construct
         throw std::invalid_argument(v && v->s != key ? "Collection: key \"" + std::string(key) + "\" has the same id as key \"" + v->s + "\""
                                                      : "Collection: duplicate key \"" + std::string(key) + "\"");
+        // GCOVR_EXCL_BR_STOP
     }
     metadata_.validate(p.metadata);
     const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
@@ -828,13 +831,45 @@ bool Collection::upsert(std::string_view key, const Document& document) {
     check_changeable();
     if (const auto it = slot_of_.find(id); it != slot_of_.end()) {
         const auto v = metadata_.read(it->second).get(kKeyField);
-        if (v && v->s != key) throw std::invalid_argument("Collection: key \"" + std::string(key) + "\" has the same id as key \"" + v->s + "\"");
+        if (v && v->s != key) throw std::invalid_argument("Collection: key \"" + std::string(key) + "\" has the same id as key \"" + v->s + "\"");  // GCOVR_EXCL_BR_LINE: needs a 64-bit hash collision between two keys
     }
     metadata_.validate(p.metadata);
     const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
         return walop::encode_document(id, p.parts, p.vector, p.text, p.sparse, p.metadata);
     }));
     return apply_upsert(id, p);
+}
+
+void Collection::check_runtime(const TtlOptions& ttl, bool string_ids) const {
+    if (ttl.default_ms < 0) throw std::invalid_argument("TtlOptions::default_ms must not be negative");
+    if (options_.schema.mode() != SchemaMode::Strict) return;
+    auto declared = [&](const char* name) {
+        for (const FieldSpec& f : options_.schema.fields())
+            if (f.name == name) return true;
+        return false;
+    };
+    if (ttl.enabled && !declared(kExpiresField))
+        throw std::invalid_argument("Collection: expiry needs the field _expires_at (Int) in this strict schema; declare it when creating the collection");
+    if (string_ids && !declared(kKeyField))
+        throw std::invalid_argument("Collection: string keys need the field _key (Keyword) in this strict schema; declare it when creating the collection");
+}
+
+void Collection::set_ttl(const TtlOptions& ttl) {
+    check_runtime(ttl, options_.string_ids);
+    const auto lock = write_lock(mutex_, this);
+    options_.ttl = ttl;
+}
+
+void Collection::set_string_ids(bool on) {
+    check_runtime(options_.ttl, on);
+    const auto lock = write_lock(mutex_, this);
+    options_.string_ids = on;
+}
+
+bool Collection::set_metadata(std::string_view key, const Metadata& metadata) {
+    const std::uint64_t id = keyed_id(key);
+    if (!get(key)) return false;  // absent, expired, or another key's document
+    return set_metadata(id, metadata);
 }
 
 bool Collection::remove(std::string_view key) {

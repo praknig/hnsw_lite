@@ -418,3 +418,69 @@ def test_expiry_keys_and_diversity(tmp_path):
     assert len({h["id"] // 6 for h in col.search(vector=groups[0], k=5, diversity=0.3)}) >= 3
     with pytest.raises(ValueError):
         idx.search(groups[0], k=5, diversity=2)
+
+
+# ---------------------------------------------------------------- every binding, and loading with runtime settings
+
+def test_index_maintenance_bindings_and_option_classes():
+    data = rng.random((1200, 8)).astype(np.float32)
+    p = hl.HnswParams()
+    p.M, p.ef_construction = 12, 100
+    p.quantization.codec = hl.Codec.SQ8
+    p.quantization.train_after = 0  # trained by hand below
+    idx = hl.HnswIndex(8, hl.Metric.L2, p)
+    assert idx.dim == 8 and idx.metric == hl.Metric.L2
+    idx.add(np.arange(1200), data, metadata=[{"tag": ["a"] if i % 3 == 0 else ["b"], "k": "x"} for i in range(1200)])
+    idx.create_payload_index("tag")
+    idx.train_codec()
+    before = idx.search(data[7], k=5)[0]
+    assert idx.reorder() == 1200 and np.array_equal(idx.search(data[7], k=5)[0], before)  # same results after reordering
+    assert idx.remove(np.arange(0, 300)) == 300
+    assert idx.compact() == 300 and len(idx) == 900
+    assert idx.rebuild() == 900 and idx.search(data[700], k=1)[0][0] == 700
+    assert idx.search(data[7], k=5, strategy=hl.Strategy.EXACT)[0][0] == 7 if 7 in idx else True
+    ivf = hl.IvfParams()
+    ivf.lists, ivf.probes, ivf.train_after = 8, 8, 0
+    q = hl.QuantizationParams()
+    flat = hl.FlatIndex(8, hl.Metric.COSINE, quantization=q, ivf=ivf)
+    assert flat.dim == 8 and flat.metric == hl.Metric.COSINE
+    flat.add(np.arange(1200), data, metadata=[{"k": "x"}] * 1200)
+    flat.create_payload_index("k")
+    flat.train_lists()
+    assert flat.search(data[3], k=1)[0][0] == 3
+    with pytest.raises(RuntimeError):
+        flat.train_codec()  # no codec configured
+    opts = hl.CollectionOptions.preset(8, hl.Preset.HIGH_RECALL)
+    pol = hl.MaintenancePolicy()
+    pol.mode, pol.interval_ms = hl.Maintenance.MANUAL, 50
+    opts.maintenance = pol
+    dur = hl.DurableOptions()
+    dur.durability = hl.Durability.SYNCED
+    opts.durability = dur
+    c = hl.Collection(options=opts)
+    c.add(1, vector=data[1], text="hello world")
+    hits = c.search(vector=data[1], text="hello", k=1, fusion=hl.Fusion.WEIGHTED)
+    assert hits[0]["id"] == 1 and c.options.maintenance.mode == hl.Maintenance.MANUAL
+    strict = hl.Collection(dim=8, metric="l2", maintenance="manual", schema={"n": hl.FieldType.INT}, strict=True)
+    with pytest.raises(ValueError):
+        strict.add(2, vector=data[2], metadata={"other": 1})
+    assert issubclass(hl.Cancelled, RuntimeError) and issubclass(hl.FormatError, RuntimeError)
+
+
+def test_load_with_runtime_settings_and_keyed_metadata(tmp_path):
+    data = rng.random((5, 4)).astype(np.float32)
+    c = hl.Collection(dim=4, metric="l2", maintenance="manual", ttl=True, string_ids=True)
+    c.add("old", vector=data[0], expires_at="2000-01-01")
+    c.add("kept", vector=data[1])
+    assert c.set_metadata("kept", {"n": 1}) and c.get("kept")["metadata"] == {"n": 1}
+    assert not c.set_metadata("old", {"n": 2}) and not c.set_metadata("absent", {"n": 3})
+    path = str(tmp_path / "c.col")
+    c.save(path)
+    plain = hl.Collection.load(path)  # both off: the expired document shows, keys are refused
+    assert hl.Collection.id_of("old") in plain
+    with pytest.raises(RuntimeError):
+        plain.get("kept")
+    loaded = hl.Collection.load(path, ttl=True, string_ids=True)
+    assert "old" not in loaded and loaded.get("kept")["key"] == "kept"
+    with pytest.raises(ValueError):
+        hl.Collection.load(path, default_ttl=-1)

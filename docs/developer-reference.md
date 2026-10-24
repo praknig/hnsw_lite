@@ -39,7 +39,7 @@ Everything lives in the namespace `vecdb`. Headers are in `include/`; one `#incl
 
 Every record has a **user ID**, a `std::uint64_t` of your choosing: any value from 0 to 2⁶⁴−1 works, and IDs need not be consecutive. Within one index or collection an ID is unique: adding an ID that is already stored throws `std::invalid_argument`. Once removed, an ID can be used again. Results always report your IDs, never internal numbers.
 
-**Limitation:** IDs are integers only. To use strings or UUIDs, keep your own map from them to integers (a hash of the string works if you handle collisions).
+**Limitation:** indexes take integer IDs only. Collections can take **string keys** (names, UUIDs) when `CollectionOptions::string_ids` is on: see [expiry and string keys](#28a-expiry-and-string-keys).
 
 ### Vectors and dimensions
 
@@ -388,6 +388,8 @@ struct MaintenanceStatus {
 |---|---|
 | `std::size_t remove_expired()` | With `ttl`: removes every expired document, returning how many (they are already hidden). `maintain()` calls it and notes "removed N expired documents". 0 without `ttl`. |
 | `static std::uint64_t id_of(std::string_view key)` | A key's numeric id: a 64-bit hash (FNV-1a with a SplitMix64 finish). |
+| `bool set_metadata(std::string_view key, const Metadata& metadata)` | Changes only the given fields of the document stored under that exact key; `false` if there is none (absent, expired, or another key's document). |
+| `void set_ttl(const TtlOptions& ttl)`, `void set_string_ids(bool on)` | The runtime settings, at any time: **a loaded collection starts with both off** (`load()` takes no options), so expired documents show and keys are refused until they are switched on. Throw `std::invalid_argument` if a strict schema lacks the reserved field; `open()` checks the same. |
 | `add(key, doc)`, `upsert(key, doc)`, `get(key)`, `contains(key)`, `remove(key)` | With `string_ids` (`std::logic_error` otherwise): the document's id is `id_of(key)`, and the key is kept with it. `add` refuses a key already present; both refuse a key whose id belongs to **another** key (`std::invalid_argument`), so two keys are never mixed up. `get`, `contains` and `remove` never act on a document that was not stored under that exact key. Hits report `key`. |
 
 **Reserved metadata names:** `_expires_at` (an integer) and `_key` (a keyword) hold the expiry time and the key; your metadata may not use them (`std::invalid_argument`). Strict schemas gain them automatically when the features are on at creation; a strict schema created without them cannot later store them. Expiry times are fixed when a document is written and logged with it, so recovery after a crash keeps them exactly.
@@ -692,7 +694,7 @@ o.modifiers = m;
 | `RecencyDecay` | `field` (a time: dates, or any unit), `origin` ("now", same unit), `half_life` (> 0, same unit), `shape` (`Exponential`: 2^(−Δt/half_life); `Linear`: 1 − Δt/(2·half_life), zero at twice the half-life), `missing` (factor without the field, 1), `floor` (smallest factor, 0) | Older records score lower; Δt = origin − value, and values at or after `origin` are not decayed |
 | `FieldMultiplier` | `field`, `missing` (1), `min` (0), `max` (∞) | The score times the field's value (booleans 0 or 1), clamped |
 | `MatchBoost` | `when` (any `Filter`), `bonus` (may be negative) | Adds the bonus when the record matches: boosting without filtering |
-| `ScoreModifiers::pool` | 0: max(4k, 20) | Candidates re-scored before the best k are kept: a boost can promote a result that ranked below k only if it is in the pool |
+| `ScoreModifiers::pool` | 0: max(4k, 20) | Candidates re-scored before the best k are kept: a boost can promote a result that ranked below k only if it is in the pool. `pool_for(k)` returns the pool a search of k uses. |
 
 Invalid rules (an empty field, a half-life that is not positive, a negative minimum, a floor outside [0, 1], min above max, non-finite numbers) throw `std::invalid_argument` when the search runs. Keyword and tag values count as missing for decays and multipliers.
 
@@ -1132,12 +1134,12 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 
 | Area | Limit |
 |---|---|
-| IDs | 64-bit unsigned integers only (no strings or UUIDs) |
+| IDs | 64-bit unsigned integers; collections can also take string keys (opt-in `string_ids`), hashed to 64-bit ids with collisions refused |
 | Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
 | Memory | About 300 to 360 bytes per vector at 32 dimensions with M 16 (the vector, its links and its ID); in general about 4 × dim + 8 × M + 40 bytes, plus metadata. Storage grows in blocks of up to 65,536 rows, but unused rows cost no resident memory |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
-| Metadata | Integer, float, boolean, keyword and tag-set fields; no dates or geographic types; a field keeps its first type |
+| Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic types; a field keeps its first type |
 | Filters | At most 256 levels deep; whole-value comparisons (no substring or full-text matching) |
 | Text | No stemming, stop words or synonyms; 32-bit hashed terms |
 | Concurrency | One change at a time per index or collection; searches in parallel; no changes from inside predicates |
@@ -1354,6 +1356,9 @@ class Collection {
     bool replay(std::span<const WalRecord> records);
     std::size_t remove_expired();
     static std::uint64_t id_of(std::string_view key);
+    bool set_metadata(std::string_view key, const Metadata& metadata);
+    void set_ttl(const TtlOptions& ttl);
+    void set_string_ids(bool on);
     void add(std::string_view key, const Document& document);
     bool upsert(std::string_view key, const Document& document);
     bool remove(std::string_view key);

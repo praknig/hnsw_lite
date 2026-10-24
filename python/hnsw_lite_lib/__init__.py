@@ -264,6 +264,16 @@ FlatIndex.search = _flat_search
 
 # ---------------------------------------------------------------- Collection
 
+def _ttl_ms(default_ttl) -> int:
+    """A default lifetime (seconds, or a timedelta) in milliseconds; 0 for none."""
+    if default_ttl is None:
+        return 0
+    seconds = default_ttl.total_seconds() if hasattr(default_ttl, "total_seconds") else float(default_ttl)
+    if seconds <= 0:
+        raise ValueError("default_ttl must be positive")
+    return int(round(seconds * 1000))
+
+
 class Collection:
     """Documents with any of a dense vector, text (BM25) and a sparse vector, plus
     metadata, under one ID space; hybrid search by default.
@@ -304,21 +314,19 @@ class Collection:
                 bm25.avg_doc_length = bm25_avg_doc_length
                 options.bm25 = bm25
             options.ttl_enabled = bool(ttl or default_ttl is not None)
-            if default_ttl is not None:  # seconds, or a timedelta
-                seconds = default_ttl.total_seconds() if hasattr(default_ttl, "total_seconds") else float(default_ttl)
-                if seconds <= 0:
-                    raise ValueError("default_ttl must be positive")
-                options.ttl_default_ms = int(round(seconds * 1000))
+            options.ttl_default_ms = _ttl_ms(default_ttl)
             options.string_ids = bool(string_ids)
         self._c = _core.Collection.open(str(path), options) if path is not None else _core.Collection(options)
         self.last_search_stopped_early = False
 
     @classmethod
-    def load(cls, path: str) -> "Collection":
-        """A collection from a file written by save() (maintenance starts manual)."""
+    def load(cls, path: str, *, ttl: bool = False, default_ttl=None, string_ids: bool = False) -> "Collection":
+        """A collection from a file written by save(). Maintenance starts manual;
+        expiry and string keys are off unless given here (as for the constructor)."""
         self = cls.__new__(cls)
         self._c = _core.Collection.load(str(path))
         self.last_search_stopped_early = False
+        self._c._set_runtime(bool(ttl or default_ttl is not None), _ttl_ms(default_ttl), bool(string_ids))
         return self
 
     # -- lifetime
@@ -440,8 +448,11 @@ class Collection:
     def count_where(self, filter) -> int:
         return self._core.count_where(as_filter(filter))
 
-    def set_metadata(self, id: int, metadata: Mapping[str, Any]) -> bool:
-        """Changes only the given fields; a value of None clears a field."""
+    def set_metadata(self, id, metadata: Mapping[str, Any]) -> bool:
+        """Changes only the given fields of the document with this id (or string key);
+        a value of None clears a field."""
+        if isinstance(id, str):
+            return self._core._set_metadata_key(id, _clean(metadata) or {})
         return self._core.set_metadata(_id(id), dict(metadata))
 
     def set_metadata_where(self, filter, changes: Mapping[str, Any]) -> int:

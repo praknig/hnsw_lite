@@ -258,6 +258,15 @@ public:
     /// String keys (CollectionOptions::string_ids; std::logic_error otherwise).
     /// add() also throws std::invalid_argument when another key has the same id.
     static std::uint64_t id_of(std::string_view key);
+    /// Changes only the given fields of the document stored under `key`; false if
+    /// there is none (a document stored under another key is never touched).
+    bool set_metadata(std::string_view key, const Metadata& metadata);
+    /// The runtime settings for expiry and string keys, after load() (which starts
+    /// with both off) or at any time. Throws std::invalid_argument if a strict
+    /// schema lacks the reserved field (_expires_at, an Int; _key, a Keyword):
+    /// declare it when creating the collection.
+    void set_ttl(const TtlOptions& ttl);
+    void set_string_ids(bool on);
     void add(std::string_view key, const Document& document);
     bool upsert(std::string_view key, const Document& document);
     bool remove(std::string_view key);
@@ -289,6 +298,7 @@ private:
     bool expired(NodeId slot) const;
     void fill_reserved(Metadata& md, std::optional<std::string>& key, std::optional<std::int64_t>* expires) const;
     std::uint64_t keyed_id(std::string_view key) const;
+    void check_runtime(const TtlOptions& ttl, bool string_ids) const;  // a strict schema has the reserved fields
     bool replaying_ = false;  // replay(): documents applied exactly as logged (expiry and keys included)
     Prepared prepare(const Document& d) const;
     bool apply_upsert(std::uint64_t id, const Prepared& p);

@@ -212,7 +212,10 @@ template <class DenseIndex>
 std::vector<HybridResult> hybrid_search(const DenseIndex& dense, std::span<const float> dense_query, const SparseIndex& sparse,
                                         const SparseVector& sparse_query, std::size_t k, const HybridOptions& options = {}) {
     if (k == 0) return fuse({}, {}, 0, options);  // validates the options; nothing to search for
-    const std::size_t depth = std::max<std::size_t>(4 * k, 20);
+    // With modifiers, each side retrieves at least the pool they re-score: a boosted
+    // document beyond a side's default depth could never be promoted otherwise.
+    const std::size_t depth = std::max<std::size_t>(std::max<std::size_t>(4 * k, 20),
+                                                    options.modifiers && !options.modifiers->empty() ? options.modifiers->pool_for(k) : 0);
     SearchOptions d = options.dense_options, s = options.sparse_options;
     if (options.filter) {
         d.filter = d.filter ? (*d.filter && *options.filter) : *options.filter;

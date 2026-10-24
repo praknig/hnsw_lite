@@ -73,7 +73,7 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `string_ids` | `bool` | Opt-in string keys (names, UUIDs) wherever an id is accepted. |
 | `options` | `hl.CollectionOptions` or `None` | Every setting at once, instead of the arguments above (`hl.CollectionOptions.preset(dim, hl.Preset.BALANCED)` is a starting point). |
 
-`hl.Collection.load(path)` reads a file written by `save(path)` (maintenance starts manual).
+`hl.Collection.load(path, ttl=False, default_ttl=None, string_ids=False)` reads a file written by `save(path)`. Maintenance starts manual, and expiry and string keys are off unless given here: a loaded collection otherwise shows expired documents and refuses keys.
 
 ### Methods
 
@@ -85,7 +85,7 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `upsert_dataframe(df, ...)` → `int` | See [pandas](#pandas). |
 | `remove(ids)` → `int` | Removes one ID or many; how many were stored. |
 | `remove_where(filter)`, `count_where(filter)` → `int` | By metadata. |
-| `set_metadata(id, metadata)` → `bool` | Changes only the given fields; `None` clears a field. |
+| `set_metadata(id, metadata)` → `bool` | Changes only the given fields; `None` clears a field. With string keys, `id` may be a key (only that exact key's document changes). |
 | `set_metadata_where(filter, changes)` → `int` | The same for every match. |
 | `get(id)` → `dict` or `None` | `{"id", "vector" (NumPy array or None), "text", "sparse" (dict or None), "metadata"}`. |
 | `search(vector=None, text=None, sparse=None, *, k=10, filter=None, ...)` | Below. |
@@ -233,6 +233,17 @@ Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [20
 | `None` in `set_metadata` | clears the field |
 | Sparse vectors: `{term: weight}` or `(indices, values)` | `SparseVector` |
 | Search results | NumPy arrays (indexes) or lists of dicts (collections) |
+
+## Enumerations and option classes
+
+`hl.Metric` (`L2`, `INNER_PRODUCT`, `COSINE`), `hl.Codec` (`NONE`, `SQ8`, `BINARY`, `PQ`, for `QuantizationParams.codec`), `hl.Strategy` (`AUTO`, `EXACT`, `GRAPH`, `ACORN`), `hl.Preset`, `hl.Fusion`, `hl.Durability`, `hl.Maintenance` (`MANUAL`, `BACKGROUND`) and `hl.FieldType` mirror the C++ enumerations. The option classes `hl.HnswParams`, `hl.QuantizationParams`, `hl.IvfParams`, `hl.DurableOptions`, `hl.MaintenancePolicy` and `hl.CollectionOptions` have the C++ fields as attributes (durations in milliseconds: `interval_ms`, `budget_ms`, `group_interval_ms`; `checkpoint_age_s` in seconds):
+
+```python
+p = hl.HnswParams()
+p.M = 32
+p.quantization.codec = hl.Codec.SQ8
+index = hl.HnswIndex(dim=384, metric=hl.Metric.COSINE, params=p)
+```
 
 ## Threads, errors and limits
 

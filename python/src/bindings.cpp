@@ -750,6 +750,14 @@ PYBIND11_MODULE(_core, m) {
         .def("_remove_key", [](Collection& c, const std::string& key) { py::gil_scoped_release free; return c.remove(std::string_view(key)); })
         .def("_contains_key", [](const Collection& c, const std::string& key) { return c.contains(std::string_view(key)); })
         .def_static("id_of", [](const std::string& key) { return Collection::id_of(key); }, py::arg("key"))
+        .def("_set_metadata_key", [](Collection& c, const std::string& key, const py::handle& md) {
+            const Metadata m = to_metadata(md);
+            return c.set_metadata(std::string_view(key), m);
+        }, py::arg("key"), py::arg("metadata"))
+        .def("_set_runtime", [](Collection& c, bool ttl, std::int64_t default_ms, bool string_ids) {
+            c.set_ttl(TtlOptions{ttl, default_ms});
+            c.set_string_ids(string_ids);
+        }, py::arg("ttl"), py::arg("default_ms"), py::arg("string_ids"))
         .def("remove_where", [](Collection& c, const Filter& f) { py::gil_scoped_release free; return c.remove_where(f); }, py::arg("filter"))
         .def("count_where", [](const Collection& c, const Filter& f) { py::gil_scoped_release free; return c.count_where(f); }, py::arg("filter"))
         .def("set_metadata", [](Collection& c, std::uint64_t id, const py::handle& md) { const Metadata m = to_metadata(md); return c.set_metadata(id, m); },
