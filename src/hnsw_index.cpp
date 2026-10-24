@@ -97,6 +97,26 @@ float HnswIndex::distance_to(const float* query, NodeId node) const {
     return index_distance(distance_(query, stored_padded(node, buffer).data(), stride_), metric_ == Metric::Cosine);
 }
 
+HnswIndex::NodeDistance HnswIndex::node_distance(const float* query) const {
+    NodeDistance d;
+    d.query = query;
+    d.cosine = metric_ == Metric::Cosine;
+    d.index = this;
+    if (const CodeQuery* cq = current_code_query(); cq && cq->index == this) {  // the same choice distance_to() makes
+        d.path = NodeDistance::Path::Codes;
+        d.codec = cq->codec;
+        d.table = cq->table;
+        d.codes = cq->codes;
+        d.code_size = cq->code_size;
+    } else if (!codes_only()) {
+        d.path = NodeDistance::Path::Vectors;
+        d.vectors = &storage_.vectors();
+        d.fn = distance_;
+        d.stride = stride_;
+    }
+    return d;
+}
+
 float HnswIndex::distance_between(NodeId a, NodeId b) const {
     // Compares two stored vectors: never through the code table of a search this
     // may run within, which belongs to another query.
@@ -138,6 +158,7 @@ bool HnswIndex::same_vector(NodeId a, NodeId b) const {
 
 Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int level,
                                     NodeId exclude, LinkLocks* locks) const {
+    const NodeDistance dist = node_distance(query);
     const GraphStorage& graph = storage_.graph();
     Candidate best = start;
     std::vector<NodeId> copy;  // parallel linking: each list is copied under its lock
@@ -152,7 +173,7 @@ Candidate HnswIndex::greedy_closest(const float* query, Candidate start, int lev
         for (NodeId neighbor : links) {
             if (neighbor == kEmpty) break;
             if (neighbor == exclude || graph.level(neighbor) < level) continue;  // stale link
-            const float d = distance_to(query, neighbor);
+            const float d = dist(neighbor);
             if (d < best.distance) {
                 best = {d, neighbor};
                 moved = true;
@@ -167,6 +188,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                std::size_t ef, int level, VisitedList& visited,
                                                NodeId exclude, const Eligibility& eligible,
                                                SearchStats* stats, LinkLocks* locks) const {
+    const NodeDistance dist = node_distance(query);
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
     const GraphStorage& graph = storage_.graph();
@@ -203,7 +225,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
             if (neighbor == kEmpty) break;
             if (graph.level(neighbor) < level) continue;  // stale link to a reused slot
             if (!visited.visit(neighbor)) continue;
-            const float d = distance_to(query, neighbor);
+            const float d = dist(neighbor);
             ++computed;
             if (results.full() && d >= results.worst_distance()) continue;
             candidates.push({d, neighbor});                       // ineligible nodes are traversed...
@@ -219,6 +241,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
 
 std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
                                                const Eligibility& eligible, SearchStats* stats) const {
+    const NodeDistance dist = node_distance(query);
     // ACORN-1 (Patel et al., SIGMOD 2024), on the existing graph: the beam holds
     // eligible nodes only, so no distance is spent on vectors a filter rejects; a
     // rejected neighbor is looked through to its own neighbors, which keeps the
@@ -235,7 +258,7 @@ std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candida
     std::size_t expanded = 0, computed = 0, steps = 0;
     const auto consider = [&](NodeId n) {
         if (!visited->visit(n)) return;
-        const float d = distance_to(query, n);
+        const float d = dist(n);
         ++computed;
         if (results.full() && d >= results.worst_distance()) return;
         candidates.push({d, n});
@@ -1147,12 +1170,13 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
 
 std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, const Eligibility& eligible,
                                              SearchStats& stats) const {
+    const NodeDistance dist = node_distance(query);
     TopK top(k);
     for (NodeId n = 0; n < storage_.size(); ++n) {
         if ((n & 255) == 255 && detail::search_should_stop()) break;
         if (!eligible(n)) continue;
         ++stats.distance_computations;
-        top.push({distance_to(query, n), n});
+        top.push({dist(n), n});
     }
     stats.nodes_visited += storage_.size();
     return top.take_sorted();
@@ -1286,6 +1310,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
     const detail::SearchStopScope stop(options, options.stats);
     PreparedVector q(indexed_dim());
     prepare_truncated(q, query, dim(), metric_);
+    const NodeDistance dist = node_distance(q.data());
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
     std::optional<CompiledFilter> compiled;
     const Eligibility eligible = eligibility(options, compiled);
@@ -1300,7 +1325,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
                 if ((n & 255) == 255 && detail::search_should_stop()) break;
                 if (!eligible(n)) continue;
                 ++stats.distance_computations;
-                const float d = distance_to(q.data(), n);
+                const float d = dist(n);
                 if (d <= radius) hits.push_back({d, n});
             }
             stats.nodes_visited = storage_.size();
@@ -1343,7 +1368,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
                     if (nb == kEmpty) break;
                     if (!visited->visit(nb)) continue;
                     ++stats.distance_computations;
-                    consider(nb, distance_to(q.data(), nb), hops);
+                    consider(nb, dist(nb), hops);
                 }
             }
         }

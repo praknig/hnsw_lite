@@ -558,6 +558,33 @@ private:
     /// and kept; an ineligible neighbor is looked through to its own neighbors.
     std::vector<Candidate> acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
                                         const Eligibility& eligible, SearchStats* stats) const;
+    /// The distance from one query to stored nodes, its path decided once when it is
+    /// made: full vectors, the code table of the search running on this thread, or
+    /// decoded codes (codes only). A search's hot loops call it thousands of times;
+    /// deciding per call cost two thread-local reads, which inside a shared library
+    /// (the Python module) are calls to __tls_get_addr, plus two out-of-line calls and
+    /// a checked row lookup. Made at the start of each searching function: the code
+    /// table in force does not change while one runs.
+    struct NodeDistance {
+        enum class Path : std::uint8_t { Vectors, Codes, Decoded };
+        Path path = Path::Decoded;
+        bool cosine = false;
+        const float* query = nullptr;
+        const VectorStore* vectors = nullptr;  // Path::Vectors
+        DistanceFn fn = nullptr;
+        std::size_t stride = 0;
+        const VectorCodec* codec = nullptr;    // Path::Codes
+        const std::vector<float>* table = nullptr;
+        const std::uint8_t* codes = nullptr;
+        std::size_t code_size = 0;
+        const HnswIndex* index = nullptr;      // Path::Decoded: through distance_to()
+        float operator()(NodeId n) const {
+            if (path == Path::Vectors) return index_distance(fn(query, vectors->row_unchecked(n), stride), cosine);
+            if (path == Path::Codes) return codec->distance(*table, codes + std::size_t(n) * code_size);
+            return index->distance_to(query, n);
+        }
+    };
+    NodeDistance node_distance(const float* query) const;
     std::vector<NodeId> select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
                                          std::size_t max) const;
 

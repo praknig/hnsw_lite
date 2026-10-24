@@ -49,6 +49,10 @@ In `--out`, per dataset:
 - **Expect others to win somewhere.** FAISS IVF-PQ uses far less memory than any full-precision graph (at much lower recall without re-ranking); hnswlib is very fast on plain unfiltered search. hnsw-lite's differences show most in filtered search, updates and deletions, hybrid search and durability, which this script measures only in part.
 - **Filtered search depends on scale.** hnsw-lite's query planner scans exactly when few vectors match (at most 2,000 by default) and uses ACORN above that, between 1% and 20% matching: on small datasets most filtered queries are exact scans. Run filtered comparisons on datasets of a million vectors or more to see ACORN.
 
+## Native comparison and profiling
+
+`bench/native_compare.cpp` compares hnsw-lite and hnswlib in C++ on identical data, without Python, and measures changes to the search: its first lines say how to build it (hnswlib is header-only; its headers are fetched once). Run without arguments, it reports both libraries' time per query and how far their results agree. To measure a change: build the program before it and keep that binary (the library is linked in statically), run `native_compare save` once, then alternate `native_compare time` between the old and new binaries; `native_compare profile` searches repeatedly for `perf record`, and prints a checksum of the results, which must not change when only speed should.
+
 ## Publishing results
 
 State the machine (CPU, cores, memory), the operating system, the library versions (the summary lists them), the dataset and every setting, and publish the JSON with the charts, so anyone can reproduce or reanalyze them. The standard public comparison is [ann-benchmarks](https://github.com/erikbern/ann-benchmarks): an adapter for hnsw-lite there is a natural next step.

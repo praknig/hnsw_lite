@@ -499,6 +499,10 @@ Filters are checked against each index's schema when used (type errors throw `st
 
 **Custom predicates.** `SearchOptions::predicate` accepts any `bool(user_id)` function, for conditions that live outside the index, such as permissions. Combined with a filter, both must pass, with the filter checked first. In batch search a predicate may be called from several threads at once, so it must be safe to call concurrently.
 
+### Distances in the hot loops
+
+A search computes thousands of distances, and each one has three possible paths: the full-precision vectors, the code table of a compressed search running on this thread, or decoding a codes-only index. Which path applies cannot change while a searching function runs, so it is decided once, at the start of each (`greedy_closest`, `search_level`, `acorn_level0`, `exact_scan`, `search_range`), in a `NodeDistance`: a few pointers and one predictable branch. The inner loop then goes straight to the row (`VectorStore::row_unchecked`: ids come from the graph and are always stored, and whether values are stored was part of the decision). Deciding per distance had cost two thread-local reads (inside a shared library such as the Python module, calls to `__tls_get_addr`), two out-of-line calls and a checked row lookup: about 10% of native search time, and 15% more from Python.
+
 ### The query planner
 
 A filtered HNSW search can either scan the matching vectors exactly, or search the graph while treating non-matching vectors like removed ones (traveled through, never returned). The planner chooses per query:

@@ -70,6 +70,11 @@ public:
     // Same, but including the zero padding. Length = stride.
     std::span<const float> get_padded(NodeId id) const { return {row(check_values(id)), stride_}; }
 
+    /// The padded row of `id`, unchecked: for the hot loops of a search, whose ids
+    /// come from the graph (always stored) and which decide once, before the loop,
+    /// that values are stored (has_values()).
+    const float* row_unchecked(NodeId id) const { return row(id); }
+
     /// Frees every stored value but keeps counting rows ("slots only"), so row
     /// numbers, removal and reuse work unchanged; for indexes that keep only
     /// codes. Afterwards add, overwrite and move_row still check their arguments
