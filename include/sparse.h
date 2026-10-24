@@ -186,6 +186,9 @@ struct HybridOptions {
     std::optional<Filter> filter;
     SearchOptions dense_options;
     SearchOptions sparse_options;
+    /// Opt-in re-scoring of the fused results by metadata (read from the dense
+    /// index): recency decay, confidence multipliers, boosts. See ScoreModifiers.
+    std::optional<ScoreModifiers> modifiers;
 };
 
 struct HybridResult {
@@ -195,6 +198,7 @@ struct HybridResult {
     std::optional<std::size_t> sparse_rank;
     std::optional<float> dense_distance;
     std::optional<float> sparse_score;         ///< the dot product
+    std::optional<double> base_score;          ///< the fused score before modifiers (when they apply)
 };
 
 /// Fuses two ranked lists (best first, as returned by search()). Ties by ID.
@@ -208,7 +212,10 @@ template <class DenseIndex>
 std::vector<HybridResult> hybrid_search(const DenseIndex& dense, std::span<const float> dense_query, const SparseIndex& sparse,
                                         const SparseVector& sparse_query, std::size_t k, const HybridOptions& options = {}) {
     if (k == 0) return fuse({}, {}, 0, options);  // validates the options; nothing to search for
-    const std::size_t depth = std::max<std::size_t>(4 * k, 20);
+    // With modifiers, each side retrieves at least the pool they re-score: a boosted
+    // document beyond a side's default depth could never be promoted otherwise.
+    const std::size_t depth = std::max<std::size_t>(std::max<std::size_t>(4 * k, 20),
+                                                    options.modifiers && !options.modifiers->empty() ? options.modifiers->pool_for(k) : 0);
     SearchOptions d = options.dense_options, s = options.sparse_options;
     if (options.filter) {
         d.filter = d.filter ? (*d.filter && *options.filter) : *options.filter;
@@ -221,7 +228,19 @@ std::vector<HybridResult> hybrid_search(const DenseIndex& dense, std::span<const
     else
         dr = dense.search(dense_query, dk, d);
     const auto sr = sparse.search(sparse_query, options.sparse_k ? options.sparse_k : depth, s);
-    return fuse(dr, sr, k, options);
+    if (!options.modifiers || options.modifiers->empty()) return fuse(dr, sr, k, options);
+    const ScoreModifiers& m = *options.modifiers;  // opt-in: fuse a larger pool, re-score by metadata, keep k
+    m.validate();
+    std::vector<HybridResult> pool = fuse(dr, sr, m.pool_for(k), options);
+    for (HybridResult& r : pool) {
+        std::optional<Metadata> md = dense.get_metadata(r.id);
+        if (!md) md = sparse.get_metadata(r.id);
+        r.base_score = r.score;
+        r.score = m.apply(r.score, md ? *md : Metadata{});
+    }
+    std::stable_sort(pool.begin(), pool.end(), [](const HybridResult& a, const HybridResult& b) { return a.score > b.score; });
+    if (pool.size() > k) pool.resize(k);
+    return pool;
 }
 
 }  // namespace vecdb

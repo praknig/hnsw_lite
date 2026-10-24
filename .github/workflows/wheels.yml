@@ -36,9 +36,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Installed here rather than by the cibuildwheel action, with pauses between
+      # attempts: macOS runners have failed to resolve PyPI's address for a while
+      # at a time, and pip's own retries are only seconds apart.
+      - name: Install cibuildwheel
+        shell: bash
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            python -m pip install "cibuildwheel==2.23.3" && exit 0
+            echo "Attempt $attempt failed; retrying in $((attempt * 10)) seconds"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
       - name: Build and test the wheels
-        uses: pypa/cibuildwheel@v2.23.3
+        run: python -m cibuildwheel --output-dir wheelhouse
         env:
+          # Patience for every pip download inside the build (test requirements too).
+          PIP_RETRIES: "10"
+          PIP_TIMEOUT: "60"
           # CPython 3.9 to 3.13, 64-bit only. musllinux (Alpine) and PyPy can come later.
           CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-*"
           CIBW_SKIP: "*-musllinux_* *-win32 *_i686"

@@ -254,6 +254,46 @@ SearchOptions search_options(const std::optional<Filter>& filter, Strategy strat
     return o;
 }
 
+/// ScoreModifiers from the canonical dict the Python layer builds (hnsw_lite_lib._modifiers).
+std::optional<ScoreModifiers> to_modifiers(const py::handle& obj) {
+    if (obj.is_none()) return std::nullopt;
+    const auto d = py::reinterpret_borrow<py::dict>(obj);
+    ScoreModifiers m;
+    if (d.contains("decays"))
+        for (auto x : d["decays"]) {
+            const auto e = py::reinterpret_borrow<py::dict>(x);
+            RecencyDecay r;
+            r.field = e["field"].cast<std::string>();
+            r.origin = e["origin"].cast<double>();
+            r.half_life = e["half_life"].cast<double>();
+            r.shape = e["shape"].cast<std::string>() == "linear" ? DecayShape::Linear : DecayShape::Exponential;
+            r.missing = e["missing"].cast<double>();
+            r.floor = e["floor"].cast<double>();
+            m.decays.push_back(r);
+        }
+    if (d.contains("multipliers"))
+        for (auto x : d["multipliers"]) {
+            const auto e = py::reinterpret_borrow<py::dict>(x);
+            m.multipliers.push_back({e["field"].cast<std::string>(), e["missing"].cast<double>(), e["min"].cast<double>(), e["max"].cast<double>()});
+        }
+    if (d.contains("boosts"))
+        for (auto x : d["boosts"]) {
+            const auto e = py::reinterpret_borrow<py::dict>(x);
+            m.boosts.push_back({e["when"].cast<Filter>(), e["bonus"].cast<double>()});
+        }
+    if (d.contains("pool")) m.pool = d["pool"].cast<std::size_t>();
+    return m;
+}
+
+/// (ids, distances, scores) as NumPy arrays: a search with modifiers.
+py::tuple scored_1d(const std::vector<SearchResult>& r) {
+    py::tuple t = results_1d(r);
+    py::array_t<float> scores(static_cast<py::ssize_t>(r.size()));
+    auto s = scores.mutable_unchecked<1>();
+    for (std::size_t j = 0; j < r.size(); ++j) s(static_cast<py::ssize_t>(j)) = r[j].score;
+    return py::make_tuple(t[0], t[1], scores);
+}
+
 py::dict health_dict(const HealthReport& h) {
     py::dict d;
     d["live"] = h.live;
@@ -386,6 +426,9 @@ void bind_records(Class& c) {
 PYBIND11_MODULE(_core, m) {
     m.doc() = "hnsw-lite: vector search with metadata filters, hybrid search and durability (C++ core)";
     m.attr("MISSING_ID") = py::int_(kMissing);
+    m.def("parse_date", [](const std::string& iso) { return parse_date(iso); }, py::arg("iso"), "Milliseconds since 1970 (UTC) of an ISO 8601 date.");
+    m.def("format_date", &format_date, py::arg("ms"), "An ISO 8601 date (UTC) from milliseconds since 1970.");
+    m.def("now_ms", &now_ms, "The current time in milliseconds since 1970 (UTC).");
 
     py::register_exception<FormatError>(m, "FormatError", PyExc_RuntimeError);
     py::register_exception<Cancelled>(m, "Cancelled", PyExc_RuntimeError);
@@ -488,15 +531,20 @@ PYBIND11_MODULE(_core, m) {
              return std::make_unique<HnswIndex>(dim, metric, params, to_schema(fields, strict));
          }), py::arg("dim"), py::arg("metric") = Metric::Cosine, py::arg("params") = HnswParams{}, py::arg("schema") = py::none(),
          py::arg("strict") = false)
-        .def("search", [](const HnswIndex& x, const py::handle& query, std::size_t k, std::size_t ef, std::optional<Filter> filter, Strategy strategy) {
+        .def("_search", [](const HnswIndex& x, const py::handle& query, std::size_t k, std::size_t ef, std::optional<Filter> filter, Strategy strategy,
+                           const py::handle& modifiers, std::optional<double> diversity) {
             const std::vector<float> q = to_vector(query, "query");
+            SearchOptions o = search_options(filter, strategy);
+            o.modifiers = to_modifiers(modifiers);
+            o.diversity = diversity;
             std::vector<SearchResult> r;
             {
                 py::gil_scoped_release free;
-                r = x.search(q, k, ef, search_options(filter, strategy));
+                r = x.search(q, k, ef, o);
             }
-            return results_1d(r);
+            return o.modifiers || o.diversity ? scored_1d(r) : results_1d(r);
         }, py::arg("query"), py::arg("k") = 10, py::arg("ef") = 64, py::arg("filter") = py::none(), py::arg("strategy") = Strategy::Auto,
+           py::arg("modifiers") = py::none(), py::arg("diversity") = py::none(),
            "Returns (ids, distances): NumPy arrays, closest first.")
         .def("search_batch", [](const HnswIndex& x, const py::handle& queries, std::size_t k, std::size_t ef, std::optional<Filter> filter,
                                 std::size_t threads) {
@@ -530,6 +578,8 @@ PYBIND11_MODULE(_core, m) {
             return d;
         })
         .def("compact", [](HnswIndex& x) { py::gil_scoped_release free; return x.compact().reclaimed; })
+        .def("reorder", [](HnswIndex& x) { py::gil_scoped_release free; return x.reorder().kept; },
+             "Opt-in: stores neighbors near each other for faster searches (same results). Returns the nodes kept.")
         .def("rebuild", [](HnswIndex& x) { py::gil_scoped_release free; return x.rebuild().kept; });
     bind_records<HnswIndex>(hnsw);
 
@@ -539,15 +589,19 @@ PYBIND11_MODULE(_core, m) {
              return std::make_unique<FlatIndex>(dim, metric, to_schema(fields, strict), q, ivf);
          }), py::arg("dim"), py::arg("metric") = Metric::Cosine, py::arg("schema") = py::none(), py::arg("strict") = false,
          py::arg("quantization") = QuantizationParams{}, py::arg("ivf") = IvfParams{})
-        .def("search", [](const FlatIndex& x, const py::handle& query, std::size_t k, std::optional<Filter> filter) {
+        .def("_search", [](const FlatIndex& x, const py::handle& query, std::size_t k, std::optional<Filter> filter, const py::handle& modifiers,
+                           std::optional<double> diversity) {
             const std::vector<float> q = to_vector(query, "query");
+            SearchOptions o = search_options(filter, Strategy::Auto);
+            o.modifiers = to_modifiers(modifiers);
+            o.diversity = diversity;
             std::vector<SearchResult> r;
             {
                 py::gil_scoped_release free;
-                r = x.search(q, k, search_options(filter, Strategy::Auto));
+                r = x.search(q, k, o);
             }
-            return results_1d(r);
-        }, py::arg("query"), py::arg("k") = 10, py::arg("filter") = py::none())
+            return o.modifiers || o.diversity ? scored_1d(r) : results_1d(r);
+        }, py::arg("query"), py::arg("k") = 10, py::arg("filter") = py::none(), py::arg("modifiers") = py::none(), py::arg("diversity") = py::none())
         .def("search_batch", [](const FlatIndex& x, const py::handle& queries, std::size_t k, std::optional<Filter> filter, std::size_t threads) {
             const FloatArray q = to_matrix(queries, "queries");
             std::vector<std::vector<SearchResult>> r;
@@ -574,11 +628,16 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("durability", &CollectionOptions::durability)
         .def_readwrite("maintenance", &CollectionOptions::maintenance)
         .def_readwrite("ef", &CollectionOptions::ef)
+        .def_property("ttl_enabled", [](const CollectionOptions& o) { return o.ttl.enabled; }, [](CollectionOptions& o, bool v) { o.ttl.enabled = v; })
+        .def_property("ttl_default_ms", [](const CollectionOptions& o) { return o.ttl.default_ms; }, [](CollectionOptions& o, std::int64_t v) { o.ttl.default_ms = v; })
+        .def_readwrite("string_ids", &CollectionOptions::string_ids)
         .def("set_schema", [](CollectionOptions& o, const py::handle& fields, bool strict) { o.schema = to_schema(fields, strict); },
              py::arg("fields"), py::arg("strict") = false);
 
-    auto document = [](const py::handle& vector, const py::handle& text, const py::handle& sparse, const py::handle& metadata) {
+    auto document = [](const py::handle& vector, const py::handle& text, const py::handle& sparse, const py::handle& metadata,
+                       const py::handle& expires_at = py::none()) {
         Document d;
+        if (!expires_at.is_none()) d.expires_at = expires_at.cast<std::int64_t>();
         if (!vector.is_none()) d.vector = to_vector(vector, "vector");
         if (!text.is_none()) d.text = text.cast<std::string>();
         d.sparse = to_sparse(sparse);
@@ -590,19 +649,38 @@ PYBIND11_MODULE(_core, m) {
         .def_static("open", [](const std::string& dir, const CollectionOptions& o) { py::gil_scoped_release free; return Collection::open(dir, o); },
                     py::arg("dir"), py::arg("options"))
         .def("__len__", &Collection::size)
-        .def("__contains__", &Collection::contains, py::arg("id"))
-        .def("add", [document](Collection& c, std::uint64_t id, const py::handle& vector, const py::handle& text, const py::handle& sparse,
-                               const py::handle& metadata) {
-            const Document d = document(vector, text, sparse, metadata);
-            py::gil_scoped_release free;
-            c.add(id, d);
-        }, py::arg("id"), py::arg("vector") = py::none(), py::arg("text") = py::none(), py::arg("sparse") = py::none(), py::arg("metadata") = py::none())
-        .def("upsert", [document](Collection& c, std::uint64_t id, const py::handle& vector, const py::handle& text, const py::handle& sparse,
-                                  const py::handle& metadata) {
-            const Document d = document(vector, text, sparse, metadata);
-            py::gil_scoped_release free;
-            return c.upsert(id, d);
-        }, py::arg("id"), py::arg("vector") = py::none(), py::arg("text") = py::none(), py::arg("sparse") = py::none(), py::arg("metadata") = py::none())
+        .def("__contains__", [](const Collection& c, const py::handle& id) {
+            if (py::isinstance<py::str>(id)) return c.contains(std::string_view(id.cast<std::string>()));
+            return c.contains(to_ids(id).at(0));
+        }, py::arg("id"))
+        .def("add", [document](Collection& c, const py::handle& id, const py::handle& vector, const py::handle& text, const py::handle& sparse,
+                                  const py::handle& metadata, const py::handle& expires_at) {
+            const Document d = document(vector, text, sparse, metadata, expires_at);
+            if (py::isinstance<py::str>(id)) {
+                const std::string key = id.cast<std::string>();
+                py::gil_scoped_release free;
+                c.add(std::string_view(key), d);
+            } else {
+                const std::uint64_t n = to_ids(id).at(0);
+                py::gil_scoped_release free;
+                c.add(n, d);
+            }
+        }, py::arg("id"), py::arg("vector") = py::none(), py::arg("text") = py::none(), py::arg("sparse") = py::none(), py::arg("metadata") = py::none(),
+           py::arg("expires_at") = py::none())
+        .def("upsert", [document](Collection& c, const py::handle& id, const py::handle& vector, const py::handle& text, const py::handle& sparse,
+                                  const py::handle& metadata, const py::handle& expires_at) {
+            const Document d = document(vector, text, sparse, metadata, expires_at);
+            if (py::isinstance<py::str>(id)) {
+                const std::string key = id.cast<std::string>();
+                py::gil_scoped_release free;
+                return c.upsert(std::string_view(key), d);
+            } else {
+                const std::uint64_t n = to_ids(id).at(0);
+                py::gil_scoped_release free;
+                return c.upsert(n, d);
+            }
+        }, py::arg("id"), py::arg("vector") = py::none(), py::arg("text") = py::none(), py::arg("sparse") = py::none(), py::arg("metadata") = py::none(),
+           py::arg("expires_at") = py::none())
         .def("_upsert_many", [](Collection& c, const py::handle& ids, const py::handle& vectors, const py::handle& texts, const py::handle& sparse,
                                 const py::handle& metadata) {
             // Converted first (under the GIL), then written without it.
@@ -632,22 +710,70 @@ PYBIND11_MODULE(_core, m) {
             return added;
         }, py::arg("ids"), py::arg("vectors") = py::none(), py::arg("texts") = py::none(), py::arg("sparse") = py::none(),
            py::arg("metadata") = py::none())
+        .def("_upsert_many_keyed", [document](Collection& c, const std::vector<std::string>& keys, const py::handle& vectors, const py::handle& texts,
+                                              const py::handle& sparse, const py::handle& metadata, const py::handle& expires) {
+            // String keys and/or expiry times: one document at a time, converted first.
+            std::vector<Document> docs(keys.size());
+            const FloatArray m = vectors.is_none() ? FloatArray() : to_matrix(vectors, "vectors");
+            for (std::size_t i = 0; i < keys.size(); ++i) {
+                if (!vectors.is_none()) {
+                    if (static_cast<std::size_t>(m.shape(0)) != keys.size()) throw py::value_error("upsert_many: one vector per id required");
+                    const std::size_t dim = static_cast<std::size_t>(m.shape(1));
+                    docs[i].vector.assign(m.data() + i * dim, m.data() + (i + 1) * dim);
+                }
+            }
+            auto each = [&](const py::handle& seq, auto&& set) {
+                if (seq.is_none()) return;
+                std::size_t i = 0;
+                for (auto item : seq) {
+                    if (i >= keys.size()) throw py::value_error("upsert_many: more entries than ids");
+                    set(docs[i++], item);
+                }
+                if (i != keys.size()) throw py::value_error("upsert_many: one entry per id required");
+            };
+            each(texts, [](Document& d, const py::handle& t) { if (!t.is_none()) d.text = py::str(t); });
+            each(sparse, [](Document& d, const py::handle& s) { d.sparse = to_sparse(s); });
+            each(metadata, [](Document& d, const py::handle& md) { d.metadata = to_metadata(md); });
+            each(expires, [](Document& d, const py::handle& e) { if (!e.is_none()) d.expires_at = e.cast<std::int64_t>(); });
+            std::size_t added = 0;
+            py::gil_scoped_release free;
+            for (std::size_t i = 0; i < keys.size(); ++i) added += c.upsert(std::string_view(keys[i]), docs[i]);
+            return added;
+        }, py::arg("keys"), py::arg("vectors") = py::none(), py::arg("texts") = py::none(), py::arg("sparse") = py::none(),
+           py::arg("metadata") = py::none(), py::arg("expires_at") = py::none())
         .def("remove", [](Collection& c, const py::handle& ids) {
             const std::vector<std::uint64_t> id = to_ids(ids);
             py::gil_scoped_release free;
             return c.remove_batch(id);
         }, py::arg("ids"))
+        .def("remove_expired", [](Collection& c) { py::gil_scoped_release free; return c.remove_expired(); })
+        .def("_remove_key", [](Collection& c, const std::string& key) { py::gil_scoped_release free; return c.remove(std::string_view(key)); })
+        .def("_contains_key", [](const Collection& c, const std::string& key) { return c.contains(std::string_view(key)); })
+        .def_static("id_of", [](const std::string& key) { return Collection::id_of(key); }, py::arg("key"))
+        .def("_set_metadata_key", [](Collection& c, const std::string& key, const py::handle& md) {
+            const Metadata m = to_metadata(md);
+            return c.set_metadata(std::string_view(key), m);
+        }, py::arg("key"), py::arg("metadata"))
+        .def("_set_runtime", [](Collection& c, bool ttl, std::int64_t default_ms, bool string_ids) {
+            c.set_ttl(TtlOptions{ttl, default_ms});
+            c.set_string_ids(string_ids);
+        }, py::arg("ttl"), py::arg("default_ms"), py::arg("string_ids"))
         .def("remove_where", [](Collection& c, const Filter& f) { py::gil_scoped_release free; return c.remove_where(f); }, py::arg("filter"))
         .def("count_where", [](const Collection& c, const Filter& f) { py::gil_scoped_release free; return c.count_where(f); }, py::arg("filter"))
         .def("set_metadata", [](Collection& c, std::uint64_t id, const py::handle& md) { const Metadata m = to_metadata(md); return c.set_metadata(id, m); },
              py::arg("id"), py::arg("metadata"))
         .def("set_metadata_where", [](Collection& c, const Filter& f, const py::handle& md) { const Metadata m = to_metadata(md); return c.set_metadata_where(f, m); },
              py::arg("filter"), py::arg("changes"))
-        .def("get", [](const Collection& c, std::uint64_t id) -> py::object {
+        .def("get", [](const Collection& c, const py::handle& id) -> py::object {
             std::optional<DocumentRecord> r;
-            {
+            if (py::isinstance<py::str>(id)) {
+                const std::string key = id.cast<std::string>();
                 py::gil_scoped_release free;
-                r = c.get(id);
+                r = c.get(std::string_view(key));
+            } else {
+                const std::uint64_t n = to_ids(id).at(0);
+                py::gil_scoped_release free;
+                r = c.get(n);
             }
             if (!r) return py::none();
             py::dict d;
@@ -656,11 +782,14 @@ PYBIND11_MODULE(_core, m) {
             d["text"] = r->text;
             d["sparse"] = r->sparse ? py::object(from_sparse(*r->sparse)) : py::none();
             d["metadata"] = from_metadata(r->metadata);
+            if (r->key) d["key"] = *r->key;
+            if (r->expires_at) d["expires_at"] = *r->expires_at;
             return d;
         }, py::arg("id"))
         .def("_search", [](const Collection& c, const py::handle& vector, const py::handle& text, const py::handle& sparse, std::size_t k,
                            std::optional<Filter> filter, Fusion fusion, double rrf_k, double vector_weight, double text_weight, double sparse_weight,
-                           std::size_t candidates, std::size_t ef, bool with_metadata, bool with_text, std::optional<double> timeout_s) {
+                           std::size_t candidates, std::size_t ef, bool with_metadata, bool with_text, std::optional<double> timeout_s,
+                           const py::handle& modifiers, std::optional<double> diversity) {
             CollectionQuery q;
             if (!vector.is_none()) q.vector = to_vector(vector, "vector");
             if (!text.is_none()) q.text = text.cast<std::string>();
@@ -676,6 +805,8 @@ PYBIND11_MODULE(_core, m) {
             o.ef = ef;
             o.with_metadata = with_metadata;
             o.with_text = with_text;
+            o.modifiers = to_modifiers(modifiers);
+            o.diversity = diversity;
             if (timeout_s) o.deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(*timeout_s));
             bool stopped = false;
             o.stopped_early = &stopped;
@@ -695,6 +826,8 @@ PYBIND11_MODULE(_core, m) {
                 d["vector_distance"] = optf(h.vector_distance);
                 d["text_score"] = optf(h.text_score);
                 d["sparse_score"] = optf(h.sparse_score);
+                if (h.base_score) d["base_score"] = *h.base_score;
+                if (h.key) d["key"] = *h.key;
                 if (with_metadata) d["metadata"] = h.metadata ? py::object(from_metadata(*h.metadata)) : py::none();
                 if (with_text) d["text"] = h.text ? py::object(py::str(*h.text)) : py::none();
                 out.append(d);
@@ -702,7 +835,7 @@ PYBIND11_MODULE(_core, m) {
             return py::make_tuple(out, stopped);
         }, py::arg("vector"), py::arg("text"), py::arg("sparse"), py::arg("k"), py::arg("filter"), py::arg("fusion"), py::arg("rrf_k"),
            py::arg("vector_weight"), py::arg("text_weight"), py::arg("sparse_weight"), py::arg("candidates"), py::arg("ef"), py::arg("with_metadata"),
-           py::arg("with_text"), py::arg("timeout"))
+           py::arg("with_text"), py::arg("timeout"), py::arg("modifiers") = py::none(), py::arg("diversity") = py::none())
         .def("checkpoint", [](Collection& c) { py::gil_scoped_release free; return c.checkpoint(); })
         .def_property_readonly("durable", &Collection::durable)
         .def("maintain", [](Collection& c, long long budget_ms) {

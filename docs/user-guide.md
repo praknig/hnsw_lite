@@ -10,6 +10,7 @@ For every method and parameter in detail, with its limits, see the [developer re
 
 - [Core ideas](#core-ideas)
 - [Collections](#collections)
+- [Expiry and string keys (collections)](#expiry-and-string-keys-collections)
 - [Creating an index](#creating-an-index)
 - [Adding vectors](#adding-vectors)
   - [Adding many vectors at once](#adding-many-vectors-at-once)
@@ -18,6 +19,8 @@ For every method and parameter in detail, with its limits, see the [developer re
 - [Removing vectors and compacting](#removing-vectors-and-compacting)
 - [Metadata](#metadata)
 - [Filtered search](#filtered-search)
+- [Re-ranking by metadata](#re-ranking-by-metadata)
+- [Diverse results (MMR)](#diverse-results-mmr)
 - [Batch search](#batch-search)
 - [Range search](#range-search)
 - [Reading records back](#reading-records-back)
@@ -30,6 +33,7 @@ For every method and parameter in detail, with its limits, see the [developer re
 - [Durability](#durability)
 - [Health reports](#health-reports)
 - [Upkeep](#upkeep)
+- [Reordering for speed](#reordering-for-speed)
 - [Disk-based index](#disk-based-index)
 - [Inverted file (IVF)](#inverted-file-ivf)
 - [Product quantization (PQ)](#product-quantization-pq)
@@ -78,7 +82,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-  |---|---|---|---|---|---|
+    |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -90,6 +94,24 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Durability:** `Collection::open(dir, options)` creates or recovers a durable directory with one write-ahead log for the whole collection, so text and sparse vectors are as safe as the dense side (see [Durability](#durability) for modes and checkpoints). Reopening requires the same dimension, metric and sides; other settings come from the directory. In memory, `save` and `load` write and read one file.
 - **Maintenance:** with `options.maintenance.mode = Maintenance::Background`, a background thread does what is due every `interval` (1 s): upkeep of the dense side when it has churned (vectors replaced or removed: a quick reachability check past 5%, upkeep if it finds damage; upkeep regardless past 20%), a rebuild when a compressed side's codec has drifted (checked past 50% churn; rebuilt when its error exceeds 4 times a retrained one's), and, for durable collections, a checkpoint when the log reaches 64 MiB or 100,000 records, or a record has waited 10 minutes. Each round has a time budget (250 ms); upkeep stops at it after at least one repair, so work left over continues next round. With the default `Maintenance::Manual`, call `maintain(budget)` when convenient: it does the same, only what is due. `last_maintenance()` reports what the last round did and why (in `notes`), `maintenance_status()` the counters it decides from, and `set_maintenance()` changes the policy while running. Maintenance is not logged: the next snapshot keeps its effect. Loading from a file starts with manual maintenance.
 - **Limits:** changes run one at a time; searches run in parallel. A predicate may read the collection (`get`, `contains`, even a nested search) but not change it or any other index. BM25 document weights use `bm25.avg_doc_length` as set at creation: set it near your corpus' mean. `dense_index()`, `text_index()` and `sparse_index()` give read-only access to the sides, for example for `health()`.
+
+## Expiry and string keys (collections)
+
+Two opt-in collection settings. **Expiry:** with `options.ttl.enabled = true`, documents with an expiry time disappear from searches, counts and lookups the moment it passes, and `remove_expired()` (or maintenance) frees them; `ttl.default_ms` gives documents without their own `expires_at` a lifetime. **String keys:** with `options.string_ids = true`, documents can be added, read and removed by any string (a name, a UUID); hits report the key.
+
+```cpp
+CollectionOptions options = CollectionOptions::preset(384);
+options.ttl.enabled = true;
+options.string_ids = true;
+Collection docs(options);
+Document d;
+d.vector = embedding;
+d.expires_at = parse_date("2025-01-01");
+docs.upsert("doc-42", d);
+auto record = docs.get("doc-42");   // record->key, record->expires_at
+```
+
+Both are runtime settings: pass them each time the collection is opened. See the [developer reference](developer-reference.md#28a-expiry-and-string-keys).
 
 ## Creating an index
 
@@ -315,6 +337,26 @@ index.create_payload_index("topic");          // exact match counts for a freque
 
 `SearchStats` reports the strategy used and why, the estimated matches, the `ef` used, and how many vectors were visited. A **payload index** keeps exact per-value counts for a keyword, boolean or tag field, so the planner counts matches instead of estimating them.
 
+## Re-ranking by metadata
+
+`SearchOptions::modifiers` (also in collection and hybrid searches) adjusts relevance by metadata after the search, in C++: **recency decay** over a date field, **multipliers** by a confidence field, and **boosts** for records matching a filter (without filtering others out). The final score is (base × decays × multipliers) + bonuses:
+
+```cpp
+ScoreModifiers m;
+m.decays.push_back({"published", double(now_ms()), 30.0 * 86400000});    // halves every 30 days
+m.multipliers.push_back({"confidence"});
+m.boosts.push_back({Filter::eq("edge_type", "verified_decision"), 0.5});
+SearchOptions o;
+o.modifiers = m;
+auto results = index.search(query, 10, 64, o);   // results[i].score, highest first
+```
+
+Dates are stored as integers (milliseconds since 1970): `Metadata().set_date("published", "2024-05-17")`, and `parse_date`, `format_date`, `now_ms`.
+
+## Diverse results (MMR)
+
+`SearchOptions::diversity` (and `CollectionSearchOptions::diversity`) re-ranks by **maximal marginal relevance**: 1 keeps the ranking; lower values trade relevance for variety, so near-duplicates do not fill the results. It chooses among the candidates the search found (max(4k, 20) by default). See the [developer reference](developer-reference.md#27-searching).
+
 ## Batch search
 
 Answer many queries in one call. Put the queries back to back in one buffer:
@@ -538,6 +580,10 @@ Updates and removals also repair better as they happen: each removed vector's fo
 **Rebuilding** (`rebuild()`, on `HnswIndex` and `FlatIndex`) is the full vacuum, for what upkeep cannot repair in place: compression and IVF lists trained on data that has since moved (see `health()`'s drift figures). It retrains them on the current vectors while the index stays in use: a snapshot is taken under the lock, the new state is built without it (searches and changes continue), and, under the lock again, IDs changed meanwhile are brought up to date and everything is swapped in at once. An HNSW index is rebuilt completely (like `compact()`, which it also replaces), then upkept if the catch-up removed anything; a flat index keeps its rows and gets new codes and list assignments. It needs memory for a second copy of the vectors while it runs; one rebuild runs at a time; a deadline, cancellation or running out of memory leaves the index as it was. Measured: SQ8 trained on narrower data clipped 43% of values, under 1% after a rebuild; IVF lists trained before the data moved fitted it 100 times worse than fresh ones (centroid distance 390 against 4) with the largest list 8.5 times the mean, and after a rebuild 4.0 and 1.5. Drifted lists cost mostly speed, since each probe scans an oversized list: with 2 of 16 probes a query scanned 3,940 vectors before the rebuild and 672 after, about 6 times less work, with recall 0.873 before and 0.874 after. At the same number of probes recall can also dip slightly after retraining, since less is scanned (0.881 to 0.859 on another dataset); raise `probes` to spend some of the saving. With only codes stored, the codec cannot be retrained (nothing to train it on), but IVF lists can, from decoded codes. IDs removed during an HNSW rebuild leave free slots in the new index, which later inserts reuse.
 
 `set_auto_compact(fraction)` runs `compact()` automatically once free slots exceed `fraction` of all slots (off by default; at most 0.9; not saved with the index). The change that crosses the threshold then takes as long as a compaction; a compaction that runs out of memory leaves the index as it was, and the next change tries again.
+
+## Reordering for speed
+
+`index.reorder()` renumbers an HNSW index so that neighbors are stored near each other in memory: the same graph and results, and on clustered data (as real embeddings are) about 24% faster searches. It blocks while it runs (a few seconds per 200,000 vectors), so call it after building or bulk loading.
 
 ## Disk-based index
 

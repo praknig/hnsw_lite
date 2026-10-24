@@ -74,7 +74,9 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [ ] C++ packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [ ] Payload index posting lists, and filter-aware graph construction
-- [ ] Benchmarks on SIFT1M and GloVe
+- [x] Graph reordering for memory locality (`reorder()`), score modifiers (recency decay, confidence, boosts), dates, MMR diversity, document expiry (TTL), string keys
+- [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
+- [ ] Benchmark results on SIFT1M and GloVe, published
 
 The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) were planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 

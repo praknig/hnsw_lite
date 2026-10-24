@@ -10,7 +10,9 @@
  */
 #include <unordered_set>
 #include <mutex>
+#include "scoring.h"
 #include "hnsw_index.h"
+#include "kmeans.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1155,6 +1157,39 @@ Eligibility HnswIndex::eligibility(const SearchOptions& options, std::optional<C
 
 std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::size_t k, std::size_t ef,
                                             const SearchOptions& options) const {
+    const bool modify = options.modifiers && !options.modifiers->empty();
+    if (modify || options.diversity) {  // opt-in: a larger pool, re-scored by metadata and/or diversified
+        if (options.diversity && !(*options.diversity >= 0.0 && *options.diversity <= 1.0))
+            throw std::invalid_argument("SearchOptions::diversity must be in [0, 1]");
+        if (modify) options.modifiers->validate();
+        SearchOptions plain = options;
+        plain.modifiers.reset();
+        plain.diversity.reset();
+        const std::size_t pool = modify ? options.modifiers->pool_for(k) : std::max<std::size_t>(4 * k, 20);
+        std::vector<SearchResult> found = search(query, pool, std::max(ef, pool), plain);
+        const auto relevance = [&](float d) { return relevance_from_distance(d, metric_); };
+        if (modify) {
+            // The size first: function arguments are evaluated in no fixed order, and
+            // moving `found` before reading its size kept nothing (found by CI: Clang
+            // evaluates left to right, GCC right to left).
+            const std::size_t all = found.size();
+            found = rescored(std::move(found), all, *options.modifiers, [&](std::uint64_t id) { return get_metadata(id); }, relevance);
+        }
+        else for (SearchResult& r : found) r.score = static_cast<float>(relevance(r.distance));
+        if (!options.diversity) {
+            if (found.size() > k) found.resize(k);
+            return found;
+        }
+        std::vector<double> rel(found.size());
+        std::vector<std::optional<std::vector<float>>> vectors(found.size());
+        for (std::size_t i = 0; i < found.size(); ++i) {
+            rel[i] = found[i].score;
+            vectors[i] = get_vector(found[i].id);
+        }
+        std::vector<SearchResult> chosen;
+        for (const std::size_t i : mmr_order(rel, vectors, k, *options.diversity)) chosen.push_back(found[i]);
+        return chosen;
+    }
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);  // records stopped_early last
     PreparedVector q(indexed_dim());
@@ -1386,6 +1421,113 @@ CompactStats HnswIndex::compact(const OperationOptions& options) {
     const auto guard = lock_.write("compact");
     const ChangeLog::Scope logged(log_, log_.begin(walop::kCompact, [] { return std::vector<unsigned char>{}; }));
     return compact_unlocked(options);
+}
+
+CompactStats HnswIndex::reorder(const OperationOptions& options) {
+    const auto guard = lock_.write("reorder");
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kReorder, [] { return std::vector<unsigned char>{}; }));
+    return reorder_unlocked(options);
+}
+
+CompactStats HnswIndex::reorder_unlocked(const OperationOptions& options) {
+    const std::size_t reclaimed = deleted_count();
+    const IdMap& ids = storage_.ids();
+    const GraphStorage& graph = storage_.graph();
+    const std::size_t slots = storage_.size();
+    // 1. The new order: breadth-first over level 0 from the entry point, then any
+    //    live node the walk did not reach, in slot order.
+    std::vector<NodeId> order;
+    order.reserve(live_);
+    std::vector<NodeId> new_of(slots, kEmpty);
+    auto take = [&](NodeId n) {
+        new_of[n] = static_cast<NodeId>(order.size());
+        order.push_back(n);
+    };
+    if (entry_ != kEmpty) {
+        take(entry_);
+        for (std::size_t head = 0; head < order.size(); ++head)
+            for (const NodeId nb : graph.links(order[head], 0)) {
+                if (nb == kEmpty) break;
+                if (new_of[nb] == kEmpty && !ids.is_deleted(nb)) take(nb);
+            }
+    }
+    for (NodeId n = 0; n < slots; ++n)
+        if (new_of[n] == kEmpty && !ids.is_deleted(n)) take(n);
+    // Then by place: breadth-first order alone keeps little locality in a graph of
+    // this degree (its frontier grows ~2M-fold per step; measured: neighbors' numbers
+    // only 17% closer). Nodes are grouped by their nearest of about sqrt(n) k-means
+    // centroids (trained on a sample), keeping breadth-first order within a group:
+    // a node's neighbors are near it in space, so mostly in its group, and so near
+    // it in memory. Deterministic (k-means with a fixed seed, any thread count).
+    const std::size_t dims = storage_.vectors().dim();
+    if (order.size() >= 1024 && storage_.vectors().has_values()) {
+        // Groups of about 1,024 nodes: near a CPU's L2 cache in size at common dimensions,
+        // and assigning n nodes costs n * k distances, so k is kept small.
+        const std::size_t k = std::min<std::size_t>(std::max<std::size_t>(2, order.size() / 1024), 4096);
+        const std::size_t sample = std::min<std::size_t>(order.size(), std::max<std::size_t>(10000, 4 * k));
+        std::vector<float> train(sample * dims);
+        for (std::size_t i = 0; i < sample; ++i) {  // spread evenly through the breadth-first order
+            const std::span<const float> v = storage_.vectors().get(order[i * order.size() / sample]);
+            std::copy(v.begin(), v.end(), train.begin() + std::ptrdiff_t(i * dims));
+        }
+        const KMeansResult km = kmeans(train, dims, KMeansParams{k, 10, 0x5e0d, 0});
+        std::vector<std::uint32_t> group(order.size());
+        pool_.get(0)->parallel_for(order.size(), [&](std::size_t i) {  // independent: the same result on any thread count
+            group[i] = nearest_centroid(km.centroids, dims, storage_.vectors().get(order[i]).data());
+        });
+        std::vector<std::size_t> pos(order.size());
+        for (std::size_t i = 0; i < pos.size(); ++i) pos[i] = i;
+        std::stable_sort(pos.begin(), pos.end(), [&](std::size_t a, std::size_t b) { return group[a] < group[b]; });
+        std::vector<NodeId> grouped(order.size());
+        for (std::size_t i = 0; i < pos.size(); ++i) grouped[i] = order[pos[i]];
+        order.swap(grouped);
+        for (std::size_t i = 0; i < order.size(); ++i) new_of[order[i]] = static_cast<NodeId>(i);
+    }
+    const NodeId new_entry = entry_ == kEmpty ? kEmpty : new_of[entry_];
+    // 2. The same graph under the new numbers, built completely before the commit
+    //    (a failure or a cancellation leaves this index untouched).
+    HnswIndex fresh(dim(), metric_, params_, metadata_.current_schema());
+    if (codec_) fresh.codec_ = codec_->clone();
+    if (codes_only()) fresh.storage_.drop_vector_values();
+    for (const std::string& field : metadata_.indexed_fields()) fresh.metadata_.index_field(field);
+    fresh.planner_ = planner_;
+    detail::OperationControl control(options, order.size());
+    const bool values = storage_.vectors().has_values();
+    for (const NodeId n : order) {
+        const std::vector<float> decoded = values ? std::vector<float>{} : stored_copy(n);  // codes only: as stored
+        const std::span<const float> v = values ? storage_.vectors().get(n) : std::span<const float>(decoded);
+        const std::span<const float> original = storage_.originals() ? storage_.original(n) : std::span<const float>{};
+        const NodeId placed = fresh.storage_.insert(ids.external(n), v, graph.level(n), original);
+        (void)fresh.metadata_.write(placed, metadata_.read(n));
+        control.advance();
+    }
+    std::vector<NodeId> mapped;
+    for (std::size_t i = 0; i < order.size(); ++i)
+        for (int l = 0; l <= graph.level(order[i]); ++l) {
+            mapped.clear();
+            for (const NodeId nb : graph.links(order[i], l)) {
+                if (nb == kEmpty) break;
+                if (new_of[nb] != kEmpty) mapped.push_back(new_of[nb]);  // links to removed slots go, as compaction drops them
+            }
+            fresh.storage_.graph().set_links(static_cast<NodeId>(i), l, mapped);
+        }
+    if (codec_ && codec_->trained()) {  // codes copied byte for byte: re-encoding could change them
+        const std::size_t cs = codec_->code_size();
+        fresh.codes_.assign(order.size() * cs, 0);
+        for (std::size_t i = 0; i < order.size(); ++i)
+            std::copy_n(codes_.data() + std::size_t(order[i]) * cs, cs, fresh.codes_.data() + i * cs);
+    }
+    control.finish();
+    // 3. Commit: moves only, nothing can throw.
+    codec_ = std::move(fresh.codec_);
+    codes_ = std::move(fresh.codes_);
+    storage_ = std::move(fresh.storage_);
+    metadata_ = std::move(fresh.metadata_);
+    entry_ = new_entry;
+    live_ = order.size();
+    free_slots_.clear();
+    visited_pool_.clear();
+    return {live_, reclaimed};
 }
 
 void HnswIndex::set_auto_compact(double fraction) {

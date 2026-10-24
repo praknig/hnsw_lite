@@ -103,6 +103,17 @@ struct Value {
  *                           .set_tags("tags", {"ai", "chips"}).
  * unset(name) is used with set_metadata() to clear a field.
  */
+/// Dates as integers: milliseconds since 1970-01-01T00:00:00Z. Store them in Int
+/// fields (Metadata::set_date), filter them like any integer, and decay by them
+/// (RecencyDecay). parse_date accepts ISO 8601: "2024-05-17", "2024-05-17T09:30",
+/// "2024-05-17T09:30:15.250", optionally ending "Z" or "+02:00"; without a zone,
+/// UTC. Throws std::invalid_argument for anything else.
+std::int64_t parse_date(std::string_view iso);
+/// The date as "YYYY-MM-DDTHH:MM:SS.mmmZ" (UTC).
+std::string format_date(std::int64_t ms);
+/// The current time in milliseconds since 1970 (UTC).
+std::int64_t now_ms();
+
 class Metadata {
 public:
     /// Sets a field; the type comes from the C++ type of `value` (see Value::from).
@@ -112,6 +123,8 @@ public:
         return *this;
     }
     /// Sets a tag-set field.
+    /// A date (ISO 8601, see parse_date), stored as an Int: milliseconds since 1970.
+    Metadata& set_date(std::string name, std::string_view iso) { return set(std::move(name), parse_date(iso)); }
     Metadata& set_tags(std::string name, std::vector<std::string> tags) {
         fields_[std::move(name)] = Value::of_tags(std::move(tags));
         return *this;

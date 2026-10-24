@@ -37,6 +37,7 @@ inline float ordered_distance(float d) {
 struct SearchResult {
     std::uint64_t id;
     float distance;
+    float score = 0;  ///< with SearchOptions::modifiers: the modified relevance (higher is better); otherwise 0
 };
 
 /**

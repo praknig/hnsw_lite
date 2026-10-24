@@ -16,10 +16,10 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 
 | Area | Features |
 |---|---|
-| **Collections** | `Collection`: documents with any of a dense vector, text (BM25) and a learned sparse vector, plus metadata, under one ID space; hybrid search by default; durable as a whole; automatic maintenance (upkeep, rebuilds, checkpoints) on a background thread or on request; presets (balanced, high recall, low memory) |
+| **Collections** | `Collection`: documents with any of a dense vector, text (BM25) and a learned sparse vector, plus metadata, under one ID space; hybrid search by default; durable as a whole; automatic maintenance (upkeep, rebuilds, checkpoints) on a background thread or on request; presets (balanced, high recall, low memory); opt-in document expiry (TTL) and string or UUID keys |
 | **Index types** | `HnswIndex` (graph, approximate); `FlatIndex` (exact), optionally an **inverted file (IVF, IVF-PQ)**; `DiskIndex` (DiskANN-style Vamana graph on disk, read-only, built within a memory budget); `SparseIndex` (inverted index for sparse vectors, exact) |
-| **Metrics and speed** | Squared L2, inner product, cosine; SIMD kernels (AVX2, AVX-512, NEON, scalar) chosen at run time, with identical results on every CPU |
-| **Search** | k-nearest search with per-query beam width; batch search on a thread pool; range search; search by stored ID; deadlines, cancellation and progress reports; search statistics |
+| **Metrics and speed** | Squared L2, inner product, cosine; SIMD kernels (AVX2, AVX-512, NEON, scalar) chosen at run time, with identical results on every CPU; opt-in graph reordering for memory locality |
+| **Search** | k-nearest search with per-query beam width; batch search on a thread pool; range search; search by stored ID; deadlines, cancellation and progress reports; search statistics; opt-in re-ranking by metadata (recency decay, confidence multipliers, boosts) and MMR diversity |
 | **Hybrid search** | Sparse vectors (SPLADE, or BM25 from the built-in `Bm25` encoder); `hybrid_search()` fusing dense and sparse results by Reciprocal Rank Fusion or weighted scores |
 | **Metadata and filters** | Typed fields (integer, float, boolean, keyword, tags), strict or dynamic schemas; filters with comparisons, ranges, membership, tags and boolean logic, plus custom predicates; a query planner choosing exact search, ACORN filtered graph search or plain graph search by selectivity; payload indexes with exact counts |
 | **Records and changes** | Add, `add_batch` (parallel graph building), update, upsert, real deletion with graph repair and slot reuse, `remove_batch`, bulk changes by filter (`remove_where`, `set_metadata_where`, `count_where`); reading back (`get_vector`, `get`, paged `scan`) |
@@ -28,7 +28,7 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 | **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
 | **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
 | **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
-| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 871 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 893 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
 ## Compared with similar libraries
 
@@ -88,8 +88,8 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | 13 | **Memory-mapped loading** of saved indexes | | 3 days |
 | 14 | **Multivector records:** several vectors per record (named, or chunks), and late-interaction (ColBERT) scoring | | 1 week |
 | 15 | **Faster sparse search:** MaxScore pruning for long posting lists; a write-ahead log for a standalone `SparseIndex` | Covered by `Collection` for most users | 3–4 days |
-| 16 | **Filtering:** ~~ACORN filtered graph search~~ (**done**); payload posting lists for exact filtered search, facet counts, geographic and date fields | | 1–2 weeks |
-| 17 | **Search extras:** recommendations from positive and negative examples, diversity re-ranking (MMR), automatic beam width for a target recall, Hamming and L1 metrics | | 1 week |
+| 16 | **Filtering:** ~~ACORN filtered graph search~~, ~~date fields~~ (**done**: dates as epoch milliseconds, `parse_date`); payload posting lists for exact filtered search, facet counts, geographic fields | | 1–2 weeks |
+| 17 | **Search extras:** ~~diversity re-ranking (MMR)~~ (**done**); recommendations from positive and negative examples, automatic beam width for a target recall, Hamming and L1 metrics | | 1 week |
 | 18 | **Records:** string and UUID IDs; expiry (TTL) | | 3 days |
 | 19 | **Concurrency:** searches that do not wait for long batch changes | | 1–1.5 weeks |
 | 20 | **Quality:** fuzzing the file and log loaders; splitting the test program by group for faster builds; Windows on ARM | | 1 week |

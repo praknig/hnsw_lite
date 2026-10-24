@@ -1,6 +1,6 @@
 # Core capabilities: test plan
 
-> **Status: completed.** These scenarios are part of the test suite; see [testing](testing.md). Kept as a record of the test design.
+> **Status: completed.** These scenarios are part of the test suite; see [testing](testing.md). Kept as a record of the test design: the counts below are as of its completion, and the groups have grown since (current counts are in [testing](testing.md)).
 
 Test scenarios for the four features designed in [core-capabilities-plan.md](core-capabilities-plan.md): real deletion, updating vectors, saving and loading, and concurrent inserts. The last section analyzes how these features affect the existing tests.
 

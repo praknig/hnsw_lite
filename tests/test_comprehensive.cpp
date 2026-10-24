@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -68,6 +68,7 @@
 #include <thread>
 #include <vector>
 
+#include "scoring.h"
 #include "arena.h"
 #include "flat_index.h"
 #include "hnsw_index.h"
@@ -18468,6 +18469,832 @@ TEST(acorn, ac05_collections_use_it_through_their_filters) {
 }
 
 // ===========================================================================
+// Reordering the graph for locality (RO1-RO6)
+// ===========================================================================
+
+namespace {
+
+std::string ro_bytes(const HnswIndex& h) {
+    std::ostringstream out;
+    h.save(out);
+    return std::move(out).str();
+}
+
+/// Every query's results (external ids and distances): unfiltered, filtered, by id, range.
+std::vector<std::vector<SearchResult>> ro_results(const HnswIndex& h, const Vectors& queries) {
+    std::vector<std::vector<SearchResult>> out;
+    SearchOptions f;
+    f.filter = Filter::lt("g", std::int64_t(3));
+    for (const auto& q : queries) {
+        out.push_back(h.search(q, 10, 64));
+        out.push_back(h.search(q, 10, 64, f));
+        out.push_back(h.search_range(q, 0.5f, 20));
+    }
+    for (std::uint64_t id = 0; id < 20; ++id)
+        if (auto r = h.search_by_id(id * 7, 5)) out.push_back(*r);
+    return out;
+}
+
+}  // namespace
+
+TEST(reorder, ro01_searches_return_the_same_results) {
+    auto data = clustered(3000, 16, 12, 4500);
+    auto queries = clustered(40, 16, 12, 4501);
+    HnswIndex h(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 3000; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 10)));
+    const auto before = ro_results(h, queries);
+    const CompactStats st = h.reorder();
+    CHECK(st.kept == 3000 && st.reclaimed == 0 && h.size() == 3000);
+    const auto after = ro_results(h, queries);
+    bool same = before.size() == after.size();
+    for (std::size_t i = 0; i < before.size() && same; ++i) same = same_results(before[i], after[i]);
+    CHECK(same);
+    HealthOptions ho;
+    ho.recall_sample = 50;
+    const HealthReport health = h.health(ho);
+    CHECK(health.unreachable == 0 && health.links_to_removed == 0 && *health.recall > 0.9);
+    // Reordering again changes nothing (the order is already breadth-first).
+    const std::string once = ro_bytes(h);
+    (void)h.reorder();
+    CHECK(ro_bytes(h) == once);
+}
+
+TEST(reorder, ro02_every_record_is_kept_and_removed_slots_go) {
+    auto data = clustered(1500, 12, 8, 4502);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 200;
+    HnswIndex h(12, Metric::Cosine, p);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i * 3, data[i], Metadata().set("n", std::int64_t(i)).set_tags("t", {"a"}));
+    for (std::uint64_t i = 0; i < 1500; i += 4) (void)h.remove(i * 3);
+    h.create_payload_index("t");
+    std::map<std::uint64_t, std::tuple<std::vector<float>, Metadata, std::vector<std::uint8_t>>> kept;
+    for (std::uint64_t i = 0; i < 1500; ++i)
+        if (h.contains(i * 3)) kept[i * 3] = {*h.get_vector(i * 3), *h.get_metadata(i * 3), *h.get_code(i * 3)};
+    const std::size_t removed = h.deleted_count();
+    const CompactStats st = h.reorder();
+    CHECK(st.kept == kept.size() && st.reclaimed == removed && h.deleted_count() == 0 && h.capacity() == kept.size());
+    bool same = h.size() == kept.size();
+    for (const auto& [id, rec] : kept)
+        same = same && *h.get_vector(id) == std::get<0>(rec) && *h.get_metadata(id) == std::get<1>(rec) && *h.get_code(id) == std::get<2>(rec);
+    CHECK(same && h.count_where(Filter::has_tag("t", "a")) == kept.size());
+    HealthOptions ho;
+    ho.recall_sample = 0;
+    CHECK(h.health(ho).unreachable == 0);
+    h.add(999999, data[0]);  // and it keeps working
+    CHECK(h.contains(999999) && h.search(data[0], 1)[0].id == 999999);
+}
+
+TEST(reorder, ro03_codes_only) {
+    auto data = clustered(1200, 16, 8, 4503);
+    auto queries = clustered(20, 16, 8, 4504);
+    HnswParams p;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 300;
+    p.quantization.keep_full_vectors = false;
+    p.quantization.rerank = false;
+    HnswIndex h(16, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 1200; ++i) h.add(i, data[i]);
+    CHECK(!h.has_vector_values());
+    std::vector<std::vector<SearchResult>> before;
+    for (const auto& q : queries) before.push_back(h.search(q, 10, 64));
+    const auto v5 = *h.get_vector(5);
+    (void)h.reorder();
+    bool same = true;
+    for (std::size_t i = 0; i < queries.size(); ++i) same = same && same_results(before[i], h.search(queries[i], 10, 64));
+    CHECK(same && *h.get_vector(5) == v5 && !h.has_vector_values());
+}
+
+TEST(reorder, ro04_cancelled_or_out_of_memory_leaves_it_untouched) {
+    auto data = clustered(800, 8, 6, 4505);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 800; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 800; i += 5) (void)h.remove(i);
+    const std::string before = ro_bytes(h);
+    std::atomic<bool> cancel{true};
+    OperationOptions o;
+    o.cancel = &cancel;
+    CHECK_THROWS_AS(Cancelled, h.reorder(o));
+    CHECK(ro_bytes(h) == before);
+    if (HNSW_ALLOC_HOOK) {  // every allocation failing in turn: the index is untouched each time
+        HnswIndex copy(8, Metric::L2);
+        for (std::uint64_t i = 0; i < 100; ++i) copy.add(i, data[i]);
+        const std::string b = ro_bytes(copy);
+        bool clean = true;
+        const long points = sweep_allocation_failures([&] { (void)copy.reorder(); }, [&] { clean = clean && ro_bytes(copy) == b; });
+        CHECK(points > 0 && clean);
+    }
+    HnswIndex empty(8, Metric::L2);  // nothing to do
+    const CompactStats st = empty.reorder();
+    CHECK(st.kept == 0 && st.reclaimed == 0 && empty.entry_point() == kEmpty);
+}
+
+TEST(reorder, ro05_durable_indexes_replay_it) {
+    auto data = clustered(600, 8, 6, 4506);
+    const std::string dir = durable_dir("ro05");
+    std::string expected;
+    {
+        auto h = HnswIndex::open_durable(dir, 8, Metric::L2);
+        for (std::uint64_t i = 0; i < 600; ++i) h->add(i, data[i]);
+        for (std::uint64_t i = 0; i < 600; i += 7) (void)h->remove(i);
+        (void)h->reorder();
+        h->add(5000, data[1]);  // a change after the reorder, replayed on the reordered graph
+        expected = ro_bytes(*h);
+    }
+    RecoveryStats st;
+    auto again = HnswIndex::open_durable(dir, 8, Metric::L2, {}, Schema::dynamic(), {}, &st);
+    CHECK(ro_bytes(*again) == expected && st.replayed > 0);
+    again.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(reorder, ro07_unreachable_nodes_and_an_untrained_codec) {
+    // Removals without repair leave live nodes that reorder's walk (which does not
+    // pass through removed nodes) cannot reach: they follow the others, and are kept. A codec not yet trained has no
+    // codes to copy.
+    auto data = clustered(1500, 8, 6, 4508);
+    HnswParams p;
+    p.M = 4;
+    p.repair_on_remove = false;
+    p.quantization.codec = CodecKind::SQ8;
+    p.quantization.train_after = 1000000;  // never trained here
+    HnswIndex h(8, Metric::L2, p);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i]);
+    for (std::uint64_t i = 0; i < 1500; i += 2) (void)h.remove(i);
+    HealthOptions ho;
+    ho.recall_sample = 0;
+    const std::size_t unreachable = h.health(ho).unreachable;
+    std::map<std::uint64_t, std::vector<float>> kept;
+    for (std::uint64_t i = 1; i < 1500; i += 2) kept[i] = *h.get_vector(i);
+    const CompactStats st = h.reorder();
+    bool same = st.kept == 750 && h.size() == 750 && !h.codec_trained();
+    for (const auto& [id, v] : kept) same = same && *h.get_vector(id) == v;
+    std::printf("    %zu unreachable before reordering (by any path, removed nodes included); every live vector kept\n", unreachable);
+    CHECK(same);
+}
+
+TEST(reorder, ro06_neighbors_are_stored_together) {
+    // Locality, measured: the average distance between a node's number and its
+    // level-0 neighbors' numbers falls (a breadth-first order keeps them close).
+    auto data = clustered(4000, 16, 40, 4507);
+    HnswIndex h(16, Metric::L2);
+    std::vector<std::uint64_t> ids(4000);
+    for (std::uint64_t i = 0; i < 4000; ++i) ids[i] = (i * 2654435761u) % 4000;  // inserted in a scrambled order
+    for (std::uint64_t i = 0; i < 4000; ++i) h.add(ids[i], data[ids[i]]);
+    // The share of level-0 links whose ends are stored within `w` positions of
+    // each other: what decides whether a neighbor shares a cache line, a page or a
+    // nearby block (an average gap is dominated by HNSW's deliberate long links).
+    auto near = [&](double w) {
+        const GraphStorage& g = h.storage().graph();
+        std::size_t close = 0, links = 0;
+        for (NodeId n = 0; n < g.size(); ++n)
+            for (const NodeId nb : g.links(n, 0)) {
+                if (nb == kEmpty) break;
+                close += std::abs(double(nb) - double(n)) <= w;
+                ++links;
+            }
+        return double(close) / double(links);
+    };
+    const double b16 = near(16), b128 = near(128), b1024 = near(1024);
+    (void)h.reorder();
+    const double a16 = near(16), a128 = near(128), a1024 = near(1024);
+    std::printf("    neighbors stored within 16 / 128 / 1024 positions: %.0f%% / %.0f%% / %.0f%% before, %.0f%% / %.0f%% / %.0f%% after\n",
+                100 * b16, 100 * b128, 100 * b1024, 100 * a16, 100 * a128, 100 * a1024);
+    CHECK(a128 > 2 * b128);
+}
+
+// ===========================================================================
+// Score modifiers and dates (SC1-SC6)
+// ===========================================================================
+
+namespace {
+bool close_to(double a, double b, double tol = 1e-9) { return std::abs(a - b) <= tol * std::max(1.0, std::abs(b)); }
+}  // namespace
+
+TEST(scoring, sc01_dates) {
+    CHECK(parse_date("1970-01-01") == 0 && parse_date("1970-01-02") == 86400000);
+    CHECK(parse_date("2024-02-29T12:30") == parse_date("2024-02-29") + (12 * 60 + 30) * 60000);  // a leap day
+    CHECK(parse_date("2024-05-17T09:30:15.250Z") == parse_date("2024-05-17T09:30:15") + 250);
+    CHECK(parse_date("2024-05-17T11:30:00+02:00") == parse_date("2024-05-17T09:30:00Z"));  // the same moment
+    CHECK(parse_date("2024-05-17T04:00:00-05:30") == parse_date("2024-05-17T09:30:00"));
+    CHECK(parse_date("1969-12-31T23:59:59.999") == -1);  // before 1970
+    CHECK(parse_date("2024-05-17T09:30:15.1") == parse_date("2024-05-17T09:30:15") + 100);
+    for (std::int64_t ms : {std::int64_t(0), std::int64_t(-1), std::int64_t(1715938215250), std::int64_t(-86400000 * 400LL), parse_date("2000-02-29T23:59:59.999")})
+        CHECK(parse_date(format_date(ms)) == ms);
+    CHECK(format_date(parse_date("2024-05-17T09:30:15.250Z")) == "2024-05-17T09:30:15.250Z");
+    for (const char* bad : {"", "2024", "2024-5-17", "2023-02-29", "2024-13-01", "2024-00-10", "2024-04-31", "2024-05-17T24:00",
+                            "2024-05-17T09:60", "2024-05-17T09:30:61", "2024-05-17T09:30:00.", "2024-05-17T09:30+2:00",
+                            "2024-05-17Z", "2024-05-17T09:30:00X", "abcd-ef-gh"})
+        CHECK_THROWS_AS(std::invalid_argument, (void)parse_date(bad));
+    const std::int64_t now = now_ms();
+    CHECK(now > parse_date("2024-01-01") && now < parse_date("2200-01-01"));
+    CHECK(Metadata().set_date("d", "2024-05-17").get("d")->i == parse_date("2024-05-17"));
+}
+
+TEST(scoring, sc02_each_rule_exactly) {
+    const double day = 86400000.0, now = double(parse_date("2024-06-01"));
+    ScoreModifiers m;
+    m.decays.push_back({"t", now, 30 * day});
+    auto at = [&](double days_old) { return m.apply(1.0, Metadata().set("t", std::int64_t(now - days_old * day))); };
+    CHECK(close_to(at(0), 1.0) && close_to(at(30), 0.5) && close_to(at(60), 0.25) && close_to(at(-10), 1.0));  // the future is not decayed
+    m.decays[0].shape = DecayShape::Linear;
+    CHECK(close_to(at(30), 0.5) && close_to(at(60), 0.0) && close_to(at(90), 0.0) && close_to(at(15), 0.75));
+    m.decays[0].floor = 0.2;
+    CHECK(close_to(at(90), 0.2));
+    m.decays[0].missing = 0.7;
+    CHECK(close_to(m.apply(2.0, Metadata()), 1.4) && close_to(m.apply(2.0, Metadata().set("t", "a keyword")), 1.4));  // not a number: missing
+    CHECK(close_to(m.apply(1.0, Metadata().set("t", now - 30 * day)), 0.5));  // a float field works too
+    ScoreModifiers c;
+    c.multipliers.push_back({"conf"});
+    CHECK(close_to(c.apply(2.0, Metadata().set("conf", 0.25)), 0.5) && close_to(c.apply(2.0, Metadata()), 2.0));
+    CHECK(close_to(c.apply(2.0, Metadata().set("conf", true)), 2.0) && close_to(c.apply(2.0, Metadata().set("conf", false)), 0.0));
+    c.multipliers[0].min = 0.5;
+    c.multipliers[0].max = 0.8;
+    CHECK(close_to(c.apply(1.0, Metadata().set("conf", 0.1)), 0.5) && close_to(c.apply(1.0, Metadata().set("conf", 3.0)), 0.8));
+    ScoreModifiers b;
+    b.boosts.push_back({Filter::eq("edge_type", "verified_decision"), 0.5});
+    b.boosts.push_back({Filter::has_tag("tags", "stale"), -0.3});
+    CHECK(close_to(b.apply(1.0, Metadata().set("edge_type", "verified_decision")), 1.5));
+    CHECK(close_to(b.apply(1.0, Metadata().set("edge_type", "guess").set_tags("tags", {"stale"})), 0.7));
+    CHECK(close_to(b.apply(1.0, Metadata()), 1.0));  // no match: unchanged, not filtered out
+    ScoreModifiers all;  // (base x decay x multiplier) + bonus
+    all.decays.push_back({"t", now, 30 * day});
+    all.multipliers.push_back({"conf"});
+    all.boosts.push_back({Filter::eq("edge_type", "verified_decision"), 0.25});
+    CHECK(close_to(all.apply(2.0, Metadata().set("t", std::int64_t(now - 30 * day)).set("conf", 0.5).set("edge_type", "verified_decision")), 0.75));
+    CHECK(ScoreModifiers{}.empty() && !all.empty() && all.pool_for(10) == 40 && all.pool_for(2) == 20);
+    all.pool = 7;
+    CHECK(all.pool_for(10) == 10 && all.pool_for(3) == 7);
+}
+
+TEST(scoring, sc03_invalid_settings) {
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<ScoreModifiers> bad(12);
+    bad[0].decays.push_back({"", 0, 1});
+    bad[1].decays.push_back({"t", 0, 0});
+    bad[2].decays.push_back({"t", 0, -1});
+    bad[3].decays.push_back({"t", kNaN, 1});
+    bad[4].decays.push_back({"t", 0, inf});
+    bad[5].decays.push_back({"t", 0, 1, DecayShape::Exponential, -1});
+    bad[6].decays.push_back({"t", 0, 1, DecayShape::Exponential, 1, 1.5});
+    bad[7].multipliers.push_back({""});
+    bad[8].multipliers.push_back({"c", 1, -0.1});
+    bad[9].multipliers.push_back({"c", 1, 0.5, 0.2});
+    bad[10].boosts.push_back({Filter::all(), inf});
+    bad[11].multipliers.push_back({"c", kNaN});
+    auto data = random_vectors(30, 4, 4600);
+    HnswIndex h(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 30; ++i) h.add(i, data[i]);
+    for (const ScoreModifiers& m : bad) {
+        CHECK_THROWS_AS(std::invalid_argument, m.validate());
+        SearchOptions o;
+        o.modifiers = m;
+        CHECK_THROWS_AS(std::invalid_argument, (void)h.search(data[0], 3, 32, o));
+    }
+}
+
+TEST(scoring, sc04_indexes_promote_without_filtering) {
+    auto data = clustered(600, 8, 6, 4601);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 600; ++i) {
+        const Metadata md = Metadata().set("kind", i == 77 ? "verified_decision" : "other").set("conf", double(i % 10) / 10);
+        h.add(i, data[i], md);
+        f.add(i, data[i], md);
+    }
+    const auto query = data[5];
+    auto check_index = [&](auto& index, auto&& search) {
+        const auto plain = search(SearchOptions{});
+        SearchOptions none;
+        none.modifiers = ScoreModifiers{};  // empty: exactly the plain search
+        CHECK(same_results(plain, search(none)));
+        bool in_plain = false;
+        for (const auto& r : plain) in_plain = in_plain || r.id == 77;
+        SearchOptions o;
+        o.modifiers = ScoreModifiers{};
+        o.modifiers->boosts.push_back({Filter::eq("kind", "verified_decision"), 10.0});
+        o.modifiers->pool = 600;  // the whole index: 77 is surely in the pool
+        const auto boosted = search(o);
+        CHECK(!in_plain && boosted.size() == 10 && boosted[0].id == 77 && boosted[0].score > 10.0);
+        bool sorted = true;
+        for (std::size_t i = 1; i < boosted.size(); ++i) sorted = sorted && boosted[i - 1].score >= boosted[i].score;
+        CHECK(sorted);
+        SearchOptions conf;  // a multiplier: every result's score is its relevance times its confidence
+        conf.modifiers = ScoreModifiers{};
+        conf.modifiers->multipliers.push_back({"conf"});
+        bool exact = true;
+        for (const auto& r : search(conf)) exact = exact && std::abs(r.score - float(relevance_from_distance(r.distance, index.metric()) * double(r.id % 10) / 10)) < 1e-5f;
+        CHECK(exact);
+    };
+    check_index(h, [&](const SearchOptions& o) { return h.search(query, 10, 64, o); });
+    check_index(f, [&](const SearchOptions& o) { return f.search(query, 10, o); });
+    CHECK(close_to(relevance_from_distance(0, Metric::L2), 1.0) && close_to(relevance_from_distance(3, Metric::L2), 0.25));
+    CHECK(close_to(relevance_from_distance(0, Metric::Cosine), 1.0) && close_to(relevance_from_distance(2, Metric::Cosine), 0.0));
+    CHECK(close_to(relevance_from_distance(0, Metric::InnerProduct), 0.5) && relevance_from_distance(-5, Metric::InnerProduct) > 0.99);
+}
+
+TEST(scoring, sc05_sparse_and_hybrid) {
+    auto data = clustered(300, 8, 4, 4602);
+    HnswIndex dense(8, Metric::L2);
+    SparseIndex sparse;
+    const double day = 86400000.0, now = double(parse_date("2024-06-01"));
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        const Metadata md = Metadata().set("t", std::int64_t(now - double(i) * day));  // id i is i days old
+        dense.add(i, data[i], md);
+        sparse.add(i, {{1, std::uint32_t(2 + i % 5)}, {1.0f, 0.5f}}, md);
+    }
+    SearchOptions so;
+    so.modifiers = ScoreModifiers{};
+    so.modifiers->decays.push_back({"t", now, 1 * day});  // halves daily: the newest wins among equal dot products
+    const auto sr = sparse.search({{1}, {1.0f}}, 5, so);
+    CHECK(sr.size() == 5 && sr[0].id == 0 && sr[1].id == 1 && close_to(sr[1].score, 0.5, 1e-6));
+    HybridOptions ho;
+    const auto plain = hybrid_search(dense, data[150], sparse, {{1}, {1.0f}}, 5, ho);
+    ho.modifiers = ScoreModifiers{};
+    ho.modifiers->boosts.push_back({Filter::between("t", std::int64_t(now - 3 * day), std::int64_t(now)), 1.0});  // the four newest
+    ho.modifiers->pool = 300;
+    const auto hr = hybrid_search(dense, data[150], sparse, {{1}, {1.0f}}, 5, ho);
+    CHECK(!plain[0].base_score && hr.size() == 5 && hr[0].base_score && hr[0].id <= 3 && hr[0].score > 1.0);
+}
+
+TEST(scoring, sc07_edges) {
+    // Validation: every rule's remaining invalid values.
+    const double inf = std::numeric_limits<double>::infinity();
+    std::vector<ScoreModifiers> bad(9);
+    bad[0].decays.push_back({"t", 0, 1, DecayShape::Exponential, kNaN});
+    bad[1].decays.push_back({"t", 0, 1, DecayShape::Exponential, inf});
+    bad[2].decays.push_back({"t", 0, 1, DecayShape::Exponential, 1, -0.1});
+    bad[3].decays.push_back({"t", 0, 1, static_cast<DecayShape>(9)});
+    bad[4].multipliers.push_back({"c", inf});
+    bad[5].multipliers.push_back({"c", 1, inf});
+    bad[6].multipliers.push_back({"c", 1, kNaN});
+    bad[7].multipliers.push_back({"c", 1, 0, kNaN});
+    bad[8].decays.push_back({"t", 0, 1, DecayShape::Linear, 1, kNaN});
+    for (const ScoreModifiers& m : bad) CHECK_THROWS_AS(std::invalid_argument, m.validate());
+    // Dates: the other separators, long fractions, and what is refused.
+    CHECK(parse_date("2024-05-17 09:30") == parse_date("2024-05-17T09:30"));
+    CHECK(parse_date("2024-05-17T09:30:00.1234567") == parse_date("2024-05-17T09:30:00") + 123);  // beyond milliseconds: cut
+    for (const char* bad_date : {"2024-05-17T09", "2024-05-17T09:30:00+24:00", "2024-05-17T09:30:00+05:60", "2024-05-17T09:30:00+05:00x",
+                                 "2024-05-17T25:00", "2024-05-17T09:30:00.12x", "2024-05-17T09:30:00Zx", "2024-05-32", "2024-05-17x"})
+        CHECK_THROWS_AS(std::invalid_argument, (void)parse_date(bad_date));
+    const std::int64_t year0 = parse_date("0000-01-01");  // before the eras' zero: the negative branches
+    CHECK(parse_date(format_date(year0)) == year0 && format_date(year0 - 86400000).find("12-31T00:00:00.000Z") != std::string::npos);
+    // rescored(): a record whose metadata is gone (removed meanwhile) keeps its base score.
+    ScoreModifiers m;
+    m.boosts.push_back({Filter::exists("x"), 1.0});
+    const auto r = rescored({SearchResult{1, 0.0f}, SearchResult{2, 1.0f}}, 5, m, [](std::uint64_t) { return std::optional<Metadata>{}; },
+                            [](float d) { return 1.0 / (1.0 + d); });
+    CHECK(r.size() == 2 && r[0].id == 1 && close_to(r[0].score, 1.0, 1e-6) && close_to(r[1].score, 0.5, 1e-6));
+    // mmr_order(): candidates without vectors, zero vectors, and no relevance at all.
+    const std::vector<std::optional<std::vector<float>>> vectors = {std::vector<float>{1, 0}, std::nullopt, std::vector<float>{0, 0},
+                                                                     std::vector<float>{1, 0.01f}};
+    const auto order = mmr_order({1.0, 0.9, 0.8, 0.7}, vectors, 4, 0.5);
+    CHECK(order.size() == 4 && std::set<std::size_t>(order.begin(), order.end()).size() == 4 && order[0] == 0);
+    const auto flat_order = mmr_order({0.0, 0.0, 0.0}, {std::nullopt, std::nullopt, std::nullopt}, 2, 0.7);
+    CHECK(flat_order == std::vector<std::size_t>({0, 1}));  // nothing to choose by: the ranking's order
+    // The index wrappers: a negative diversity, and fewer results than k.
+    auto data = random_vectors(6, 4, 4604);
+    HnswIndex h(4, Metric::L2);
+    FlatIndex f(4, Metric::L2);
+    for (std::uint64_t i = 0; i < 6; ++i) {
+        h.add(i, data[i], Metadata().set("c", 0.5));
+        f.add(i, data[i], Metadata().set("c", 0.5));
+    }
+    SearchOptions neg;
+    neg.diversity = -0.1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.search(data[0], 3, 32, neg));
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search(data[0], 3, neg));
+    SearchOptions few;
+    few.modifiers = ScoreModifiers{};
+    few.modifiers->multipliers.push_back({"c"});
+    CHECK(h.search(data[0], 50, 64, few).size() == 6 && f.search(data[0], 50, few).size() == 6);
+    SearchOptions div_only;
+    div_only.diversity = 1.0;
+    CHECK(h.search(data[0], 50, 64, div_only).size() == 6);
+}
+
+TEST(scoring, sc08_values_directly) {
+    // Value's factories: the forms Metadata::set builds, made directly.
+    const Value b = Value::of_bool(true), k = Value::of_keyword("w");
+    CHECK(b.type == FieldType::Bool && b.b && k.type == FieldType::Keyword && k.s == "w");
+}
+
+TEST(scoring, sc06_collections) {
+    auto data = clustered(400, 8, 5, 4603);
+    Collection c(co_options(8, true));
+    const double day = 86400000.0, now = double(parse_date("2024-06-01"));
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        Document d = co_doc(data, i, true);
+        d.metadata = Metadata().set("t", std::int64_t(now - double(i % 50) * day)).set("conf", i == 300 ? 1.0 : 0.1);
+        c.add(i, d);
+    }
+    CollectionQuery q;
+    q.vector = data[3];
+    q.text = "alpha";
+    const auto plain = c.search(q, 10);
+    CHECK(!plain[0].base_score);
+    CollectionSearchOptions o;
+    o.modifiers = ScoreModifiers{};
+    o.modifiers->multipliers.push_back({"conf"});
+    o.modifiers->pool = 400;
+    const auto hits = c.search(q, 10, o);
+    bool consistent = hits.size() == 10;
+    for (const auto& h : hits) consistent = consistent && h.base_score && close_to(h.score, *h.base_score * (h.id == 300 ? 1.0 : 0.1), 1e-9);
+    CHECK(consistent && hits[0].id == 300);  // confidence 1.0 beats every 0.1 (its base score is within 10x of the best)
+    o.modifiers->multipliers[0].min = -1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(q, 10, o));
+}
+
+// ===========================================================================
+// Expiry, string keys and diversity (FE1-FE3)
+// ===========================================================================
+
+TEST(features, fe01_expiry) {
+    auto data = random_vectors(20, 4, 4700);
+    CollectionOptions o = co_options(4, true);
+    o.ttl.enabled = true;
+    Collection c(o);
+    const std::int64_t now = now_ms();
+    auto doc = [&](std::size_t i, std::optional<std::int64_t> expires) {
+        Document d = co_doc(data, i, true);
+        d.metadata = Metadata().set("n", std::int64_t(i));
+        d.expires_at = expires;
+        return d;
+    };
+    c.add(1, doc(1, now - 1000));        // already expired
+    c.add(2, doc(2, now + 3600000));     // in an hour
+    c.add(3, doc(3, std::nullopt));      // never (no default lifetime)
+    CHECK(!c.get(1) && !c.contains(1) && c.get(2) && c.get(2)->expires_at == now + 3600000 && c.get(3) && !c.get(3)->expires_at);
+    CHECK(c.get(2)->metadata == Metadata().set("n", std::int64_t(2)));  // the reserved field is reported apart, not as metadata
+    CHECK(c.count_where(Filter::all()) == 2 && c.size() == 3);  // hidden at once, freed later
+    CollectionQuery q;
+    q.vector = data[1];
+    q.text = "alpha";
+    bool hidden = true;
+    for (const auto& h : c.search(q, 10)) hidden = hidden && h.id != 1;
+    CHECK(hidden);
+    CHECK(c.remove_expired() == 1 && c.size() == 2 && c.remove_expired() == 0);
+    c.add(4, doc(4, now - 1));
+    const MaintenanceReport r = c.maintain();
+    CHECK(c.size() == 2 && std::find(r.notes.begin(), r.notes.end(), "removed 1 expired documents") != r.notes.end());
+    // A default lifetime.
+    CollectionOptions d = o;
+    d.ttl.default_ms = 40;
+    Collection short_lived(d);
+    short_lived.add(1, doc(1, std::nullopt));
+    CHECK(short_lived.contains(1) && *short_lived.get(1)->expires_at <= now_ms() + 40);
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    CHECK(!short_lived.contains(1) && short_lived.count_where(Filter::all()) == 0);
+    // Rules: expiry needs the option; the reserved names are refused; negative defaults.
+    Collection plain(co_options(4, true));
+    CHECK_THROWS_AS(std::invalid_argument, plain.add(9, doc(9, now)));
+    Document reserved = co_doc(data, 5, true);
+    reserved.metadata = Metadata().set("_expires_at", std::int64_t(0));
+    CHECK_THROWS_AS(std::invalid_argument, c.add(9, reserved));
+    CHECK_THROWS_AS(std::invalid_argument, c.set_metadata(2, Metadata().set("_key", "x")));
+    CollectionOptions neg = o;
+    neg.ttl.default_ms = -1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection(neg));
+    // A strict schema gains the field; durable collections keep expiry times.
+    CollectionOptions strict = o;
+    strict.schema = Schema::strict({{"n", FieldType::Int}});
+    Collection s(strict);
+    s.add(1, doc(1, now + 100000));
+    CHECK(s.get(1)->expires_at == now + 100000);
+    const std::string dir = co_dir("fe01");
+    {
+        auto dc = Collection::open(dir, o);
+        dc->add(1, doc(1, now - 5));
+        dc->add(2, doc(2, now + 3600000));
+    }
+    auto again = Collection::open(dir, o);
+    CHECK(!again->contains(1) && again->get(2)->expires_at == now + 3600000);
+    again.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(features, fe02_string_keys) {
+    auto data = random_vectors(10, 4, 4701);
+    CollectionOptions o = co_options(4, true);
+    o.string_ids = true;
+    Collection c(o);
+    const std::string uuid = "123e4567-e89b-12d3-a456-426614174000";
+    c.add("alpha", co_doc(data, 0, true));
+    CHECK(c.upsert(uuid, co_doc(data, 1, true)) && !c.upsert(uuid, co_doc(data, 2, true)));
+    CHECK(c.contains("alpha") && c.get(uuid)->key == uuid && c.get(uuid)->id == Collection::id_of(uuid) && !c.contains("beta"));
+    CHECK_THROWS_AS(std::invalid_argument, c.add("alpha", co_doc(data, 3, true)));  // a duplicate key
+    CollectionQuery q;
+    q.vector = data[0];
+    const auto hits = c.search(q, 2);
+    CHECK(hits[0].key == std::optional<std::string>("alpha") && !hits[0].metadata);
+    // A document added by number under a key's id is never mistaken for the key's.
+    c.add(Collection::id_of("gamma"), co_doc(data, 4, true));
+    CHECK(!c.get("gamma") && !c.remove("gamma") && c.contains(Collection::id_of("gamma")));
+    CHECK(c.remove("alpha") && !c.contains("alpha") && !c.remove("alpha"));
+    CHECK(Collection::id_of("a") != Collection::id_of("b") && Collection::id_of("") == Collection::id_of(""));
+    Collection off(co_options(4, true));
+    CHECK_THROWS_AS(std::logic_error, off.add("x", co_doc(data, 0, true)));
+    CHECK_THROWS_AS(std::logic_error, (void)off.get("x"));
+    const std::string dir = co_dir("fe02");
+    {
+        auto dc = Collection::open(dir, o);
+        dc->add("kept", co_doc(data, 5, true));
+    }
+    CHECK(Collection::open(dir, o)->get("kept")->key == std::optional<std::string>("kept"));
+    std::filesystem::remove_all(dir);
+}
+
+TEST(features, fe04_edges) {
+    auto data = random_vectors(20, 4, 4703);
+    // Strict schemas: the reserved fields added for both features, or kept when declared already.
+    CollectionOptions s = co_options(4, true);
+    s.ttl.enabled = true;
+    s.string_ids = true;
+    s.schema = Schema::strict({{"n", FieldType::Int}, {"_expires_at", FieldType::Int}});
+    Collection strict(s);
+    Document d = co_doc(data, 0, true);
+    d.metadata = Metadata().set("n", std::int64_t(1));
+    d.expires_at = now_ms() + 100000;
+    strict.add("k1", d);
+    CHECK(strict.get("k1")->key == std::optional<std::string>("k1") && strict.get("k1")->expires_at);
+    // Expiry with a filter; remove_expired and maintenance with nothing to remove; without expiry.
+    CollectionOptions o = co_options(4, true);
+    o.ttl.enabled = true;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        Document doc = co_doc(data, i, true);
+        doc.metadata = Metadata().set("g", std::int64_t(i % 2));
+        if (i < 3) doc.expires_at = now_ms() - 10;
+        c.add(i, doc);
+    }
+    CollectionQuery q;
+    q.vector = data[0];
+    CollectionSearchOptions filtered;
+    filtered.filter = Filter::eq("g", std::int64_t(0));
+    bool ok = true;
+    for (const auto& h : c.search(q, 10, filtered)) ok = ok && h.id % 2 == 0 && h.id >= 3;
+    CHECK(ok && c.count_where(Filter::eq("g", std::int64_t(0))) == 3);
+    CHECK(c.remove_expired() == 3 && c.remove_expired() == 0);
+    const MaintenanceReport r = c.maintain();
+    CHECK(std::none_of(r.notes.begin(), r.notes.end(), [](const std::string& n) { return n.find("expired") != std::string::npos; }));
+    Collection plain(co_options(4, true));
+    CHECK(plain.remove_expired() == 0);
+    CHECK_THROWS_AS(std::invalid_argument, (void)plain.set_metadata_where(Filter::all(), Metadata().set("_key", "x")));
+    // Empty modifiers on a collection: the plain ranking.
+    CollectionSearchOptions none;
+    none.modifiers = ScoreModifiers{};
+    const auto a = c.search(q, 5), b = c.search(q, 5, none);
+    bool same = a.size() == b.size();
+    for (std::size_t i = 0; i < a.size() && same; ++i) same = a[i].id == b[i].id && !b[i].base_score;
+    CHECK(same);
+    // A keyed upsert in a durable collection: logged, and recovered.
+    CollectionOptions k = co_options(4, true);
+    k.string_ids = true;
+    const std::string dir = co_dir("fe04");
+    {
+        auto dc = Collection::open(dir, k);
+        CHECK(dc->upsert("u1", co_doc(data, 1, true)) && !dc->upsert("u1", co_doc(data, 2, true)));
+    }
+    CHECK(Collection::open(dir, k)->get("u1")->text == co_doc(data, 2, true).text);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(features, fe05_runtime_settings_keys_and_snapshots) {
+    auto data = random_vectors(20, 4, 4704);
+    const std::int64_t now = now_ms();
+    CollectionOptions o = co_options(4, true);
+    o.ttl.enabled = true;
+    o.string_ids = true;
+    Collection c(o);
+    Document gone = co_doc(data, 0, true), kept = co_doc(data, 1, true);
+    gone.expires_at = now - 1000;
+    c.add("gone", gone);
+    c.add("kept", kept);
+    c.add(Collection::id_of("numeric"), co_doc(data, 2, true));  // stored by number under a key's id
+    // Keyed metadata: only the document stored under that exact key.
+    CHECK(c.set_metadata("kept", Metadata().set("tag", "x")) && c.get("kept")->metadata.get("tag")->s == "x");
+    CHECK(!c.set_metadata("gone", Metadata().set("tag", "x")) && !c.set_metadata("absent", Metadata()) && !c.set_metadata("numeric", Metadata()));
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.set_metadata("kept", Metadata().set("_key", "y")));
+    CHECK(!c.get("gone") && c.remove_expired() == 1);  // expiry and keys together
+    // A loaded collection starts with both off: expired documents show, keys are refused, until switched on.
+    c.add("late", [&] { Document d = co_doc(data, 3, true); d.expires_at = now - 1; return d; }());
+    std::ostringstream out;
+    c.save(out);
+    std::istringstream in(out.str());
+    auto loaded = Collection::load(in);
+    CHECK(loaded->contains(Collection::id_of("late")));
+    CHECK_THROWS_AS(std::logic_error, (void)loaded->get("kept"));
+    loaded->set_ttl(TtlOptions{true, 0});
+    loaded->set_string_ids(true);
+    CHECK(!loaded->contains(Collection::id_of("late")) && loaded->get("kept")->key == std::optional<std::string>("kept"));
+    CHECK_THROWS_AS(std::invalid_argument, loaded->set_ttl(TtlOptions{true, -5}));
+    // A strict schema without the reserved fields: refused clearly, not by a failing search later.
+    CollectionOptions strict = co_options(4, true);
+    strict.schema = Schema::strict({{"n", FieldType::Int}});
+    Collection s(strict);
+    CHECK_THROWS_AS(std::invalid_argument, s.set_ttl(TtlOptions{true, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, s.set_string_ids(true));
+    s.set_ttl(TtlOptions{});  // turning it off is always fine
+    const std::string sdir = co_dir("fe05s");
+    { auto made = Collection::open(sdir, strict); }
+    // Reopened, the stored strict schema is reported as it is (options() reported it as dynamic before).
+    CHECK(Collection::open(sdir, strict)->options().schema.mode() == SchemaMode::Strict);
+    CollectionOptions strict_ttl = strict;
+    strict_ttl.ttl.enabled = true;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(sdir, strict_ttl));  // the stored schema lacks _expires_at
+    std::filesystem::remove_all(sdir);
+    // Durable: expiry times and keys survive a snapshot, then a log replayed after it.
+    const std::string dir = co_dir("fe05");
+    {
+        auto dc = Collection::open(dir, o);
+        Document a = co_doc(data, 4, true);
+        a.expires_at = now + 3600000;
+        dc->add("before", a);
+        (void)dc->checkpoint();
+        dc->add("after", co_doc(data, 5, true));
+    }
+    auto again = Collection::open(dir, o);
+    CHECK(again->get("before")->expires_at == now + 3600000 && again->contains("after"));
+    again.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(features, fe06_combinations) {
+    auto data = clustered(400, 8, 4, 4705);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 400; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 4)).set("gold", i == 101));
+    // Modifiers with a filter: the boost works among the filtered only.
+    SearchOptions mf;
+    mf.filter = Filter::eq("g", std::int64_t(1));
+    mf.modifiers = ScoreModifiers{};
+    mf.modifiers->boosts.push_back({Filter::eq("gold", true), 10.0});
+    mf.modifiers->pool = 400;
+    const auto r1 = h.search(data[0], 5, 64, mf);
+    CHECK(r1[0].id == 101 && std::all_of(r1.begin(), r1.end(), [](const SearchResult& r) { return r.id % 4 == 1; }));
+    // Diversity with a filter, and with modifiers: still only matching records, the boosted one first.
+    SearchOptions both = mf;
+    both.diversity = 0.5;
+    const auto r2 = h.search(data[0], 5, 64, both);
+    CHECK(r2.size() == 5 && r2[0].id == 101 && std::all_of(r2.begin(), r2.end(), [](const SearchResult& r) { return r.id % 4 == 1; }));
+    // Hybrid modifiers when an id is only in the sparse index: its metadata comes from there.
+    HnswIndex dense(8, Metric::L2);
+    SparseIndex sparse;
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        dense.add(i, data[i]);
+        sparse.add(i, {{1}, {1.0f}});
+    }
+    sparse.add(999, {{1}, {1.0f}}, Metadata().set("gold", true));  // sparse only
+    HybridOptions ho;
+    ho.modifiers = ScoreModifiers{};
+    ho.modifiers->boosts.push_back({Filter::eq("gold", true), 10.0});
+    ho.modifiers->pool = 100;
+    const auto hr = hybrid_search(dense, data[0], sparse, {{1}, {1.0f}}, 3, ho);
+    CHECK(hr[0].id == 999 && hr[0].score > 10.0);
+    // reorder() followed by a snapshot: the reordered index is what reopens.
+    const std::string dir = co_dir("fe06");
+    std::string expected;
+    {
+        auto d = HnswIndex::open_durable(dir, 8, Metric::L2);
+        for (std::uint64_t i = 0; i < 400; ++i) d->add(i, data[i]);
+        (void)d->reorder();
+        (void)d->checkpoint();
+        d->add(500, data[1]);
+        std::ostringstream out;
+        d->save(out);
+        expected = out.str();
+    }
+    auto reopened = HnswIndex::open_durable(dir, 8, Metric::L2);
+    std::ostringstream out;
+    reopened->save(out);
+    CHECK(out.str() == expected);
+    reopened.reset();
+    std::filesystem::remove_all(dir);
+}
+
+TEST(features, fe07_expiry_under_concurrency) {
+    // Background maintenance removes expiring documents while searches and writes run:
+    // no errors, no expired document ever returned, and nothing expired left at the end.
+    auto data = random_vectors(600, 8, 4706);
+    CollectionOptions o = co_options(8, true);
+    o.ttl.enabled = true;
+    o.maintenance.mode = Maintenance::Background;
+    o.maintenance.interval = std::chrono::milliseconds(2);
+    Collection c(o);
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0}, expired_seen{0};
+    std::thread searcher([&] {
+        CollectionQuery q;
+        q.text = "alpha";
+        std::size_t i = 0;
+        while (!stop) {
+            q.vector = data[i++ % 600];
+            try {
+                CollectionSearchOptions so;
+                so.with_metadata = true;
+                for (const auto& h : c.search(q, 10, so)) {
+                    const auto r = c.get(h.id);  // a hit may expire just after the search: get() then hides it
+                    if (r && r->expires_at && *r->expires_at < now_ms() - 50) ++expired_seen;
+                }
+            } catch (...) {
+                ++errors;
+            }
+        }
+    });
+    run_threads(2, [&](std::size_t t) {
+        for (std::uint64_t i = t; i < 600; i += 2) {
+            Document d = co_doc(data, i, true);
+            d.expires_at = now_ms() + std::int64_t(i % 20);  // expiring within 20 ms
+            try {
+                (void)c.upsert(i, d);
+            } catch (...) {
+                ++errors;
+            }
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    stop = true;
+    searcher.join();
+    c.set_maintenance(MaintenancePolicy{});
+    (void)c.remove_expired();
+    CHECK(errors == 0 && expired_seen == 0 && c.count_where(Filter::all()) == 0 && c.size() == 0);
+}
+
+TEST(features, fe03_diversity) {
+    // Ten groups of six near-duplicates around different directions: a plain search
+    // returns one group; diversity spreads the results over groups. (MMR reorders
+    // the candidate pool only, max(4k, 20) by default: groups must fit in it.)
+    std::mt19937 rng(4702);
+    std::normal_distribution<float> tiny(0, 0.005f);
+    Vectors data;
+    for (std::size_t g = 0; g < 10; ++g)
+        for (std::size_t i = 0; i < 6; ++i) {
+            std::vector<float> v(16, 0.0f);
+            v[0] = 1.0f;
+            v[1 + g] = 0.6f;
+            for (float& x : v) x += tiny(rng);
+            data.push_back(v);
+        }
+    const std::vector<float> query = data[0];
+    auto groups = [](const auto& ids) {
+        std::set<std::uint64_t> g;
+        for (const auto id : ids) g.insert(id / 6);
+        return g.size();
+    };
+    HnswIndex h(16, Metric::Cosine);
+    FlatIndex f(16, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 60; ++i) {
+        h.add(i, data[i]);
+        f.add(i, data[i]);
+    }
+    for (int which = 0; which < 2; ++which) {
+        auto search = [&](const SearchOptions& so) { return which == 0 ? h.search(query, 5, 64, so) : f.search(query, 5, so); };
+        auto ids = [](const std::vector<SearchResult>& r) { std::vector<std::uint64_t> v; for (const auto& x : r) v.push_back(x.id); return v; };
+        const auto plain = search(SearchOptions{});
+        SearchOptions one;
+        one.diversity = 1.0;
+        SearchOptions mixed;
+        mixed.diversity = 0.3;
+        CHECK(groups(ids(plain)) == 1 && ids(search(one)) == ids(plain) && groups(ids(search(mixed))) >= 3 && search(mixed)[0].id == plain[0].id);
+        SearchOptions bad;
+        bad.diversity = 1.5;
+        CHECK_THROWS_AS(std::invalid_argument, (void)search(bad));
+    }
+    SparseIndex sp;
+    sp.add(1, {{1}, {1.0f}});
+    SearchOptions sd;
+    sd.diversity = 0.5;
+    CHECK_THROWS_AS(std::invalid_argument, (void)sp.search({{1}, {1.0f}}, 1, sd));
+    CollectionOptions co = co_options(16);
+    co.text = false;
+    Collection c(co);
+    for (std::uint64_t i = 0; i < 60; ++i) {
+        Document d;
+        d.vector = data[i];
+        c.add(i, d);
+    }
+    CollectionQuery q;
+    q.vector = query;
+    CollectionSearchOptions mixed;
+    mixed.diversity = 0.3;
+    std::vector<std::uint64_t> got;
+    for (const auto& hit : c.search(q, 5, mixed)) got.push_back(hit.id);
+    CHECK(got.size() == 5 && groups(got) >= 3);
+    mixed.diversity = -0.1;
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search(q, 5, mixed));
+    CollectionOptions text_only;
+    text_only.dim = 0;
+    Collection t(text_only);
+    Document td;
+    td.text = "word";
+    t.add(1, td);
+    CollectionQuery tq;
+    tq.text = "word";
+    CollectionSearchOptions td_opts;
+    td_opts.diversity = 0.5;
+    CHECK_THROWS_AS(std::invalid_argument, (void)t.search(tq, 1, td_opts));
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -18814,7 +19641,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"
