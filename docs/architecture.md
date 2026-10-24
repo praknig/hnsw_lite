@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 870 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 871 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -188,7 +188,7 @@ Because every memory block starts on a 64-byte boundary and every row is a whole
 
 ### Chunked storage
 
-Rows are stored in fixed-size blocks of `2^shelf_bits` rows. By default a block holds up to 65,536 rows but at most 8 MB (for example, 16,384 rows at 128 dimensions and 1,024 rows at 1,536 dimensions), so small indexes of long vectors stay small. New blocks are added when needed; existing blocks never move or grow. Finding vector `N`:
+Rows are stored in fixed-size blocks of `2^shelf_bits` rows. By default a block holds up to 65,536 rows but at most 8 MB (for example, 16,384 rows at 128 dimensions and 1,024 rows at 1,536 dimensions), so small indexes of long vectors stay small. New blocks are added when needed; existing blocks never move or grow. **Blocks are not filled when allocated:** each row is written when its vector is added (the vector, then zeros in the padding the SIMD kernels read), and large blocks come from the operating system as pages that become resident only when first written, so the unused part of a block costs address space but no memory. (Filling them cost an index of 100 vectors 17.5 MB resident; it now takes about 1.6 MB. Where transparent huge pages are set to `always`, each block's first write brings in a 2 MB page, so a small index holds about 2 MB per block it has written to.) Finding vector `N`:
 
 ```
 block   = N >> shelf_bits
@@ -206,7 +206,7 @@ Variable-size data (upper-level neighbor lists) comes from a bump allocator. It 
 
 - **Level 0:** every node has `M0 = 2 * M` slots. With `M = 16`, that is 32 slots × 4 bytes = 128 bytes, exactly two cache lines.
 - **Levels 1 and up:** a node at level `L` gets one arena allocation of `L * M` slots. Only about `1 / M` of nodes reach level 1, so most nodes use no extra memory.
-- **Empty slots** hold `kEmpty` (the maximum `NodeId`). A list's length is the position of the first `kEmpty`. New level-0 blocks are filled with byte `0xFF`, which makes every slot `kEmpty` with no extra work.
+- **Empty slots** hold `kEmpty` (the maximum `NodeId`). A list's length is the position of the first `kEmpty`. Level-0 blocks are left untouched when allocated; each node's slots are set to `kEmpty` when the node is added, so unused rows of a block never become resident.
 
 ### Memory budget
 

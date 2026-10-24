@@ -44,6 +44,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <malloc.h>  // mallopt, malloc_trim (l09)
+#endif
 #include <cstring>
 #include <initializer_list>
 #include <mutex>
@@ -11265,6 +11268,54 @@ TEST(lean, l07_with_sq8) {
     CHECK(h.search(data[7], 1, 64)[0].id == 7);
     auto h2 = load_hnsw(save_bytes(h));
     CHECK(save_bytes(*h2) == save_bytes(h) && h2->codec_trained());
+}
+
+TEST(lean, l09_unused_storage_is_not_resident) {
+    // Found by benchmarking: storage blocks hold 65,536 rows and were filled when
+    // allocated, so an index of 100 vectors held 17.5 MB resident (an 8 MiB vector
+    // block and an 8.6 MiB link block). Rows are now written as they are used, and
+    // pages never written cost no memory.
+#ifndef __linux__
+    SKIP("measures resident memory through /proc (Linux)");
+#else
+    if (!HNSW_ALLOC_HOOK) SKIP("sanitizers add their own memory");
+    // Large blocks from fresh pages, returned on release: otherwise glibc raises its
+    // threshold after big blocks are freed and recycles pages other tests left
+    // resident, which would hide the waste this test exists to catch.
+    mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    malloc_trim(0);
+    auto resident_mb = [] {
+        std::ifstream f("/proc/self/statm");
+        long pages_total = 0, pages_resident = 0;
+        f >> pages_total >> pages_resident;
+        return double(pages_resident) * double(sysconf(_SC_PAGESIZE)) / double(1 << 20);
+    };
+    auto data = random_vectors(100, 32, 4400);
+    const double before = resident_mb();
+    HnswIndex h(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) h.add(i, data[i]);
+    FlatIndex f(32, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) f.add(i, data[i]);
+    const double grown = resident_mb() - before;
+    std::string huge_pages = "unknown";
+    {
+        std::ifstream thp("/sys/kernel/mm/transparent_hugepage/enabled");
+        std::string line;
+        if (std::getline(thp, line)) {
+            const auto a = line.find('['), b = line.find(']');
+            if (a != std::string::npos && b != std::string::npos && b > a) huge_pages = line.substr(a + 1, b - a - 1);
+        }
+    }
+    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s)\n", grown, huge_pages.c_str());
+    // Without huge pages this takes about 1 MB. With transparent huge pages set to
+    // "always" (as on GitHub's runners), the first write into each of the three
+    // blocks brings in a whole 2 MB page: about 7 MB. Filled blocks took 25 MB.
+    CHECK(grown < 12.0);
+    // The vectors and links written row by row read back exactly, padding included.
+    bool same = true;
+    for (std::uint64_t i = 0; i < 100; ++i) same = same && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i];
+    CHECK(same && h.search(data[7], 1)[0].id == 7 && f.search(data[7], 1)[0].id == 7);
+#endif
 }
 
 TEST(lean, l08_default_keeps_everything) {
