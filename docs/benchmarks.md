@@ -53,6 +53,51 @@ In `--out`, per dataset:
 
 `bench/native_compare.cpp` compares hnsw-lite and hnswlib in C++ on identical data, without Python, and measures changes to the search: its first lines say how to build it (hnswlib is header-only; its headers are fetched once). Run without arguments, it reports both libraries' time per query and how far their results agree. To measure a change: build the program before it and keep that binary (the library is linked in statically), run `native_compare save` once, then alternate `native_compare time` between the old and new binaries; `native_compare profile` searches repeatedly for `perf record`, and prints a checksum of the results, which must not change when only speed should.
 
+## Stress and load testing at scale
+
+`bench/python/stress.py` tests hnsw-lite at a million vectors (by default) with checks, not only timings, and exits with 1 if any check fails:
+
+```bash
+pip install hnsw-lite-lib numpy psutil
+python bench/python/stress.py                                   # 1,000,000 x 128, every phase
+python bench/python/stress.py --vectors 100000 --duration 20    # a quick run
+python bench/python/stress.py --phases build,recall,load        # some phases only
+```
+
+| Phase | What it does | What it checks |
+|---|---|---|
+| `build` | Inserts the vectors in batches on every core | Every vector stored; insert speed holding up as the index grows |
+| `recall` | Exact ground truth by brute force, then searches at `ef` 32 to 256 | Recall@10 at least 0.9 at `ef` 128, and growing with `ef` |
+| `load` | 1, 2, 4… up to `--clients` concurrent search clients, `--duration` seconds each | No errors; queries per second and latency percentiles; throughput growing with clients (on several cores) |
+| `mixed` | Searchers and writers at once (inserts, updates, removes) | The exact final count; sampled ids present or absent as expected; sampled vectors identical to their last write; recall against a fresh brute force; upkeep leaving no vector unreachable |
+| `durable` | A child process writes to a durable collection and is killed mid-write (`SIGKILL`) | Every write it acknowledged survives recovery, with the right vector (one more may appear: written, but killed before acknowledging) |
+
+Other options: `--dim` (128), `--clusters` (1,000: real embeddings are clustered), `--M`, `--ef-construction`, `--ef` (128, for the load and mixed phases), `--batch`, `--threads`, `--queries` (200), `--writers` (2), `--crash-after` (10 s), `--seed`, `--out`. Memory: about (4 × dim + 200) bytes per vector for the index plus the test's own copy of the data (4 × dim bytes per vector): about 1.3 GB at a million 128-dimensional vectors.
+
+Results go to `stress-results/stress.md` (a summary with every check) and `stress.json`. Measured on one shared virtual core (so the load phase cannot scale with clients):
+
+| Phase | 1,000,000 × 128 |
+|---|---|
+| Build | 270 s, about 3,700 inserts/s on one core |
+| Recall@10 | 0.862 at `ef` 32, 0.970 at 64, 0.998 at 128, 1.000 at 256 |
+| Load (`ef` 128) | 4,462 queries/s on one core; p50 0.19 ms, p99 0.49 ms |
+| Mixed (30 s) | 59,185 searches during 6,954 changes; exact count and vectors; recall 0.998 |
+| Crash | 4,239 acknowledged writes, all recovered in 0.7 s |
+
+**What it found:** about 1 vector in 1,000 (1,119 of a million) could not be reached by a search before upkeep, which repaired them all in one second. A large bulk load is worth following with `upkeep()` (a collection with background maintenance does it for you).
+
+## Nightly benchmark
+
+`.github/workflows/benchmark.yml` runs `stress.py` every night at 02:00 UTC (and on demand: *Actions > Benchmark > Run workflow*, with the size and duration as inputs) and publishes the results to the **`benchmarks` branch**, created on the first run with no code history. It never commits to `master`: the README there shows the charts straight from the `benchmarks` branch, so they update without any commit to `master`, `master`'s protection and history stay untouched, and the bot's pushes trigger no other workflow.
+
+On the branch: `README.md` (the latest run, the charts, a table of the last 30 runs), `latest-recall.png`, `latest-load.png`, `latest-build.png`, `history.png` (insert speed, queries per second, recall and p99 latency across nights; rates and latencies drawn from zero, so noise looks like noise), `latest.json`, and every run's full results in `runs/`. If any check fails, the results are still published and the job fails, so a regression is both recorded and visible.
+
+**Sizing.** `stress.py --vectors auto` picks the largest run that fits in 70% of the free memory (about 1,400 bytes per vector at 128 dimensions: the index plus the test's copy of the data), at most `--max-vectors` (50 million); `--max-hours 4` stops building at two hours, so a run fits GitHub's six-hour limit. On GitHub's standard runner (16 GB) that is about 8 million vectors; 50 million needs about 70 GB.
+
+**A bigger machine.** Set the repository variable `BENCHMARK_RUNNER` (*Settings > Secrets and variables > Actions > Variables*) to a [larger runner](https://docs.github.com/en/actions/using-github-hosted-runners/using-larger-runners)'s label, or to `self-hosted` for your own machine; the workflow uses it in `runs-on` without any change. Compare nights on the same machine: the charts mark run sizes when they differ.
+
+**Locally:** `python bench/python/publish_benchmark.py --results stress-results --site <a directory>` draws the same charts and page from a `stress.py` run.
+
 ## Publishing results
 
 State the machine (CPU, cores, memory), the operating system, the library versions (the summary lists them), the dataset and every setting, and publish the JSON with the charts, so anyone can reproduce or reanalyze them. The standard public comparison is [ann-benchmarks](https://github.com/erikbern/ann-benchmarks): an adapter for hnsw-lite there is a natural next step.
