@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 894 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 903 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -220,7 +220,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 ## Project status
 
-Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, saving and loading (file format version 3), thread-safe indexes and parallel building (`add_batch`), bulk changes by filter, reading records back, search by stored ID, deadlines and cancellation, and compression (SQ8, binary and PQ codes with SIMD kernels, Matryoshka truncation, keeping only codes), an inverted file (IVF, IVF-PQ), and a disk-based index. Next: see the [roadmap](docs/project-notes.md#roadmap).
+Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys and saved settings; score modifiers, dates and diversity re-ranking; graph reordering; Python bindings and wheels; benchmark and stress tools with a nightly run. Next: see the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

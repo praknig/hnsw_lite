@@ -1000,6 +1000,8 @@ Filled by `open_durable` and `Collection::open` when you pass a pointer:
 |---|---|
 | `created` | A new directory was created (nothing recovered). |
 | `snapshot_lsn` | The sequence number of the snapshot recovery started from. |
+| `segments` | Log segments read. |
+| `replayed` | Log records replayed (aborted ones included). |
 | `fallbacks` | Newer snapshots that could not be read (an older one was used). |
 | `segments`, `replayed` | Log segments read; records replayed. |
 | `torn_bytes` | Bytes of a last record cut short by the crash, discarded. |

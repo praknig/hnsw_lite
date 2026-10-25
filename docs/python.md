@@ -123,11 +123,11 @@ docs.count_where(hl.Filter.ge("published", hl.to_ms("2024-01-01")))
 
 ```python
 hits = docs.search(vector=q, text="pricing", k=10, modifiers={
-    "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
-    "multiply": "provenance_confidence",                           # times a field (0 to 1)
-    "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
-              ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
-    "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
+   "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
+   "multiply": "provenance_confidence",                           # times a field (0 to 1)
+   "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
+             ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
+   "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
 })
 ```
 
@@ -217,7 +217,7 @@ f = F.eq("lang", "en") & (F.ge("year", 2020) | F.has_tag("tags", "featured")) & 
 | `Filter.exists(field)`, `Filter.all()` | has a value; everything |
 | `a & b`, `a \| b`, `~a` | and, or, not (Python's `and`, `or` and `not` cannot be overloaded: use the operators) |
 
-Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.
+Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). `hl.as_filter(f)` does that conversion explicitly (a `Filter` or `None` is returned as it is), for building on a dict filter with `&`, `|` and `~`. The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.
 
 ## How Python values are converted
 
@@ -244,6 +244,8 @@ p.M = 32
 p.quantization.codec = hl.Codec.SQ8
 index = hl.HnswIndex(dim=384, metric=hl.Metric.COSINE, params=p)
 ```
+
+`hl.CollectionOptions` (for `hl.Collection(options=...)`) also has `bm25`, an `hl.Bm25Params` with `k1` (1.2: how quickly repeated words stop adding to a score), `b` (0.75: how much long texts are discounted) and `avg_doc_length` (100 tokens); and `set_schema(fields, strict=False)`, which takes the same `{"name": type}` dict as the constructor's `schema` (with `strict=True`, fields outside it are refused).
 
 ## Threads, errors and limits
 
