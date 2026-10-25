@@ -202,6 +202,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 | Document | What's inside |
 |---|---|
+| [How it works](docs/how-it-works.md) | In plain terms: exact and approximate search, how the HNSW graph is built and searched, what each setting changes, filtering, deletion, memory, speed and durability |
 | [Getting started](docs/getting-started.md) | Building on every platform, build options, using hnsw-lite in your project, troubleshooting |
 | [User guide](docs/user-guide.md) | Everything the library does and how to use it: indexes, metrics, metadata, filters, batch and range search, threads, errors |
 | [Developer reference](docs/developer-reference.md) | Every method and parameter in detail: what it does, what it expects, what can go wrong, and its limits |
@@ -210,7 +211,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 894 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 903 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, the roadmap, and references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
