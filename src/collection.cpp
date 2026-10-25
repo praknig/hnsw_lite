@@ -165,11 +165,21 @@ void Collection::check_changeable() const {
     if (failed_) throw std::runtime_error("Collection: a failed change could not be rolled back; changes are refused until it is reopened");  // GCOVR_EXCL_BR_LINE: needs a second failure while restoring (see apply_upsert)
 }
 
-Collection::Prepared Collection::prepare(const Document& d) const { return prepare_keyed(d, std::nullopt); }
+CollectionOptions Collection::options() const {
+    const auto lock = read_lock(mutex_, this);
+    return options_;
+}
 
-Collection::Prepared Collection::prepare_keyed(const Document& d, std::optional<std::string_view> key) const {
+Collection::Runtime Collection::runtime() const {
+    const auto lock = read_lock(mutex_, this);
+    return {options_.ttl, options_.string_ids};
+}
+
+Collection::Prepared Collection::prepare(const Document& d) const { return prepare_keyed(d, std::nullopt, runtime()); }
+
+Collection::Prepared Collection::prepare_keyed(const Document& d, std::optional<std::string_view> key, const Runtime& rt) const {
     if (!replaying_) check_unreserved(d.metadata);  // a logged document carries its reserved fields
-    if (d.expires_at && !options_.ttl.enabled) throw std::invalid_argument("Collection: expires_at needs CollectionOptions::ttl.enabled");
+    if (d.expires_at && !rt.ttl.enabled) throw std::invalid_argument("Collection: expires_at needs CollectionOptions::ttl.enabled");
     Prepared p;
     if (!d.vector.empty()) {
         if (!dense_) throw std::invalid_argument("Collection: a vector given, but the collection has no dense side (dim 0)");
@@ -197,9 +207,9 @@ Collection::Prepared Collection::prepare_keyed(const Document& d, std::optional<
         p.sparse = d.sparse;
     }
     p.metadata = d.metadata;  // checked under the lock: the field table changes with dynamic schemas
-    if (options_.ttl.enabled && !replaying_) {  // the expiry time, fixed now, is logged with the document
+    if (rt.ttl.enabled && !replaying_) {  // the expiry time, fixed now, is logged with the document
         if (d.expires_at) p.metadata.set(kExpiresField, *d.expires_at);
-        else if (options_.ttl.default_ms > 0) p.metadata.set(kExpiresField, now_ms() + options_.ttl.default_ms);
+        else if (rt.ttl.default_ms > 0) p.metadata.set(kExpiresField, now_ms() + rt.ttl.default_ms);
     }
     if (key) p.metadata.set(kKeyField, std::string(*key));
     return p;
@@ -786,7 +796,7 @@ void Collection::fill_reserved(Metadata& m, std::optional<std::string>& key, std
 }
 
 std::size_t Collection::remove_expired() {
-    if (!options_.ttl.enabled) return 0;
+    if (!runtime().ttl.enabled) return 0;
     return remove_where(Filter::lt(kExpiresField, now_ms()));
 }
 
@@ -800,14 +810,15 @@ std::uint64_t Collection::id_of(std::string_view key) {
     return h ^ (h >> 31);
 }
 
-std::uint64_t Collection::keyed_id(std::string_view key) const {
-    if (!options_.string_ids) throw std::logic_error("Collection: string keys need CollectionOptions::string_ids");
+std::uint64_t Collection::keyed_id(std::string_view key, const Runtime& rt) const {
+    if (!rt.string_ids) throw std::logic_error("Collection: string keys need CollectionOptions::string_ids");
     return id_of(key);
 }
 
 void Collection::add(std::string_view key, const Document& document) {
-    const std::uint64_t id = keyed_id(key);
-    Prepared p = prepare_keyed(document, key);
+    const Runtime rt = runtime();
+    const std::uint64_t id = keyed_id(key, rt);
+    Prepared p = prepare_keyed(document, key, rt);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (slot_of_.count(id)) {
@@ -825,8 +836,9 @@ void Collection::add(std::string_view key, const Document& document) {
 }
 
 bool Collection::upsert(std::string_view key, const Document& document) {
-    const std::uint64_t id = keyed_id(key);
-    Prepared p = prepare_keyed(document, key);
+    const Runtime rt = runtime();
+    const std::uint64_t id = keyed_id(key, rt);
+    Prepared p = prepare_keyed(document, key, rt);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (const auto it = slot_of_.find(id); it != slot_of_.end()) {
@@ -855,25 +867,25 @@ void Collection::check_runtime(const TtlOptions& ttl, bool string_ids) const {
 }
 
 void Collection::set_ttl(const TtlOptions& ttl) {
+    const auto lock = write_lock(mutex_, this);  // the check reads the other setting: under the lock too
     check_runtime(ttl, options_.string_ids);
-    const auto lock = write_lock(mutex_, this);
     options_.ttl = ttl;
 }
 
 void Collection::set_string_ids(bool on) {
-    check_runtime(options_.ttl, on);
     const auto lock = write_lock(mutex_, this);
+    check_runtime(options_.ttl, on);
     options_.string_ids = on;
 }
 
 bool Collection::set_metadata(std::string_view key, const Metadata& metadata) {
-    const std::uint64_t id = keyed_id(key);
+    const std::uint64_t id = keyed_id(key, runtime());
     if (!get(key)) return false;  // absent, expired, or another key's document
     return set_metadata(id, metadata);
 }
 
 bool Collection::remove(std::string_view key) {
-    const std::uint64_t id = keyed_id(key);
+    const std::uint64_t id = keyed_id(key, runtime());
     {
         const auto lock = read_lock(mutex_, this);
         const auto it = slot_of_.find(id);
@@ -887,7 +899,7 @@ bool Collection::remove(std::string_view key) {
 bool Collection::contains(std::string_view key) const { return get(key).has_value(); }
 
 std::optional<DocumentRecord> Collection::get(std::string_view key) const {
-    std::optional<DocumentRecord> r = get(keyed_id(key));
+    std::optional<DocumentRecord> r = get(keyed_id(key, runtime()));
     if (r && r->key != std::optional<std::string>(std::string(key))) return std::nullopt;
     return r;
 }
@@ -1065,7 +1077,7 @@ MaintenanceReport Collection::maintain(std::chrono::milliseconds budget) {
             }
         }
     }
-    if (options_.ttl.enabled) {
+    if (runtime().ttl.enabled) {
         const std::size_t gone = remove_expired();
         if (gone) r.notes.push_back("removed " + std::to_string(gone) + " expired documents");
     }

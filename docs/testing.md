@@ -445,12 +445,68 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 114. **A reloaded collection reported its strict schema as dynamic.** The schema was still enforced (the metadata store keeps it), but `options().schema` was not restored on load, so code consulting it, the new strict-schema check included, saw an empty dynamic schema (`fe05`).
 115. **Hybrid modifiers could not reach beyond each side's default depth.** The fused pool grew with `ScoreModifiers::pool`, but each side still retrieved max(4k, 20), so a boosted document outside it could never be promoted; each side now retrieves at least the pool (`fe06`).
 116. **A huge but finite planner multiplier overflowed the beam width (found by fuzzing the HNSW loader).** `max_ef_multiplier` and `acorn_ef_multiplier` are checked to be finite and at least 1, so 1e300 passes; `ef` times it then exceeds `size_t`, and converting such a double is undefined behavior (the clamp to the index size came after the conversion). Three places did it: the planner's graph beam, ACORN's beam, and ACORN's fallback. `clamped_count()` (`common.h`) now clamps before converting. The planner code predates the fuzzing job, which found it at random (once in about 35,000 inputs); `pl19` reproduces it deterministically, failing under UBSan on the old code (`query_planner.cpp:369`) and passing on the fix.
+117. **A simulated latency shorter than asked, on Windows.** `BlockFile`'s simulated storage latency slept with `std::this_thread::sleep_for`, and `co15` checks that a read takes at least that long by `steady_clock`. MinGW sleeps with the coarse Windows timer while `steady_clock` reads the precise performance counter, so the sleep could end slightly early by that clock, and `co15` failed now and then in the Windows job only. The wait now finishes against `steady_clock` itself, so it lasts at least the latency on every platform. No other test asserts a minimum elapsed time, and this is the library's only sleep.
 
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 
 A test also looped over `*f.search_by_id(...)` directly and read freed memory, failing at random (about 60% of runs): a range-based `for` destroys the temporary optional before the loop body. The test stores the result first now, and the [user guide](user-guide.md#searching-by-stored-id) warns about this trap.
 
 Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
+
+## Adversarial tests
+
+`tests/test_adversarial.cpp` is a separate program (CTest entry `adversarial`) that tries to break the library, as a careless caller or an attacker might. Every test asserts a precise outcome: a clean exception, a bounded result, unchanged state, or memory that does not grow.
+
+```bash
+./build/test_adversarial              # all 16 tests
+./build/test_adversarial b4_          # the tests whose names contain "b4_"
+```
+
+| Category | Tests | What they attack |
+|---|---|---|
+| A. Absurd sizes | `a1`–`a3` | `k`, `ef` and limits near 2^64 (results bounded by what is stored, nothing reserved); dimensions of 0, above `kMaxDim` and near 2^64 (refused before allocating); a 1 MB keyword, 3,000 fields, 10,000 tags |
+| B. Leaks and growth | `b1`–`b5` | Building and destroying every kind of index and collection; 300 rounds of rejected operations; 200 durable open/close cycles (open files counted); keyword churn with unique values (the dictionary must forget them); save and load cycles. Resident memory is measured on Linux and must stay flat; under AddressSanitizer, LeakSanitizer checks instead |
+| C. Hostile numbers | `c1`–`c3` | NaN and infinity in every input; values near the float maximum on every metric (no NaN, infinities sorted last); zero vectors under cosine, denormals, 2,000 identical vectors |
+| D. Structural abuse | `d1`–`d3` | Filters nested 100,000 deep (refused at 256, no stack overflow), 100,000-value lists and 50,000-tag conditions; every operation on empty and emptied indexes; writes from inside a search predicate (refused) |
+| E. Corrupt files | `e1` | About 3,200 truncated or byte-flipped files across the four formats: each refused cleanly |
+| F. Concurrency | `f1` | Eight threads mixing every operation at once; then a healthy graph and every remaining id findable |
+
+CI runs it in every platform job, under AddressSanitizer, UBSan and LeakSanitizer (with leak detection), and its concurrency tests (`f1`, `d3`) under ThreadSanitizer.
+
+**What it found:** the library withstood every attack. One consequence of a deliberate design was made explicit: any finite float is accepted and overflowing distances become infinity, so in an L2 or inner-product graph a vector with components near 3e38 ties all its distances at infinity and graph search may not reach it (exact search does; see the limits in the [developer reference](developer-reference.md#11-limits-at-a-glance)). `c2` checks the contract: no NaN anywhere, infinities sorted last, exact search finding the vector.
+
+## Race-condition tests
+
+`tests/test_races.cpp` (CTest entry `races`) makes threads collide deliberately on every kind of shared state. A race depends on timing, so a test can pass a thousand times and still hide one: these tests are meant to run under ThreadSanitizer, which reports any unsynchronized access even when the timing worked out. Without it they still check that results stay consistent. Each test runs for `RACE_MS` milliseconds (400 by default; CI uses 1,500).
+
+```bash
+cmake -B build-tsan -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+cmake --build build-tsan --target test_races
+RACE_MS=1500 ./build-tsan/test_races
+```
+
+| Test | Collision |
+|---|---|
+| `r01` | `set_ttl` and `set_string_ids` changing while keyed writes, reads, removals, `remove_expired` and searches run |
+| `r02` | Background maintenance while its policy changes and writes and searches continue; the collection destroyed mid-maintenance |
+| `r03` | A durable collection: concurrent writes, checkpoints, maintenance and searches |
+| `r04` | `set_planner_params` and `set_auto_compact` while searches and writes read them |
+| `r05` | The shared thread pool: parallel batch searches from several threads, parallel batch inserts, `reorder()` |
+| `r06` | Hybrid search (with modifiers) while both the dense and the sparse index change |
+| `r07` | IVF lists retrained and a codec trained automatically by inserts, while searches run |
+| `r08` | A sparse index: adds, removes, searches and save/load at once |
+| `r09` | Cancellation and deadlines fired from other threads during `compact`, `reorder` and `rebuild` |
+| `r10` | One `DiskIndex` file, two open instances, many threads searching (with and without a filter): concurrent results must equal the sequential ones |
+| `r11` | `remove_where` and `set_metadata_where` sweeping the collection while keyed writes, reads, filtered counts and filtered searches run |
+| `r12` | Snapshots (`save`) of a collection and a flat index taken while writers run: each must load back internally consistent |
+
+**What they found:** three data races, all in the collection's runtime settings (`r01`). `set_ttl()` and `set_string_ids()` wrote the settings under the collection's lock, while keyed operations, the preparation of every document and `remove_expired()` read them without it; the setters also read each other's setting before locking. Every test passed on its results; only ThreadSanitizer saw them. Each operation now reads one snapshot of the settings under the lock, and `options()` returns a copy taken under the lock. Tests `r02` to `r12` found no race: maintenance, durability, setters, the thread pool, hybrid search, training, sparse indexes, cancellation, shared disk indexes, bulk changes and snapshots were clean under deliberate collision.
+
+**Beyond threads in one process.** Two Python tests cover what ThreadSanitizer cannot see: `test_python_threads_run_in_parallel_safely` (eight Python threads in the C++ code at once, since the bindings release the GIL) and `test_durable_directory_is_locked_across_processes` (a second process is refused a durable directory another holds; killing the holder releases the lock, as `flock` and `LockFileEx` are released by the operating system, and its acknowledged write survives).
+
+**Nightly.** The nightly workflow runs the adversarial tests three times under AddressSanitizer, UBSan and LeakSanitizer, and the race tests three times at 5 seconds per test under ThreadSanitizer, with the adversarial concurrency tests five times: races are probabilistic, and more runs see more interleavings.
+
+**What these tests cannot show.** ThreadSanitizer finds data races, not logic races (a check and an action each properly locked, with the state changing between them): only the tests' consistency checks catch those. Each run sees only the interleavings that happen during it. ThreadSanitizer runs on x86 Linux; the ARM jobs run the tests without race detection.
 
 ## Continuous integration
 

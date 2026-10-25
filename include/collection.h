@@ -235,7 +235,9 @@ public:
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
-    const CollectionOptions& options() const { return options_; }
+    /// A copy of the options, taken under the lock (set_ttl and set_string_ids may
+    /// change them from another thread).
+    CollectionOptions options() const;
 
     /// The k best documents for the query (at least one part; std::invalid_argument
     /// otherwise, or for a part the collection does not have).
@@ -293,11 +295,18 @@ public:
 
 private:
     struct Prepared;  // a checked document (its metadata is checked under the lock)
-    Prepared prepare_keyed(const Document& d, std::optional<std::string_view> key) const;
+    /// The runtime settings (expiry, string keys), read once under the lock: an operation
+    /// uses one consistent snapshot, as if it ran entirely before or after a change.
+    struct Runtime {
+        TtlOptions ttl;
+        bool string_ids = false;
+    };
+    Runtime runtime() const;
+    Prepared prepare_keyed(const Document& d, std::optional<std::string_view> key, const Runtime& rt) const;
     std::optional<Filter> alive_filter() const;  // expiry: not yet expired (none without expiry)
     bool expired(NodeId slot) const;
     void fill_reserved(Metadata& md, std::optional<std::string>& key, std::optional<std::int64_t>* expires) const;
-    std::uint64_t keyed_id(std::string_view key) const;
+    std::uint64_t keyed_id(std::string_view key, const Runtime& rt) const;
     void check_runtime(const TtlOptions& ttl, bool string_ids) const;  // a strict schema has the reserved fields
     bool replaying_ = false;  // replay(): documents applied exactly as logged (expiry and keys included)
     Prepared prepare(const Document& d) const;

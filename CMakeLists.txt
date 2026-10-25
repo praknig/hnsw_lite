@@ -102,6 +102,21 @@ if(HNSW_LITE_BUILD_TESTS)
       endforeach()
     endif()
   endforeach()
+
+  # A separate program that tries to break the library: absurd sizes, leaks and
+  # unbounded growth, hostile numbers, structural abuse, corrupt files, concurrent
+  # misuse (tests/test_adversarial.cpp). Most telling under the sanitizers.
+  add_executable(test_adversarial tests/test_adversarial.cpp)
+  target_link_libraries(test_adversarial PRIVATE hnsw_lite)
+  hnsw_lite_setup(test_adversarial)
+  add_test(NAME adversarial COMMAND test_adversarial)
+
+  # Race-condition tests: threads deliberately colliding on every kind of shared
+  # state (tests/test_races.cpp). Written for ThreadSanitizer (CI's thread-sanitizer job).
+  add_executable(test_races tests/test_races.cpp)
+  target_link_libraries(test_races PRIVATE hnsw_lite)
+  hnsw_lite_setup(test_races)
+  add_test(NAME races COMMAND test_races)
 endif()
 
 if(HNSW_LITE_BUILD_BENCHMARKS)

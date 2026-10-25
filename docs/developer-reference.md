@@ -222,7 +222,7 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t size() const` | Number of documents. |
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
-| `const CollectionOptions& options() const` | The collection's settings (for a recovered collection, the stored ones). |
+| `CollectionOptions options() const` | A copy of the collection's settings, taken under its lock, since `set_ttl` and `set_string_ids` may change them from another thread (for a recovered collection, the stored ones). |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only pointers to the sides (null if absent), for example to call `health()` on the dense side. Do not keep them beyond the collection's lifetime. |
 
 ```cpp
@@ -389,7 +389,7 @@ struct MaintenanceStatus {
 | `std::size_t remove_expired()` | With `ttl`: removes every expired document, returning how many (they are already hidden). `maintain()` calls it and notes "removed N expired documents". 0 without `ttl`. |
 | `static std::uint64_t id_of(std::string_view key)` | A key's numeric id: a 64-bit hash (FNV-1a with a SplitMix64 finish). |
 | `bool set_metadata(std::string_view key, const Metadata& metadata)` | Changes only the given fields of the document stored under that exact key; `false` if there is none (absent, expired, or another key's document). |
-| `void set_ttl(const TtlOptions& ttl)`, `void set_string_ids(bool on)` | The runtime settings, at any time: **a loaded collection starts with both off** (`load()` takes no options), so expired documents show and keys are refused until they are switched on. Throw `std::invalid_argument` if a strict schema lacks the reserved field; `open()` checks the same. |
+| `void set_ttl(const TtlOptions& ttl)`, `void set_string_ids(bool on)` | The runtime settings, at any time, from any thread (an operation already running uses the settings it started with): **a loaded collection starts with both off** (`load()` takes no options), so expired documents show and keys are refused until they are switched on. Throw `std::invalid_argument` if a strict schema lacks the reserved field; `open()` checks the same. |
 | `add(key, doc)`, `upsert(key, doc)`, `get(key)`, `contains(key)`, `remove(key)` | With `string_ids` (`std::logic_error` otherwise): the document's id is `id_of(key)`, and the key is kept with it. `add` refuses a key already present; both refuse a key whose id belongs to **another** key (`std::invalid_argument`), so two keys are never mixed up. `get`, `contains` and `remove` never act on a document that was not stored under that exact key. Hits report `key`. |
 
 **Reserved metadata names:** `_expires_at` (an integer) and `_key` (a keyword) hold the expiry time and the key; your metadata may not use them (`std::invalid_argument`). Strict schemas gain them automatically when the features are on at creation; a strict schema created without them cannot later store them. Expiry times are fixed when a document is written and logged with it, so recovery after a crash keeps them exactly.
@@ -1140,6 +1140,7 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic types; a field keeps its first type |
+| Vector magnitudes | Any finite float is accepted. A distance that overflows becomes infinity (never NaN), and infinities sort last, ties in insertion order. Consequence: in an L2 or inner-product graph, a vector whose distances to every neighbor overflow (components near 3e38) ties them all at infinity, so graph search may not reach it; exact search (`Strategy::ForceExact`, `FlatIndex`) still finds it. Cosine normalizes, so it is unaffected. Real embeddings are many orders of magnitude below this. |
 | Filters | At most 256 levels deep; whole-value comparisons (no substring or full-text matching) |
 | Text | No stemming, stop words or synonyms; 32-bit hashed terms |
 | Concurrency | One change at a time per index or collection; searches in parallel; no changes from inside predicates |
@@ -1347,7 +1348,7 @@ class Collection {
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
-    const CollectionOptions& options() const;
+    CollectionOptions options() const;
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
     void save(const std::string& path) const;
     void save(std::ostream& out) const;
