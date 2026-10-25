@@ -102,6 +102,14 @@ if(HNSW_LITE_BUILD_TESTS)
       endforeach()
     endif()
   endforeach()
+
+  # A separate program that tries to break the library: absurd sizes, leaks and
+  # unbounded growth, hostile numbers, structural abuse, corrupt files, concurrent
+  # misuse (tests/test_adversarial.cpp). Most telling under the sanitizers.
+  add_executable(test_adversarial tests/test_adversarial.cpp)
+  target_link_libraries(test_adversarial PRIVATE hnsw_lite)
+  hnsw_lite_setup(test_adversarial)
+  add_test(NAME adversarial COMMAND test_adversarial)
 endif()
 
 if(HNSW_LITE_BUILD_BENCHMARKS)
@@ -129,4 +137,3 @@ if(HNSW_LITE_BUILD_PYTHON)
   pybind11_add_module(_core python/src/bindings.cpp)
   target_link_libraries(_core PRIVATE hnsw_lite)
   install(TARGETS _core LIBRARY DESTINATION hnsw_lite_lib)
-endif()

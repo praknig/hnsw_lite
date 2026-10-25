@@ -348,11 +348,18 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
 
       - name: Build
-        run: cmake --build build --parallel --target test_comprehensive
+        run: cmake --build build --parallel --target test_comprehensive test_adversarial
 
       - name: Test threaded groups
         # The threaded groups (14), four at a time.
         run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk|health|upkeep|rebuild|wal|durable|sparse|collection|maintenance|presets|features|scoring|reorder)(\..*)?$'
+
+      - name: Adversarial concurrency
+        # Every operation at once from eight threads, and writes from inside a search
+        # (tests/test_adversarial.cpp): the data races ThreadSanitizer is for.
+        run: |
+          ./build/test_adversarial f1_
+          ./build/test_adversarial d3_
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).

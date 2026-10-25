@@ -1140,6 +1140,7 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic types; a field keeps its first type |
+| Vector magnitudes | Any finite float is accepted. A distance that overflows becomes infinity (never NaN), and infinities sort last, ties in insertion order. Consequence: in an L2 or inner-product graph, a vector whose distances to every neighbor overflow (components near 3e38) ties them all at infinity, so graph search may not reach it; exact search (`Strategy::ForceExact`, `FlatIndex`) still finds it. Cosine normalizes, so it is unaffected. Real embeddings are many orders of magnitude below this. |
 | Filters | At most 256 levels deep; whole-value comparisons (no substring or full-text matching) |
 | Text | No stemming, stop words or synonyms; 32-bit hashed terms |
 | Concurrency | One change at a time per index or collection; searches in parallel; no changes from inside predicates |

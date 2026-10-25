@@ -452,6 +452,28 @@ A test also looped over `*f.search_by_id(...)` directly and read freed memory, f
 
 Two test assumptions were also wrong and corrected: a zero vector is valid with cosine distance (as documented), and graphs with `M = 2` are poorly connected however they are built (about 89% of vectors reachable even one by one), so `b08` compares with one-by-one adds.
 
+## Adversarial tests
+
+`tests/test_adversarial.cpp` is a separate program (CTest entry `adversarial`) that tries to break the library, as a careless caller or an attacker might. Every test asserts a precise outcome: a clean exception, a bounded result, unchanged state, or memory that does not grow.
+
+```bash
+./build/test_adversarial              # all 16 tests
+./build/test_adversarial b4_          # the tests whose names contain "b4_"
+```
+
+| Category | Tests | What they attack |
+|---|---|---|
+| A. Absurd sizes | `a1`–`a3` | `k`, `ef` and limits near 2^64 (results bounded by what is stored, nothing reserved); dimensions of 0, above `kMaxDim` and near 2^64 (refused before allocating); a 1 MB keyword, 3,000 fields, 10,000 tags |
+| B. Leaks and growth | `b1`–`b5` | Building and destroying every kind of index and collection; 300 rounds of rejected operations; 200 durable open/close cycles (open files counted); keyword churn with unique values (the dictionary must forget them); save and load cycles. Resident memory is measured on Linux and must stay flat; under AddressSanitizer, LeakSanitizer checks instead |
+| C. Hostile numbers | `c1`–`c3` | NaN and infinity in every input; values near the float maximum on every metric (no NaN, infinities sorted last); zero vectors under cosine, denormals, 2,000 identical vectors |
+| D. Structural abuse | `d1`–`d3` | Filters nested 100,000 deep (refused at 256, no stack overflow), 100,000-value lists and 50,000-tag conditions; every operation on empty and emptied indexes; writes from inside a search predicate (refused) |
+| E. Corrupt files | `e1` | About 3,200 truncated or byte-flipped files across the four formats: each refused cleanly |
+| F. Concurrency | `f1` | Eight threads mixing every operation at once; then a healthy graph and every remaining id findable |
+
+CI runs it in every platform job, under AddressSanitizer, UBSan and LeakSanitizer (with leak detection), and its concurrency tests (`f1`, `d3`) under ThreadSanitizer.
+
+**What it found:** the library withstood every attack. One consequence of a deliberate design was made explicit: any finite float is accepted and overflowing distances become infinity, so in an L2 or inner-product graph a vector with components near 3e38 ties all its distances at infinity and graph search may not reach it (exact search does; see the limits in the [developer reference](developer-reference.md#11-limits-at-a-glance)). `c2` checks the contract: no NaN anywhere, infinities sorted last, exact search finding the vector.
+
 ## Continuous integration
 
 Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).
