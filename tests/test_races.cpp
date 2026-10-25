@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "collection.h"
+#include "disk_index.h"
 #include "flat_index.h"
 #include "hnsw_index.h"
 #include "sparse.h"
@@ -449,6 +450,154 @@ RACE_TEST(r09_cancellation_and_deadlines_from_other_threads) {
     });
     std::printf("    %d completed, %d cancelled\n", completed.load(), cancelled.load());
     CHECK(h.size() == 1500 && h.search(data[7], 1)[0].id == 7);
+}
+
+// ---------------------------------------------------------------- r10
+
+RACE_TEST(r10_disk_index_shared_by_many_searchers) {
+    // One file, two open instances, many threads searching both, with and without a
+    // filter: concurrent results must equal the sequential ones (search is
+    // deterministic), whatever the interleaving.
+    const std::string path = temp_dir("r10") + ".disk";
+    auto data = random_vectors(800, 8, 10);
+    std::vector<std::uint64_t> ids(800);
+    std::vector<float> flat;
+    std::vector<Metadata> md;
+    for (std::uint64_t i = 0; i < 800; ++i) {
+        ids[i] = i;
+        flat.insert(flat.end(), data[i].begin(), data[i].end());
+        md.push_back(Metadata().set("g", std::int64_t(i % 4)));
+    }
+    DiskIndex::build(path, ids, flat, 8, Metric::L2, {}, md);
+    auto a = DiskIndex::open(path);
+    auto b = DiskIndex::open(path);
+    SearchOptions filtered;
+    filtered.filter = Filter::eq("g", std::int64_t(2));
+    std::vector<std::vector<std::uint64_t>> expected(40), expected_f(40);
+    for (std::size_t q = 0; q < 40; ++q) {
+        for (const auto& r : a->search(data[q * 7], 10)) expected[q].push_back(r.id);
+        for (const auto& r : a->search(data[q * 7], 10, {}, filtered)) expected_f[q].push_back(r.id);
+    }
+    std::atomic<int> mismatches{0};
+    auto searcher = [&](const DiskIndex& d) {
+        return [&](std::size_t, std::mt19937& rng) {
+            const std::size_t q = rng() % 40;
+            std::vector<std::uint64_t> got, got_f;
+            for (const auto& r : d.search(data[q * 7], 10)) got.push_back(r.id);
+            for (const auto& r : d.search(data[q * 7], 10, {}, filtered)) got_f.push_back(r.id);
+            if (got != expected[q] || got_f != expected_f[q]) ++mismatches;
+        };
+    };
+    collide({searcher(*a), searcher(*a), searcher(*a), searcher(*b), searcher(*b)});
+    CHECK(mismatches == 0);
+    a.reset();
+    b.reset();
+    std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------- r11
+
+RACE_TEST(r11_bulk_changes_against_keyed_writes) {
+    // remove_where and set_metadata_where sweep the whole collection while keyed
+    // writes, reads and filtered counts run: every count stays within bounds and
+    // every document read back is complete.
+    auto data = random_vectors(300, 8, 11);
+    CollectionOptions o = manual_options(8);
+    o.string_ids = true;
+    Collection c(o);
+    std::atomic<int> bad{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::size_t i = rng() % 300;
+            Document d;
+            d.vector = data[i];
+            d.metadata = Metadata().set("g", std::int64_t(i % 5)).set("flag", false);
+            (void)c.upsert("k" + std::to_string(i), d);
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            if (rng() % 2) (void)c.set_metadata_where(Filter::eq("g", std::int64_t(rng() % 5)), Metadata().set("flag", true));
+            else (void)c.remove_where(Filter::eq("g", std::int64_t(rng() % 5)) && Filter::eq("flag", true));
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            const std::size_t i = rng() % 300;
+            if (const auto r = c.get("k" + std::to_string(i)))
+                if (!r->metadata.get("g") || r->metadata.get("g")->i != std::int64_t(i % 5) || !r->metadata.get("flag")) ++bad;
+            // Each count bounded on its own: two calls are two moments, and writers run in
+            // between, so "some <= all" across them would not hold (found on macOS CI).
+            const std::size_t all = c.count_where(Filter::all()), some = c.count_where(Filter::eq("flag", true));
+            if (all > 300 || some > 300) ++bad;
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            CollectionQuery q;
+            q.vector = data[rng() % 300];
+            CollectionSearchOptions so;
+            so.filter = Filter::eq("flag", false);
+            so.with_metadata = true;
+            for (const auto& h : c.search(q, 5, so))
+                if (!h.metadata || !h.metadata->get("flag") || h.metadata->get("flag")->b) ++bad;
+        },
+    });
+    CHECK(bad == 0 && c.count_where(Filter::all()) == c.size());
+}
+
+// ---------------------------------------------------------------- r12
+
+RACE_TEST(r12_snapshots_taken_during_writes) {
+    // Saving while writers run: every snapshot must load back internally consistent
+    // (counts agree, every stored document readable and findable by its own vector).
+    auto data = random_vectors(300, 8, 12);
+    Collection c(manual_options(8));
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        Document d;
+        d.vector = data[i];
+        d.text = "word" + std::to_string(i % 3);
+        c.add(i, d);
+        f.add(i, data[i]);
+    }
+    std::atomic<int> inconsistent{0}, snapshots{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = rng() % 300;
+            Document d;
+            d.vector = data[i];
+            d.text = "word" + std::to_string(i % 3);
+            (void)c.upsert(i, d);
+            if (rng() % 3 == 0) (void)c.remove(rng() % 300);
+            (void)f.upsert(i, data[i]);
+            if (rng() % 3 == 0) (void)f.remove(rng() % 300);
+        },
+        [&](std::size_t, std::mt19937&) {
+            std::ostringstream out;
+            c.save(out);
+            std::istringstream in(out.str());
+            auto copy = Collection::load(in);
+            if (copy->count_where(Filter::all()) != copy->size()) ++inconsistent;
+            for (std::uint64_t i = 0; i < 300; ++i) {
+                const auto r = copy->get(i);
+                if (!r) continue;
+                if (!r->vector || *r->vector != data[i]) {
+                    ++inconsistent;
+                    continue;
+                }
+                CollectionQuery q;
+                q.vector = *r->vector;
+                const auto hits = copy->search(q, 1);
+                if (hits.empty() || hits[0].id != i) ++inconsistent;
+            }
+            ++snapshots;
+        },
+        [&](std::size_t, std::mt19937&) {
+            std::ostringstream out;
+            f.save(out);
+            std::istringstream in(out.str());
+            auto copy = FlatIndex::load(in);
+            for (std::uint64_t i = 0; i < 300; ++i)
+                if (const auto v = copy->get_vector(i); v && *v != data[i]) ++inconsistent;
+        },
+    });
+    std::printf("    %d collection snapshots checked\n", snapshots.load());
+    CHECK(inconsistent == 0 && snapshots > 0);
 }
 
 // ---------------------------------------------------------------- main

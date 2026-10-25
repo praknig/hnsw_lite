@@ -31,6 +31,7 @@
 #include <vector>
 #if defined(__linux__)
 #include <dirent.h>
+#include <sys/prctl.h>
 #endif
 
 #include "collection.h"
@@ -122,15 +123,22 @@ int open_files() {
     return -1;
 }
 
-/// Runs `round` `rounds` times and checks that resident memory does not keep growing:
-/// after a warm-up, the last measurement may exceed the first by at most `slack_kb`
-/// (allocators keep some freed memory). Skipped where memory cannot be measured, or
-/// under AddressSanitizer, whose quarantine holds freed memory on purpose (there,
-/// LeakSanitizer checks for leaks instead).
+/// Runs `round` `rounds` times and checks that resident memory does not KEEP growing.
+/// Memory is measured for the whole process, which also reflects how the allocator
+/// reuses or returns what earlier tests freed: a one-time shift can land in either
+/// window (found on CI: b4 grew 7.9 MB once in the coverage job, then stayed flat; b1
+/// jumped by one 2 MB transparent huge page in a second window). A leak grows
+/// steadily, so the test fails only if BOTH windows grow by more than half of
+/// `slack_kb`. (main() also turns transparent huge pages off for this program, so
+/// memory moves in 4 KB pages rather than 2 MB jumps.) Skipped where
+/// memory cannot be measured, or under AddressSanitizer, whose quarantine holds freed
+/// memory on purpose (there, LeakSanitizer checks for leaks instead).
 void check_no_growth(int rounds, long slack_kb, const std::function<void()>& round) {
     for (int i = 0; i < 3; ++i) round();  // warm-up
     const long before = rss_kb();
-    for (int i = 0; i < rounds; ++i) round();
+    for (int i = 0; i < rounds / 2; ++i) round();
+    const long middle = rss_kb();
+    for (int i = rounds / 2; i < rounds; ++i) round();
     const long after = rss_kb();
 #if defined(__SANITIZE_ADDRESS__)
     constexpr bool asan = true;
@@ -144,8 +152,9 @@ void check_no_growth(int rounds, long slack_kb, const std::function<void()>& rou
     constexpr bool asan = false;
 #endif
     if (before < 0 || asan) return;
-    std::printf("    resident memory %ld KB -> %ld KB over %d rounds\n", before, after, rounds);
-    if (after - before > slack_kb) fail(__LINE__, "memory grew by " + std::to_string(after - before) + " KB");
+    std::printf("    resident memory %ld KB -> %ld KB -> %ld KB over two windows of %d rounds\n", before, middle, after, rounds / 2);
+    if (middle - before > slack_kb / 2 && after - middle > slack_kb / 2)
+        fail(__LINE__, "memory grew in both windows: " + std::to_string(middle - before) + " KB, then " + std::to_string(after - middle) + " KB");
 }
 
 std::string temp_dir(const char* name) {
@@ -637,6 +646,11 @@ ADV_TEST(f1_every_operation_at_once) {
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {
+#if defined(__linux__)
+    // Memory is measured in pages: with transparent huge pages ("always" on GitHub's
+    // runners) one write can bring in 2 MB at once. Off for this program only.
+    (void)prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0);
+#endif
     const std::string only = argc > 1 ? argv[1] : "";
     std::printf("hnsw-lite adversarial tests\n");
     int run = 0;

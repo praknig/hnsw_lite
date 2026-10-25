@@ -45,6 +45,7 @@
 #include <unistd.h>
 #endif
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <malloc.h>  // mallopt, malloc_trim (l09)
 #endif
 #include <cstring>
@@ -11327,6 +11328,11 @@ TEST(lean, l09_unused_storage_is_not_resident) {
         f >> pages_total >> pages_resident;
         return double(pages_resident) * double(sysconf(_SC_PAGESIZE)) / double(1 << 20);
     };
+    // Transparent huge pages would count a whole 2 MB page for any byte written into a
+    // block, varying with alignment from run to run (12.1 MB once on CI, past the
+    // threshold). Off for this process while measuring, memory is counted in normal
+    // pages, as this test means it; the setting is restored afterwards.
+    const bool thp_off = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0;
     auto data = random_vectors(100, 32, 4400);
     const double before = resident_mb();
     HnswIndex h(32, Metric::L2);
@@ -11334,6 +11340,7 @@ TEST(lean, l09_unused_storage_is_not_resident) {
     FlatIndex f(32, Metric::L2);
     for (std::uint64_t i = 0; i < 100; ++i) f.add(i, data[i]);
     const double grown = resident_mb() - before;
+    if (thp_off) prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
     std::string huge_pages = "unknown";
     {
         std::ifstream thp("/sys/kernel/mm/transparent_hugepage/enabled");
@@ -11343,11 +11350,12 @@ TEST(lean, l09_unused_storage_is_not_resident) {
             if (a != std::string::npos && b != std::string::npos && b > a) huge_pages = line.substr(a + 1, b - a - 1);
         }
     }
-    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s)\n", grown, huge_pages.c_str());
-    // Without huge pages this takes about 1 MB. With transparent huge pages set to
-    // "always" (as on GitHub's runners), the first write into each of the three
-    // blocks brings in a whole 2 MB page: about 7 MB. Filled blocks took 25 MB.
-    CHECK(grown < 12.0);
+    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s, %s for this test)\n", grown,
+                huge_pages.c_str(), thp_off ? "off" : "could not be turned off");
+    // In normal pages this takes about 1 MB; filled blocks took 25 MB. Where huge pages
+    // could not be turned off (kernels before 3.15), each block's first write may bring
+    // in a whole 2 MB page: a looser bound then.
+    CHECK(grown < (thp_off ? 4.0 : 12.0));
     // The vectors and links written row by row read back exactly, padding included.
     bool same = true;
     for (std::uint64_t i = 0; i < 100; ++i) same = same && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i];
@@ -16463,6 +16471,46 @@ TEST(wal, wl19_every_path) {
     (void)f.detach_log();
     std::filesystem::remove(path);
     std::filesystem::remove(temp_path("wl19b"));
+}
+
+TEST(durable, du16_a_crash_while_creating_a_log_segment) {
+    // Found by du14 on CI: a writer killed after a new segment's file appeared but before
+    // its header was complete left the directory unopenable ("log segment header
+    // incomplete"). Such a newest segment cannot hold a record, so it is discarded.
+    auto data = random_vectors(30, 4, 4900);
+    for (const std::size_t size : {std::size_t(0), std::size_t(17), wal::kHeaderSize}) {  // empty, partial, all zeros
+        const std::string dir = durable_dir("du16");
+        {
+            auto h = HnswIndex::open_durable(dir, 4, Metric::L2);
+            for (std::uint64_t i = 0; i < 20; ++i) h->add(i, data[i]);
+        }
+        const std::string torn = dir + "/wal-" + std::string(19, '0') + "9.log";  // newer than any segment
+        std::ofstream(torn, std::ios::binary).write(std::string(size, '\0').data(), static_cast<std::streamsize>(size));
+        RecoveryStats st;
+        {
+            auto h = HnswIndex::open_durable(dir, 4, Metric::L2, {}, Schema::dynamic(), {}, &st);
+            CHECK(h->size() == 20 && h->search(data[3], 1)[0].id == 3 && !std::filesystem::exists(torn));
+            h->add(20, data[20]);  // and it keeps working
+        }
+        auto again = HnswIndex::open_durable(dir, 4, Metric::L2);
+        CHECK(again->size() == 21);
+        again.reset();
+        std::filesystem::remove_all(dir);
+    }
+    // The same defect in an older segment, or with data after the header, is still refused.
+    const std::string dir = durable_dir("du16b");
+    {
+        auto h = HnswIndex::open_durable(dir, 4, Metric::L2);
+        h->add(1, data[1]);
+    }
+    std::string first;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().filename().string().rfind("wal-", 0) == 0) first = e.path().string();
+    std::ofstream(first, std::ios::binary | std::ios::trunc).write("partial", 7);  // the only segment, but now a newer one follows
+    const std::string newer = dir + "/wal-" + std::string(19, '0') + "9.log";
+    std::ofstream(newer, std::ios::binary).write(std::string(10, 'x').data(), 10);
+    CHECK_THROWS_AS(FormatError, (void)HnswIndex::open_durable(dir, 4, Metric::L2));
+    std::filesystem::remove_all(dir);
 }
 
 TEST(durable, du15_every_path) {

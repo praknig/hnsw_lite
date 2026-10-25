@@ -152,7 +152,25 @@ Opened<Index> open_dir(const std::string& dir, Kind kind, Create&& create, Load&
         std::uint64_t expected = st.snapshot_lsn;
         std::string last;
         for (std::size_t i = 0; i < segs.size(); ++i) {
-            WalScan s = wal::read_segment(join(dir, segment_name(segs[i])));
+            const std::string path = join(dir, segment_name(segs[i]));
+            // A crash while creating a segment (after the file appears, before its header is
+            // complete) leaves a newest segment no longer than a header and unreadable. It
+            // cannot hold a record (records follow the header): discard it; a new one is
+            // started below. Anywhere else, or with data after it, this is damage.
+            if (i + 1 == segs.size() && std::filesystem::file_size(path) <= wal::kHeaderSize) {
+                bool interrupted = false;
+                try {
+                    (void)wal::read_segment(path);
+                } catch (const FormatError&) {
+                    interrupted = true;
+                }
+                if (interrupted) {
+                    st.torn_bytes = std::filesystem::file_size(path);
+                    std::filesystem::remove(path);
+                    continue;
+                }
+            }
+            WalScan s = wal::read_segment(path);
             if (s.identity != identity) throw FormatError("log segment from another index in " + dir);
             if (s.first_lsn != segs[i]) throw FormatError("log segment named for another LSN in " + dir);
             const std::uint64_t end = s.first_lsn + s.records.size();

@@ -189,3 +189,44 @@ jobs:
           else
             gh issue create --title "Nightly run failed" --label nightly-failure --body "$body"
           fi
+
+  # Concurrency bugs are probabilistic and runner images change under the code: the
+  # adversarial suite and the race-condition tests, under their sanitizers, longer
+  # and repeated each night (CI runs them once per change).
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Adversarial tests under ASan + UBSan, three runs
+            configure: -DCMAKE_BUILD_TYPE=Debug -DHNSW_LITE_SANITIZE=ON
+            targets: test_adversarial
+            run: for i in 1 2 3; do ./build/test_adversarial || exit 1; done
+          - name: Race tests under ThreadSanitizer, three long runs
+            configure: -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+            targets: test_races test_adversarial
+            run: >-
+              for i in 1 2 3; do RACE_MS=5000 ./build/test_races || exit 1; done &&
+              for i in 1 2 3 4 5; do ./build/test_adversarial f1_ && ./build/test_adversarial d3_ || exit 1; done
+    env:
+      ASAN_OPTIONS: detect_leaks=1:halt_on_error=1:malloc_context_size=5
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Allow ThreadSanitizer on this kernel
+        # Newer kernels randomize memory addresses more than TSan supports.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -B build ${{ matrix.configure }}
+
+      - name: Build
+        run: cmake --build build --parallel --target ${{ matrix.targets }}
+
+      - name: Run
+        run: ${{ matrix.run }}
