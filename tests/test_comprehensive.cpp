@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -69,6 +69,7 @@
 #include <thread>
 #include <vector>
 
+#include "half.h"
 #include "scoring.h"
 #include "arena.h"
 #include "flat_index.h"
@@ -2514,16 +2515,21 @@ TEST(robustness, oom_id_map_add_all_or_nothing) {
     if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
     // Sweep every add from 0 to 300 entries, so failures also hit the moments
     // when the internal arrays and hash table grow.
+    // Most adds allocate nothing (the compact table allocates only to grow): a sweep
+    // then finds no point to fail (0). Some adds must allocate, or the growth moments
+    // this test is for would go unexercised.
     IdMap m;
     bool all_completed = true;
+    int allocating = 0;
     for (std::uint64_t i = 0; i < 300; ++i) {
         const long points = sweep_allocation_failures([&] { m.add(1000 + i); }, [&] {
             CHECK(m.size() == i && !m.find(1000 + i).has_value());
         });
-        all_completed = all_completed && points > 0;
+        all_completed = all_completed && points >= 0;  // -1 is a problem; 0 is nothing to fail
+        allocating += points > 0;
         if (m.size() != i + 1) break;
     }
-    CHECK(all_completed);
+    CHECK(all_completed && allocating > 5);
     REQUIRE(m.size() == 300);
     bool consistent = true;
     for (std::uint64_t i = 0; i < 300; ++i) consistent = consistent && *m.find(1000 + i) == i && m.external(NodeId(i)) == 1000 + i;
@@ -2584,7 +2590,7 @@ TEST(robustness, oom_flat_add_all_or_nothing) {
         CHECK(f.size() == 50 && !f.contains(999));
         CHECK(same_results(f.search(data[0], 10), before));
     });
-    CHECK(points > 0);
+    CHECK(points >= 0);  // -1 is a problem; 0: nothing had to grow (the ID map allocates only to grow)
     CHECK(f.size() == 51 && f.contains(999));  // the same ID works after failures
     CHECK(f.search(data[50], 1)[0].id == 999);
 }
@@ -3415,6 +3421,127 @@ TEST(deletion, d64_oom_hnsw_compact) {
     });
     CHECK(points > 0);
     CHECK(h.capacity() == 150 && h.deleted_count() == 0);
+}
+
+TEST(deletion, d70_id_map_against_a_model) {
+    // The compact ID map (open addressing over slot numbers, backward-shift removal),
+    // driven by every operation the indexes perform in random order, over a small key
+    // space (so ids are re-added often and probe runs collide and wrap around), and
+    // compared after every step with a plain model.
+    IdMap m;
+    std::map<std::uint64_t, NodeId> model;        // id -> slot find() must return
+    std::vector<std::uint64_t> slot_key;          // slot -> id
+    std::vector<bool> slot_dead;
+    std::mt19937_64 rng(4242);
+    auto free_slots = [&] {
+        std::vector<NodeId> out;
+        for (NodeId s = 0; s < slot_key.size(); ++s) {
+            auto it = model.find(slot_key[s]);
+            if (slot_dead[s] && (it == model.end() || it->second != s)) out.push_back(s);
+        }
+        return out;
+    };
+    bool consistent = true;
+    for (int step = 0; step < 60000 && consistent; ++step) {
+        const std::uint64_t id = rng() % 300;
+        const auto it = model.find(id);
+        switch (rng() % 8) {
+            case 0:
+            case 1:  // add (or refused as a duplicate)
+                if (it == model.end()) {
+                    const NodeId s = m.add(id);
+                    consistent = consistent && s == slot_key.size();
+                    model[id] = s;
+                    slot_key.push_back(id);
+                    slot_dead.push_back(false);
+                } else {
+                    bool refused = false;
+                    try {
+                        (void)m.add(id);
+                    } catch (const std::invalid_argument&) {
+                        refused = true;
+                    }
+                    consistent = consistent && refused;
+                }
+                break;
+            case 2:  // add, then roll it back
+                if (it == model.end()) {
+                    (void)m.add(id);
+                    m.undo_last_add(id);
+                }
+                break;
+            case 3:  // release
+                if (it != model.end()) {
+                    const auto s = m.release(id);
+                    consistent = consistent && s && *s == it->second;
+                    slot_dead[it->second] = true;
+                    model.erase(it);
+                } else {
+                    consistent = consistent && !m.release(id);
+                }
+                break;
+            case 4: {  // reuse a free slot
+                const auto f = free_slots();
+                if (!f.empty() && it == model.end()) {
+                    const NodeId s = f[rng() % f.size()];
+                    m.bind(s, id);
+                    model[id] = s;
+                    slot_key[s] = id;
+                    slot_dead[s] = false;
+                }
+                break;
+            }
+            case 5:  // update: a new version in a new slot, then switch, then retire the old
+                if (it != model.end()) {
+                    const NodeId old = it->second;
+                    const NodeId fresh = m.add_unmapped(id);
+                    slot_key.push_back(id);
+                    slot_dead.push_back(false);
+                    consistent = consistent && m.find(id) == old;  // still the old version meanwhile
+                    m.repoint(id, fresh);
+                    m.retire(old);
+                    model[id] = fresh;
+                    slot_dead[old] = true;
+                }
+                break;
+            case 6: {  // swap-with-last removal: move the last slot into a released one, drop the last
+                const auto f = free_slots();
+                if (!f.empty() && slot_key.size() >= 2) {
+                    const NodeId to = f[rng() % f.size()], last = static_cast<NodeId>(slot_key.size() - 1);
+                    if (to != last) {
+                        m.move_slot(last, to);
+                        if (auto k = model.find(slot_key[last]); k != model.end() && k->second == last) k->second = to;
+                        slot_key[to] = slot_key[last];
+                        slot_dead[to] = slot_dead[last];
+                    }
+                    m.pop_back_slot();  // the last slot is now unreferenced (moved, or itself free)
+                    slot_key.pop_back();
+                    slot_dead.pop_back();
+                }
+                break;
+            }
+            default:  // mark deleted (a tombstone, still mapped)
+                if (it != model.end() && rng() % 4 == 0) {
+                    m.mark_deleted(it->second);  // the id stays mapped to its slot, now flagged
+                    slot_dead[it->second] = true;
+                }
+                break;
+        }
+        // After every step: every id's lookup matches the model, and so does every slot.
+        for (std::uint64_t k = 0; k < 300 && consistent; ++k) {
+            const auto got = m.find(k);
+            const auto want = model.find(k);
+            consistent = (want == model.end()) ? !got : (got && *got == want->second);
+        }
+        consistent = consistent && m.size() == slot_key.size();
+        for (NodeId s = 0; s < slot_key.size() && consistent; ++s) {
+            const auto f = model.find(slot_key[s]);
+            const bool free_in_model = slot_dead[s] && (f == model.end() || f->second != s);
+            consistent = m.external(s) == slot_key[s] && m.is_deleted(s) == slot_dead[s] && m.is_free(s) == free_in_model;
+        }
+        if (!consistent) std::printf("    diverged from the model at step %d\n", step);
+    }
+    CHECK(consistent);
 }
 
 TEST(deletion, d65_flat_compact_is_noop) {
@@ -11108,8 +11235,8 @@ TEST(matryoshka, m11_out_of_memory) {
     }
     const std::string fb = save_bytes(f);
     std::uint64_t id = 500;
-    CHECK(sweep_allocation_failures([&] { f.add(id, data[55]); }, [&] { CHECK(save_bytes(f) == fb); }) > 0);
-    CHECK(sweep_allocation_failures([&] { h.add(id, data[55]); }, [&] { CHECK(!h.contains(id) && h.size() == 50); }) > 0);
+    CHECK(sweep_allocation_failures([&] { f.add(id, data[55]); }, [&] { CHECK(save_bytes(f) == fb); }) >= 0);  // -1: a problem
+    CHECK(sweep_allocation_failures([&] { h.add(id, data[55]); }, [&] { CHECK(!h.contains(id) && h.size() == 50); }) >= 0);
     CHECK(*h.get_vector(500) == data[55] && *f.get_vector(500) == data[55]);
 }
 
@@ -19160,17 +19287,17 @@ TEST(features, fe05_runtime_settings_keys_and_snapshots) {
     CHECK(!c.set_metadata("gone", Metadata().set("tag", "x")) && !c.set_metadata("absent", Metadata()) && !c.set_metadata("numeric", Metadata()));
     CHECK_THROWS_AS(std::invalid_argument, (void)c.set_metadata("kept", Metadata().set("_key", "y")));
     CHECK(!c.get("gone") && c.remove_expired() == 1);  // expiry and keys together
-    // A loaded collection starts with both off: expired documents show, keys are refused, until switched on.
+    // A loaded collection restores its settings: expired documents stay hidden, keys work.
     c.add("late", [&] { Document d = co_doc(data, 3, true); d.expires_at = now - 1; return d; }());
     std::ostringstream out;
     c.save(out);
     std::istringstream in(out.str());
     auto loaded = Collection::load(in);
+    CHECK(!loaded->contains(Collection::id_of("late")) && loaded->get("kept")->key == std::optional<std::string>("kept"));
+    loaded->set_ttl(TtlOptions{});  // switched off explicitly: the expired document shows
+    loaded->set_string_ids(false);
     CHECK(loaded->contains(Collection::id_of("late")));
     CHECK_THROWS_AS(std::logic_error, (void)loaded->get("kept"));
-    loaded->set_ttl(TtlOptions{true, 0});
-    loaded->set_string_ids(true);
-    CHECK(!loaded->contains(Collection::id_of("late")) && loaded->get("kept")->key == std::optional<std::string>("kept"));
     CHECK_THROWS_AS(std::invalid_argument, loaded->set_ttl(TtlOptions{true, -5}));
     // A strict schema without the reserved fields: refused clearly, not by a failing search later.
     CollectionOptions strict = co_options(4, true);
@@ -19303,6 +19430,51 @@ TEST(features, fe07_expiry_under_concurrency) {
     CHECK(errors == 0 && expired_seen == 0 && c.count_where(Filter::all()) == 0 && c.size() == 0);
 }
 
+TEST(features, fe08_settings_are_saved) {
+    auto data = random_vectors(10, 4, 4707);
+    auto doc = [&](std::size_t i) { return co_doc(data, i, true); };
+    // Unused settings change nothing: such a file is written exactly as before (the
+    // settings block, 11 bytes, appears only with expiry or string keys).
+    CollectionOptions plain_o = co_options(4, true), bare_o = plain_o, set_o = plain_o;
+    bare_o.ttl = TtlOptions{true, 0};  // no default lifetime: its documents are identical to plain's
+    bare_o.string_ids = true;
+    set_o.ttl = TtlOptions{true, 60000};  // a default lifetime also stores an expiry time per document
+    set_o.string_ids = true;
+    Collection plain(plain_o), bare(bare_o), with(set_o);
+    plain.add(1, doc(1));
+    bare.add(1, doc(1));
+    with.add(1, doc(1));
+    std::ostringstream a, ab, b;
+    plain.save(a);
+    bare.save(ab);
+    with.save(b);
+    CHECK(ab.str().size() == a.str().size() + 11);
+    std::istringstream ai(a.str()), bi(b.str());
+    const auto pl = Collection::load(ai), wl = Collection::load(bi);
+    CHECK(!pl->options().ttl.enabled && !pl->options().string_ids);
+    CHECK(wl->options().ttl.enabled && wl->options().ttl.default_ms == 60000 && wl->options().string_ids);
+    // Durable: a change after the last snapshot survives through the log.
+    const std::string dir = co_dir("fe08");
+    {
+        auto d = Collection::open(dir, set_o);
+        d->add("k", doc(2));
+        d->set_ttl(TtlOptions{});  // logged, no checkpoint after it
+    }
+    {
+        auto d = Collection::open(dir, plain_o);  // nothing passed: the stored settings
+        CHECK(!d->options().ttl.enabled && d->options().string_ids && d->get("k"));
+        CollectionOptions on = plain_o;
+        on.ttl = TtlOptions{true, 0};
+        d.reset();
+        d = Collection::open(dir, on);  // passed at open: switched on, and logged
+        CHECK(d->options().ttl.enabled && d->options().string_ids);
+    }
+    auto again = Collection::open(dir, plain_o);  // left out: never switched off by omission
+    CHECK(again->options().ttl.enabled && again->options().string_ids);
+    again.reset();
+    std::filesystem::remove_all(dir);
+}
+
 TEST(features, fe03_diversity) {
     // Ten groups of six near-duplicates around different directions: a plain search
     // returns one group; diversity spreads the results over groups. (MMR reorders
@@ -19376,6 +19548,280 @@ TEST(features, fe03_diversity) {
     CollectionSearchOptions td_opts;
     td_opts.diversity = 0.5;
     CHECK_THROWS_AS(std::invalid_argument, (void)t.search(tq, 1, td_opts));
+}
+
+// ===========================================================================
+// Half-precision vectors: float16 and bfloat16 (HF1-HF6)
+// ===========================================================================
+
+namespace {
+float hf_ref_l2(const float* q, const std::vector<float>& h) {
+    float s = 0;
+    for (std::size_t j = 0; j < h.size(); ++j) s += (q[j] - h[j]) * (q[j] - h[j]);
+    return s;
+}
+HnswParams half_params(CodecKind kind) {
+    HnswParams p;
+    p.quantization.codec = kind;
+    p.quantization.keep_full_vectors = false;
+    p.quantization.rerank = false;
+    return p;
+}
+}  // namespace
+
+TEST(half, hf01_conversions_at_the_edges) {
+    CHECK(float_to_f16(1.0f) == 0x3C00 && float_to_f16(-2.0f) == 0xC000 && float_to_f16(-0.0f) == 0x8000 && float_to_f16(0.0f) == 0);
+    CHECK(float_to_f16(65504.0f) == 0x7BFF && float_to_f16(65519.0f) == 0x7BFF);    // the largest, and what rounds to it
+    CHECK(float_to_f16(65520.0f) == 0x7BFF && float_to_f16(1e30f) == 0x7BFF);       // beyond: saturated, never infinite
+    CHECK(float_to_f16(-1e30f) == 0xFBFF);
+    CHECK(float_to_f16(std::ldexp(1.0f, -24)) == 0x0001);                           // the smallest subnormal
+    CHECK(float_to_f16(std::ldexp(1.0f, -25)) == 0x0000);                           // exactly half of it: ties to even (0)
+    CHECK(float_to_f16(std::ldexp(3.0f, -25)) == 0x0002);                           // 1.5 of it: ties to even (2)
+    CHECK(float_to_f16(1.0f + std::ldexp(1.0f, -11)) == 0x3C00);                    // a tie between 1 and the next: even
+    CHECK(float_to_f16(1.0f + std::ldexp(3.0f, -11)) == 0x3C02);                    // the other tie: up, to even
+    for (std::uint32_t h = 0; h < 0x7C00; ++h) {  // every finite positive float16 round-trips exactly
+        if (float_to_f16(f16_to_float(std::uint16_t(h))) != h) {
+            CHECK(false);
+            break;
+        }
+    }
+    CHECK(f16_to_float(0x7BFF) == 65504.0f && f16_to_float(0x0001) == std::ldexp(1.0f, -24));
+    CHECK(float_to_bf16(1.0f) == 0x3F80 && bf16_to_float(0x3F80) == 1.0f && float_to_bf16(-0.0f) == 0x8000);
+    CHECK(float_to_bf16(std::numeric_limits<float>::max()) == 0x7F7F);              // would round to infinity: saturated
+    CHECK(float_to_bf16(std::bit_cast<float>(0x3F808000u)) == 0x3F80);              // a tie: to even
+    CHECK(float_to_bf16(std::bit_cast<float>(0x3F818000u)) == 0x3F82);              // the other tie: up, to even
+    CHECK(kF16Max == 65504.0f);
+}
+
+TEST(half, hf02_kernels_match_on_every_instruction_set) {
+    const CodeKernels ref = get_code_kernels(Isa::Scalar);
+    std::mt19937 rng(7001);
+    std::normal_distribution<float> d(0, 1);
+    int checked = 0;
+    bool same = true;
+    for (const Isa isa : {Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        CodeKernels k;
+        try {
+            k = get_code_kernels(isa);
+        } catch (const std::invalid_argument&) {
+            continue;  // this CPU cannot run it (CI's emulated and ARM jobs cover the others)
+        }
+        for (std::size_t n = 1; n <= 70; ++n) {  // every SIMD width and tail
+            std::vector<float> q(n);
+            std::vector<std::uint16_t> f(n), b(n);
+            for (std::size_t j = 0; j < n; ++j) {
+                q[j] = d(rng);
+                f[j] = float_to_f16(d(rng));
+                b[j] = float_to_bf16(d(rng));
+            }
+            auto close = [](float a, float e) { return std::fabs(a - e) <= 1e-5f * std::max(1.0f, std::fabs(e)); };
+            same = same && close(k.f16_l2(q.data(), f.data(), n), ref.f16_l2(q.data(), f.data(), n)) &&
+                   close(k.f16_dot(q.data(), f.data(), n), ref.f16_dot(q.data(), f.data(), n)) &&
+                   close(k.bf16_l2(q.data(), b.data(), n), ref.bf16_l2(q.data(), b.data(), n)) &&
+                   close(k.bf16_dot(q.data(), b.data(), n), ref.bf16_dot(q.data(), b.data(), n));
+            std::vector<float> got(n), want(n);  // decoding must be exact: bit for bit
+            k.f16_decode(f.data(), got.data(), n);
+            ref.f16_decode(f.data(), want.data(), n);
+            same = same && std::memcmp(got.data(), want.data(), n * sizeof(float)) == 0;
+            k.bf16_decode(b.data(), got.data(), n);
+            ref.bf16_decode(b.data(), want.data(), n);
+            same = same && std::memcmp(got.data(), want.data(), n * sizeof(float)) == 0;
+        }
+        ++checked;
+    }
+    std::printf("    %d instruction sets checked against the scalar kernels\n", checked);
+    CHECK(same && checked >= 1);
+}
+
+TEST(half, hf03_the_codec) {
+    auto data = random_vectors(50, 24, 7002);
+    for (const CodecKind kind : {CodecKind::F16, CodecKind::BF16})
+        for (const Metric m : {Metric::L2, Metric::InnerProduct, Metric::Cosine}) {
+            HalfCodec c(kind, 24, m);
+            CHECK(c.trained() && c.code_size() == 48 && c.state().empty() && c.kind() == kind);
+            std::vector<std::uint8_t> code(48);
+            std::vector<float> back(24), table;
+            bool exact = true, distances = true;
+            for (const auto& v : data) {
+                c.encode(v, code.data());
+                c.decode(code.data(), back);
+                for (std::size_t j = 0; j < 24; ++j) {
+                    const float want = kind == CodecKind::F16 ? f16_to_float(float_to_f16(v[j])) : bf16_to_float(float_to_bf16(v[j]));
+                    exact = exact && back[j] == want;
+                }
+                c.prepare(data[0], table);
+                double dot = 0;
+                for (std::size_t j = 0; j < 24; ++j) dot += double(data[0][j]) * back[j];
+                const double want = m == Metric::L2 ? hf_ref_l2(data[0].data(), back) : m == Metric::Cosine ? 1 - dot : -dot;
+                distances = distances && std::fabs(c.distance(table, code.data()) - want) <= 1e-4 * std::max(1.0, std::fabs(want));
+            }
+            CHECK(exact && distances && c.finite(code.data()));
+            CHECK_THROWS_AS(std::invalid_argument, c.restore(std::vector<float>{1.0f}));
+            CHECK_THROWS_AS(std::invalid_argument, c.encode(std::vector<float>(3, 1.0f), code.data()));
+        }
+    HalfCodec f16(CodecKind::F16, 3, Metric::L2), bf16(CodecKind::BF16, 3, Metric::L2);
+    CHECK_NOTHROW(f16.check(std::vector<float>{65504.0f, -65504.0f, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, f16.check(std::vector<float>{0, 65505.0f, 0}));
+    CHECK_NOTHROW(bf16.check(std::vector<float>{1e38f, -1e38f, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, HalfCodec(CodecKind::SQ8, 3, Metric::L2));
+    const std::uint8_t inf[6] = {0x00, 0x7C, 0, 0, 0, 0};
+    CHECK(!f16.finite(inf) && bf16.finite(inf));  // 0x7C00 is infinity in float16, an ordinary value in bfloat16
+}
+
+TEST(half, hf04_recall_within_half_a_point_of_float32) {
+    // The acceptance criterion: recall@10 (against exact neighbors) within 0.005 of the
+    // float32 index's, for both formats, on HNSW and flat indexes, codes only.
+    auto data = clustered(4000, 128, 40, 7003);
+    auto queries = clustered(100, 128, 40, 7004);
+    for (const Metric m : {Metric::L2, Metric::Cosine}) {
+        FlatIndex exact(128, m);
+        for (std::uint64_t i = 0; i < 4000; ++i) exact.add(i, data[i]);
+        auto recall = [&](auto&& search) {
+            double hits = 0;
+            for (const auto& q : queries) {
+                std::set<std::uint64_t> truth;
+                for (const auto& r : exact.search(q, 10)) truth.insert(r.id);
+                for (const auto& r : search(q)) hits += truth.count(r.id);
+            }
+            return hits / (10.0 * double(queries.size()));
+        };
+        HnswIndex f32(128, m);
+        for (std::uint64_t i = 0; i < 4000; ++i) f32.add(i, data[i]);
+        const double base = recall([&](const std::vector<float>& q) { return f32.search(q, 10, 64); });
+        for (const CodecKind kind : {CodecKind::F16, CodecKind::BF16}) {
+            HnswIndex h(128, m, half_params(kind));
+            FlatIndex f(128, m, Schema::dynamic(), half_params(kind).quantization);
+            for (std::uint64_t i = 0; i < 4000; ++i) {
+                h.add(i, data[i]);
+                f.add(i, data[i]);
+            }
+            const double rh = recall([&](const std::vector<float>& q) { return h.search(q, 10, 64); });
+            const double rf = recall([&](const std::vector<float>& q) { return f.search(q, 10); });
+            std::printf("    %s %s: recall@10 float32 graph %.4f, half graph %.4f, half exact scan %.4f\n",
+                        m == Metric::L2 ? "L2" : "cosine", kind == CodecKind::F16 ? "float16" : "bfloat16", base, rh, rf);
+            // The criterion: graph recall within 0.005 of float32. Exact scans: bfloat16 keeps
+            // about 2.4 digits, so near-ties among the true top 10 can swap (0.994 on CI,
+            // where another standard library generates other test data); float16, 3.3 digits.
+            const double scan_floor = kind == CodecKind::F16 ? 0.995 : 0.99;
+            CHECK(!h.has_vector_values() && rh >= base - 0.005 && rf >= scan_floor);
+        }
+    }
+}
+
+TEST(half, hf05_every_path) {
+    auto data = clustered(1200, 32, 8, 7005);
+    for (const CodecKind kind : {CodecKind::F16, CodecKind::BF16}) {
+        HnswIndex h(32, Metric::L2, half_params(kind));
+        for (std::uint64_t i = 0; i < 1000; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 5)));
+        std::vector<std::uint64_t> ids;
+        std::vector<float> flat;
+        for (std::uint64_t i = 1000; i < 1200; ++i) {
+            ids.push_back(i);
+            flat.insert(flat.end(), data[i].begin(), data[i].end());
+        }
+        h.add_batch(ids, flat, 2);
+        const auto stored = *h.get_vector(7);  // the decoded values: each one rounded to 16 bits
+        bool rounded = true;
+        for (std::size_t j = 0; j < 32; ++j) {
+            const float want = kind == CodecKind::F16 ? f16_to_float(float_to_f16(data[7][j])) : bf16_to_float(float_to_bf16(data[7][j]));
+            rounded = rounded && stored[j] == want;
+        }
+        CHECK(rounded && !h.has_vector_values() && h.size() == 1200);
+        SearchOptions o;
+        o.filter = Filter::eq("g", std::int64_t(2));
+        bool filtered = true;
+        for (const auto& r : h.search(data[7], 10, 64, o)) filtered = filtered && r.id % 5 == 2;
+        CHECK(filtered && h.search(data[7], 1)[0].id == 7 && !h.search_range(data[7], 1e6f, 5).empty());
+        CHECK(h.search_by_id(7, 3)->size() == 3 && h.search_batch(flat, 5).size() == 200);
+        CHECK(h.update(7, data[8]));  // 7 now holds 8's vector: both rounded alike, so both come first
+        const auto twins = h.search(data[8], 2);  // their distance to the float32 query is the rounding only: tiny, not 0
+        CHECK((twins.size() == 2 && std::set<std::uint64_t>{twins[0].id, twins[1].id} == std::set<std::uint64_t>{7, 8} &&
+               twins[1].distance < 1e-3f && twins[0].distance == twins[1].distance));
+        CHECK(h.remove(9) && !h.contains(9));
+        (void)h.compact();
+        (void)h.reorder();
+        (void)h.rebuild();
+        (void)h.upkeep();
+        HealthOptions ho;
+        ho.recall_sample = 0;
+        CHECK(h.health(ho).unreachable == 0 && h.search(data[100], 1)[0].id == 100);
+        std::ostringstream out;
+        h.save(out);
+        std::istringstream in(out.str());
+        auto loaded = HnswIndex::load(in);
+        std::ostringstream again;
+        loaded->save(again);
+        CHECK(again.str() == out.str() && !loaded->has_vector_values() && loaded->search(data[100], 1)[0].id == 100);
+        // IVF over half-precision codes.
+        IvfParams ivf;
+        ivf.lists = 8;
+        ivf.probes = 8;
+        ivf.train_after = 0;
+        FlatIndex f(32, Metric::InnerProduct, Schema::dynamic(), half_params(kind).quantization, ivf);
+        for (std::uint64_t i = 0; i < 1200; ++i) f.add(i, data[i]);
+        f.train_lists();
+        CHECK(f.search(data[3], 1)[0].id == 3);
+        std::ostringstream fo;
+        f.save(fo);
+        std::istringstream fi(fo.str());
+        CHECK(FlatIndex::load(fi)->search(data[3], 1)[0].id == 3);
+    }
+    // Durable recovery, and a collection storing float16.
+    const std::string dir = durable_dir("hf05");
+    {
+        auto d = HnswIndex::open_durable(dir, 32, Metric::L2, half_params(CodecKind::F16));
+        for (std::uint64_t i = 0; i < 300; ++i) d->add(i, data[i]);
+    }
+    auto back = HnswIndex::open_durable(dir, 32, Metric::L2, half_params(CodecKind::F16));
+    CHECK(back->size() == 300 && !back->has_vector_values() && back->search(data[10], 1)[0].id == 10);
+    back.reset();
+    std::filesystem::remove_all(dir);
+    CollectionOptions co = co_options(32);
+    co.hnsw = half_params(CodecKind::F16);
+    Collection c(co);
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        Document doc;
+        doc.vector = data[i];
+        c.add(i, doc);
+    }
+    CollectionQuery q;
+    q.vector = data[42];
+    CHECK(c.search(q, 1)[0].id == 42);
+}
+
+TEST(half, hf06_refusals_and_damaged_files) {
+    // float16 cannot hold values beyond 65504: refused at every write path, before any change.
+    HnswIndex h(4, Metric::L2, half_params(CodecKind::F16));
+    FlatIndex f(4, Metric::L2, Schema::dynamic(), half_params(CodecKind::F16).quantization);
+    h.add(1, std::vector<float>{1, 2, 3, 4});
+    f.add(1, std::vector<float>{1, 2, 3, 4});
+    std::ostringstream before;
+    h.save(before);
+    const std::vector<float> big{1, 70000.0f, 3, 4};
+    CHECK_THROWS_AS(std::invalid_argument, h.add(2, big));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.update(1, big));
+    const std::vector<std::uint64_t> two{2, 3};
+    std::vector<float> batch{1, 1, 1, 1, 1, 70000.0f, 1, 1};
+    CHECK_THROWS_AS(std::invalid_argument, h.add_batch(two, batch));
+    CHECK_THROWS_AS(std::invalid_argument, f.add(2, big));
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.update(1, big));
+    std::ostringstream after;
+    h.save(after);
+    CHECK(after.str() == before.str() && f.size() == 1);
+    // Queries are never stored: any finite query works. Cosine normalizes first: any size fits.
+    CHECK(h.search(big, 1).size() == 1);
+    HnswIndex cos(4, Metric::Cosine, half_params(CodecKind::F16));
+    CHECK_NOTHROW(cos.add(1, std::vector<float>{1e30f, 2e30f, 0, 0}));
+    HnswIndex bf(4, Metric::L2, half_params(CodecKind::BF16));
+    CHECK_NOTHROW(bf.add(1, std::vector<float>{1e30f, 0, 0, 0}));
+    // A damaged file: an infinity bit pattern in a code, and a half codec claiming to be untrained.
+    std::string bytes = before.str();
+    const std::size_t at = bytes.find(std::string("\x00\x3c\x00\x40", 4));  // the codes of {1, 2}: 0x3C00, 0x4000
+    REQUIRE(at != std::string::npos);
+    std::string inf = bytes;
+    inf[at + 1] = '\x7c';  // 1.0 (0x3C00) becomes infinity (0x7C00)
+    std::istringstream bad(inf);
+    CHECK_THROWS_AS(FormatError, HnswIndex::load(bad));
 }
 
 // ===========================================================================
@@ -19725,7 +20171,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

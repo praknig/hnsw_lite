@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 894 tests, 100% line coverage, memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 903 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -28,7 +28,7 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Health reports and upkeep:** reachability, degrees, estimated recall and drift on every index type; incremental `upkeep()` (like a database's vacuum), `rebuild()` retraining compression and IVF lists while the index stays in use, and optional automatic compaction.
 - **Disk-based index (DiskANN-style):** indexes larger than memory, built within a memory budget and searched with a few disk reads per query (concurrently), with filters.
 - **Inverted file (IVF, and IVF-PQ):** scan only the lists nearest to a query, with filters and every codec.
-- **Compression (SQ8, binary, PQ) and Matryoshka truncation:** one byte or one bit per dimension, or one byte per part of the vector (PQ), searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it; optionally keep only the codes (about a quarter of the memory) (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
+- **Compression (SQ8, binary, PQ, half precision) and Matryoshka truncation:** one byte or one bit per dimension, one byte per part of the vector (PQ), or two bytes per dimension (float16 and bfloat16, which halve vector memory with almost no recall lost), searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it; optionally keep only the codes (about a quarter of the memory) (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
 - **Search by stored ID, deadlines and cancellation:** "more like record 42"; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
 - **Save and load:** one call writes the whole index to a file and one reads it back, checked against damage and portable between platforms.
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
@@ -202,6 +202,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 | Document | What's inside |
 |---|---|
+| [How it works](docs/how-it-works.md) | In plain terms: exact and approximate search, how the HNSW graph is built and searched, what each setting changes, filtering, deletion, memory, speed and durability |
 | [Getting started](docs/getting-started.md) | Building on every platform, build options, using hnsw-lite in your project, troubleshooting |
 | [User guide](docs/user-guide.md) | Everything the library does and how to use it: indexes, metrics, metadata, filters, batch and range search, threads, errors |
 | [Developer reference](docs/developer-reference.md) | Every method and parameter in detail: what it does, what it expects, what can go wrong, and its limits |
@@ -210,7 +211,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 894 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 903 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, the roadmap, and references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
@@ -219,7 +220,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 ## Project status
 
-Done: Flat and HNSW indexes, SIMD kernels, updates and real deletion, metadata, filtered search, batch search, range search, saving and loading (file format version 3), thread-safe indexes and parallel building (`add_batch`), bulk changes by filter, reading records back, search by stored ID, deadlines and cancellation, and compression (SQ8, binary and PQ codes with SIMD kernels, Matryoshka truncation, keeping only codes), an inverted file (IVF, IVF-PQ), and a disk-based index. Next: see the [roadmap](docs/project-notes.md#roadmap).
+Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys and saved settings; score modifiers, dates and diversity re-ranking; graph reordering; Python bindings and wheels; benchmark and stress tools with a nightly run. Next: see the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

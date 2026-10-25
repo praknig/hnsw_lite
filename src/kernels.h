@@ -53,4 +53,20 @@ float bits_sum_avx512(const float* w, const std::uint8_t* c, std::size_t n);
 float sq8_l2_neon(const float* t, const float* s, const std::uint8_t* c, std::size_t n);
 float sq8_dot_neon(const float* w, const std::uint8_t* c, std::size_t n);
 float bits_sum_neon(const float* w, const std::uint8_t* c, std::size_t n);
+
+// Half-precision codes (HalfCodec), against a float32 query q, each with the same four versions:
+//   f16_l2, f16_dot:   sum over j of (q[j] - h[j])^2 and of q[j] * h[j], h[j] the float16 c[j]
+//   bf16_l2, bf16_dot: the same with bfloat16 codes
+#define VECDB_HALF_KERNELS(isa)                                                  \
+    float f16_l2_##isa(const float* q, const std::uint16_t* c, std::size_t n);   \
+    float f16_dot_##isa(const float* q, const std::uint16_t* c, std::size_t n);  \
+    float bf16_l2_##isa(const float* q, const std::uint16_t* c, std::size_t n);  \
+    float bf16_dot_##isa(const float* q, const std::uint16_t* c, std::size_t n);  \
+    void f16_decode_##isa(const std::uint16_t* c, float* out, std::size_t n);     \
+    void bf16_decode_##isa(const std::uint16_t* c, float* out, std::size_t n);
+VECDB_HALF_KERNELS(scalar)
+VECDB_HALF_KERNELS(avx2)
+VECDB_HALF_KERNELS(avx512)
+VECDB_HALF_KERNELS(neon)
+#undef VECDB_HALF_KERNELS
 }  // namespace vecdb::kernels

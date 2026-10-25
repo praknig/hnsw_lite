@@ -120,8 +120,8 @@ Settings chosen when a collection is created. Start from [`CollectionOptions::pr
 | `store_text` | `true` | Keep each document's text, so `get()` and search results can return it. `false` saves memory; the text is still indexed for search. |
 | `durability` | `DurableOptions{}` | For `Collection::open` only: snapshots kept and when the log is flushed to disk. See [`DurableOptions`](#81-durableoptions-and-durability). |
 | `maintenance` | `MaintenancePolicy{}` | When maintenance runs (manual by default). See [Maintenance](#28-maintenance). **Not saved** with the collection: `load()` starts with manual maintenance, and `open()` takes it from the options you pass. |
-| `ttl` | off | **Opt-in expiry** (`TtlOptions { bool enabled; std::int64_t default_ms; }`): documents with an expiry time (`Document::expires_at`, or now + `default_ms` when that is above 0) disappear from searches, counts, `get` and `contains` the moment it passes, and are freed by `remove_expired()` or maintenance. **Not saved**: pass it on every open. |
-| `string_ids` | false | **Opt-in string keys** (names, UUIDs): enables the `std::string_view` overloads of `add`, `upsert`, `get`, `contains` and `remove`. **Not saved**: pass it on every open. |
+| `ttl` | off | **Opt-in expiry** (`TtlOptions { bool enabled; std::int64_t default_ms; }`): documents with an expiry time (`Document::expires_at`, or now + `default_ms` when that is above 0) disappear from searches, counts, `get` and `contains` the moment it passes, and are freed by `remove_expired()` or maintenance. **Saved with the collection** (only when not the defaults, so other files are unchanged): `load()` and `open()` keep it. Passing it at `open()` switches the feature on; leaving it out never switches it off (`set_ttl` and `set_string_ids` do). |
+| `string_ids` | false | **Opt-in string keys** (names, UUIDs): enables the `std::string_view` overloads of `add`, `upsert`, `get`, `contains` and `remove`. **Saved with the collection** (only when not the defaults, so other files are unchanged): `load()` and `open()` keep it. Passing it at `open()` switches the feature on; leaving it out never switches it off (`set_ttl` and `set_string_ids` do). |
 | `ef` | 0 | Default beam width of dense searches (higher: better recall, slower). 0 uses the library default, max(candidates, 64). **Not saved**, like `maintenance`. A search's own `CollectionSearchOptions::ef` overrides it. |
 
 At least one side must exist (`dim > 0`, `text` or `sparse`); otherwise the constructor throws `std::invalid_argument`.
@@ -389,7 +389,7 @@ struct MaintenanceStatus {
 | `std::size_t remove_expired()` | With `ttl`: removes every expired document, returning how many (they are already hidden). `maintain()` calls it and notes "removed N expired documents". 0 without `ttl`. |
 | `static std::uint64_t id_of(std::string_view key)` | A key's numeric id: a 64-bit hash (FNV-1a with a SplitMix64 finish). |
 | `bool set_metadata(std::string_view key, const Metadata& metadata)` | Changes only the given fields of the document stored under that exact key; `false` if there is none (absent, expired, or another key's document). |
-| `void set_ttl(const TtlOptions& ttl)`, `void set_string_ids(bool on)` | The runtime settings, at any time, from any thread (an operation already running uses the settings it started with): **a loaded collection starts with both off** (`load()` takes no options), so expired documents show and keys are refused until they are switched on. Throw `std::invalid_argument` if a strict schema lacks the reserved field; `open()` checks the same. |
+| `void set_ttl(const TtlOptions& ttl)`, `void set_string_ids(bool on)` | The runtime settings, at any time, from any thread (an operation already running uses the settings it started with): **changes are saved with the collection** and, for durable collections, logged at once (they survive a crash before the next checkpoint). Throw `std::invalid_argument` if a strict schema lacks the reserved field; `open()` checks the same. |
 | `add(key, doc)`, `upsert(key, doc)`, `get(key)`, `contains(key)`, `remove(key)` | With `string_ids` (`std::logic_error` otherwise): the document's id is `id_of(key)`, and the key is kept with it. `add` refuses a key already present; both refuse a key whose id belongs to **another** key (`std::invalid_argument`), so two keys are never mixed up. `get`, `contains` and `remove` never act on a document that was not stored under that exact key. Hits report `key`. |
 
 **Reserved metadata names:** `_expires_at` (an integer) and `_key` (a keyword) hold the expiry time and the key; your metadata may not use them (`std::invalid_argument`). Strict schemas gain them automatically when the features are on at creation; a strict schema created without them cannot later store them. Expiry times are fixed when a document is written and logged with it, so recovery after a crash keeps them exactly.
@@ -529,7 +529,7 @@ Compression ("quantization") stores each vector as a compact **code** and search
 
 | Field | Default | What it does |
 |---|---|---|
-| `codec` | `CodecKind::None` | `None`: full precision only. `SQ8`: one byte per dimension (4× smaller than floats), very little recall lost. `Binary`: one bit per dimension (32× smaller), coarse: use with re-ranking. `PQ` (product quantization): one byte per *part* of the vector (with the default of one part per 8 dimensions, 32× smaller than floats); needs training, and re-ranking for good recall. |
+| `codec` | `CodecKind::None` | `None`: full precision only. `SQ8`: one byte per dimension (4× smaller than floats), very little recall lost. `Binary`: one bit per dimension (32× smaller), coarse: use with re-ranking. `PQ` (product quantization): one byte per *part* of the vector (with the default of one part per 8 dimensions, 32× smaller than floats); needs training, and re-ranking for good recall. `F16` and `BF16` (half precision): two bytes per dimension (2× smaller), no training; with `keep_full_vectors = false` they replace the float32 vectors from the first insert. Recall@10 within 0.005 of float32 in our tests. `F16` (IEEE float16) keeps about 3.3 significant digits and refuses values beyond ±65504 (`std::invalid_argument`, before any change); `BF16` (bfloat16) keeps float32's range with about 2.4 digits. |
 | `train_after` | 1000 | Train the codec automatically once this many vectors are stored; until then searches use full precision. 0: only when you call `train_codec()`. |
 | `rerank` | `true` | Re-rank the best candidates found with codes at full precision. Better recall for a little more work. Needs the full vectors kept. |
 | `rerank_factor` | 4 | Exact searches with re-ranking compare k × this many candidates by code first (at least 1). |
@@ -1000,6 +1000,8 @@ Filled by `open_durable` and `Collection::open` when you pass a pointer:
 |---|---|
 | `created` | A new directory was created (nothing recovered). |
 | `snapshot_lsn` | The sequence number of the snapshot recovery started from. |
+| `segments` | Log segments read. |
+| `replayed` | Log records replayed (aborted ones included). |
 | `fallbacks` | Newer snapshots that could not be read (an older one was used). |
 | `segments`, `replayed` | Log segments read; records replayed. |
 | `torn_bytes` | Bytes of a last record cut short by the crash, discarded. |
@@ -1136,11 +1138,12 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 |---|---|
 | IDs | 64-bit unsigned integers; collections can also take string keys (opt-in `string_ids`), hashed to 64-bit ids with collisions refused |
 | Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
-| Memory | About 300 to 360 bytes per vector at 32 dimensions with M 16 (the vector, its links and its ID); in general about 4 × dim + 8 × M + 40 bytes, plus metadata. Storage grows in blocks of up to 65,536 rows, but unused rows cost no resident memory |
+| Memory | In general about 4 × dim + 8 × M + 45 bytes per vector (2 × dim with half precision and codes only), plus metadata. Measured with M 16: 687 bytes at 128 dimensions (448 with float16 or bfloat16, 35% less) and 3,280 at 768 (1,753 with half precision, 47% less). Storage grows in blocks of up to 65,536 rows, but unused rows cost no resident memory |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
 | Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic types; a field keeps its first type |
 | Vector magnitudes | Any finite float is accepted. A distance that overflows becomes infinity (never NaN), and infinities sort last, ties in insertion order. Consequence: in an L2 or inner-product graph, a vector whose distances to every neighbor overflow (components near 3e38) ties them all at infinity, so graph search may not reach it; exact search (`Strategy::ForceExact`, `FlatIndex`) still finds it. Cosine normalizes, so it is unaffected. Real embeddings are many orders of magnitude below this. |
+| Half precision | `F16` refuses values beyond ±65504 (use `BF16` for larger ones); queries stay float32, so any finite query works. The disk index (`DiskIndex`) keeps float32 vectors. Building a half-precision index costs a little more time at high dimensions (measured: 26% at 768, none at 128). |
 | Filters | At most 256 levels deep; whole-value comparisons (no substring or full-text matching) |
 | Text | No stemming, stop words or synonyms; 32-bit hashed terms |
 | Concurrency | One change at a time per index or collection; searches in parallel; no changes from inside predicates |
@@ -1678,7 +1681,7 @@ struct CompactStats {
 **`CodecKind`** (enumeration)
 
 ```cpp
-enum class CodecKind { None, SQ8, Binary, PQ };
+enum class CodecKind { None, SQ8, Binary, PQ, F16, BF16 };
 ```
 
 **`QuantizationParams`**
@@ -2281,6 +2284,10 @@ std::int64_t now_ms();
 inline double relevance_from_distance(float distance, Metric metric);
 template <class MetadataOf, class Relevance> std::vector<SearchResult> rescored(std::vector<SearchResult> found, std::size_t k, const ScoreModifiers& m, MetadataOf&& metadata_of, Relevance&& relevance);
 inline std::vector<std::size_t> mmr_order(const std::vector<double>& relevance, const std::vector<std::optional<std::vector<float>>>& vectors, std::size_t k, double lambda);
+inline std::uint16_t float_to_f16(float f) noexcept;
+inline float f16_to_float(std::uint16_t h) noexcept;
+inline std::uint16_t float_to_bf16(float f) noexcept;
+inline float bf16_to_float(std::uint16_t h) noexcept;
 ```
 
 <!-- END GENERATED -->

@@ -9,7 +9,7 @@ import json, pathlib, re, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 HEADERS = ["scoring.h", "collection.h", "hnsw_index.h", "flat_index.h", "disk_index.h", "vamana.h", "sparse.h", "metadata.h", "filter.h",
-           "search_result.h", "health.h", "codec.h", "durable.h", "wal.h", "distance.h"]
+           "search_result.h", "health.h", "codec.h", "half.h", "durable.h", "wal.h", "distance.h"]
 # Public API by header, in reference order. Records whose public members are listed in full.
 GROUPS = [
     ("Collections (collection.h)", ["Preset", "Maintenance", "MaintenancePolicy", "MaintenanceReport", "MaintenanceStatus", "TtlOptions", "CollectionOptions",
@@ -30,7 +30,8 @@ GROUPS = [
     ("Durability (durable.h, wal.h)", ["Durability", "DurableOptions", "RecoveryStats", "WalRecord", "WalScan", "WalWriter", "FileLock"]),
 ]
 FUNCTIONS = ["hybrid_search", "fuse", "sparse_dot", "l2_radius", "write_vectors_file", "read_segment", "sync_path", "sync_directory", "plan_search",
-             "validate", "parse_date", "format_date", "now_ms", "relevance_from_distance", "rescored", "mmr_order"]
+             "validate", "parse_date", "format_date", "now_ms", "relevance_from_distance", "rescored", "mmr_order",
+             "float_to_f16", "f16_to_float", "float_to_bf16", "bf16_to_float"]
 
 def dump():
     with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:

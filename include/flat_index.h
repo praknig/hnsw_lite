@@ -324,6 +324,9 @@ public:
     const MetadataStore& metadata() const { return metadata_; }
 
 private:
+    /// Prepares `vector` into scratch_ (validated, normalized for cosine) and checks the
+    /// codec can encode it (float16's range): every write path calls it before changing anything.
+    void prepare_checked(std::span<const float> vector);
     /// A stored vector as input again (for compact and search_by_id): the vector as
     /// given if kept, otherwise the stored one, padded with zeros to dim() when
     /// truncating (truncation ignores those values).

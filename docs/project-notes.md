@@ -63,7 +63,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
 - [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
 - [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
-- [ ] Fuzzing the file and log loaders
+- [x] Fuzzing the file and log loaders
 - [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
 - [x] Automatic maintenance of collections (`MaintenancePolicy`, `maintain()`, a background thread)
 - [x] Presets for collections (`CollectionOptions::preset`)
@@ -76,7 +76,14 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [ ] Payload index posting lists, and filter-aware graph construction
 - [x] Graph reordering for memory locality (`reorder()`), score modifiers (recency decay, confidence, boosts), dates, MMR diversity, document expiry (TTL), string keys
 - [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
+- [x] Half-precision vectors (float16, bfloat16), a compact ID map, and collection settings (expiry, string keys) saved with the collection
 - [ ] Benchmark results on SIFT1M and GloVe, published
+- [ ] Collections: scanning every document, and exporting to a DataFrame
+- [ ] Faceted search: counts by field over the top hits and the whole corpus (then filtered counts, numeric ranges)
+- [ ] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
+- [ ] A first release on PyPI (v0.1.0), with a changelog
+- [ ] LangChain and LlamaIndex integrations; an ann-benchmarks adapter
+- [ ] Integer SIMD kernels for SQ8 distances; half precision for the disk index
 
 The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) were planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 

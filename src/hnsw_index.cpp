@@ -55,7 +55,16 @@ HnswIndex::HnswIndex(std::size_t dim, Metric metric, HnswParams params, Schema s
       scratch_(vecdb::indexed_dim(params.quantization, dim)),
       rng_(params.seed),
       codec_(make_codec(params.quantization.codec, vecdb::indexed_dim(params.quantization, dim), metric, params.quantization.pq_subspaces)),
-      metadata_(std::move(schema)) {}
+      metadata_(std::move(schema)) {
+    // A codec that needs no training (half precision) is ready at once: in codes-only
+    // mode the float32 vectors are never kept, from the first insert.
+    if (codec_ && codec_->trained() && !params_.quantization.keep_full_vectors) storage_.drop_vector_values();
+}
+
+void HnswIndex::prepare_checked(std::span<const float> vector) {
+    prepare_truncated(scratch_, vector, dim(), metric_);
+    if (codec_ && codec_->trained()) codec_->check(scratch_.values());  // before any change: encoding must not fail
+}
 
 int HnswIndex::random_level() {
     // Uniform in [0, 1) from the top 53 bits. Done by hand instead of with
@@ -95,6 +104,8 @@ private:
 float HnswIndex::distance_to(const float* query, NodeId node) const {
     if (const CodeQuery* cq = current_code_query(); cq && cq->index == this)
         return cq->codec->distance(*cq->table, cq->codes + std::size_t(node) * cq->code_size);
+    if (codes_only() && codec_->direct())  // half precision: straight from the code, no decoding
+        return codec_->distance_direct(query, codes_.data() + std::size_t(node) * codec_->code_size());
     thread_local std::vector<float> buffer;  // codes only: the node, decoded
     return index_distance(distance_(query, stored_padded(node, buffer).data(), stride_), metric_ == Metric::Cosine);
 }
@@ -110,6 +121,11 @@ HnswIndex::NodeDistance HnswIndex::node_distance(const float* query) const {
         d.table = cq->table;
         d.codes = cq->codes;
         d.code_size = cq->code_size;
+    } else if (codes_only() && codec_->direct()) {  // half precision: the same choice distance_to() makes
+        d.path = NodeDistance::Path::Direct;
+        d.codec = codec_.get();
+        d.codes = codes_.data();
+        d.code_size = codec_->code_size();
     } else if (!codes_only()) {
         d.path = NodeDistance::Path::Vectors;
         d.vectors = &storage_.vectors();
@@ -405,7 +421,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     note_change(id);  // for a running rebuild(); harmless if nothing changes
     // 1. Validate everything before changing anything (or drawing a random level).
     if (prepared) scratch_.prepare(vector, Metric::L2);  // copied exactly (L2 never normalizes): see the header
-    else prepare_truncated(scratch_, vector, dim(), metric_);
+    else prepare_checked(vector);
     metadata_.validate(metadata);
     if (storage_.ids().find(id)) throw std::invalid_argument("external id already exists");
     reserve_one_more(free_slots_);  // so a failed insert can always hand its slot back
@@ -485,7 +501,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         std::unordered_set<std::uint64_t> seen;
         seen.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            prepare_truncated(scratch_, vec(i), dim(), metric_);
+            prepare_checked(vec(i));
             if (storage_.ids().find(ids[i]) || !seen.insert(ids[i]).second)
                 throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
         }
@@ -509,7 +525,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         //    since a reused slot keeps its old links (other nodes route through it)
         //    until the moment it is reused.
         for (std::size_t i = 0; i < reuse; ++i) {
-            prepare_truncated(scratch_, vec(i), dim(), metric_);
+            prepare_checked(vec(i));
             const NodeId slot = free_slots_.back();
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
@@ -539,7 +555,7 @@ void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         //    yet, so the graph does not change. All storage grows here, so nothing
         //    reallocates while threads link in step 5.
         for (std::size_t i = reuse; i < n; ++i) {
-            prepare_truncated(scratch_, vec(i), dim(), metric_);
+            prepare_checked(vec(i));
             const auto slot = static_cast<NodeId>(storage_.size());
             undo.push_back(metadata_.write(slot, row(i)));
             const int level = random_level();
@@ -843,7 +859,7 @@ bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
     const RngGuard rng_guard(rng_);  // a failed change draws no level
     // 1. Validate everything before changing anything.
-    prepare_truncated(scratch_, vector, dim(), metric_);
+    prepare_checked(vector);
     if (metadata) metadata_.validate(*metadata);
     IdMap& ids = storage_.ids();
     const auto found = ids.find(id);
@@ -932,7 +948,12 @@ std::optional<std::vector<SearchResult>> HnswIndex::search_by_id(std::uint64_t i
 void HnswIndex::reserve_code(NodeId slot) {
     if (!codec_ || !codec_->trained()) return;
     const std::size_t needed = (std::size_t(slot) + 1) * codec_->code_size();
-    if (codes_.size() < needed) codes_.resize(std::max(needed, codes_.size() + codes_.size() / 2));  // grow geometrically
+    if (codes_.size() < needed) {
+        // Capacity grows geometrically, but only the codes in use are written: reserve()
+        // leaves the rest untouched (not resident), where resize() would zero-fill it.
+        if (codes_.capacity() < needed) codes_.reserve(std::max(needed, codes_.capacity() + codes_.capacity() / 2));
+        codes_.resize(needed);
+    }
 }
 
 void HnswIndex::encode_slot(NodeId slot) {

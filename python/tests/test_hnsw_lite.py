@@ -476,12 +476,9 @@ def test_load_with_runtime_settings_and_keyed_metadata(tmp_path):
     assert not c.set_metadata("old", {"n": 2}) and not c.set_metadata("absent", {"n": 3})
     path = str(tmp_path / "c.col")
     c.save(path)
-    plain = hl.Collection.load(path)  # both off: the expired document shows, keys are refused
-    assert hl.Collection.id_of("old") in plain
-    with pytest.raises(RuntimeError):
-        plain.get("kept")
-    loaded = hl.Collection.load(path, ttl=True, string_ids=True)
+    loaded = hl.Collection.load(path)  # the saved settings come back: expired stays hidden, keys work
     assert "old" not in loaded and loaded.get("kept")["key"] == "kept"
+    assert hl.Collection.load(path, ttl=True).get("kept")["key"] == "kept"  # passing one never switches another off
     with pytest.raises(ValueError):
         hl.Collection.load(path, default_ttl=-1)
 
@@ -564,3 +561,35 @@ def test_durable_directory_is_locked_across_processes(tmp_path):
             time.sleep(0.1)
     assert 42 in c  # and its acknowledged write survived
     c.close()
+
+
+# ---------------------------------------------------------------- half precision
+
+def test_half_precision_vectors(tmp_path):
+    data = rng.random((500, 32)).astype(np.float32)
+    for codec in (hl.Codec.F16, hl.Codec.BF16):
+        p = hl.HnswParams()
+        p.quantization.codec = codec
+        p.quantization.keep_full_vectors = False
+        p.quantization.rerank = False
+        idx = hl.HnswIndex(32, hl.Metric.L2, p)
+        idx.add(np.arange(500), data)
+        assert idx.search(data[7], k=1)[0][0] == 7
+        dtype = np.float16 if codec == hl.Codec.F16 else None
+        stored = idx.get_vector(7)
+        if dtype is not None:  # float16: exactly NumPy's rounding (nearest, ties to even)
+            assert np.array_equal(stored, data[7].astype(np.float16).astype(np.float32))
+        assert np.max(np.abs(stored - data[7])) < 0.01
+        path = str(tmp_path / f"half{int(codec)}.idx")
+        idx.save(path)
+        again = hl.HnswIndex.load(path)
+        assert np.array_equal(again.get_vector(7), stored)
+    big = np.full(32, 70000.0, dtype=np.float32)
+    p = hl.HnswParams()
+    p.quantization.codec = hl.Codec.F16
+    p.quantization.keep_full_vectors = False
+    p.quantization.rerank = False
+    f16 = hl.HnswIndex(32, hl.Metric.L2, p)
+    with pytest.raises(ValueError, match="65504"):
+        f16.add(1, big)
+    assert len(f16) == 0

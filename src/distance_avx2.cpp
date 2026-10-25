@@ -18,6 +18,7 @@
 
 #include <cstdint>
 
+#include "half.h"
 #include "kernels.h"
 
 namespace vecdb::kernels {
@@ -123,4 +124,70 @@ float bits_sum_avx2(const float* w, const std::uint8_t* c, std::size_t n) {
         if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
     return sum;
 }
+
+// Half precision: 8 values per step. float16 widens with F16C (vcvtph2ps); bfloat16
+// is the top half of a float32, so widening is a zero-extension and a 16-bit shift.
+namespace {
+inline __m256 f16x8(const std::uint16_t* c) { return _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c))); }
+inline __m256 bf16x8(const std::uint16_t* c) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(c))), 16));
+}
+}  // namespace
+
+float f16_l2_avx2(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) {
+        const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(q + j), f16x8(c + j));
+        acc = _mm256_fmadd_ps(d, d, acc);
+    }
+    float sum = hsum(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - f16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float f16_dot_avx2(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + j), f16x8(c + j), acc);
+    float sum = hsum(acc);
+    for (; j < n; ++j) sum += q[j] * f16_to_float(c[j]);
+    return sum;
+}
+float bf16_l2_avx2(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) {
+        const __m256 d = _mm256_sub_ps(_mm256_loadu_ps(q + j), bf16x8(c + j));
+        acc = _mm256_fmadd_ps(d, d, acc);
+    }
+    float sum = hsum(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - bf16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float bf16_dot_avx2(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + j), bf16x8(c + j), acc);
+    float sum = hsum(acc);
+    for (; j < n; ++j) sum += q[j] * bf16_to_float(c[j]);
+    return sum;
+}
+
+void f16_decode_avx2(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) _mm256_storeu_ps(out + j, f16x8(c + j));
+    for (; j < n; ++j) out[j] = f16_to_float(c[j]);
+}
+void bf16_decode_avx2(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 8 <= n; j += 8) _mm256_storeu_ps(out + j, bf16x8(c + j));
+    for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
+}
+
 }  // namespace vecdb::kernels

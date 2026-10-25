@@ -32,6 +32,7 @@
 #if defined(__linux__)
 #include <dirent.h>
 #include <sys/prctl.h>
+#include <malloc.h>  // mallinfo2 (heap_kb)
 #endif
 
 #include "collection.h"
@@ -98,7 +99,7 @@ std::vector<std::vector<float>> random_vectors(std::size_t n, std::size_t dim, s
 }
 
 /// Resident memory in KB (Linux), or -1.
-long rss_kb() {
+[[maybe_unused]] long rss_kb() {
 #if defined(__linux__)
     if (FILE* f = std::fopen("/proc/self/statm", "r")) {
         long pages = 0, resident = 0;
@@ -108,6 +109,19 @@ long rss_kb() {
     }
 #endif
     return -1;
+}
+
+/// Bytes held from malloc, over every arena (glibc 2.33+): what accumulates when memory
+/// is really kept. Resident memory also moves with how the allocator keeps or returns
+/// freed pages, by megabytes at a time (b1 swung 8 MB in one window on master too).
+/// Elsewhere, resident memory.
+long heap_kb() {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    const struct mallinfo2 m = mallinfo2();
+    return static_cast<long>((m.uordblks + m.hblkhd) / 1024);
+#else
+    return rss_kb();
+#endif
 }
 
 /// Open file descriptors (Linux), or -1.
@@ -123,9 +137,9 @@ int open_files() {
     return -1;
 }
 
-/// Runs `round` `rounds` times and checks that resident memory does not KEEP growing.
-/// Memory is measured for the whole process, which also reflects how the allocator
-/// reuses or returns what earlier tests freed: a one-time shift can land in either
+/// Runs `round` `rounds` times and checks that memory in use (heap_kb) does not KEEP
+/// growing. Memory is measured for the whole process, which can also reflect how the
+/// allocator reuses or returns what earlier tests freed: a one-time shift can land in either
 /// window (found on CI: b4 grew 7.9 MB once in the coverage job, then stayed flat; b1
 /// jumped by one 2 MB transparent huge page in a second window). A leak grows
 /// steadily, so the test fails only if BOTH windows grow by more than half of
@@ -135,11 +149,11 @@ int open_files() {
 /// memory on purpose (there, LeakSanitizer checks for leaks instead).
 void check_no_growth(int rounds, long slack_kb, const std::function<void()>& round) {
     for (int i = 0; i < 3; ++i) round();  // warm-up
-    const long before = rss_kb();
+    const long before = heap_kb();
     for (int i = 0; i < rounds / 2; ++i) round();
-    const long middle = rss_kb();
+    const long middle = heap_kb();
     for (int i = rounds / 2; i < rounds; ++i) round();
-    const long after = rss_kb();
+    const long after = heap_kb();
 #if defined(__SANITIZE_ADDRESS__)
     constexpr bool asan = true;
 #elif defined(__has_feature)
@@ -152,7 +166,7 @@ void check_no_growth(int rounds, long slack_kb, const std::function<void()>& rou
     constexpr bool asan = false;
 #endif
     if (before < 0 || asan) return;
-    std::printf("    resident memory %ld KB -> %ld KB -> %ld KB over two windows of %d rounds\n", before, middle, after, rounds / 2);
+    std::printf("    memory in use %ld KB -> %ld KB -> %ld KB over two windows of %d rounds\n", before, middle, after, rounds / 2);
     if (middle - before > slack_kb / 2 && after - middle > slack_kb / 2)
         fail(__LINE__, "memory grew in both windows: " + std::to_string(middle - before) + " KB, then " + std::to_string(after - middle) + " KB");
 }

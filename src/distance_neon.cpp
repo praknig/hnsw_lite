@@ -15,6 +15,7 @@
  * This file is part of every build, but its code only exists on 64-bit ARM.
  * On x86 it compiles to nothing, so IDEs on x86 show no errors for it.
  */
+#include "half.h"
 #include "kernels.h"
 
 #if defined(__aarch64__) || defined(_M_ARM64)
@@ -115,6 +116,70 @@ float bits_sum_neon(const float* w, const std::uint8_t* c, std::size_t n) {
         if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
     return sum;
 }
+
+// Half precision: 4 values per step. float16 converts natively (fcvtl); bfloat16 is a
+// 16-bit left shift into the top half of a float32.
+namespace {
+inline float32x4_t f16x4(const std::uint16_t* c) { return vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(c))); }
+inline float32x4_t bf16x4(const std::uint16_t* c) { return vreinterpretq_f32_u32(vshll_n_u16(vld1_u16(c), 16)); }
+}  // namespace
+
+float f16_l2_neon(const float* q, const std::uint16_t* c, std::size_t n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) {
+        const float32x4_t d = vsubq_f32(vld1q_f32(q + j), f16x4(c + j));
+        acc = vfmaq_f32(acc, d, d);
+    }
+    float sum = vaddvq_f32(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - f16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float f16_dot_neon(const float* q, const std::uint16_t* c, std::size_t n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) acc = vfmaq_f32(acc, vld1q_f32(q + j), f16x4(c + j));
+    float sum = vaddvq_f32(acc);
+    for (; j < n; ++j) sum += q[j] * f16_to_float(c[j]);
+    return sum;
+}
+float bf16_l2_neon(const float* q, const std::uint16_t* c, std::size_t n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) {
+        const float32x4_t d = vsubq_f32(vld1q_f32(q + j), bf16x4(c + j));
+        acc = vfmaq_f32(acc, d, d);
+    }
+    float sum = vaddvq_f32(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - bf16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float bf16_dot_neon(const float* q, const std::uint16_t* c, std::size_t n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) acc = vfmaq_f32(acc, vld1q_f32(q + j), bf16x4(c + j));
+    float sum = vaddvq_f32(acc);
+    for (; j < n; ++j) sum += q[j] * bf16_to_float(c[j]);
+    return sum;
+}
+
+void f16_decode_neon(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) vst1q_f32(out + j, f16x4(c + j));
+    for (; j < n; ++j) out[j] = f16_to_float(c[j]);
+}
+void bf16_decode_neon(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 4 <= n; j += 4) vst1q_f32(out + j, bf16x4(c + j));
+    for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
+}
+
 }  // namespace vecdb::kernels
 
 #endif  // 64-bit ARM

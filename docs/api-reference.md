@@ -334,7 +334,7 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `SparseIndex(schema)` | `add`, `remove`, `remove_batch`, `remove_where`, `update`, `upsert`, `set_metadata`, `contains`, `size`, `get_vector`, `get_metadata`, `records`, `search(query, k, options)`, `document_frequency(term)`, `terms`, `postings`, `dead_postings`, `slots`, `compact`, `save`, `load` |
 | `Bm25(Bm25Params)` | `k1` (1.2), `b` (0.75), `avg_doc_length` (100); `fit(documents)`, `encode_document(text)`, `encode_query(text, index)`, `tokenize`, `term_id` |
 | `hybrid_search(dense, dense_query, sparse, sparse_query, k, options)` | Dense and sparse searches fused by ID; the dense index is any `HnswIndex` or `FlatIndex` |
-| `fuse(dense_results, sparse_results, k, options)` | Fuses two ranked lists |
+| `fuse(dense, sparse, k, options)` | Fuses two ranked lists |
 | `HybridOptions` | `fusion` (`Rrf`, `Weighted`), `rrf_k` (60), `dense_weight`, `sparse_weight` (1), `dense_k`, `sparse_k` (0: max(4k, 20)), `dense_ef` (0: max(dense_k, 64)), `filter`, `dense_options`, `sparse_options` |
 | `HybridResult` | `id`, `score` (higher is better), `dense_rank`, `sparse_rank` (1-based), `dense_distance`, `sparse_score` |
 
@@ -387,5 +387,5 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `parse_date(iso)`, `format_date(ms)`, `now_ms()`, `Metadata::set_date(name, iso)` | Dates as milliseconds since 1970 (UTC) |
 | `CollectionOptions::ttl { enabled, default_ms }`, `Document::expires_at`, `Collection::remove_expired()` | Opt-in expiry |
 | `CollectionOptions::string_ids`; `Collection::id_of(key)`; `add`, `upsert`, `get`, `contains`, `remove`, `set_metadata` taking a `std::string_view` key | Opt-in string keys; `DocumentRecord::key`, `CollectionHit::key` |
-| `Collection::set_ttl(ttl)`, `Collection::set_string_ids(on)` | The runtime settings at any time (a loaded collection starts with both off) |
+| `Collection::set_ttl(ttl)`, `Collection::set_string_ids(on)` | The settings at any time; saved with the collection and logged for durable ones |
 | `HnswIndex::reorder(options)` | Opt-in: neighbors stored together for faster searches (same graph and results) |

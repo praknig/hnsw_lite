@@ -82,7 +82,8 @@ X86Features detect_x86() {
     const bool os_saves_ymm = (xcr0 & 0x06) == 0x06;  // 128- and 256-bit registers
     const bool os_saves_zmm = (xcr0 & 0xE6) == 0xE6;  // plus all 512-bit state
     const CpuidRegs l7 = cpuid(7, 0);
-    f.avx2_fma = os_saves_ymm && fma && (l7.b & (1u << 5));  // GCOVR_EXCL_BR_LINE: CPU-dependent
+    const bool f16c = l1.c & (1u << 29);  // float16 conversion: the half-precision kernels need it
+    f.avx2_fma = os_saves_ymm && fma && f16c && (l7.b & (1u << 5));  // GCOVR_EXCL_BR_LINE: CPU-dependent
     f.avx512f = os_saves_zmm && (l7.b & (1u << 16));         // GCOVR_EXCL_BR_LINE: CPU-dependent
     return f;
 }
@@ -145,15 +146,23 @@ CodeKernels get_code_kernels(Isa isa) {
     if (!isa_supported(isa)) throw std::invalid_argument(std::string("code kernels: CPU does not support ") + isa_name(isa));
     switch (isa) {
 #if defined(HNSW_LITE_HAVE_AVX2)
-        case Isa::Avx2: return {kernels::sq8_l2_avx2, kernels::sq8_dot_avx2, kernels::bits_sum_avx2};
+        case Isa::Avx2: return {kernels::sq8_l2_avx2, kernels::sq8_dot_avx2, kernels::bits_sum_avx2, kernels::f16_l2_avx2,
+                                 kernels::f16_dot_avx2, kernels::bf16_l2_avx2, kernels::bf16_dot_avx2,
+                                 kernels::f16_decode_avx2, kernels::bf16_decode_avx2};
 #endif
 #if defined(HNSW_LITE_HAVE_AVX512)
-        case Isa::Avx512: return {kernels::sq8_l2_avx512, kernels::sq8_dot_avx512, kernels::bits_sum_avx512};
+        case Isa::Avx512: return {kernels::sq8_l2_avx512, kernels::sq8_dot_avx512, kernels::bits_sum_avx512, kernels::f16_l2_avx512,
+                                 kernels::f16_dot_avx512, kernels::bf16_l2_avx512, kernels::bf16_dot_avx512,
+                                 kernels::f16_decode_avx512, kernels::bf16_decode_avx512};
 #endif
 #if defined(HNSW_LITE_HAVE_NEON)
-        case Isa::Neon: return {kernels::sq8_l2_neon, kernels::sq8_dot_neon, kernels::bits_sum_neon};
+        case Isa::Neon: return {kernels::sq8_l2_neon, kernels::sq8_dot_neon, kernels::bits_sum_neon, kernels::f16_l2_neon,
+                                 kernels::f16_dot_neon, kernels::bf16_l2_neon, kernels::bf16_dot_neon,
+                                 kernels::f16_decode_neon, kernels::bf16_decode_neon};
 #endif
-        default: return {kernels::sq8_l2_scalar, kernels::sq8_dot_scalar, kernels::bits_sum_scalar};
+        default: return {kernels::sq8_l2_scalar, kernels::sq8_dot_scalar, kernels::bits_sum_scalar, kernels::f16_l2_scalar,
+                         kernels::f16_dot_scalar, kernels::bf16_l2_scalar, kernels::bf16_dot_scalar,
+                         kernels::f16_decode_scalar, kernels::bf16_decode_scalar};
     }
 }
 

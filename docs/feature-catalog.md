@@ -23,12 +23,12 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 | **Hybrid search** | Sparse vectors (SPLADE, or BM25 from the built-in `Bm25` encoder); `hybrid_search()` fusing dense and sparse results by Reciprocal Rank Fusion or weighted scores |
 | **Metadata and filters** | Typed fields (integer, float, boolean, keyword, tags), strict or dynamic schemas; filters with comparisons, ranges, membership, tags and boolean logic, plus custom predicates; a query planner choosing exact search, ACORN filtered graph search or plain graph search by selectivity; payload indexes with exact counts |
 | **Records and changes** | Add, `add_batch` (parallel graph building), update, upsert, real deletion with graph repair and slot reuse, `remove_batch`, bulk changes by filter (`remove_where`, `set_metadata_where`, `count_where`); reading back (`get_vector`, `get`, paged `scan`) |
-| **Compression** | SQ8, binary and product quantization (PQ), each with optional re-ranking at full precision and SIMD code kernels; Matryoshka truncation; keeping only codes to save memory |
+| **Compression** | SQ8, binary and product quantization (PQ), each with optional re-ranking at full precision and SIMD code kernels; Matryoshka truncation; keeping only codes to save memory; half precision (float16, bfloat16): vectors halved, recall within 0.005 |
 | **Storage** | Versioned, checksummed file format (older versions still load); atomic saves; deterministic files, identical across platforms |
 | **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
 | **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
 | **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
-| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 894 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 903 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
 ## Compared with similar libraries
 

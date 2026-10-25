@@ -91,7 +91,7 @@ struct LoadedCodec {
 LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t slots) {
     LoadedCodec c;
     const auto kind = r.get<std::uint8_t>();
-    if (kind > static_cast<std::uint8_t>(CodecKind::PQ)) throw FormatError("unknown codec");
+    if (kind > static_cast<std::uint8_t>(CodecKind::BF16)) throw FormatError("unknown codec");
     c.params.codec = static_cast<CodecKind>(kind);
     c.params.train_after = static_cast<std::size_t>(r.get<std::uint64_t>());
     const auto rerank = r.get<std::uint8_t>();
@@ -101,6 +101,8 @@ LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t sl
     validate(c.params);  // invalid settings become a FormatError (see guarded_load)
     const auto trained = r.get<std::uint8_t>();
     if (trained > 1 || (trained == 1 && c.params.codec == CodecKind::None)) throw FormatError("invalid codec training flag");
+    const bool half = c.params.codec == CodecKind::F16 || c.params.codec == CodecKind::BF16;
+    if (half && trained != 1) throw FormatError("a half-precision codec is always trained");
     std::vector<float> state;
     std::uint64_t count = 0;
     std::size_t code_bytes = 0;
@@ -123,6 +125,11 @@ LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t sl
             const std::size_t k = static_cast<PQCodec&>(*c.codec).centroids();
             for (std::uint8_t b : c.codes)
                 if (b >= k) throw FormatError("a code refers to a centroid that does not exist");
+        }
+        if (half) {  // infinity and NaN bit patterns would break the no-NaN guarantee
+            const auto& h = static_cast<const HalfCodec&>(*c.codec);
+            for (std::size_t s = 0; s < slots; ++s)
+                if (!h.finite(c.codes.data() + s * h.code_size())) throw FormatError("a half-precision code is infinite or NaN");
         }
     }
     return c;

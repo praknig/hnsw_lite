@@ -488,6 +488,9 @@ public:
     const Storage& storage() const { return storage_; }
 
 private:
+    /// Prepares `vector` into scratch_ (validated, normalized for cosine) and checks the
+    /// codec can encode it (float16's range): every write path calls it before changing anything.
+    void prepare_checked(std::span<const float> vector);
     /// A stored vector as input again (for compact and search_by_id): the vector as
     /// given if kept, otherwise the stored one, padded with zeros to dim() when
     /// truncating (truncation ignores those values).
@@ -580,14 +583,14 @@ private:
     /// a checked row lookup. Made at the start of each searching function: the code
     /// table in force does not change while one runs.
     struct NodeDistance {
-        enum class Path : std::uint8_t { Vectors, Codes, Decoded };
+        enum class Path : std::uint8_t { Vectors, Codes, Direct, Decoded };
         Path path = Path::Decoded;
         bool cosine = false;
         const float* query = nullptr;
         const VectorStore* vectors = nullptr;  // Path::Vectors
         DistanceFn fn = nullptr;
         std::size_t stride = 0;
-        const VectorCodec* codec = nullptr;    // Path::Codes
+        const VectorCodec* codec = nullptr;    // Path::Codes and Path::Direct
         const std::vector<float>* table = nullptr;
         const std::uint8_t* codes = nullptr;
         std::size_t code_size = 0;
@@ -595,6 +598,7 @@ private:
         float operator()(NodeId n) const {
             if (path == Path::Vectors) return index_distance(fn(query, vectors->row_unchecked(n), stride), cosine);
             if (path == Path::Codes) return codec->distance(*table, codes + std::size_t(n) * code_size);
+            if (path == Path::Direct) return codec->distance_direct(query, codes + std::size_t(n) * code_size);
             return index->distance_to(query, n);
         }
     };

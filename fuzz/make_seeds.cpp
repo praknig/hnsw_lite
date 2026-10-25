@@ -37,12 +37,26 @@ int main(int argc, char** argv) {
     HnswIndex hq(4, Metric::Cosine, q);
     for (std::uint64_t i = 0; i < 20; ++i) hq.add(i, vec(4));
     write(root + "/1", "hnsw_sq8.idx", hq);
+    HnswParams half;  // half precision, codes only: the loader's checks on float16 codes
+    half.quantization.codec = CodecKind::F16;
+    half.quantization.keep_full_vectors = false;
+    half.quantization.rerank = false;
+    HnswIndex hh(4, Metric::L2, half);
+    for (std::uint64_t i = 0; i < 20; ++i) hh.add(i, vec(4));
+    write(root + "/1", "hnsw_f16.idx", hh);
     IvfParams ivf;
     ivf.lists = 3;
     ivf.train_after = 10;
     FlatIndex f(4, Metric::InnerProduct, Schema::dynamic(), {}, ivf);
     for (std::uint64_t i = 0; i < 20; ++i) f.add(i, vec(4), Metadata().set("a", 1.5));
     write(root + "/2", "flat_ivf.idx", f);
+    QuantizationParams bq;  // bfloat16 codes only, with IVF lists
+    bq.codec = CodecKind::BF16;
+    bq.keep_full_vectors = false;
+    bq.rerank = false;
+    FlatIndex fb(4, Metric::L2, Schema::dynamic(), bq, ivf);
+    for (std::uint64_t i = 0; i < 20; ++i) fb.add(i, vec(4));
+    write(root + "/2", "flat_bf16.idx", fb);
     SparseIndex s;
     for (std::uint64_t i = 0; i < 20; ++i) s.add(i, {{std::uint32_t(i % 5), std::uint32_t(7 + i % 3)}, {1.0f, 0.5f}}, Metadata().set("b", true));
     (void)s.remove(4);
@@ -62,6 +76,16 @@ int main(int argc, char** argv) {
     }
     (void)c.remove(2);
     write(root + "/4", "collection.col", c);
+    CollectionOptions ko = co;  // with saved settings (expiry, string keys): the settings block
+    ko.ttl = TtlOptions{true, 3600000};
+    ko.string_ids = true;
+    Collection kc(ko);
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        Document d;
+        d.vector = vec(4);
+        kc.add("key" + std::to_string(i), d);
+    }
+    write(root + "/4", "collection_settings.col", kc);
     fs::create_directories(root + "/5");
     const std::string seg = root + "/5/segment.wal";
     fs::remove(seg);

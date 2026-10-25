@@ -73,7 +73,7 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `string_ids` | `bool` | Opt-in string keys (names, UUIDs) wherever an id is accepted. |
 | `options` | `hl.CollectionOptions` or `None` | Every setting at once, instead of the arguments above (`hl.CollectionOptions.preset(dim, hl.Preset.BALANCED)` is a starting point). |
 
-`hl.Collection.load(path, ttl=False, default_ttl=None, string_ids=False)` reads a file written by `save(path)`. Maintenance starts manual, and expiry and string keys are off unless given here: a loaded collection otherwise shows expired documents and refuses keys.
+`hl.Collection.load(path, ttl=False, default_ttl=None, string_ids=False)` reads a file written by `save(path)`. Maintenance starts manual; expiry and string keys come back as saved (the arguments switch them on, never off).
 
 ### Methods
 
@@ -123,11 +123,11 @@ docs.count_where(hl.Filter.ge("published", hl.to_ms("2024-01-01")))
 
 ```python
 hits = docs.search(vector=q, text="pricing", k=10, modifiers={
-    "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
-    "multiply": "provenance_confidence",                           # times a field (0 to 1)
-    "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
-              ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
-    "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
+   "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
+   "multiply": "provenance_confidence",                           # times a field (0 to 1)
+   "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
+             ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
+   "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
 })
 ```
 
@@ -153,7 +153,7 @@ hits = docs.search(vector=q, k=10, diversity=0.5)                     # MMR: 1 k
 ids, distances, scores = index.search(q, k=10, diversity=0.5)         # indexes too
 ```
 
-`upsert_many` and `upsert_dataframe` take string keys (an `object` id column) and expiry times (`expires_at=` a list, `expires_column=`). Hits carry `key`; `hl.Collection.id_of(key)` gives a key's numeric id. The metadata names `_expires_at` and `_key` are reserved. `ttl` and `string_ids` are not stored: pass them on every open.
+`upsert_many` and `upsert_dataframe` take string keys (an `object` id column) and expiry times (`expires_at=` a list, `expires_column=`). Hits carry `key`; `hl.Collection.id_of(key)` gives a key's numeric id. The metadata names `_expires_at` and `_key` are reserved. `ttl` and `string_ids` are saved with the collection: a reopened or loaded collection keeps them (arguments switch a feature on, never off by omission).
 
 ## pandas
 
@@ -217,7 +217,7 @@ f = F.eq("lang", "en") & (F.ge("year", 2020) | F.has_tag("tags", "featured")) & 
 | `Filter.exists(field)`, `Filter.all()` | has a value; everything |
 | `a & b`, `a \| b`, `~a` | and, or, not (Python's `and`, `or` and `not` cannot be overloaded: use the operators) |
 
-Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.
+Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). `hl.as_filter(f)` does that conversion explicitly (a `Filter` or `None` is returned as it is), for building on a dict filter with `&`, `|` and `~`. The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.
 
 ## How Python values are converted
 
@@ -236,7 +236,7 @@ Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [20
 
 ## Enumerations and option classes
 
-`hl.Metric` (`L2`, `INNER_PRODUCT`, `COSINE`), `hl.Codec` (`NONE`, `SQ8`, `BINARY`, `PQ`, for `QuantizationParams.codec`), `hl.Strategy` (`AUTO`, `EXACT`, `GRAPH`, `ACORN`), `hl.Preset`, `hl.Fusion`, `hl.Durability`, `hl.Maintenance` (`MANUAL`, `BACKGROUND`) and `hl.FieldType` mirror the C++ enumerations. The option classes `hl.HnswParams`, `hl.QuantizationParams`, `hl.IvfParams`, `hl.DurableOptions`, `hl.MaintenancePolicy` and `hl.CollectionOptions` have the C++ fields as attributes (durations in milliseconds: `interval_ms`, `budget_ms`, `group_interval_ms`; `checkpoint_age_s` in seconds):
+`hl.Metric` (`L2`, `INNER_PRODUCT`, `COSINE`), `hl.Codec` (`NONE`, `SQ8`, `BINARY`, `PQ`, `F16`, `BF16`, for `QuantizationParams.codec`; `F16` and `BF16` with `keep_full_vectors = False` halve vector memory), `hl.Strategy` (`AUTO`, `EXACT`, `GRAPH`, `ACORN`), `hl.Preset`, `hl.Fusion`, `hl.Durability`, `hl.Maintenance` (`MANUAL`, `BACKGROUND`) and `hl.FieldType` mirror the C++ enumerations. The option classes `hl.HnswParams`, `hl.QuantizationParams`, `hl.IvfParams`, `hl.DurableOptions`, `hl.MaintenancePolicy` and `hl.CollectionOptions` have the C++ fields as attributes (durations in milliseconds: `interval_ms`, `budget_ms`, `group_interval_ms`; `checkpoint_age_s` in seconds):
 
 ```python
 p = hl.HnswParams()
@@ -244,6 +244,8 @@ p.M = 32
 p.quantization.codec = hl.Codec.SQ8
 index = hl.HnswIndex(dim=384, metric=hl.Metric.COSINE, params=p)
 ```
+
+`hl.CollectionOptions` (for `hl.Collection(options=...)`) also has `bm25`, an `hl.Bm25Params` with `k1` (1.2: how quickly repeated words stop adding to a score), `b` (0.75: how much long texts are discounted) and `avg_doc_length` (100 tokens); and `set_schema(fields, strict=False)`, which takes the same `{"name": type}` dict as the constructor's `schema` (with `strict=True`, fields outside it are refused).
 
 ## Threads, errors and limits
 

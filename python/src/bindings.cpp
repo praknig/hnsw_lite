@@ -436,7 +436,9 @@ PYBIND11_MODULE(_core, m) {
     py::enum_<Metric>(m, "Metric").value("L2", Metric::L2).value("INNER_PRODUCT", Metric::InnerProduct).value("COSINE", Metric::Cosine);
     py::enum_<FieldType>(m, "FieldType").value("INT", FieldType::Int).value("FLOAT", FieldType::Float).value("BOOL", FieldType::Bool)
         .value("KEYWORD", FieldType::Keyword).value("TAGS", FieldType::Tags);
-    py::enum_<CodecKind>(m, "Codec").value("NONE", CodecKind::None).value("SQ8", CodecKind::SQ8).value("BINARY", CodecKind::Binary).value("PQ", CodecKind::PQ);
+    py::enum_<CodecKind>(m, "Codec").value("NONE", CodecKind::None).value("SQ8", CodecKind::SQ8).value("BINARY", CodecKind::Binary).value("PQ", CodecKind::PQ)
+        .value("F16", CodecKind::F16)
+        .value("BF16", CodecKind::BF16);
     py::enum_<Strategy>(m, "Strategy").value("AUTO", Strategy::Auto).value("EXACT", Strategy::ForceExact).value("GRAPH", Strategy::ForceGraph)
         .value("ACORN", Strategy::ForceAcorn);
     py::enum_<Preset>(m, "Preset").value("BALANCED", Preset::Balanced).value("HIGH_RECALL", Preset::HighRecall).value("LOW_MEMORY", Preset::LowMemory);
