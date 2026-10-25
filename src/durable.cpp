@@ -295,15 +295,26 @@ std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionO
         throw std::invalid_argument("Collection::open: the directory holds a collection with another dimension, metric or sides");
     o.index->options_.durability = durability;
     o.index->options_.ef = options.ef;  // runtime settings come from the caller
-    o.index->check_runtime(options.ttl, options.string_ids);  // a stored strict schema must have the reserved fields
-    o.index->options_.ttl = options.ttl;
-    o.index->options_.string_ids = options.string_ids;
+    // The settings stored with the collection are kept. The caller can switch a feature
+    // on (and set a default lifetime), never off by leaving it out: set_ttl() and
+    // set_string_ids() switch them off. Checked before anything is attached.
+    const Runtime stored = o.index->runtime();
+    Runtime wanted = stored;
+    if (options.ttl.enabled) {
+        wanted.ttl.enabled = true;
+        if (options.ttl.default_ms > 0) wanted.ttl.default_ms = options.ttl.default_ms;
+    }
+    if (options.string_ids) wanted.string_ids = true;
+    if (options.ttl.default_ms < 0) throw std::invalid_argument("TtlOptions::default_ms must not be negative");
+    o.index->check_runtime(wanted.ttl, wanted.string_ids);  // a stored strict schema must have the reserved fields
     o.index->log_.set_sync_each(durability.durability == Durability::Synced);
     o.index->log_.attach(std::move(*o.log));
     o.index->durable_ = std::move(o.state);
     o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
     o.index->checkpoint_lsn_ = st->snapshot_lsn;
     if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
+    if (wanted.ttl.enabled != stored.ttl.enabled || wanted.ttl.default_ms != stored.ttl.default_ms || wanted.string_ids != stored.string_ids)
+        o.index->change_settings(wanted);  // logged: a crash before the next checkpoint keeps it
     o.index->set_maintenance(maintenance);
     return std::move(o.index);
 }

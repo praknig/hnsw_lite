@@ -387,5 +387,5 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `parse_date(iso)`, `format_date(ms)`, `now_ms()`, `Metadata::set_date(name, iso)` | Dates as milliseconds since 1970 (UTC) |
 | `CollectionOptions::ttl { enabled, default_ms }`, `Document::expires_at`, `Collection::remove_expired()` | Opt-in expiry |
 | `CollectionOptions::string_ids`; `Collection::id_of(key)`; `add`, `upsert`, `get`, `contains`, `remove`, `set_metadata` taking a `std::string_view` key | Opt-in string keys; `DocumentRecord::key`, `CollectionHit::key` |
-| `Collection::set_ttl(ttl)`, `Collection::set_string_ids(on)` | The runtime settings at any time (a loaded collection starts with both off) |
+| `Collection::set_ttl(ttl)`, `Collection::set_string_ids(on)` | The settings at any time; saved with the collection and logged for durable ones |
 | `HnswIndex::reorder(options)` | Opt-in: neighbors stored together for faster searches (same graph and results) |

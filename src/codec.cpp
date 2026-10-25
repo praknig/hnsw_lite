@@ -3,7 +3,9 @@
  * @brief Vector codecs; see codec.h. Built without floating-point contraction
  *        (see CMakeLists.txt), so codes are identical on every CPU.
  */
+#include <cstring>
 #include "codec.h"
+#include "half.h"
 #include "kmeans.h"
 
 #include <algorithm>
@@ -253,12 +255,78 @@ float PQCodec::distance(const std::vector<float>& table, const std::uint8_t* cod
     return metric() == Metric::Cosine ? 1.0f + sum : sum;  // cosine: 1 - dot, and sum is -dot
 }
 
+// ---------------------------------------------------------------- half precision
+
+HalfCodec::HalfCodec(CodecKind kind, std::size_t dim, Metric metric) : VectorCodec(dim, metric), kind_(kind) {
+    if (kind != CodecKind::F16 && kind != CodecKind::BF16) throw std::invalid_argument("HalfCodec: kind must be F16 or BF16");
+}
+
+void HalfCodec::restore(std::span<const float> state) {
+    if (!state.empty()) throw std::invalid_argument("HalfCodec: has no state to restore");
+}
+
+void HalfCodec::train(std::span<const float> sample) {
+    if (sample.size() % dim() != 0) throw std::invalid_argument("HalfCodec: sample must hold whole vectors");
+}
+
+void HalfCodec::check(std::span<const float> v) const {
+    if (kind_ != CodecKind::F16) return;  // bfloat16 holds every finite float32 magnitude
+    for (const float x : v)
+        if (std::fabs(x) > kF16Max)
+            throw std::invalid_argument("float16 holds values up to 65504 in magnitude; use bfloat16 (CodecKind::BF16) for larger values");
+}
+
+void HalfCodec::encode(std::span<const float> v, std::uint8_t* code) const {
+    if (v.size() != dim()) throw std::invalid_argument("HalfCodec: vector has the wrong dimension");
+    for (std::size_t j = 0; j < v.size(); ++j) {
+        const std::uint16_t h = kind_ == CodecKind::F16 ? float_to_f16(v[j]) : float_to_bf16(v[j]);
+        std::memcpy(code + 2 * j, &h, 2);
+    }
+}
+
+void HalfCodec::decode(const std::uint8_t* code, std::span<float> out) const {
+    const std::size_t n = std::min(out.size(), dim());
+    const auto* c = reinterpret_cast<const std::uint16_t*>(code);  // 2-byte aligned (see distance_direct)
+    if (kind_ == CodecKind::F16) kernels_.f16_decode(c, out.data(), n);  // SIMD where available
+    else kernels_.bf16_decode(c, out.data(), n);
+}
+
+void HalfCodec::prepare(std::span<const float> query, std::vector<float>& table) const {
+    table.assign(query.begin(), query.end());  // distances compare the float32 query directly
+}
+
+float HalfCodec::distance(const std::vector<float>& table, const std::uint8_t* code) const {
+    return distance_direct(table.data(), code);  // the prepared query is the query itself
+}
+
+float HalfCodec::distance_direct(const float* query, const std::uint8_t* code) const {
+    // Codes start at multiples of code_size() in byte arrays from operator new, so they
+    // are 2-byte aligned.
+    const auto* c = reinterpret_cast<const std::uint16_t*>(code);
+    const bool f16 = kind_ == CodecKind::F16;
+    if (metric() == Metric::L2) return f16 ? kernels_.f16_l2(query, c, dim()) : kernels_.bf16_l2(query, c, dim());
+    const float dot = f16 ? kernels_.f16_dot(query, c, dim()) : kernels_.bf16_dot(query, c, dim());
+    return metric() == Metric::Cosine ? 1.0f - dot : -dot;
+}
+
+bool HalfCodec::finite(const std::uint8_t* code) const {
+    const std::uint16_t exponent = kind_ == CodecKind::F16 ? 0x7C00 : 0x7F80;  // all ones: infinity or NaN
+    for (std::size_t j = 0; j < dim(); ++j) {
+        std::uint16_t h;
+        std::memcpy(&h, code + 2 * j, 2);
+        if ((h & exponent) == exponent) return false;
+    }
+    return true;
+}
+
 std::unique_ptr<VectorCodec> make_codec(CodecKind kind, std::size_t dim, Metric metric, std::size_t pq_subspaces) {
     switch (kind) {
         case CodecKind::None: return nullptr;
         case CodecKind::SQ8: return std::make_unique<SQ8Codec>(dim, metric);
         case CodecKind::Binary: return std::make_unique<BinaryCodec>(dim, metric);
         case CodecKind::PQ: return std::make_unique<PQCodec>(dim, metric, pq_subspaces);
+        case CodecKind::F16:
+        case CodecKind::BF16: return std::make_unique<HalfCodec>(kind, dim, metric);
     }
     throw std::invalid_argument("unknown codec kind");  // GCOVR_EXCL_LINE: every enumerator is handled above
 }

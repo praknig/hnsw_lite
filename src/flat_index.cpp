@@ -26,6 +26,12 @@ FlatIndex::FlatIndex(std::size_t dim, Metric metric, Schema schema, Quantization
     ivf_ = ivf;
     if (keeps_originals(quant_, metric, dim)) originals_.emplace(dim);  // keep the vectors as given
     codec_ = make_codec(quant_.codec, vectors_.dim(), metric, quant_.pq_subspaces);
+    if (codec_ && codec_->trained() && !quant_.keep_full_vectors) vectors_.drop_values();  // half precision: codes only from the start
+}
+
+void FlatIndex::prepare_checked(std::span<const float> vector) {
+    prepare_truncated(scratch_, vector, dim(), metric_);
+    if (codec_ && codec_->trained()) codec_->check(scratch_.values());  // before any change: encoding must not fail
 }
 
 void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
@@ -37,7 +43,7 @@ void FlatIndex::add(std::uint64_t id, std::span<const float> vector, const Metad
 void FlatIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
     note_change(id);  // for a running rebuild(); harmless if nothing changes
     // 1. Validate everything before changing anything.
-    prepare_truncated(scratch_, vector, dim(), metric_);
+    prepare_checked(vector);
     metadata_.validate(metadata);
     if (ids_.find(id)) throw std::invalid_argument("external id already exists");
 
@@ -71,7 +77,12 @@ void FlatIndex::add_vector(std::span<const float> original) {
     }
     if (coded) {  // room for the code first: may throw, before any change
         const std::size_t needed = (vectors_.size() + 1) * codec_->code_size();
-        if (codes_.size() < needed) codes_.resize(std::max(needed, codes_.size() + codes_.size() / 2));
+        if (codes_.size() < needed) {
+            // Capacity grows geometrically, but only the codes in use are written: reserve()
+            // leaves the rest untouched (not resident), where resize() would zero-fill it.
+            if (codes_.capacity() < needed) codes_.reserve(std::max(needed, codes_.capacity() + codes_.capacity() / 2));
+            codes_.resize(needed);
+        }
     }
     vectors_.add(scratch_.values());
     if (!originals_) {
@@ -459,7 +470,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
         std::unordered_set<std::uint64_t> seen;
         seen.reserve(n);
         for (std::size_t i = 0; i < n; ++i) {
-            prepare_truncated(scratch_, vectors.subspan(i * d, d), dim(), metric_);
+            prepare_checked(vectors.subspan(i * d, d));
             if (ids_.find(ids[i]) || !seen.insert(ids[i]).second)
                 throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
         }
@@ -473,7 +484,7 @@ void FlatIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span
     detail::OperationControl control(options, n);  // may throw Cancelled before any change
     try {
         for (std::size_t i = 0; i < n; ++i) {
-            prepare_truncated(scratch_, vectors.subspan(i * d, d), dim(), metric_);
+            prepare_checked(vectors.subspan(i * d, d));
             const auto slot = static_cast<NodeId>(vectors_.size());
             undo.push_back(metadata_.write(slot, row(i)));
             try {
@@ -551,7 +562,7 @@ bool FlatIndex::upsert(std::uint64_t id, std::span<const float> vector, const Me
 
 bool FlatIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
     note_change(id);
-    prepare_truncated(scratch_, vector, dim(), metric_);  // validates; may throw before any change
+    prepare_checked(vector);  // validates; may throw before any change
     if (metadata) metadata_.validate(*metadata);
     const auto node = ids_.find(id);
     if (!node) return false;

@@ -111,7 +111,7 @@ docs.upsert("doc-42", d);
 auto record = docs.get("doc-42");   // record->key, record->expires_at
 ```
 
-Both are runtime settings: pass them each time the collection is opened. See the [developer reference](developer-reference.md#28a-expiry-and-string-keys).
+Both are saved with the collection: a reopened or loaded collection keeps them (switch them off with `set_ttl` and `set_string_ids`). See the [developer reference](developer-reference.md#28a-expiry-and-string-keys).
 
 ## Creating an index
 
@@ -743,6 +743,20 @@ Every index is safe to use from any number of threads at once, with no lock of y
 **All-or-nothing:** every change either completes or leaves the index's contents as they were (every stored vector, its metadata, and search results), including when memory runs out partway through. A failed `add` never leaves a half-inserted vector or a new metadata field behind. With HNSW, internal bookkeeping may still move on: if memory runs out while a vector is being linked, its slot is kept free for the next add (so `capacity()` can grow by one), and the random level drawn for it is used up. A `FlatIndex` is restored exactly.
 
 Removing an ID that is not stored is not an error: `remove` returns `false`, as do `set_metadata` and (with an empty result) `get_metadata`.
+
+## Half precision (float16, bfloat16)
+
+Storing each value in 16 bits instead of 32 halves the vectors' memory, with almost no effect on recall (within 0.005 of float32 in our tests). No training is needed: the float32 vectors are never kept.
+
+```cpp
+HnswParams p;
+p.quantization.codec = CodecKind::F16;        // or CodecKind::BF16
+p.quantization.keep_full_vectors = false;     // store only the 16-bit values
+p.quantization.rerank = false;
+HnswIndex index(768, Metric::Cosine, p);
+```
+
+Measured with M 16: 448 instead of 687 bytes per vector at 128 dimensions (35% less), 1,753 instead of 3,280 at 768 (47% less); the links do not shrink, so the saving grows with the dimension. **float16** keeps about 3.3 significant digits and refuses values beyond ±65504; **bfloat16** keeps float32's range with about 2.4 digits. For cosine, vectors are normalized first, so both always fit. `get_vector` returns the stored (rounded) values. Works with flat and IVF indexes and collections (`CollectionOptions::hnsw`) too.
 
 ## Memory
 

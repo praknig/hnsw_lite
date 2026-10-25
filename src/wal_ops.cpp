@@ -221,6 +221,14 @@ std::vector<unsigned char> encode_fraction(double fraction) {
     return std::move(o.bytes);
 }
 
+std::vector<unsigned char> encode_collection_settings(bool ttl_enabled, std::int64_t ttl_default_ms, bool string_ids) {
+    Out o;
+    o.put<std::uint8_t>(ttl_enabled ? 1 : 0);
+    o.put<std::int64_t>(ttl_default_ms);
+    o.put<std::uint8_t>(string_ids ? 1 : 0);
+    return std::move(o.bytes);
+}
+
 Op decode(std::uint8_t type, std::span<const unsigned char> payload) {
     In in(payload);
     Op op;
@@ -274,6 +282,12 @@ Op decode(std::uint8_t type, std::span<const unsigned char> payload) {
             break;
         }
         case kSetAutoCompact: op.fraction = in.get<double>(); break;
+        case kCollectionSettings:
+            op.ttl_enabled = in.get<std::uint8_t>();
+            op.ttl_default_ms = in.get<std::int64_t>();
+            op.string_ids = in.get<std::uint8_t>();
+            if (op.ttl_enabled > 1 || op.string_ids > 1 || op.ttl_default_ms < 0) throw FormatError("log record: invalid collection settings");
+            break;
         case kDocument: {
             op.ids.push_back(in.get<std::uint64_t>());
             op.parts = in.get<std::uint8_t>();

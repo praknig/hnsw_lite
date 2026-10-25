@@ -16,6 +16,7 @@
 
 #include <cstdint>
 
+#include "half.h"
 #include "kernels.h"
 
 namespace vecdb::kernels {
@@ -111,4 +112,69 @@ float bits_sum_avx512(const float* w, const std::uint8_t* c, std::size_t n) {
         if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
     return sum;
 }
+
+// Half precision: 16 values per step (vcvtph2ps zmm is part of AVX-512F).
+namespace {
+inline __m512 f16x16(const std::uint16_t* c) { return _mm512_cvtph_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c))); }
+inline __m512 bf16x16(const std::uint16_t* c) {
+    return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c))), 16));
+}
+}  // namespace
+
+float f16_l2_avx512(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(q + j), f16x16(c + j));
+        acc = _mm512_fmadd_ps(d, d, acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - f16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float f16_dot_avx512(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + j), f16x16(c + j), acc);
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) sum += q[j] * f16_to_float(c[j]);
+    return sum;
+}
+float bf16_l2_avx512(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(q + j), bf16x16(c + j));
+        acc = _mm512_fmadd_ps(d, d, acc);
+    }
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) {
+        const float d = q[j] - bf16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float bf16_dot_avx512(const float* q, const std::uint16_t* c, std::size_t n) {
+    __m512 acc = _mm512_setzero_ps();
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + j), bf16x16(c + j), acc);
+    float sum = _mm512_reduce_add_ps(acc);
+    for (; j < n; ++j) sum += q[j] * bf16_to_float(c[j]);
+    return sum;
+}
+
+void f16_decode_avx512(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) _mm512_storeu_ps(out + j, f16x16(c + j));
+    for (; j < n; ++j) out[j] = f16_to_float(c[j]);
+}
+void bf16_decode_avx512(const std::uint16_t* c, float* out, std::size_t n) {
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) _mm512_storeu_ps(out + j, bf16x16(c + j));
+    for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
+}
+
 }  // namespace vecdb::kernels

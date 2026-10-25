@@ -43,6 +43,7 @@ enum Type : std::uint8_t {
     kDocument = 20,            ///< Collection: id, parts, vector, text, sparse vector, metadata (an upsert)
     kDocumentRemove = 21,      ///< Collection: ids
     kDocumentMetadata = 22,    ///< Collection: ids, metadata changes
+    kCollectionSettings = 23,  ///< Collection: expiry enabled, default lifetime, string keys
 };
 
 /// A decoded operation; only the fields its type uses are set.
@@ -60,6 +61,9 @@ struct Op {
     std::uint8_t parts = 0;  ///< kDocument: 1 vector, 2 text, 4 sparse vector
     std::string text;
     SparseVector sparse;
+    std::uint8_t ttl_enabled = 0;     ///< kCollectionSettings
+    std::int64_t ttl_default_ms = 0;
+    std::uint8_t string_ids = 0;
 };
 
 std::vector<unsigned char> encode_add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
@@ -74,6 +78,7 @@ std::vector<unsigned char> encode_rebuild(const RebuildOptions& o);
 std::vector<unsigned char> encode_field(std::string_view field);
 std::vector<unsigned char> encode_planner(const PlannerParams& p);
 std::vector<unsigned char> encode_fraction(double fraction);
+std::vector<unsigned char> encode_collection_settings(bool ttl_enabled, std::int64_t ttl_default_ms, bool string_ids);
 std::vector<unsigned char> encode_document(std::uint64_t id, std::uint8_t parts, std::span<const float> vector, std::string_view text,
                                            const SparseVector& sparse, const Metadata& metadata);
 

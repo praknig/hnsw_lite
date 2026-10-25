@@ -57,6 +57,15 @@ struct CodeKernels {
     float (*sq8_l2)(const float* t, const float* s, const std::uint8_t* c, std::size_t n);
     float (*sq8_dot)(const float* w, const std::uint8_t* c, std::size_t n);
     float (*bits_sum)(const float* w, const std::uint8_t* c, std::size_t n);
+    /// Half precision (HalfCodec): squared L2 and dot product between a float32 query
+    /// and float16 or bfloat16 codes.
+    float (*f16_l2)(const float* q, const std::uint16_t* c, std::size_t n);
+    float (*f16_dot)(const float* q, const std::uint16_t* c, std::size_t n);
+    float (*bf16_l2)(const float* q, const std::uint16_t* c, std::size_t n);
+    float (*bf16_dot)(const float* q, const std::uint16_t* c, std::size_t n);
+    /// Half precision: n codes widened to float32 (decoding, for comparing two stored vectors).
+    void (*f16_decode)(const std::uint16_t* c, float* out, std::size_t n);
+    void (*bf16_decode)(const std::uint16_t* c, float* out, std::size_t n);
 };
 
 /// The fastest code kernels this CPU supports (the same choice as get_distance).

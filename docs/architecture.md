@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 894 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 902 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -201,6 +201,10 @@ Neighbor lists on level 0 use the same scheme.
 ### Arena allocator
 
 Variable-size data (upper-level neighbor lists) comes from a bump allocator. It requests large blocks (1 MB by default) and hands out pieces by advancing a counter. Individual pieces are never freed; everything is freed when the arena is destroyed. This avoids one heap allocation per node and keeps related data close together in memory. Only trivially copyable, trivially destructible types may be stored, which is checked at compile time.
+
+### The ID map
+
+`IdMap` keeps user id → slot in an open-addressing table (linear probing, load at most 0.7) of 4-byte slot numbers only: a key is not stored twice, since the key of the slot in a bucket is `to_external_[slot]`. About 6 to 8 bytes per id, where `std::unordered_map` took about 40 (measured: 32 bytes per vector less in total). Removal shifts the following entries of the probe run back instead of leaving tombstones, so it never allocates and never throws; inserts reserve room first, so they stay all or nothing. During an update two slots hold the same id for a moment; the table points to one, and `repoint` switches it. Lookups take one more memory access, but they are off the search path (searches read `to_external_` directly).
 
 ### Graph storage
 
@@ -420,6 +424,11 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 **Bit-identical everywhere.** Centroids and codes are saved in index files, and the golden-file tests require those files to be identical on every platform. So random choices use SplitMix64, sums are accumulated in a fixed order, and `kmeans.cpp` and `codec.cpp` are compiled without floating-point contraction (`-ffp-contract=off`): GCC fuses `a * b + c` into one instruction by default on ARM, which changes rounding. Built for ARM64 without the flag, SQ8 distances differed from x86; with it, every result matches bit for bit.
 
 ### Compressed indexes
+
+**Half precision** (`HalfCodec`, `half.h`) stores each value as float16 or bfloat16, rounded to nearest, ties to even, exactly as the hardware does (checked against the F16C instruction on all 2^32 float32 inputs). It needs no training, so in codes-only mode the float32 vectors are dropped at construction. Its prepared query is the query itself, so it offers a **direct distance**: between any float32 vector and a code, with no table and no decoding. The graph uses it for every distance (`NodeDistance::Path::Direct`), and decoding (to compare two stored vectors) uses SIMD kernels; without both, building was 9× slower than with float32. The kernels widen 16-bit values with F16C on AVX2 (the AVX2 path now requires F16C, which every AVX2 CPU has), `vcvtph2ps` on AVX-512 and `fcvtl` on NEON; bfloat16 widens by a 16-bit shift. float16's range check (`VectorCodec::check`) runs where vectors are prepared, before any change, since encoding happens in steps that must not throw. The loader refuses codes with infinity or NaN bit patterns.
+
+**Code buffers** grow by capacity (`reserve`, geometric) but are sized exactly (`resize` to what is used): resizing to 1.5× zero-filled half the growth, making it resident before use (about 70 bytes per vector at 128 dimensions in half precision, and as much for every codes-only codec).
+
 
 **Maintenance** (`collection.cpp`). Counters of dense vectors replaced or removed since the last upkeep and rebuild (atomics, updated under the collection's exclusive lock), and the last snapshot's LSN and time, drive `maintain()`: a reachability-only health check, `upkeep()` with the round's deadline, a drift check with a retrained sample, `rebuild()`, then `checkpoint()`, one round at a time under a maintenance mutex, never holding the collection's lock while the sides work (they lock themselves). A background thread waits on a condition variable between rounds, records errors in the round's report, and is joined before any member is destroyed. Upkeep stops at a deadline only after one repair in the call, so budgeted rounds always progress; a checkpoint whose snapshot failed retries only the snapshot (the log already writes to the new segment).
 

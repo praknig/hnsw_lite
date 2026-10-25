@@ -321,12 +321,18 @@ class Collection:
 
     @classmethod
     def load(cls, path: str, *, ttl: bool = False, default_ttl=None, string_ids: bool = False) -> "Collection":
-        """A collection from a file written by save(). Maintenance starts manual;
-        expiry and string keys are off unless given here (as for the constructor)."""
+        """A collection from a file written by save(), with its saved settings (expiry,
+        string keys). Maintenance starts manual. ttl, default_ttl and string_ids switch a
+        feature on; switching one off takes set_ttl/set_string_ids in C++ (or saving without it)."""
         self = cls.__new__(cls)
         self._c = _core.Collection.load(str(path))
         self.last_search_stopped_early = False
-        self._c._set_runtime(bool(ttl or default_ttl is not None), _ttl_ms(default_ttl), bool(string_ids))
+        # The saved settings are kept; arguments switch a feature on, never off by omission.
+        if ttl or default_ttl is not None or string_ids:
+            stored = self._c.options
+            self._c._set_runtime(bool(stored.ttl_enabled or ttl or default_ttl is not None),
+                                 _ttl_ms(default_ttl) if default_ttl is not None else stored.ttl_default_ms,
+                                 bool(stored.string_ids or string_ids))
         return self
 
     # -- lifetime

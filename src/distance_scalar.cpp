@@ -11,6 +11,7 @@
  */
 #include <cstdint>
 
+#include "half.h"
 #include "kernels.h"
 
 namespace vecdb::kernels {
@@ -66,4 +67,40 @@ float bits_sum_scalar(const float* w, const std::uint8_t* c, std::size_t n) {
         if ((c[j / 8] >> (j % 8)) & 1u) sum += w[j];
     return sum;
 }
+
+// Half precision: the reference results the SIMD versions must match.
+float f16_l2_scalar(const float* q, const std::uint16_t* c, std::size_t n) {
+    float sum = 0;
+    for (std::size_t j = 0; j < n; ++j) {
+        const float d = q[j] - f16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float f16_dot_scalar(const float* q, const std::uint16_t* c, std::size_t n) {
+    float sum = 0;
+    for (std::size_t j = 0; j < n; ++j) sum += q[j] * f16_to_float(c[j]);
+    return sum;
+}
+float bf16_l2_scalar(const float* q, const std::uint16_t* c, std::size_t n) {
+    float sum = 0;
+    for (std::size_t j = 0; j < n; ++j) {
+        const float d = q[j] - bf16_to_float(c[j]);
+        sum += d * d;
+    }
+    return sum;
+}
+float bf16_dot_scalar(const float* q, const std::uint16_t* c, std::size_t n) {
+    float sum = 0;
+    for (std::size_t j = 0; j < n; ++j) sum += q[j] * bf16_to_float(c[j]);
+    return sum;
+}
+
+void f16_decode_scalar(const std::uint16_t* c, float* out, std::size_t n) {
+    for (std::size_t j = 0; j < n; ++j) out[j] = f16_to_float(c[j]);
+}
+void bf16_decode_scalar(const std::uint16_t* c, float* out, std::size_t n) {
+    for (std::size_t j = 0; j < n; ++j) out[j] = bf16_to_float(c[j]);
+}
+
 }  // namespace vecdb::kernels

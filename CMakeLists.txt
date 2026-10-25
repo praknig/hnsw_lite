@@ -41,7 +41,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     set_source_files_properties(src/distance_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/distance_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   else()
-    set_source_files_properties(src/distance_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+    set_source_files_properties(src/distance_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
     set_source_files_properties(src/distance_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f")
   endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
@@ -84,7 +84,7 @@ if(HNSW_LITE_BUILD_TESTS)
   target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
   hnsw_lite_setup(test_comprehensive)
   foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-          metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance presets acorn reorder scoring features stress e2e)
+          metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance presets acorn reorder scoring features half stress e2e)
     # The heaviest groups run as several CTest entries (shards), so that a
     # parallel run (ctest -j) is not held up by one long group; they start first.
     set(shards 1)

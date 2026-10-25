@@ -34,6 +34,8 @@ enum class CodecKind : std::uint8_t {
     SQ8 = 1,   ///< 8-bit scalar quantization: one byte per dimension
     Binary = 2,  ///< binary quantization: one bit per dimension
     PQ = 3,      ///< product quantization: one byte per part of the vector
+    F16 = 4,     ///< half precision (IEEE float16): two bytes per dimension, values up to 65504
+    BF16 = 5,    ///< bfloat16: two bytes per dimension, float32's range with 8 bits of precision
 };
 
 /// How an index stores its vectors in compact form (see the compression and
@@ -109,7 +111,7 @@ inline std::size_t saturating_mul(std::size_t a, std::size_t b) {
 
 /// Throws std::invalid_argument for settings that cannot work.
 inline void validate(const QuantizationParams& q) {
-    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::PQ)) throw std::invalid_argument("QuantizationParams: unknown codec");
+    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::BF16)) throw std::invalid_argument("QuantizationParams: unknown codec");
     if (q.rerank_factor < 1) throw std::invalid_argument("QuantizationParams::rerank_factor must be at least 1");
 }
 
@@ -153,6 +155,24 @@ public:
 
     /// The distance between a prepared query and one code (see the file comment).
     virtual float distance(const std::vector<float>& table, const std::uint8_t* code) const = 0;
+
+    /// Throws std::invalid_argument if `v` (dim values, already validated as finite and,
+    /// for cosine, normalized) cannot be encoded faithfully. Called before an insert or an
+    /// update changes anything, since encoding itself happens in steps that must not
+    /// throw. Only float16 refuses anything: values beyond its range (+-65504).
+    virtual void check(std::span<const float> v) const { (void)v; }
+
+    /// Whether distance_direct() is available: a distance between any float32 vector and
+    /// a code with no prepare() step and no decoding (half precision: the prepared query
+    /// is the vector itself). The index uses it to compare stored vectors quickly.
+    virtual bool direct() const { return false; }
+    /// The distance between `query` (dim values, prepared as the index prepares vectors)
+    /// and a code, the same as distance() with a prepared query. Only when direct().
+    virtual float distance_direct(const float* query, const std::uint8_t* code) const {
+        (void)query;
+        (void)code;
+        return 0.0f;
+    }
 
 protected:
     /// The fastest code kernels for this CPU, chosen once (see distance.h).
@@ -253,6 +273,44 @@ public:
 private:
     float high(std::size_t j) const;  // what a set bit decodes to
     std::vector<float> threshold_, spread_;
+};
+
+/**
+ * @brief Half precision: each value stored in 16 bits, float16 (CodecKind::F16) or
+ * bfloat16 (CodecKind::BF16), rounded to the nearest representable value.
+ *
+ * Needs no training (trained() is always true). With keep_full_vectors = false the
+ * float32 vectors are dropped from the first insert, halving vector memory; distances
+ * are then computed between the float32 query and the 16-bit values (SIMD kernels:
+ * F16C on AVX2, AVX-512, NEON). float16 keeps about 3.3 significant digits and refuses
+ * values beyond +-65504 (check); bfloat16 keeps float32's range with about 2.4 digits.
+ * Cosine vectors are normalized before encoding, so both suit every metric.
+ */
+class HalfCodec final : public VectorCodec {
+public:
+    HalfCodec(CodecKind kind, std::size_t dim, Metric metric);
+
+    CodecKind kind() const override { return kind_; }
+    std::unique_ptr<VectorCodec> clone() const override { return std::make_unique<HalfCodec>(*this); }
+    std::vector<float> state() const override { return {}; }
+    void restore(std::span<const float> state) override;
+    std::size_t code_size() const override { return 2 * dim(); }
+    bool trained() const override { return true; }
+    void train(std::span<const float> sample) override;
+    void encode(std::span<const float> v, std::uint8_t* code) const override;
+    void decode(const std::uint8_t* code, std::span<float> out) const override;
+    void prepare(std::span<const float> query, std::vector<float>& table) const override;
+    float distance(const std::vector<float>& table, const std::uint8_t* code) const override;
+    void check(std::span<const float> v) const override;
+    bool direct() const override { return true; }
+    float distance_direct(const float* query, const std::uint8_t* code) const override;
+
+    /// Whether `code` (code_size() bytes) holds only finite values: false for the bit
+    /// patterns of infinity and NaN, which a damaged file could contain.
+    bool finite(const std::uint8_t* code) const;
+
+private:
+    CodecKind kind_;
 };
 
 /**

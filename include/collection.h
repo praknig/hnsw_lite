@@ -100,8 +100,9 @@ enum class Preset {
     LowMemory,   ///< M 12, ef_construction 150; SQ8 codes only (vectors about 4x smaller); search beam 128
 };
 
-/// Opt-in expiry. Not stored: pass the same setting each time the collection is
-/// opened or loaded (expiry times themselves are stored, in metadata).
+/// Opt-in expiry. Saved with the collection (see set_ttl); for an existing collection, opening it
+/// with expiry enabled switches it on, and leaving it out never switches it off
+/// (expiry times themselves are stored in metadata).
 struct TtlOptions {
     bool enabled = false;
     /// The lifetime of a document added without Document::expires_at, in
@@ -127,12 +128,12 @@ struct CollectionOptions {
     /// says, cosine distance, BM25 text, and background maintenance. Adjust any
     /// field afterwards. Throws std::invalid_argument for an unknown preset.
     static CollectionOptions preset(std::size_t dim, Preset preset = Preset::Balanced, std::size_t expected_size = 100000);
-    /// Opt-in: documents expire (see TtlOptions). Not stored.
+    /// Opt-in: documents expire (see TtlOptions). Saved with the collection.
     TtlOptions ttl;
     /// Opt-in: string keys (any string: names, UUIDs). A key's id is
     /// Collection::id_of(key), a 64-bit hash; the key itself is kept in metadata
     /// and checked, so two keys with the same hash are refused, never mixed up.
-    /// Not stored: pass it on every open.
+    /// Saved with the collection: kept by load() and open() (see TtlOptions).
     bool string_ids = false;
 };
 
@@ -302,6 +303,9 @@ private:
         bool string_ids = false;
     };
     Runtime runtime() const;
+    /// Changes the runtime settings under the lock: checked (check_runtime), logged for
+    /// durable collections (so they survive a crash), then applied.
+    void change_settings(const Runtime& next);
     Prepared prepare_keyed(const Document& d, std::optional<std::string_view> key, const Runtime& rt) const;
     std::optional<Filter> alive_filter() const;  // expiry: not yet expired (none without expiry)
     bool expired(NodeId slot) const;

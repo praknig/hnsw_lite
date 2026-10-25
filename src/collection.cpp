@@ -594,6 +594,13 @@ bool Collection::replay(std::span<const WalRecord> records) {
                     break;
                 }
                 case walop::kDocumentRemove: (void)remove_batch(op.ids); break;
+                case walop::kCollectionSettings: {  // applied as logged (the log is not attached while replaying)
+                    const TtlOptions ttl{op.ttl_enabled == 1, op.ttl_default_ms};
+                    check_runtime(ttl, op.string_ids == 1);
+                    options_.ttl = ttl;
+                    options_.string_ids = op.string_ids == 1;
+                    break;
+                }
                 case walop::kDocumentMetadata:
                     for (const std::uint64_t id : op.ids) (void)set_metadata(id, op.metadata.at(0));
                     break;
@@ -630,6 +637,15 @@ void Collection::save_unlocked(std::ostream& out) const {
         w.put<double>(options_.bm25.k1);
         w.put<double>(options_.bm25.b);
         w.put<double>(options_.bm25.avg_doc_length);
+        // The runtime settings, only when they differ from the defaults: a collection
+        // that uses neither expiry nor string keys is written exactly as before, so
+        // older versions still read it (they refuse a file with the settings, cleanly).
+        if (options_.ttl.enabled || options_.ttl.default_ms != 0 || options_.string_ids) {
+            w.put<std::uint8_t>(1);  // the settings block's own version
+            w.put<std::uint8_t>(options_.ttl.enabled ? 1 : 0);
+            w.put<std::int64_t>(options_.ttl.default_ms);
+            w.put<std::uint8_t>(options_.string_ids ? 1 : 0);
+        }
     });
     persist::write_section(out, kDocs, [&](persist::Writer& w) {
         w.put<std::uint64_t>(id_of_.size());
@@ -693,6 +709,15 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     o.bm25.k1 = r.get<double>();
     o.bm25.b = r.get<double>();
     o.bm25.avg_doc_length = r.get<double>();
+    if (r.section_left() > 0) {  // the runtime settings (written only when not the defaults)
+        if (r.get<std::uint8_t>() != 1) throw FormatError("collection: unknown settings block");
+        const std::uint8_t ttl = r.get<std::uint8_t>();
+        const std::int64_t default_ms = r.get<std::int64_t>();
+        const std::uint8_t keys = r.get<std::uint8_t>();
+        if (ttl > 1 || keys > 1 || default_ms < 0) throw FormatError("collection: invalid settings");
+        o.ttl = TtlOptions{ttl == 1, default_ms};
+        o.string_ids = keys == 1;
+    }
     r.end_section();
     std::unique_ptr<Collection> c;
     try {
@@ -726,6 +751,11 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     r.begin_section(kMeta, "metadata");
     c->metadata_ = MetadataStore::load(r, static_cast<std::size_t>(slots), [&](NodeId n) { return c->live_[n] != 0; });
     c->options_.schema = c->metadata_.current_schema();  // the schema in force, as stored (options() reported it as dynamic before)
+    try {  // stored settings must suit the stored schema (a strict one needs the reserved fields)
+        c->check_runtime(c->options_.ttl, c->options_.string_ids);
+    } catch (const std::invalid_argument& e) {
+        throw FormatError(std::string("collection: settings do not suit the schema: ") + e.what());
+    }
     r.end_section();
     r.begin_section(kSide, "sides");
     const std::string dense = r.get_string(), text_bytes = r.get_string(), sparse_bytes = r.get_string();
@@ -866,15 +896,31 @@ void Collection::check_runtime(const TtlOptions& ttl, bool string_ids) const {
         throw std::invalid_argument("Collection: string keys need the field _key (Keyword) in this strict schema; declare it when creating the collection");
 }
 
+void Collection::change_settings(const Runtime& next) {
+    const auto lock = write_lock(mutex_, this);
+    check_runtime(next.ttl, next.string_ids);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCollectionSettings, [&] {
+        return walop::encode_collection_settings(next.ttl.enabled, next.ttl.default_ms, next.string_ids);
+    }));
+    options_.ttl = next.ttl;
+    options_.string_ids = next.string_ids;
+}
+
 void Collection::set_ttl(const TtlOptions& ttl) {
     const auto lock = write_lock(mutex_, this);  // the check reads the other setting: under the lock too
     check_runtime(ttl, options_.string_ids);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCollectionSettings, [&] {
+        return walop::encode_collection_settings(ttl.enabled, ttl.default_ms, options_.string_ids);
+    }));
     options_.ttl = ttl;
 }
 
 void Collection::set_string_ids(bool on) {
     const auto lock = write_lock(mutex_, this);
     check_runtime(options_.ttl, on);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCollectionSettings, [&] {
+        return walop::encode_collection_settings(options_.ttl.enabled, options_.ttl.default_ms, on);
+    }));
     options_.string_ids = on;
 }
 
