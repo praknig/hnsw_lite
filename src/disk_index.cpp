@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <functional>
+#include <chrono>
 #include <thread>
 #include <mutex>
 #include <future>
@@ -80,7 +81,14 @@ BlockFile::~BlockFile() {
 
 void BlockFile::read(std::uint64_t offset, void* buffer, std::size_t n) const {
     if (offset > size_ || n > size_ - offset) throw FormatError("read past the end of the file");
-    if (latency_.count() > 0) std::this_thread::sleep_for(latency_);  // simulated slow storage
+    if (latency_.count() > 0) {  // simulated slow storage: at least latency_, on every platform
+        // sleep_for may wake early as steady_clock measures it (MinGW sleeps with the coarse
+        // Windows timer while steady_clock reads the precise performance counter): finish
+        // the wait against steady_clock itself.
+        const auto until = std::chrono::steady_clock::now() + latency_;
+        std::this_thread::sleep_until(until);
+        while (std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    }
     auto* p = static_cast<char*>(buffer);
     while (n > 0) {
 #ifdef _WIN32
