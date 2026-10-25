@@ -222,7 +222,7 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t size() const` | Number of documents. |
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
-| `const CollectionOptions& options() const` | The collection's settings (for a recovered collection, the stored ones). |
+| `CollectionOptions options() const` | A copy of the collection's settings, taken under its lock, since `set_ttl` and `set_string_ids` may change them from another thread (for a recovered collection, the stored ones). |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only pointers to the sides (null if absent), for example to call `health()` on the dense side. Do not keep them beyond the collection's lifetime. |
 
 ```cpp
@@ -1348,7 +1348,7 @@ class Collection {
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
-    const CollectionOptions& options() const;
+    CollectionOptions options() const;
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
     void save(const std::string& path) const;
     void save(std::ostream& out) const;
