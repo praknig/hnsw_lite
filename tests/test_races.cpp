@@ -522,8 +522,10 @@ RACE_TEST(r11_bulk_changes_against_keyed_writes) {
             const std::size_t i = rng() % 300;
             if (const auto r = c.get("k" + std::to_string(i)))
                 if (!r->metadata.get("g") || r->metadata.get("g")->i != std::int64_t(i % 5) || !r->metadata.get("flag")) ++bad;
+            // Each count bounded on its own: two calls are two moments, and writers run in
+            // between, so "some <= all" across them would not hold (found on macOS CI).
             const std::size_t all = c.count_where(Filter::all()), some = c.count_where(Filter::eq("flag", true));
-            if (some > all || all > 300) ++bad;
+            if (all > 300 || some > 300) ++bad;
         },
         [&](std::size_t, std::mt19937& rng) {
             CollectionQuery q;
