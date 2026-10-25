@@ -50,6 +50,15 @@ void ScoreModifiers::validate() const {
     for (const MatchBoost& b : boosts) need(finite(b.bonus), "a boost's bonus must be finite");
 }
 
+// GCC 16 reports -Wstringop-overflow and -Warray-bounds inside std::vector::resize once
+// MetadataStore::write is inlined here ("8 bytes into a region of size 1"): a false positive of its
+// flow analysis on plain vector growth, which runs clean under AddressSanitizer. Silenced for this
+// function only.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
 double ScoreModifiers::apply(double base, const Metadata& md) const {
     double factor = 1.0;
     for (const RecencyDecay& d : decays) {
@@ -77,6 +86,9 @@ double ScoreModifiers::apply(double base, const Metadata& md) const {
     }
     return score;
 }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 // ---------------------------------------------------------------- dates
 

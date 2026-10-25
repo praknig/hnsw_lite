@@ -12,7 +12,7 @@ The Python package has its own pytest suite in `python/tests` (18 tests: convers
 
 ### The comprehensive suite
 
-`tests/test_comprehensive.cpp` contains **every test scenario in one program: 893 individually named tests** in 49 groups, with a built-in runner. It needs no external test framework.
+`tests/test_comprehensive.cpp` contains **every test scenario in one program: 894 individually named tests** in 49 groups, with a built-in runner. It needs no external test framework.
 
 | Group | Tests | What it covers |
 |---|---|---|
@@ -25,7 +25,7 @@ The Python package has its own pytest suite in `python/tests` (18 tests: convers
 | `deletion` | 59 | Scenarios D1 to D66 from the [test plan](core-capabilities-test-plan.md), each test named after its scenario ID, plus 8 tests added by the coverage audit. Layer 1 building blocks (release, bind, overwrite, move, node reset); Flat swap-with-last removal checked against a `std::map` reference over 10,000 random operations; HNSW slot reuse at higher and lower levels, graph repair, entry-point reassignment, removing everything, 20-cycle churn for every metric, removing a whole cluster; `compact()`; statistics; out-of-memory sweeps for every new operation |
 | `metadata` | 32 | MD scenarios: every type round-trips; strict and dynamic schemas; type errors; extreme values (64-bit limits, 1 MB strings, UTF-8, 1,000 tags); `set_metadata` and `unset`; metadata following slots through swap-with-last, reuse and `compact()`; 3,000 random operations against a reference; out-of-memory sweeps, including no field left behind by a failed insert |
 | `filter` | 35 | FL scenarios: every condition, and 1,000 random nested filters, checked against an independent reference evaluator; missing-field and exact integer/float rules; type errors; Flat exact against brute force; HNSW never violating a filter across 1,000 random filters, recall at 50% to 5% selectivity, matches clustered or scattered, entry point failing the filter; predicates alone, combined, throwing, and called from 8 threads |
-| `planner` | 18 | PL scenarios: sampled selectivity accuracy; exact payload counts; each threshold and its inclusive boundary; per-query overrides; forced strategies; exact strategy equal to Flat; tiny, empty and all-removed indexes; determinism; consistent statistics; invalid settings; recall at 1% to 100% selectivity |
+| `planner` | 19 | PL scenarios: sampled selectivity accuracy; exact payload counts; each threshold and its inclusive boundary; per-query overrides; forced strategies; exact strategy equal to Flat; tiny, empty and all-removed indexes; determinism; consistent statistics; invalid settings; recall at 1% to 100% selectivity |
 | `payload` | 6 | PI scenarios: counts exact after 2,000 random operations; identical results with or without the index; backfill equal to incremental; unsupported types rejected; out of memory; kept by `compact()` |
 | `batch` | 16 | BT scenarios: identical to single searches for every metric and thread count; tile boundaries; invalid input rejected before any work; filters and predicates; 10,000 queries; the thread pool under failures, stress and concurrent callers |
 | `range` | 16 | RG scenarios: Flat exact for every metric; squared L2 radius; radius 0, negative, infinite and NaN; optional cap; HNSW recall by radius; crossing outside vectors; filters; removed vectors; forced exact equal to Flat |
@@ -72,7 +72,7 @@ Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per 
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 893 test names
+test_comprehensive --list               # list all 894 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
@@ -86,7 +86,7 @@ On Windows the program is `.\build\test_comprehensive.exe`. In CLion, put the sa
 **Output.** Each test prints PASS, FAIL or SKIP with its time. A failing check prints its line number and expression, and the test continues (`CHECK`) unless the check was essential (`REQUIRE`). The run ends with a summary listing every failed test, and the exit code is non-zero if anything failed:
 
 ```
-hnsw-lite comprehensive tests | kernel: avx512 | 893 of 893 tests selected
+hnsw-lite comprehensive tests | kernel: avx512 | 894 of 894 tests selected
 
 [layer1]
   PASS  round_up_boundaries                                0.0 ms
@@ -140,7 +140,7 @@ gcovr -r . build-cov --merge-lines --filter "$PWD/include/" --filter "$PWD/src/"
 
 ### CTest
 
-CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 60 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 893 tests selected`: that entry's share, not tests left out. Together the 60 entries run all 893 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
+CTest runs the comprehensive suite as one entry per group, the heaviest groups split into shards (`--shard K/N` runs every N-th test of a group; `disk` in 4, `pq`, `binary`, `codes_only`, `sq8`, `add_batch`, `deletion`, `control` and `upkeep` in 2), 60 entries in total. Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 894 tests selected`: that entry's share, not tests left out. Together the 60 entries run all 894 tests; `test_comprehensive` on its own runs them all in one process. Shards start first, so a parallel run (`ctest -j 4`) is not held up by one long group. In CI every job runs four entries at a time (`CTEST_PARALLEL_LEVEL`), and the emulated-CPU jobs run the same entries, read from `ctest -N -V`, each under QEMU. Each group runs in its own process, so a crash in one group cannot stop the others:
 
 The environment variable `HNSW_LITE_TEST_EXCLUDE` adds exclusions (space- or comma-separated, like `--exclude`) to every run, including runs through CTest, which cannot pass arguments: CI's sanitizer job uses it to skip the seven heavy measurement tests, which run natively on every platform.
 
@@ -444,6 +444,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
 113. **Metadata could not be changed by string key.** `set_metadata` now takes a key too, changing only that exact key's document (`fe05`).
 114. **A reloaded collection reported its strict schema as dynamic.** The schema was still enforced (the metadata store keeps it), but `options().schema` was not restored on load, so code consulting it, the new strict-schema check included, saw an empty dynamic schema (`fe05`).
 115. **Hybrid modifiers could not reach beyond each side's default depth.** The fused pool grew with `ScoreModifiers::pool`, but each side still retrieved max(4k, 20), so a boosted document outside it could never be promoted; each side now retrieves at least the pool (`fe06`).
+116. **A huge but finite planner multiplier overflowed the beam width (found by fuzzing the HNSW loader).** `max_ef_multiplier` and `acorn_ef_multiplier` are checked to be finite and at least 1, so 1e300 passes; `ef` times it then exceeds `size_t`, and converting such a double is undefined behavior (the clamp to the index size came after the conversion). Three places did it: the planner's graph beam, ACORN's beam, and ACORN's fallback. `clamped_count()` (`common.h`) now clamps before converting. The planner code predates the fuzzing job, which found it at random (once in about 35,000 inputs); `pl19` reproduces it deterministically, failing under UBSan on the old code (`query_planner.cpp:369`) and passing on the fix.
 
 The model-based test also showed two expected behaviors, now documented: results with equal distances may come in a different order in HNSW and Flat (and after `compact()`), and inner-product indexes whose vectors differ in length by orders of magnitude leave some vectors hard to reach.
 

@@ -32,6 +32,15 @@ constexpr std::size_t round_up(std::size_t n, std::size_t m) {
     return (n + m - 1) / m * m;
 }
 
+// A count from a floating-point value, clamped to [0, limit] before converting:
+// converting a double beyond size_t's range is undefined behavior (fuzzing found a
+// beam width of 2e41 from a huge but finite planner multiplier). NaN gives 0.
+inline std::size_t clamped_count(double x, std::size_t limit) noexcept {
+    if (!(x > 0.0)) return 0;
+    if (x >= static_cast<double>(limit)) return limit;
+    return static_cast<std::size_t>(x);
+}
+
 // The largest vector dimension (16.7 million), for constructors and loaders alike:
 // beyond it, sizes computed from the dimension could overflow (round_up of a
 // dimension near 2**64 wraps around to a tiny size).

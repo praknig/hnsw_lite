@@ -34,9 +34,9 @@ jobs:
           - { name: macOS Apple Silicon, os: macos-14 }
           - { name: Windows x86-64, os: windows-2022 }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -73,7 +73,7 @@ jobs:
           # Building uses every core; one wheel at a time keeps memory in check.
           CMAKE_BUILD_PARALLEL_LEVEL: "4"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-${{ matrix.os }}
           path: wheelhouse/*.whl
@@ -82,7 +82,7 @@ jobs:
     name: Source distribution
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Build the source distribution
         run: pipx run build --sdist
@@ -92,7 +92,7 @@ jobs:
           python -m pip install dist/*.tar.gz
           python -c "import hnsw_lite_lib as hl; print(hl.__version__)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -106,7 +106,7 @@ jobs:
     permissions:
       id-token: write  # trusted publishing
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: The tag matches the package version
         run: |
@@ -118,7 +118,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true

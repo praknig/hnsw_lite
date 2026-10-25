@@ -168,6 +168,13 @@ static void hook_free_aligned(void* p) noexcept {
 #endif
 }
 
+// GCC 11+ (-Wmismatched-new-delete) pairs the library's nothrow new, inlined into std::stable_sort's
+// temporary buffer, with the free() below. At run time that new forwards to the replacement
+// operator new (malloc), so the pairing is consistent, as the standard allows for replacements.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+#endif
 void* operator new(std::size_t n) { return hook_alloc(n); }
 void* operator new[](std::size_t n) { return hook_alloc(n); }
 void* operator new(std::size_t n, std::align_val_t a) { return hook_alloc_aligned(n, std::size_t(a)); }
@@ -180,6 +187,9 @@ void operator delete(void* p, std::align_val_t) noexcept { hook_free_aligned(p);
 void operator delete[](void* p, std::align_val_t) noexcept { hook_free_aligned(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept { hook_free_aligned(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { hook_free_aligned(p); }
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic pop
+#endif
 #endif
 
 // ===========================================================================
@@ -5577,6 +5587,32 @@ TEST(planner, pl17_exact_counts_for_every_filter_kind) {
     plain.search(data[0], 5, 64, o);
     CHECK(!st.exact_count && std::fabs(st.selectivity - 0.2) < 0.08);  // no payload index: sampled
     CHECK(h.metadata().value_count(*h.metadata().find_field("category"), 999999) == 0);  // unknown value ID
+}
+
+TEST(planner, pl19_huge_multipliers_stay_defined) {
+    // Fuzzing found it: a multiplier can be finite yet huge (1e300 passes "finite and
+    // at least 1"), and ef x multiplier then exceeds size_t, whose conversion is
+    // undefined behavior. Beams are now clamped before converting. Every path: the
+    // planner's graph beam, ACORN's beam, and ACORN's fallback to the graph search.
+    auto data = clustered(1500, 8, 6, 4800);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 1500; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 40)));
+    PlannerParams p;
+    p.max_ef_multiplier = 1e300;
+    p.acorn_ef_multiplier = 1e300;
+    h.set_planner_params(p);
+    bool ok = true;
+    for (const Strategy s : {Strategy::Auto, Strategy::ForceGraph, Strategy::ForceAcorn}) {
+        SearchOptions o;
+        o.filter = Filter::eq("g", std::int64_t(3));  // 2.5% of the vectors
+        o.strategy = s;
+        SearchStats st;
+        o.stats = &st;
+        const auto r = h.search(data[3], 10, 32, o);
+        ok = ok && r.size() == 10 && st.ef <= h.size();
+        for (const auto& x : r) ok = ok && x.id % 40 == 3;
+    }
+    CHECK(ok && clamped_count(1e300, 7) == 7 && clamped_count(-1, 7) == 0 && clamped_count(kNaN, 7) == 0 && clamped_count(3.9, 7) == 3);
 }
 
 TEST(planner, pl18_plan_search_directly) {

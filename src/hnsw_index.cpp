@@ -1273,7 +1273,7 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
             // The matches are scattered beyond two hops of where the search went:
             // fall back to the ordinary filtered search, with a widened beam.
             stats.strategy = run = Strategy::ForceGraph;
-            ef = std::min(storage_.size(), static_cast<std::size_t>(double(ef) * params.max_ef_multiplier));
+            ef = clamped_count(double(ef) * params.max_ef_multiplier, storage_.size());
         }
     }
     if (run == Strategy::ForceGraph) {

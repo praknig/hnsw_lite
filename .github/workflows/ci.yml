@@ -37,7 +37,7 @@ jobs:
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0  # the history is needed to find the merge base
 
@@ -64,7 +64,7 @@ jobs:
     if: needs.changes.outputs.docs == 'true' || needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check links and anchors
         run: python3 .github/scripts/check_links.py
@@ -121,7 +121,7 @@ jobs:
     env:
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Show compiler and CPU
         shell: bash
@@ -172,7 +172,7 @@ jobs:
             qemu_cpu: Haswell,-hle,-rtm
             kernel: AVX2 kernels
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-user
@@ -212,7 +212,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: msys2/setup-msys2@v2
         with:
@@ -249,7 +249,7 @@ jobs:
       # tests cover, at the highest cost under the sanitizers.
       HNSW_LITE_TEST_EXCLUDE: pq06_ pq12_ uk01_ uk06_ dk15_ dk30_ dk34_
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DHNSW_LITE_SANITIZE=ON
@@ -273,7 +273,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install gcovr
         run: pipx install gcovr
@@ -320,7 +320,7 @@ jobs:
 
       - name: Upload HTML report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: coverage-report
           path: coverage/
@@ -335,7 +335,7 @@ jobs:
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Allow ThreadSanitizer on this kernel
         # Newer kernels randomize memory addresses more than TSan supports.
@@ -366,14 +366,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Fuzz
         run: bash .github/scripts/fuzz.sh 60
 
       - name: Keep the crashing inputs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: fuzz-findings
           path: fuzz-out/artifacts
@@ -393,9 +393,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
