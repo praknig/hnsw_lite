@@ -474,6 +474,30 @@ CI runs it in every platform job, under AddressSanitizer, UBSan and LeakSanitize
 
 **What it found:** the library withstood every attack. One consequence of a deliberate design was made explicit: any finite float is accepted and overflowing distances become infinity, so in an L2 or inner-product graph a vector with components near 3e38 ties all its distances at infinity and graph search may not reach it (exact search does; see the limits in the [developer reference](developer-reference.md#11-limits-at-a-glance)). `c2` checks the contract: no NaN anywhere, infinities sorted last, exact search finding the vector.
 
+## Race-condition tests
+
+`tests/test_races.cpp` (CTest entry `races`) makes threads collide deliberately on every kind of shared state. A race depends on timing, so a test can pass a thousand times and still hide one: these tests are meant to run under ThreadSanitizer, which reports any unsynchronized access even when the timing worked out. Without it they still check that results stay consistent. Each test runs for `RACE_MS` milliseconds (400 by default; CI uses 1,500).
+
+```bash
+cmake -B build-tsan -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_CXX_FLAGS=-fsanitize=thread -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+cmake --build build-tsan --target test_races
+RACE_MS=1500 ./build-tsan/test_races
+```
+
+| Test | Collision |
+|---|---|
+| `r01` | `set_ttl` and `set_string_ids` changing while keyed writes, reads, removals, `remove_expired` and searches run |
+| `r02` | Background maintenance while its policy changes and writes and searches continue; the collection destroyed mid-maintenance |
+| `r03` | A durable collection: concurrent writes, checkpoints, maintenance and searches |
+| `r04` | `set_planner_params` and `set_auto_compact` while searches and writes read them |
+| `r05` | The shared thread pool: parallel batch searches from several threads, parallel batch inserts, `reorder()` |
+| `r06` | Hybrid search (with modifiers) while both the dense and the sparse index change |
+| `r07` | IVF lists retrained and a codec trained automatically by inserts, while searches run |
+| `r08` | A sparse index: adds, removes, searches and save/load at once |
+| `r09` | Cancellation and deadlines fired from other threads during `compact`, `reorder` and `rebuild` |
+
+**What they found:** three data races, all in the collection's runtime settings (`r01`). `set_ttl()` and `set_string_ids()` wrote the settings under the collection's lock, while keyed operations, the preparation of every document and `remove_expired()` read them without it; the setters also read each other's setting before locking. Every test passed on its results; only ThreadSanitizer saw them. Each operation now reads one snapshot of the settings under the lock, and `options()` returns a copy taken under the lock. Tests `r02` to `r09` found no race: maintenance, durability, setters, the thread pool, hybrid search, training, sparse indexes and cancellation were clean under deliberate collision.
+
 ## Continuous integration
 
 Every change is built and tested automatically by GitHub Actions ([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)).

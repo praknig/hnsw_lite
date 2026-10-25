@@ -196,7 +196,7 @@ jobs:
         # follow CMakeLists.txt), each under QEMU, four at a time, sharded entries
         # first; stress is left out. Any failure fails the step.
         run: |
-          ctest --test-dir build -N -V | sed -n 's/^[0-9]*: Test command: [^ ]* //p' | tr -d '"' |
+          ctest --test-dir build -N -V | sed -n 's/^[0-9]*: Test command: [^ ]*test_comprehensive //p' | tr -d '"' |
             grep -vx -- '--group stress' |
             awk '/--shard/ {print; next} {rest = rest $0 "\n"} END {printf "%s", rest}' |
             xargs -P 4 -L 1 qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --exclude p20_ --exclude p21_ $HEAVY
@@ -285,7 +285,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS=--coverage
 
       - name: Build
-        run: cmake --build build --parallel --target test_comprehensive
+        run: cmake --build build --parallel --target test_comprehensive test_adversarial test_races
 
       - name: Test
         # Four groups at a time; GCC locks .gcda files while merging, so parallel
@@ -348,7 +348,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
 
       - name: Build
-        run: cmake --build build --parallel --target test_comprehensive test_adversarial
+        run: cmake --build build --parallel --target test_comprehensive test_adversarial test_races
 
       - name: Test threaded groups
         # The threaded groups (14), four at a time.
@@ -360,6 +360,13 @@ jobs:
         run: |
           ./build/test_adversarial f1_
           ./build/test_adversarial d3_
+
+      - name: Race-condition tests
+        # Threads deliberately colliding on every kind of shared state
+        # (tests/test_races.cpp), longer than the default 400 ms per test.
+        env:
+          RACE_MS: "1500"
+        run: ./build/test_races
 
   # The one check to require in branch protection: passes when every job that
   # ran succeeded (jobs skipped because nothing relevant changed are fine).
