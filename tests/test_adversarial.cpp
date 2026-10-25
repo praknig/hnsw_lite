@@ -122,15 +122,20 @@ int open_files() {
     return -1;
 }
 
-/// Runs `round` `rounds` times and checks that resident memory does not keep growing:
-/// after a warm-up, the last measurement may exceed the first by at most `slack_kb`
-/// (allocators keep some freed memory). Skipped where memory cannot be measured, or
-/// under AddressSanitizer, whose quarantine holds freed memory on purpose (there,
-/// LeakSanitizer checks for leaks instead).
+/// Runs `round` `rounds` times and checks that resident memory does not KEEP growing.
+/// Memory is measured for the whole process, which also reflects how the allocator
+/// reuses or returns what earlier tests freed: a one-time shift can show up in any
+/// single window (found on CI's coverage job, where b4 grew 7.9 MB once, then stayed
+/// flat). A leak grows steadily, so the test measures two consecutive windows and fails
+/// only if the second still grows by more than half of `slack_kb`. Skipped where
+/// memory cannot be measured, or under AddressSanitizer, whose quarantine holds freed
+/// memory on purpose (there, LeakSanitizer checks for leaks instead).
 void check_no_growth(int rounds, long slack_kb, const std::function<void()>& round) {
     for (int i = 0; i < 3; ++i) round();  // warm-up
     const long before = rss_kb();
-    for (int i = 0; i < rounds; ++i) round();
+    for (int i = 0; i < rounds / 2; ++i) round();
+    const long middle = rss_kb();
+    for (int i = rounds / 2; i < rounds; ++i) round();
     const long after = rss_kb();
 #if defined(__SANITIZE_ADDRESS__)
     constexpr bool asan = true;
@@ -144,8 +149,9 @@ void check_no_growth(int rounds, long slack_kb, const std::function<void()>& rou
     constexpr bool asan = false;
 #endif
     if (before < 0 || asan) return;
-    std::printf("    resident memory %ld KB -> %ld KB over %d rounds\n", before, after, rounds);
-    if (after - before > slack_kb) fail(__LINE__, "memory grew by " + std::to_string(after - before) + " KB");
+    std::printf("    resident memory %ld KB -> %ld KB -> %ld KB over two windows of %d rounds\n", before, middle, after, rounds / 2);
+    if (after - middle > slack_kb / 2)
+        fail(__LINE__, "memory still growing in the second window: " + std::to_string(after - middle) + " KB");
 }
 
 std::string temp_dir(const char* name) {
