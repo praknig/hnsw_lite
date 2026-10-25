@@ -484,3 +484,71 @@ def test_load_with_runtime_settings_and_keyed_metadata(tmp_path):
     assert "old" not in loaded and loaded.get("kept")["key"] == "kept"
     with pytest.raises(ValueError):
         hl.Collection.load(path, default_ttl=-1)
+
+
+# ---------------------------------------------------------------- threads and processes
+
+def test_python_threads_run_in_parallel_safely():
+    """The bindings release the GIL in searches and writes, so these Python threads
+    really run at once in the C++ code: results must stay consistent."""
+    import concurrent.futures
+    import time
+    data = rng.random((600, 8)).astype(np.float32)
+    idx = hl.HnswIndex(8, hl.Metric.L2)
+    idx.add(np.arange(300), data[:300])
+    col = hl.Collection(dim=8, metric="l2", maintenance="manual")
+    col.upsert_many(np.arange(300), data[:300], texts=["word"] * 300)
+    stop = time.monotonic() + 1.0
+    def worker(w):
+        r = np.random.default_rng(w)
+        n = 0
+        while time.monotonic() < stop:
+            i = int(r.integers(600))
+            op = w % 4
+            if op == 0:
+                idx.upsert(i, data[i])
+            elif op == 1:
+                idx.remove(i)
+            elif op == 2:
+                ids, dist = idx.search(data[i], k=5)
+                assert len(ids) == len(dist) and np.all(np.diff(dist) >= 0)
+            else:
+                col.upsert(i, vector=data[i], text="word")
+                hits = col.search(vector=data[i], text="word", k=3)
+                assert all(h["id"] < 600 for h in hits)
+            n += 1
+        return n
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        done = sum(ex.map(worker, range(8)))
+    assert done > 0
+    for i in range(600):
+        if i in idx:
+            assert idx.search(data[i], k=1, ef=64)[0][0] == i
+    assert col.count_where(hl.Filter.all()) == len(col)
+
+
+def test_durable_directory_is_locked_across_processes(tmp_path):
+    """A second process cannot open a durable collection another process holds, and
+    the lock dies with its holder (the OS releases flock and LockFileEx), so a
+    crashed writer never leaves the directory locked."""
+    import subprocess
+    import sys
+    path = str(tmp_path / "locked.db")
+    child = subprocess.Popen(
+        [sys.executable, "-c",
+         "import sys, numpy as np, hnsw_lite_lib as hl\n"
+         f"c = hl.Collection(dim=4, metric='l2', maintenance='manual', path={path!r})\n"
+         "c.upsert(42, vector=np.ones(4, dtype=np.float32))\n"
+         "print('ready', flush=True)\n"
+         "sys.stdin.read()\n"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        with pytest.raises(Exception, match="in use"):
+            hl.Collection(dim=4, metric="l2", maintenance="manual", path=path)
+    finally:
+        child.kill()  # a crash: SIGKILL on POSIX, TerminateProcess on Windows
+        child.wait()
+    c = hl.Collection(dim=4, metric="l2", maintenance="manual", path=path)  # the lock died with the child
+    assert 42 in c  # and its acknowledged write survived
+    c.close()
