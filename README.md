@@ -188,6 +188,16 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 - **Errors:** invalid input (wrong dimension, NaN, a duplicate ID, a metadata type mismatch) throws `std::invalid_argument` and leaves the index unchanged.
 - **Saving:** `index.save(path)` writes everything, and `HnswIndex::load(path)` returns the index exactly as it was; a damaged file throws `vecdb::FormatError`.
 
+## Nightly benchmark
+
+A workflow runs the stress and load test every night at the largest size the machine's memory allows (up to 50 million vectors) and publishes the results to the [`benchmarks` branch](https://github.com/praknig/hnsw_lite/tree/benchmarks). These charts update from there automatically:
+
+![Nightly benchmark trends](https://raw.githubusercontent.com/praknig/hnsw_lite/benchmarks/history.png)
+
+![Latest recall and speed](https://raw.githubusercontent.com/praknig/hnsw_lite/benchmarks/latest-recall.png)
+
+See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
+
 ## Documentation
 
 | Document | What's inside |
