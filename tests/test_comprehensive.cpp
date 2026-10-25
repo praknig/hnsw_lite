@@ -16465,6 +16465,46 @@ TEST(wal, wl19_every_path) {
     std::filesystem::remove(temp_path("wl19b"));
 }
 
+TEST(durable, du16_a_crash_while_creating_a_log_segment) {
+    // Found by du14 on CI: a writer killed after a new segment's file appeared but before
+    // its header was complete left the directory unopenable ("log segment header
+    // incomplete"). Such a newest segment cannot hold a record, so it is discarded.
+    auto data = random_vectors(30, 4, 4900);
+    for (const std::size_t size : {std::size_t(0), std::size_t(17), wal::kHeaderSize}) {  // empty, partial, all zeros
+        const std::string dir = durable_dir("du16");
+        {
+            auto h = HnswIndex::open_durable(dir, 4, Metric::L2);
+            for (std::uint64_t i = 0; i < 20; ++i) h->add(i, data[i]);
+        }
+        const std::string torn = dir + "/wal-" + std::string(19, '0') + "9.log";  // newer than any segment
+        std::ofstream(torn, std::ios::binary).write(std::string(size, '\0').data(), static_cast<std::streamsize>(size));
+        RecoveryStats st;
+        {
+            auto h = HnswIndex::open_durable(dir, 4, Metric::L2, {}, Schema::dynamic(), {}, &st);
+            CHECK(h->size() == 20 && h->search(data[3], 1)[0].id == 3 && !std::filesystem::exists(torn));
+            h->add(20, data[20]);  // and it keeps working
+        }
+        auto again = HnswIndex::open_durable(dir, 4, Metric::L2);
+        CHECK(again->size() == 21);
+        again.reset();
+        std::filesystem::remove_all(dir);
+    }
+    // The same defect in an older segment, or with data after the header, is still refused.
+    const std::string dir = durable_dir("du16b");
+    {
+        auto h = HnswIndex::open_durable(dir, 4, Metric::L2);
+        h->add(1, data[1]);
+    }
+    std::string first;
+    for (const auto& e : std::filesystem::directory_iterator(dir))
+        if (e.path().filename().string().rfind("wal-", 0) == 0) first = e.path().string();
+    std::ofstream(first, std::ios::binary | std::ios::trunc).write("partial", 7);  // the only segment, but now a newer one follows
+    const std::string newer = dir + "/wal-" + std::string(19, '0') + "9.log";
+    std::ofstream(newer, std::ios::binary).write(std::string(10, 'x').data(), 10);
+    CHECK_THROWS_AS(FormatError, (void)HnswIndex::open_durable(dir, 4, Metric::L2));
+    std::filesystem::remove_all(dir);
+}
+
 TEST(durable, du15_every_path) {
     auto data = random_vectors(40, 4, 2420);
     const std::string dir = durable_dir("du15");
