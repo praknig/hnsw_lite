@@ -45,6 +45,7 @@
 #include <unistd.h>
 #endif
 #ifdef __linux__
+#include <sys/prctl.h>
 #include <malloc.h>  // mallopt, malloc_trim (l09)
 #endif
 #include <cstring>
@@ -11327,6 +11328,11 @@ TEST(lean, l09_unused_storage_is_not_resident) {
         f >> pages_total >> pages_resident;
         return double(pages_resident) * double(sysconf(_SC_PAGESIZE)) / double(1 << 20);
     };
+    // Transparent huge pages would count a whole 2 MB page for any byte written into a
+    // block, varying with alignment from run to run (12.1 MB once on CI, past the
+    // threshold). Off for this process while measuring, memory is counted in normal
+    // pages, as this test means it; the setting is restored afterwards.
+    const bool thp_off = prctl(PR_SET_THP_DISABLE, 1, 0, 0, 0) == 0;
     auto data = random_vectors(100, 32, 4400);
     const double before = resident_mb();
     HnswIndex h(32, Metric::L2);
@@ -11334,6 +11340,7 @@ TEST(lean, l09_unused_storage_is_not_resident) {
     FlatIndex f(32, Metric::L2);
     for (std::uint64_t i = 0; i < 100; ++i) f.add(i, data[i]);
     const double grown = resident_mb() - before;
+    if (thp_off) prctl(PR_SET_THP_DISABLE, 0, 0, 0, 0);
     std::string huge_pages = "unknown";
     {
         std::ifstream thp("/sys/kernel/mm/transparent_hugepage/enabled");
@@ -11343,11 +11350,12 @@ TEST(lean, l09_unused_storage_is_not_resident) {
             if (a != std::string::npos && b != std::string::npos && b > a) huge_pages = line.substr(a + 1, b - a - 1);
         }
     }
-    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s)\n", grown, huge_pages.c_str());
-    // Without huge pages this takes about 1 MB. With transparent huge pages set to
-    // "always" (as on GitHub's runners), the first write into each of the three
-    // blocks brings in a whole 2 MB page: about 7 MB. Filled blocks took 25 MB.
-    CHECK(grown < 12.0);
+    std::printf("    100 vectors in an HNSW and a flat index: %.1f MB resident (transparent huge pages: %s, %s for this test)\n", grown,
+                huge_pages.c_str(), thp_off ? "off" : "could not be turned off");
+    // In normal pages this takes about 1 MB; filled blocks took 25 MB. Where huge pages
+    // could not be turned off (kernels before 3.15), each block's first write may bring
+    // in a whole 2 MB page: a looser bound then.
+    CHECK(grown < (thp_off ? 4.0 : 12.0));
     // The vectors and links written row by row read back exactly, padding included.
     bool same = true;
     for (std::uint64_t i = 0; i < 100; ++i) same = same && *h.get_vector(i) == data[i] && *f.get_vector(i) == data[i];
