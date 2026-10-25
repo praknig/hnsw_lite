@@ -2,6 +2,7 @@
  * @file flat_index.cpp
  * @brief Implementation of FlatIndex (see flat_index.h for the design).
  */
+#include "scoring.h"
 #include "flat_index.h"
 #include <limits>
 #include "kmeans.h"
@@ -666,6 +667,39 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k,
                                             const SearchOptions& options) const {
+    const bool modify = options.modifiers && !options.modifiers->empty();
+    if (modify || options.diversity) {  // opt-in: a larger pool, re-scored by metadata and/or diversified
+        if (options.diversity && !(*options.diversity >= 0.0 && *options.diversity <= 1.0))
+            throw std::invalid_argument("SearchOptions::diversity must be in [0, 1]");
+        if (modify) options.modifiers->validate();
+        SearchOptions plain = options;
+        plain.modifiers.reset();
+        plain.diversity.reset();
+        const std::size_t pool = modify ? options.modifiers->pool_for(k) : std::max<std::size_t>(4 * k, 20);
+        std::vector<SearchResult> found = search(query, pool, plain);
+        const auto relevance = [&](float d) { return relevance_from_distance(d, metric_); };
+        if (modify) {
+            // The size first: function arguments are evaluated in no fixed order, and
+            // moving `found` before reading its size kept nothing (found by CI: Clang
+            // evaluates left to right, GCC right to left).
+            const std::size_t all = found.size();
+            found = rescored(std::move(found), all, *options.modifiers, [&](std::uint64_t id) { return get_metadata(id); }, relevance);
+        }
+        else for (SearchResult& r : found) r.score = static_cast<float>(relevance(r.distance));
+        if (!options.diversity) {
+            if (found.size() > k) found.resize(k);
+            return found;
+        }
+        std::vector<double> rel(found.size());
+        std::vector<std::optional<std::vector<float>>> vectors(found.size());
+        for (std::size_t i = 0; i < found.size(); ++i) {
+            rel[i] = found[i].score;
+            vectors[i] = get_vector(found[i].id);
+        }
+        std::vector<SearchResult> chosen;
+        for (const std::size_t i : mmr_order(rel, vectors, k, *options.diversity)) chosen.push_back(found[i]);
+        return chosen;
+    }
     const auto guard = lock_.read();
     const detail::SearchStopScope stop(options, options.stats);  // records stopped_early last
     PreparedVector q(indexed_dim());

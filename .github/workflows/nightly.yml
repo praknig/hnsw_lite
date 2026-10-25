@@ -41,7 +41,7 @@ jobs:
           - cpu: Haswell
             qemu_cpu: Haswell,-hle,-rtm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-user
@@ -63,7 +63,7 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-log-emulated-${{ matrix.cpu }}
           path: test.log
@@ -80,7 +80,7 @@ jobs:
       ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DHNSW_LITE_SANITIZE=ON -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
@@ -99,7 +99,7 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-log-address-sanitizer
           path: test.log
@@ -114,7 +114,7 @@ jobs:
     env:
       TSAN_OPTIONS: halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Allow ThreadSanitizer on this kernel
         # Newer kernels randomize memory addresses more than TSan supports.
@@ -141,7 +141,7 @@ jobs:
 
       - name: Upload log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: nightly-log-thread-sanitizer
           path: test.log

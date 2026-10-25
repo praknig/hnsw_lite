@@ -8,14 +8,15 @@ Rewrites the part of docs/developer-reference.md between the GENERATED markers.
 import json, pathlib, re, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-HEADERS = ["collection.h", "hnsw_index.h", "flat_index.h", "disk_index.h", "vamana.h", "sparse.h", "metadata.h", "filter.h",
+HEADERS = ["scoring.h", "collection.h", "hnsw_index.h", "flat_index.h", "disk_index.h", "vamana.h", "sparse.h", "metadata.h", "filter.h",
            "search_result.h", "health.h", "codec.h", "durable.h", "wal.h", "distance.h"]
 # Public API by header, in reference order. Records whose public members are listed in full.
 GROUPS = [
-    ("Collections (collection.h)", ["Preset", "Maintenance", "MaintenancePolicy", "MaintenanceReport", "MaintenanceStatus", "CollectionOptions",
+    ("Collections (collection.h)", ["Preset", "Maintenance", "MaintenancePolicy", "MaintenanceReport", "MaintenanceStatus", "TtlOptions", "CollectionOptions",
                                     "Document", "DocumentRecord", "CollectionQuery", "CollectionSearchOptions", "CollectionHit", "Collection"]),
     ("Metadata and filters (metadata.h, filter.h)", ["FieldType", "Value", "Metadata", "FieldSpec", "SchemaMode", "Schema", "CompareOp", "Filter",
-                                                     "Strategy", "PlanReason", "PlannerParams", "SearchStats", "SearchOptions", "OperationOptions",
+                                                     "Strategy", "PlanReason", "PlannerParams", "DecayShape", "RecencyDecay", "FieldMultiplier", "MatchBoost",
+                                                     "ScoreModifiers", "SearchStats", "SearchOptions", "OperationOptions",
                                                      "Record", "ScanOptions", "Page", "PlanDecision"]),
     ("Results and distances (search_result.h, distance.h)", ["Metric", "SearchResult", "CompactStats"]),
     ("HnswIndex (hnsw_index.h, codec.h)", ["CodecKind", "QuantizationParams", "HnswParams", "HnswIndex"]),
@@ -29,7 +30,7 @@ GROUPS = [
     ("Durability (durable.h, wal.h)", ["Durability", "DurableOptions", "RecoveryStats", "WalRecord", "WalScan", "WalWriter", "FileLock"]),
 ]
 FUNCTIONS = ["hybrid_search", "fuse", "sparse_dot", "l2_radius", "write_vectors_file", "read_segment", "sync_path", "sync_directory", "plan_search",
-             "validate"]
+             "validate", "parse_date", "format_date", "now_ms", "relevance_from_distance", "rescored", "mmr_order"]
 
 def dump():
     with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:

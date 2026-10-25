@@ -25,10 +25,10 @@ find_package(Threads REQUIRED)  # batch search runs on a thread pool
 # ---------------------------------------------------------------------------
 file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
-            src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
-            src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
-            src/kmeans.cpp src/codec.cpp src/vamana.cpp src/disk_index.cpp src/health.cpp src/upkeep.cpp src/rebuild.cpp src/wal.cpp src/wal_ops.cpp src/wal_replay.cpp src/durable.cpp src/sparse.cpp src/collection.cpp  # ..., durability, sparse and hybrid search, collections
-            ${HNSW_LITE_HEADERS})
+        src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
+        src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
+        src/kmeans.cpp src/codec.cpp src/vamana.cpp src/disk_index.cpp src/health.cpp src/upkeep.cpp src/rebuild.cpp src/wal.cpp src/wal_ops.cpp src/wal_replay.cpp src/durable.cpp src/sparse.cpp src/collection.cpp src/scoring.cpp  # ..., durability, sparse and hybrid search, collections
+        ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
 add_library(hnsw_lite::hnsw_lite ALIAS hnsw_lite)
@@ -84,7 +84,7 @@ if(HNSW_LITE_BUILD_TESTS)
   target_link_libraries(test_comprehensive PRIVATE hnsw_lite)
   hnsw_lite_setup(test_comprehensive)
   foreach(group layer1 layer2 helpers flat hnsw robustness deletion concurrency
-                metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance presets acorn stress e2e)
+          metadata filter planner payload batch range search_e2e update hardening persistence add_batch bulk records control codec sq8 matryoshka lean review codes_only binary pq ivf edges vamana disk health upkeep rebuild wal durable sparse collection maintenance presets acorn reorder scoring features stress e2e)
     # The heaviest groups run as several CTest entries (shards), so that a
     # parallel run (ctest -j) is not held up by one long group; they start first.
     set(shards 1)

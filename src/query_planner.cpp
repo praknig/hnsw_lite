@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
-
 #include "filter.h"
 
 namespace vecdb {
@@ -366,12 +365,12 @@ PlanDecision plan_search(std::size_t capacity, std::size_t live, const Eligibili
     // 3. A graph search visits about 1 / selectivity nodes per useful one: widen the beam.
     //    ACORN scores matching nodes only: its beam widens by a fixed factor instead.
     if (d.strategy == Strategy::ForceAcorn) {
-        d.ef = std::min(capacity, std::max(ef, static_cast<std::size_t>(double(ef) * params.acorn_ef_multiplier)));
+        d.ef = std::min(capacity, std::max(ef, clamped_count(double(ef) * params.acorn_ef_multiplier, capacity)));
         return d;
     }
     const double cap = double(ef) * params.max_ef_multiplier;
     const double wanted = d.selectivity > 0.0 ? std::ceil(double(ef) / d.selectivity) : cap;
-    d.ef = std::min(capacity, std::max(ef, static_cast<std::size_t>(std::min(wanted, cap))));
+    d.ef = std::min(capacity, std::max(ef, clamped_count(std::min(wanted, cap), capacity)));
     return d;
 }
 

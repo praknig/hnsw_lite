@@ -1,0 +1,100 @@
+# Nightly benchmark: bench/python/stress.py at the largest size the machine's
+# memory allows (up to 50 million vectors), published with charts to the
+# `benchmarks` branch (never to master). The README on master shows the charts
+# straight from that branch, so they update without any commit to master.
+#
+# The machine: the repository variable BENCHMARK_RUNNER (Settings > Secrets and
+# variables > Actions > Variables), for example a larger runner's label or
+# "self-hosted"; without it, GitHub's standard runner (about 8 million vectors).
+name: Benchmark
+
+on:
+  schedule:
+    - cron: "0 2 * * *"  # 02:00 UTC every night
+  workflow_dispatch:
+    inputs:
+      vectors:
+        description: "Vectors: a number, or auto (as many as fit in memory)"
+        default: "auto"
+      max_vectors:
+        description: "The most auto may choose"
+        default: "50000000"
+      duration:
+        description: "Seconds per load level and for the mixed phase"
+        default: "60"
+
+permissions:
+  contents: write  # to push the benchmarks branch
+
+concurrency:
+  group: benchmark
+  cancel-in-progress: false  # never interrupt a run halfway; the next one waits
+
+jobs:
+  benchmark:
+    name: Benchmark
+    runs-on: ${{ vars.BENCHMARK_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build and install the package
+        run: python -m pip install . numpy psutil matplotlib
+
+      - name: Run the benchmark
+        id: run
+        continue-on-error: true  # publish even when a check fails; the last step fails the job
+        run: >
+          python bench/python/stress.py
+          --vectors "${{ inputs.vectors || 'auto' }}"
+          --max-vectors "${{ inputs.max_vectors || '50000000' }}"
+          --duration "${{ inputs.duration || '60' }}"
+          --max-hours 4
+          --out stress-results
+
+      - name: Check out the benchmarks branch
+        if: always() && hashFiles('stress-results/stress.json') != ''
+        run: |
+          if git ls-remote --exit-code --heads origin benchmarks > /dev/null; then
+            git fetch --depth 1 origin benchmarks
+            git worktree add site FETCH_HEAD
+          else
+            # The first run: a branch of its own, with no code history.
+            git worktree add --detach site
+            git -C site checkout --orphan benchmarks
+            git -C site rm -rf --quiet .
+          fi
+
+      - name: Publish the results and charts
+        if: always() && hashFiles('stress-results/stress.json') != ''
+        run: >
+          python bench/python/publish_benchmark.py --results stress-results --site site
+          --commit "${{ github.sha }}"
+          --commit-url "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Commit to the benchmarks branch
+        if: always() && hashFiles('stress-results/stress.json') != ''
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "Benchmark $(date -u +%Y-%m-%d) for ${GITHUB_SHA::7}"
+          git push origin HEAD:benchmarks
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: benchmark-results
+          path: stress-results
+
+      - name: Fail if any check failed
+        if: steps.run.outcome == 'failure'
+        run: |
+          echo "::error::The benchmark found failing checks: see stress-results/stress.md and the benchmarks branch"
+          exit 1

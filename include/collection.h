@@ -100,6 +100,15 @@ enum class Preset {
     LowMemory,   ///< M 12, ef_construction 150; SQ8 codes only (vectors about 4x smaller); search beam 128
 };
 
+/// Opt-in expiry. Not stored: pass the same setting each time the collection is
+/// opened or loaded (expiry times themselves are stored, in metadata).
+struct TtlOptions {
+    bool enabled = false;
+    /// The lifetime of a document added without Document::expires_at, in
+    /// milliseconds (0: such documents never expire).
+    std::int64_t default_ms = 0;
+};
+
 struct CollectionOptions {
     std::size_t dim = 0;             ///< dense vector length; 0: no dense side
     Metric metric = Metric::Cosine;
@@ -118,6 +127,13 @@ struct CollectionOptions {
     /// says, cosine distance, BM25 text, and background maintenance. Adjust any
     /// field afterwards. Throws std::invalid_argument for an unknown preset.
     static CollectionOptions preset(std::size_t dim, Preset preset = Preset::Balanced, std::size_t expected_size = 100000);
+    /// Opt-in: documents expire (see TtlOptions). Not stored.
+    TtlOptions ttl;
+    /// Opt-in: string keys (any string: names, UUIDs). A key's id is
+    /// Collection::id_of(key), a 64-bit hash; the key itself is kept in metadata
+    /// and checked, so two keys with the same hash are refused, never mixed up.
+    /// Not stored: pass it on every open.
+    bool string_ids = false;
 };
 
 /// A document. Every part is optional; a part the collection was not created
@@ -127,6 +143,9 @@ struct Document {
     std::string text;
     SparseVector sparse;
     Metadata metadata;
+    /// When the document expires, in milliseconds since 1970 (see parse_date, now_ms).
+    /// Only with CollectionOptions::ttl enabled; otherwise the default lifetime applies.
+    std::optional<std::int64_t> expires_at;
 };
 
 /// A document read back. text is empty unless store_text.
@@ -136,6 +155,8 @@ struct DocumentRecord {
     std::string text;
     std::optional<SparseVector> sparse;
     Metadata metadata;
+    std::optional<std::string> key;          ///< with string ids: the document's key
+    std::optional<std::int64_t> expires_at;  ///< with expiry: when it expires
 };
 
 struct CollectionQuery {
@@ -160,6 +181,14 @@ struct CollectionSearchOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     const std::atomic<bool>* cancel = nullptr;
     bool* stopped_early = nullptr;
+    /// Opt-in re-scoring of the fused hits by metadata: recency decay, confidence
+    /// multipliers, boosts (see ScoreModifiers). Hits then carry base_score.
+    std::optional<ScoreModifiers> modifiers;
+    /// Opt-in diversity (maximal marginal relevance): 1 keeps the ranking, lower
+    /// values trade relevance for variety, choosing each next hit by
+    /// diversity x relevance - (1 - diversity) x its highest cosine similarity to
+    /// the hits already chosen. In [0, 1]; needs a dense side.
+    std::optional<double> diversity;
 };
 
 struct CollectionHit {
@@ -170,6 +199,8 @@ struct CollectionHit {
     std::optional<float> text_score, sparse_score;  ///< dot products
     std::optional<Metadata> metadata;
     std::optional<std::string> text;
+    std::optional<double> base_score;                   ///< the fused score before modifiers (when they apply)
+    std::optional<std::string> key;                     ///< with string ids: the document's key
 };
 
 class Collection {
@@ -219,6 +250,29 @@ public:
     /// final operation was dropped (see HnswIndex::replay).
     bool replay(std::span<const WalRecord> records);
 
+    /// With expiry: removes every expired document; returns how many. Expired
+    /// documents are already hidden from searches, counts and lookups; this frees
+    /// them (maintain() calls it too). 0 without expiry.
+    std::size_t remove_expired();
+
+    /// String keys (CollectionOptions::string_ids; std::logic_error otherwise).
+    /// add() also throws std::invalid_argument when another key has the same id.
+    static std::uint64_t id_of(std::string_view key);
+    /// Changes only the given fields of the document stored under `key`; false if
+    /// there is none (a document stored under another key is never touched).
+    bool set_metadata(std::string_view key, const Metadata& metadata);
+    /// The runtime settings for expiry and string keys, after load() (which starts
+    /// with both off) or at any time. Throws std::invalid_argument if a strict
+    /// schema lacks the reserved field (_expires_at, an Int; _key, a Keyword):
+    /// declare it when creating the collection.
+    void set_ttl(const TtlOptions& ttl);
+    void set_string_ids(bool on);
+    void add(std::string_view key, const Document& document);
+    bool upsert(std::string_view key, const Document& document);
+    bool remove(std::string_view key);
+    bool contains(std::string_view key) const;
+    std::optional<DocumentRecord> get(std::string_view key) const;
+
     /// Runs the maintenance that is due (see MaintenancePolicy): a health check and
     /// upkeep of the dense side within `budget` (0: no limit), a rebuild if its
     /// codec drifted (once started, a rebuild runs to the end), then a checkpoint if
@@ -239,6 +293,13 @@ public:
 
 private:
     struct Prepared;  // a checked document (its metadata is checked under the lock)
+    Prepared prepare_keyed(const Document& d, std::optional<std::string_view> key) const;
+    std::optional<Filter> alive_filter() const;  // expiry: not yet expired (none without expiry)
+    bool expired(NodeId slot) const;
+    void fill_reserved(Metadata& md, std::optional<std::string>& key, std::optional<std::int64_t>* expires) const;
+    std::uint64_t keyed_id(std::string_view key) const;
+    void check_runtime(const TtlOptions& ttl, bool string_ids) const;  // a strict schema has the reserved fields
+    bool replaying_ = false;  // replay(): documents applied exactly as logged (expiry and keys included)
     Prepared prepare(const Document& d) const;
     bool apply_upsert(std::uint64_t id, const Prepared& p);
     bool apply_remove(std::uint64_t id);

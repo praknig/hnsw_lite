@@ -281,6 +281,61 @@ struct SearchStats {
  *  - range_expand_outside: range search only; how many hops a search may take
  *    through vectors outside the radius to reach more of the region.
  */
+/// How metadata adjusts relevance after a search, evaluated in C++ on the final
+/// candidates (no callback per node). final = (base x every decay x every
+/// multiplier) + every matching bonus. Opt-in: an empty or absent set changes nothing.
+enum class DecayShape : std::uint8_t {
+    Exponential,  ///< halves every half_life: 2^(-dt / half_life)
+    Linear,       ///< 1 - dt / (2 half_life): half at half_life, zero at twice that
+};
+
+/// Recency: older records (a smaller `field` value than `origin`) score lower.
+/// `field` holds a time, as an integer or float in any unit (dates: milliseconds
+/// since 1970, see parse_date); `origin` ("now") and `half_life` use the same unit.
+/// Values at or after `origin` are not decayed.
+struct RecencyDecay {
+    std::string field;
+    double origin = 0;
+    double half_life = 0;  ///< > 0
+    DecayShape shape = DecayShape::Exponential;
+    double missing = 1.0;  ///< the factor for a record without the field (>= 0)
+    double floor = 0.0;    ///< the smallest factor (0 to 1): old records never fall below it
+};
+
+/// Confidence or provenance: the score times a numeric field (booleans count as
+/// 0 or 1), clamped to [min, max].
+struct FieldMultiplier {
+    std::string field;
+    double missing = 1.0;  ///< the factor for a record without the field (>= 0)
+    double min = 0.0;      ///< >= 0
+    double max = std::numeric_limits<double>::infinity();
+};
+
+/// A bonus added when the record matches `when` (any filter: a tag, a keyword, a
+/// range): boosts without filtering anything out. Negative bonuses demote.
+struct MatchBoost {
+    Filter when;
+    double bonus = 0.0;
+};
+
+struct ScoreModifiers {
+    std::vector<RecencyDecay> decays;
+    std::vector<FieldMultiplier> multipliers;
+    std::vector<MatchBoost> boosts;
+    /// Candidates re-scored before the best k are kept (a boost can promote a
+    /// result that ranked below k): 0 means max(4k, 20).
+    std::size_t pool = 0;
+
+    bool empty() const { return decays.empty() && multipliers.empty() && boosts.empty(); }
+    std::size_t pool_for(std::size_t k) const { return pool ? std::max(pool, k) : std::max<std::size_t>(4 * k, 20); }
+    /// Throws std::invalid_argument for an empty field name, a half-life that is not
+    /// positive and finite, a non-finite origin, bonus or factor, a negative missing
+    /// factor or minimum, a floor outside [0, 1], or min above max.
+    void validate() const;
+    /// The modified score of a record with metadata `md` and base score `base`.
+    double apply(double base, const Metadata& md) const;
+};
+
 struct SearchOptions {
     /// IVF (FlatIndex with IvfParams): lists to probe; 0: the index's default.
     std::size_t probes = 0;
@@ -296,6 +351,12 @@ struct SearchOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     /// Stop when another thread sets this to true; same behavior as a deadline.
     const std::atomic<bool>* cancel = nullptr;
+    /// Opt-in re-scoring by metadata (recency decay, confidence, boosts); results
+    /// then carry SearchResult::score and are ordered by it. See ScoreModifiers.
+    std::optional<ScoreModifiers> modifiers;
+    /// Opt-in diversity (maximal marginal relevance), dense indexes: 1 keeps the
+    /// ranking; lower values trade relevance for variety (see mmr_order). In [0, 1].
+    std::optional<double> diversity;
 };
 
 /// Thrown when a long operation (add_batch, compact, save) is cancelled or

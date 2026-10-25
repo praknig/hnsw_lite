@@ -2,6 +2,7 @@
  * @file collection.cpp
  * @brief Collections of documents over dense, text and sparse sides; see collection.h.
  */
+#include "scoring.h"
 #include "collection.h"
 
 #include <algorithm>
@@ -114,7 +115,37 @@ CollectionOptions CollectionOptions::preset(std::size_t dim, Preset preset, std:
 
 // ---------------------------------------------------------------- construction
 
-Collection::Collection(CollectionOptions options) : options_(std::move(options)), bm25_(options_.bm25), metadata_(options_.schema) {
+namespace {
+
+constexpr const char* kExpiresField = "_expires_at";
+constexpr const char* kKeyField = "_key";
+
+/// A strict schema gains the reserved fields of the features turned on.
+CollectionOptions with_reserved_fields(CollectionOptions o) {
+    if (o.schema.mode() != SchemaMode::Strict) return o;
+    std::vector<FieldSpec> fields = o.schema.fields();
+    auto add = [&](const char* name, FieldType type) {
+        for (const FieldSpec& f : fields)
+            if (f.name == name) return;
+        fields.push_back({name, type});
+    };
+    if (o.ttl.enabled) add(kExpiresField, FieldType::Int);
+    if (o.string_ids) add(kKeyField, FieldType::Keyword);
+    o.schema = Schema::strict(std::move(fields));
+    return o;
+}
+
+void check_unreserved(const Metadata& md) {
+    for (const auto& [name, value] : md.fields())
+        if (name == kExpiresField || name == kKeyField)
+            throw std::invalid_argument("Collection: the metadata field " + name + " is reserved (expiry and string ids)");
+}
+
+}  // namespace
+
+Collection::Collection(CollectionOptions options)
+    : options_(with_reserved_fields(std::move(options))), bm25_(options_.bm25), metadata_(options_.schema) {
+    if (options_.ttl.default_ms < 0) throw std::invalid_argument("TtlOptions::default_ms must not be negative");
     if (options_.dim == 0 && !options_.text && !options_.sparse)
         throw std::invalid_argument("Collection: no side at all (set dim, text or sparse)");
     if (options_.dim > 0) dense_ = std::make_unique<HnswIndex>(options_.dim, options_.metric, options_.hnsw);
@@ -134,7 +165,11 @@ void Collection::check_changeable() const {
     if (failed_) throw std::runtime_error("Collection: a failed change could not be rolled back; changes are refused until it is reopened");  // GCOVR_EXCL_BR_LINE: needs a second failure while restoring (see apply_upsert)
 }
 
-Collection::Prepared Collection::prepare(const Document& d) const {
+Collection::Prepared Collection::prepare(const Document& d) const { return prepare_keyed(d, std::nullopt); }
+
+Collection::Prepared Collection::prepare_keyed(const Document& d, std::optional<std::string_view> key) const {
+    if (!replaying_) check_unreserved(d.metadata);  // a logged document carries its reserved fields
+    if (d.expires_at && !options_.ttl.enabled) throw std::invalid_argument("Collection: expires_at needs CollectionOptions::ttl.enabled");
     Prepared p;
     if (!d.vector.empty()) {
         if (!dense_) throw std::invalid_argument("Collection: a vector given, but the collection has no dense side (dim 0)");
@@ -162,6 +197,11 @@ Collection::Prepared Collection::prepare(const Document& d) const {
         p.sparse = d.sparse;
     }
     p.metadata = d.metadata;  // checked under the lock: the field table changes with dynamic schemas
+    if (options_.ttl.enabled && !replaying_) {  // the expiry time, fixed now, is logged with the document
+        if (d.expires_at) p.metadata.set(kExpiresField, *d.expires_at);
+        else if (options_.ttl.default_ms > 0) p.metadata.set(kExpiresField, now_ms() + options_.ttl.default_ms);
+    }
+    if (key) p.metadata.set(kKeyField, std::string(*key));
     return p;
 }
 
@@ -324,6 +364,7 @@ std::size_t Collection::remove_where(const Filter& filter) {
 }
 
 bool Collection::set_metadata(std::uint64_t id, const Metadata& metadata) {
+    if (!replaying_) check_unreserved(metadata);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     const auto it = slot_of_.find(id);
@@ -337,6 +378,7 @@ bool Collection::set_metadata(std::uint64_t id, const Metadata& metadata) {
 }
 
 std::size_t Collection::set_metadata_where(const Filter& filter, const Metadata& changes) {
+    if (!replaying_) check_unreserved(changes);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     metadata_.validate(changes);
@@ -355,7 +397,8 @@ std::size_t Collection::set_metadata_where(const Filter& filter, const Metadata&
 
 bool Collection::contains(std::uint64_t id) const {
     const auto lock = read_lock(mutex_, this);
-    return slot_of_.count(id) != 0;
+    const auto it = slot_of_.find(id);
+    return it != slot_of_.end() && !expired(it->second);
 }
 
 std::size_t Collection::size() const {
@@ -365,19 +408,21 @@ std::size_t Collection::size() const {
 
 std::size_t Collection::count_where(const Filter& filter) const {
     const auto lock = read_lock(mutex_, this);
-    return matching(filter).size();
+    const std::optional<Filter> alive = alive_filter();
+    return matching(alive ? filter && *alive : filter).size();
 }
 
 std::optional<DocumentRecord> Collection::get(std::uint64_t id) const {
     const auto lock = read_lock(mutex_, this);
     const auto it = slot_of_.find(id);
-    if (it == slot_of_.end()) return std::nullopt;
+    if (it == slot_of_.end() || expired(it->second)) return std::nullopt;
     DocumentRecord r;
     r.id = id;
     if (dense_) r.vector = dense_->get_vector(id);
     if (sparse_) r.sparse = sparse_->get_vector(id);
     r.text = texts_[it->second];
     r.metadata = metadata_.read(it->second);
+    fill_reserved(r.metadata, r.key, &r.expires_at);
     return r;
 }
 
@@ -401,7 +446,10 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     if (k == 0 || slot_of_.empty()) return {};
     // The filter runs on the collection's metadata, for every side, as a predicate.
     std::optional<CompiledFilter> compiled;
-    if (o.filter) compiled.emplace(*o.filter, metadata_);
+    const std::optional<Filter> alive = alive_filter();  // expiry: expired documents are never found
+    if (o.filter && alive) compiled.emplace(*o.filter && *alive, metadata_);
+    else if (o.filter) compiled.emplace(*o.filter, metadata_);
+    else if (alive) compiled.emplace(*alive, metadata_);
     SearchOptions side;
     if (compiled || o.predicate) {
         side.predicate = [&](std::uint64_t id) {
@@ -414,7 +462,10 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     }
     side.deadline = o.deadline;
     side.cancel = o.cancel;
-    const std::size_t depth = o.candidates ? o.candidates : std::max<std::size_t>(4 * k, 20);
+    if (o.modifiers && !o.modifiers->empty()) o.modifiers->validate();
+    if (o.diversity && !(*o.diversity >= 0.0 && *o.diversity <= 1.0)) throw std::invalid_argument("CollectionSearchOptions::diversity must be in [0, 1]");
+    if (o.diversity && !dense_) throw std::invalid_argument("CollectionSearchOptions::diversity needs a dense side (the documents' vectors)");
+    const std::size_t depth = std::max<std::size_t>(o.candidates ? o.candidates : std::max<std::size_t>(4 * k, 20), o.modifiers && !o.modifiers->empty() ? o.modifiers->pool_for(k) : 0);
     struct List {
         std::vector<SearchResult> results;
         double weight;
@@ -463,13 +514,38 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     std::vector<CollectionHit> out;
     out.reserve(by_id.size());
     for (auto& [id, h] : by_id) out.push_back(std::move(h));
+    if (o.modifiers && !o.modifiers->empty()) {  // opt-in: every fused candidate re-scored by its metadata
+        for (CollectionHit& h : out) {
+            h.base_score = h.score;
+            h.score = o.modifiers->apply(h.score, metadata_.read(slot_of_.at(h.id)));
+        }
+    }
     const std::size_t n = std::min(k, out.size());
-    std::partial_sort(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n), out.end(),
-                      [](const CollectionHit& a, const CollectionHit& b) { return a.score > b.score || (a.score == b.score && a.id < b.id); });
-    out.resize(n);
+    const auto better = [](const CollectionHit& a, const CollectionHit& b) { return a.score > b.score || (a.score == b.score && a.id < b.id); };
+    if (o.diversity) {  // opt-in: maximal marginal relevance over every fused candidate
+        std::sort(out.begin(), out.end(), better);
+        std::vector<double> relevance(out.size());
+        std::vector<std::optional<std::vector<float>>> vectors(out.size());
+        for (std::size_t i = 0; i < out.size(); ++i) {
+            relevance[i] = out[i].score;
+            vectors[i] = dense_->get_vector(out[i].id);
+        }
+        const std::vector<std::size_t> order = mmr_order(relevance, vectors, n, *o.diversity);
+        std::vector<CollectionHit> chosen;
+        chosen.reserve(order.size());
+        for (const std::size_t i : order) chosen.push_back(std::move(out[i]));
+        out.swap(chosen);
+    } else {
+        std::partial_sort(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n), out.end(), better);
+        out.resize(n);
+    }
     for (CollectionHit& h : out) {
         const NodeId slot = slot_of_.at(h.id);
-        if (o.with_metadata) h.metadata = metadata_.read(slot);
+        if (o.with_metadata || options_.string_ids) {
+            Metadata md = metadata_.read(slot);
+            fill_reserved(md, h.key, nullptr);
+            if (o.with_metadata) h.metadata = std::move(md);
+        }
         if (o.with_text) h.text = texts_[slot];
     }
     return out;
@@ -482,6 +558,11 @@ bool Collection::replay(std::span<const WalRecord> records) {
         const auto lock = read_lock(mutex_, this);
         if (log_.attached()) throw std::logic_error("replay: the collection's log is attached (replayed changes must not be logged again)");
     }
+    struct Replaying {  // documents are applied exactly as they were logged
+        bool& flag;
+        explicit Replaying(bool& f) : flag(f) { flag = true; }
+        ~Replaying() { flag = false; }
+    } replaying(replaying_);
     std::unordered_set<std::uint64_t> aborted;
     for (const WalRecord& r : records)
         if (r.type == walop::kAbort) aborted.insert(walop::decode(r.type, r.payload).lsn);
@@ -634,6 +715,7 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     r.end_section();
     r.begin_section(kMeta, "metadata");
     c->metadata_ = MetadataStore::load(r, static_cast<std::size_t>(slots), [&](NodeId n) { return c->live_[n] != 0; });
+    c->options_.schema = c->metadata_.current_schema();  // the schema in force, as stored (options() reported it as dynamic before)
     r.end_section();
     r.begin_section(kSide, "sides");
     const std::string dense = r.get_string(), text_bytes = r.get_string(), sparse_bytes = r.get_string();
@@ -678,6 +760,136 @@ std::unique_ptr<Collection> Collection::load(const std::string& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path);
     return load(in);
+}
+
+// ---------------------------------------------------------------- expiry and string keys
+
+std::optional<Filter> Collection::alive_filter() const {
+    if (!options_.ttl.enabled) return std::nullopt;
+    return !Filter::lt(kExpiresField, now_ms());  // documents without an expiry time match too
+}
+
+bool Collection::expired(NodeId slot) const {
+    if (!options_.ttl.enabled) return false;
+    const std::optional<Value> v = metadata_.read(slot).get(kExpiresField);
+    return v && v->type == FieldType::Int && v->i < now_ms();
+}
+
+void Collection::fill_reserved(Metadata& m, std::optional<std::string>& key, std::optional<std::int64_t>* expires) const {
+    // Reserved fields are reported as fields of their own, not as metadata.
+    if (const auto v = m.get(kKeyField); v && v->type == FieldType::Keyword) key = v->s;
+    if (const auto v = m.get(kExpiresField); v && v->type == FieldType::Int && expires) *expires = v->i;
+    Metadata clean;
+    for (const auto& [name, value] : m.fields())
+        if (value && name != kKeyField && name != kExpiresField) clean.set(name, *value);
+    m = std::move(clean);
+}
+
+std::size_t Collection::remove_expired() {
+    if (!options_.ttl.enabled) return 0;
+    return remove_where(Filter::lt(kExpiresField, now_ms()));
+}
+
+std::uint64_t Collection::id_of(std::string_view key) {
+    std::uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a, then a SplitMix64 finish to spread the bits
+    for (const char c : key) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001b3ull;
+    h ^= h >> 30;
+    h *= 0xbf58476d1ce4e5b9ull;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebull;
+    return h ^ (h >> 31);
+}
+
+std::uint64_t Collection::keyed_id(std::string_view key) const {
+    if (!options_.string_ids) throw std::logic_error("Collection: string keys need CollectionOptions::string_ids");
+    return id_of(key);
+}
+
+void Collection::add(std::string_view key, const Document& document) {
+    const std::uint64_t id = keyed_id(key);
+    Prepared p = prepare_keyed(document, key);
+    const auto lock = write_lock(mutex_, this);
+    check_changeable();
+    if (slot_of_.count(id)) {
+        const auto v = metadata_.read(slot_of_.at(id)).get(kKeyField);
+        // GCOVR_EXCL_BR_START: the first branch needs two different keys with the same 64-bit hash, which no test can construct
+        throw std::invalid_argument(v && v->s != key ? "Collection: key \"" + std::string(key) + "\" has the same id as key \"" + v->s + "\""
+                                                     : "Collection: duplicate key \"" + std::string(key) + "\"");
+        // GCOVR_EXCL_BR_STOP
+    }
+    metadata_.validate(p.metadata);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
+        return walop::encode_document(id, p.parts, p.vector, p.text, p.sparse, p.metadata);
+    }));
+    (void)apply_upsert(id, p);
+}
+
+bool Collection::upsert(std::string_view key, const Document& document) {
+    const std::uint64_t id = keyed_id(key);
+    Prepared p = prepare_keyed(document, key);
+    const auto lock = write_lock(mutex_, this);
+    check_changeable();
+    if (const auto it = slot_of_.find(id); it != slot_of_.end()) {
+        const auto v = metadata_.read(it->second).get(kKeyField);
+        if (v && v->s != key) throw std::invalid_argument("Collection: key \"" + std::string(key) + "\" has the same id as key \"" + v->s + "\"");  // GCOVR_EXCL_BR_LINE: needs a 64-bit hash collision between two keys
+    }
+    metadata_.validate(p.metadata);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kDocument, [&] {
+        return walop::encode_document(id, p.parts, p.vector, p.text, p.sparse, p.metadata);
+    }));
+    return apply_upsert(id, p);
+}
+
+void Collection::check_runtime(const TtlOptions& ttl, bool string_ids) const {
+    if (ttl.default_ms < 0) throw std::invalid_argument("TtlOptions::default_ms must not be negative");
+    if (options_.schema.mode() != SchemaMode::Strict) return;
+    auto declared = [&](const char* name) {
+        for (const FieldSpec& f : options_.schema.fields())
+            if (f.name == name) return true;
+        return false;
+    };
+    if (ttl.enabled && !declared(kExpiresField))
+        throw std::invalid_argument("Collection: expiry needs the field _expires_at (Int) in this strict schema; declare it when creating the collection");
+    if (string_ids && !declared(kKeyField))
+        throw std::invalid_argument("Collection: string keys need the field _key (Keyword) in this strict schema; declare it when creating the collection");
+}
+
+void Collection::set_ttl(const TtlOptions& ttl) {
+    check_runtime(ttl, options_.string_ids);
+    const auto lock = write_lock(mutex_, this);
+    options_.ttl = ttl;
+}
+
+void Collection::set_string_ids(bool on) {
+    check_runtime(options_.ttl, on);
+    const auto lock = write_lock(mutex_, this);
+    options_.string_ids = on;
+}
+
+bool Collection::set_metadata(std::string_view key, const Metadata& metadata) {
+    const std::uint64_t id = keyed_id(key);
+    if (!get(key)) return false;  // absent, expired, or another key's document
+    return set_metadata(id, metadata);
+}
+
+bool Collection::remove(std::string_view key) {
+    const std::uint64_t id = keyed_id(key);
+    {
+        const auto lock = read_lock(mutex_, this);
+        const auto it = slot_of_.find(id);
+        if (it == slot_of_.end()) return false;
+        const auto v = metadata_.read(it->second).get(kKeyField);
+        if (!v || v->s != key) return false;  // another key's document: never removed by mistake
+    }
+    return remove(id);
+}
+
+bool Collection::contains(std::string_view key) const { return get(key).has_value(); }
+
+std::optional<DocumentRecord> Collection::get(std::string_view key) const {
+    std::optional<DocumentRecord> r = get(keyed_id(key));
+    if (r && r->key != std::optional<std::string>(std::string(key))) return std::nullopt;
+    return r;
 }
 
 // ---------------------------------------------------------------- maintenance
@@ -852,6 +1064,10 @@ MaintenanceReport Collection::maintain(std::chrono::milliseconds budget) {
                 }
             }
         }
+    }
+    if (options_.ttl.enabled) {
+        const std::size_t gone = remove_expired();
+        if (gone) r.notes.push_back("removed " + std::to_string(gone) + " expired documents");
     }
     if (durable_) {
         std::uint64_t bytes = 0, records = 0;

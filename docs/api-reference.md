@@ -376,3 +376,16 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `MaintenanceReport` | `when`, `elapsed`, `health`, `upkept`, `upkeep`, `rebuilt`, `rebuild`, `checkpointed`, `checkpoint_lsn`, `budget_exhausted`, `notes`, `error` |
 | `MaintenanceStatus` | `log_bytes`, `log_records`, `since_checkpoint`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds` |
 
+## Re-ranking, diversity, dates, expiry and keys
+
+| Name | Description |
+|---|---|
+| `ScoreModifiers { decays, multipliers, boosts, pool }` | Opt-in re-scoring by metadata: `RecencyDecay { field, origin, half_life, shape, missing, floor }`, `FieldMultiplier { field, missing, min, max }`, `MatchBoost { when, bonus }`; `validate()`, `apply(base, metadata)`, `pool_for(k)` |
+| `SearchOptions::modifiers`, `HybridOptions::modifiers`, `CollectionSearchOptions::modifiers` | Results then carry `SearchResult::score` (hybrid and collection hits also `base_score`) |
+| `SearchOptions::diversity`, `CollectionSearchOptions::diversity` | Opt-in MMR in [0, 1] (dense indexes and collections) |
+| `relevance_from_distance(d, metric)`, `rescored(...)`, `mmr_order(...)` (`scoring.h`) | The building blocks |
+| `parse_date(iso)`, `format_date(ms)`, `now_ms()`, `Metadata::set_date(name, iso)` | Dates as milliseconds since 1970 (UTC) |
+| `CollectionOptions::ttl { enabled, default_ms }`, `Document::expires_at`, `Collection::remove_expired()` | Opt-in expiry |
+| `CollectionOptions::string_ids`; `Collection::id_of(key)`; `add`, `upsert`, `get`, `contains`, `remove`, `set_metadata` taking a `std::string_view` key | Opt-in string keys; `DocumentRecord::key`, `CollectionHit::key` |
+| `Collection::set_ttl(ttl)`, `Collection::set_string_ids(on)` | The runtime settings at any time (a loaded collection starts with both off) |
+| `HnswIndex::reorder(options)` | Opt-in: neighbors stored together for faster searches (same graph and results) |
