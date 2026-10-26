@@ -5762,6 +5762,52 @@ TEST(planner, pl20_exact_fallback_bounds_correlated_filters) {
     }
 }
 
+TEST(planner, pl21_exact_fallback_from_acorn_and_with_codecs) {
+    // The fallback from an ACORN search, and from a graph search over SQ8 codes with
+    // re-ranking: both give exactly the exact search's results.
+    const std::size_t n = 3000, d = 16, clusters = 30;
+    std::mt19937 rng(2121);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<std::vector<float>> centers(clusters, std::vector<float>(d));
+    for (auto& c : centers) for (float& x : c) x = nd(rng) * 6;
+    std::vector<std::vector<float>> data(n, std::vector<float>(d));
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < d; ++j) data[i][j] = centers[i % clusters][j] + nd(rng);
+    HnswParams coded;
+    coded.quantization.codec = CodecKind::SQ8;
+    coded.quantization.train_after = 500;  // re-ranking on, full vectors kept
+    for (const bool acorn : {true, false}) {
+        HnswIndex h(d, Metric::L2, acorn ? HnswParams{} : coded);
+        for (std::uint64_t i = 0; i < n; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % clusters)));
+        PlannerParams p = h.planner_params();
+        p.fallback_factor = 0.05;  // a tiny budget: the fallback happens
+        p.max_exact_matches = 0;
+        p.max_exact_fraction = 0;
+        p.acorn_below = acorn ? 1.0 : 0.0;  // ACORN for this filter, or the graph search
+        h.set_planner_params(p);
+        const Filter f = Filter::lt("c", std::int64_t(3));
+        std::size_t fell_back = 0, same = 0;
+        for (int qi = 0; qi < 20; ++qi) {
+            const auto& q = data[std::size_t(rng() % n)];
+            SearchStats st;
+            SearchOptions o;
+            o.filter = f;
+            o.stats = &st;
+            const auto got = h.search(q, 10, 16, o);
+            SearchOptions e;
+            e.filter = f;
+            e.strategy = Strategy::ForceExact;
+            const auto truth = h.search(q, 10, 16, e);
+            if (st.reason != PlanReason::ExactFallback) continue;
+            ++fell_back;
+            bool equal = got.size() == truth.size();
+            for (std::size_t i = 0; equal && i < got.size(); ++i) equal = got[i].id == truth[i].id;
+            same += equal;
+        }
+        CHECK(fell_back > 0 && same == fell_back);
+    }
+}
+
 TEST(planner, pl17_exact_counts_for_every_filter_kind) {
     auto data = clustered(600, 8, 4, 390);
     HnswIndex h(8, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
@@ -11074,6 +11120,33 @@ TEST(codec, q0_22_rabitq_edges) {
     CHECK(v.valid_code(with(1, 0.8f).data()) && v.valid_code(with(0, 0).data()) && v.valid_code(with(0, 1).data()) && v.valid_code(with(3e38f, 1).data()));
     for (const auto& [length, alignment] : std::vector<std::pair<float, float>>{{nan, 0.5f}, {inf, 0.5f}, {-1.0f, 0.5f}, {1.0f, nan}, {1.0f, inf}, {1.0f, -0.1f}, {1.0f, 1.5f}})
         CHECK(!v.valid_code(with(length, alignment).data()));
+    // Refusals: a centroid that is not finite, samples of the wrong size or with NaN, decoding
+    // into the wrong size, a codec kind beyond the last; and SQ8 with a zero inner-product query.
+    {
+        RaBitQCodec r(4, Metric::L2);
+        auto state = std::vector<float>(16, 1.0f);
+        state[1] = nan;
+        CHECK_THROWS_AS(std::invalid_argument, r.restore(state));
+        CHECK_THROWS_AS(std::invalid_argument, r.train(std::vector<float>{}));
+        CHECK_THROWS_AS(std::invalid_argument, r.train(std::vector<float>(6, 1.0f)));
+        std::vector<float> bad_sample(8, 1.0f);
+        bad_sample[5] = inf;
+        CHECK_THROWS_AS(std::invalid_argument, r.train(bad_sample));
+        r.train(std::vector<float>{1, 2, 3, 4, 4, 3, 2, 1});
+        std::vector<std::uint8_t> c4(r.code_size());
+        r.encode(std::vector<float>{1, 1, 1, 1}, c4.data());
+        std::vector<float> wrong(3);
+        CHECK_THROWS_AS(std::invalid_argument, r.decode(c4.data(), wrong));
+        QuantizationParams beyond;
+        beyond.codec = static_cast<CodecKind>(static_cast<int>(CodecKind::RaBitQ) + 1);
+        CHECK_THROWS_AS(std::invalid_argument, validate(beyond));
+        SQ8Codec s8(4, Metric::InnerProduct);
+        s8.train(std::vector<float>{1, 2, 3, 4, -1, 0, 2, 1});
+        std::vector<std::uint8_t> sc(s8.code_size());
+        s8.encode(std::vector<float>{1, 1, 1, 1}, sc.data());
+        s8.prepare(std::vector<float>(4, 0.0f), table);
+        CHECK(s8.distance(table, sc.data()) == 0.0f);  // a zero query: no scale, a zero distance
+    }
     // An alignment of 0 (never written by encode, but possible in a zeroed slot): a finite distance.
     v.prepare(std::vector<float>(8, 1.0f), table);
     CHECK(std::isfinite(v.distance(table, with(2, 0).data())));

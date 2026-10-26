@@ -105,7 +105,7 @@ float SQ8Codec::distance(const std::vector<float>& table, const std::uint8_t* co
         // infinity - infinity. NaN arises only there, where the true distance is beyond
         // float's range: infinity (found by a4 in a build using the plain kernel).
         const float l2 = kernels_.sq8_l2(table.data(), step_.data(), code, d);  // SIMD where available
-        return std::isnan(l2) ? std::numeric_limits<float>::infinity() : l2;
+        return std::isnan(l2) ? std::numeric_limits<float>::infinity() : l2;  // GCOVR_EXCL_BR_LINE: CPU-dependent (the plain kernel only)
     }
     const auto* w8 = reinterpret_cast<const std::int8_t*>(table.data() + 4);
     double numbers[2];  // the constant and the scale (see prepare)

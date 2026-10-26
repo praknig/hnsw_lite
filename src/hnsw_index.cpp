@@ -250,7 +250,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
             if (eligible(neighbor)) results.push({d, neighbor});  // ...but never returned
         }
         if (budget && computed >= budget) {  // the caller falls back to an exact scan
-            if (over_budget) *over_budget = true;
+            if (over_budget) *over_budget = true;  // GCOVR_EXCL_BR_LINE: defensive: every caller passing a budget passes over_budget
             break;
         }
     }
@@ -304,7 +304,7 @@ std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candida
             }
         }
         if (budget && computed >= budget) {  // the caller falls back to an exact scan
-            if (over_budget) *over_budget = true;
+            if (over_budget) *over_budget = true;  // GCOVR_EXCL_BR_LINE: defensive: every caller passing a budget passes over_budget
             break;
         }
     }

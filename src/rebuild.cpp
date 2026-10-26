@@ -41,7 +41,9 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
         records.reserve(live_);
         // With codes only, the codec is never retrained (training needs the floats): each
         // code is carried over byte for byte rather than re-encoded from its decoded vector.
-        const std::size_t cs = codes_only_now && codec_ && codec_->trained() && !as_given ? codec_->code_size() : 0;
+        // Codes only implies a trained codec: training is what drops the floats, and the
+        // loader refuses a file without vector values and a trained codec.
+        const std::size_t cs = codes_only_now && !as_given ? codec_->code_size() : 0;
         for (NodeId n = 0; n < storage_.size(); ++n)
             if (!ids.is_deleted(n))
                 records.push_back({ids.external(n), as_given ? std::vector<float>(storage_.original(n).begin(), storage_.original(n).end()) : stored_copy(n),
@@ -111,7 +113,7 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
             if (const auto node = ids.find(id)) {
                 if (storage_.originals()) fresh.add_unlocked(id, storage_.original(*node), metadata_.read(*node));
                 else {  // codes only: the current code, carried over as it is
-                    fresh.code_given_ = codes_only() && codec_ && codec_->trained() ? codes_.data() + std::size_t(*node) * codec_->code_size() : nullptr;
+                    fresh.code_given_ = codes_only() ? codes_.data() + std::size_t(*node) * codec_->code_size() : nullptr;  // codes only: a trained codec
                     fresh.add_unlocked(id, stored_copy(*node), metadata_.read(*node), true);
                     fresh.code_given_ = nullptr;
                 }
@@ -286,4 +288,3 @@ RebuildStats FlatIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
 }
 
 }  // namespace vecdb
-
