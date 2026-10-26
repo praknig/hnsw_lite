@@ -6,19 +6,19 @@ Queries per second at a recall@10 of at least 0.90 / 0.95 / 0.99 (one query per 
 
 | Library | q/s @ 0.90 | q/s @ 0.95 | q/s @ 0.99 | batch q/s @ 0.95 | build (s) | memory (MB) | index file (MB) |
 |---|---|---|---|---|---|---|---|
-| hnsw-lite | 9,566 | 5,533 | 2,117 | 13,824 | 176.3 | 703 | 586 |
-| hnswlib | 11,904 | 6,963 | 2,732 | 14,619 | 166.7 | 732 | 630 |
-| faiss-hnsw | 11,890 | 7,103 | 3,969 | 15,825 | 174.4 | 656 | 626 |
-| usearch | 4,247 | 2,631 | 1,095 | 8,731 | 244.8 | 733 | 630 |
-| faiss-ivfpq | — | — | — | — | 37.6 | 154 | 25 |
+| hnsw-lite | 11,164 | 6,398 | 2,396 | 15,854 | 156.1 | 701 | 586 |
+| hnswlib | 12,948 | 7,580 | 2,933 | 16,760 | 147.8 | 732 | 630 |
+| faiss-hnsw | 12,930 | 7,772 | 4,345 | 19,013 | 150.4 | 656 | 626 |
+| usearch | 4,753 | 2,926 | 1,221 | 9,812 | 220.8 | 733 | 630 |
+| faiss-ivfpq | — | — | — | — | 36.2 | 154 | 25 |
 
 Filtered search: queries per second at a recall@10 of at least 0.95 (one thread). The filter keeps vectors whose bucket (id % 100) is below the percentage, so matches are spread evenly; hnsw-lite filters on metadata stored in the index, hnswlib with a Python callback, FAISS with an ID selector:
 
 | Library | 1% matching | 10% matching | 30% matching |
 |---|---|---|---|
-| hnsw-lite | — | 614 | 2,159 |
-| hnswlib | 267 | 1,973 | 2,747 |
-| faiss-hnsw | — | — | 3,072 |
+| hnsw-lite | — | 816 | 2,409 |
+| hnswlib | 297 | 2,172 | 2,948 |
+| faiss-hnsw | — | — | 3,294 |
 | faiss-ivfpq | — | — | — |
 
 — : the library did not reach that recall in the sweep, or does not support it.
