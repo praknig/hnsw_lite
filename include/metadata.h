@@ -16,6 +16,7 @@
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
+#include <span>
 #include <vector>
 
 #include "common.h"
@@ -364,10 +365,12 @@ public:
         ids.reserve(keep);
         for (std::uint32_t id = 0; id < strings.size(); ++id) ids.emplace(strings[id], id);
         std::vector<ValueCounts> counts(cols_.size());
+        std::vector<std::vector<std::vector<NodeId>>> postings(cols_.size());  // renumbered lists, filled in the commit
         for (std::size_t f = 0; f < cols_.size(); ++f) {
             const Column& c = cols_[f];
             if (!c.indexed || (c.type != FieldType::Keyword && c.type != FieldType::Tags)) continue;
             counts[f].reset(keep);
+            postings[f].resize(keep);
             for (std::uint32_t id = 0; id < remap.size(); ++id)
                 if (remap[id] != kNone) counts[f].set(remap[id], c.counts.count(id));
         }
@@ -380,7 +383,12 @@ public:
                 if (c.type == FieldType::Tags)
                     for (std::uint32_t& id : c.tags[s]) id = remap[id];
             }
-            if (c.indexed && (c.type == FieldType::Keyword || c.type == FieldType::Tags)) c.counts = std::move(counts[f]);
+            if (c.indexed && (c.type == FieldType::Keyword || c.type == FieldType::Tags)) {
+                c.counts = std::move(counts[f]);
+                for (std::uint32_t id = 0; id < remap.size() && id < c.postings.size(); ++id)  // moving a list never allocates
+                    if (remap[id] != kNone) postings[f][remap[id]] = std::move(c.postings[id]);
+                c.postings.swap(postings[f]);
+            }
         }
         strings_.swap(strings);
         refs_.swap(refs);
@@ -435,11 +443,29 @@ public:
         if (c.type == FieldType::Int || c.type == FieldType::Float)
             throw std::invalid_argument("only keyword, boolean and tag-set fields can be indexed");
         if (c.indexed) return;
-        c.counts.reset(c.type == FieldType::Bool ? 2 : strings_.size());  // may throw; nothing changed yet
+        const std::size_t values = c.type == FieldType::Bool ? 2 : strings_.size();
+        // Build the posting lists and counts first (may throw; nothing changed yet).
+        std::vector<std::vector<NodeId>> lists(values);
+        for (NodeId s = 0; s < c.present.size(); ++s) {
+            if (!c.present[s]) continue;
+            if (c.type == FieldType::Bool) lists[c.bools[s]].push_back(s);
+            if (c.type == FieldType::Keyword) lists[c.keywords[s]].push_back(s);
+            if (c.type == FieldType::Tags)
+                for (std::uint32_t id : c.tags[s]) lists[id].push_back(s);
+        }
+        c.counts.reset(values);
+        for (std::uint32_t id = 0; id < values; ++id) c.counts.set(id, lists[id].size());
+        c.postings = std::move(lists);
         c.indexed = true;
-        for (NodeId s = 0; s < c.present.size(); ++s) c.count_row(s, true);
     }
     bool is_indexed(std::size_t f) const { return cols_[f].indexed; }
+    /// The rows holding value `id` (dictionary ID, or 0 and 1 for booleans) of indexed
+    /// field `f`, in ascending order; empty for a value no row holds.
+    std::span<const NodeId> posting(std::size_t f, std::uint32_t id) const {
+        const Column& c = cols_[f];
+        if (!c.indexed || id >= c.postings.size()) return {};
+        return c.postings[id];
+    }
     /// Names of indexed fields.
     std::vector<std::string> indexed_fields() const {
         std::vector<std::string> out;
@@ -468,6 +494,26 @@ private:
         std::vector<std::uint32_t> keywords;
         std::vector<std::vector<std::uint32_t>> tags;
         ValueCounts counts;
+        /// Indexed columns: for each value (dictionary ID, or 0 and 1 for booleans), the
+        /// rows holding it, in ascending order: the posting lists. Kept with `counts`;
+        /// room for an insertion is reserved beforehand (reserve_posting), so updating
+        /// them in a commit step never allocates.
+        std::vector<std::vector<NodeId>> postings;
+        /// Room to add one row to value `id`'s posting list. May throw.
+        void reserve_posting(std::uint32_t id) {
+            if (postings.size() <= id) postings.resize(std::size_t(id) + 1);
+            std::vector<NodeId>& p = postings[id];
+            if (p.size() == p.capacity()) p.reserve(p.size() + p.size() / 2 + 8);
+        }
+        void posting_insert(std::uint32_t id, NodeId s) noexcept {  // room reserved: no allocation
+            std::vector<NodeId>& p = postings[id];
+            p.insert(std::lower_bound(p.begin(), p.end(), s), s);
+        }
+        void posting_erase(std::uint32_t id, NodeId s) noexcept {
+            std::vector<NodeId>& p = postings[id];
+            const auto it = std::lower_bound(p.begin(), p.end(), s);
+            if (it != p.end() && *it == s) p.erase(it);
+        }
 
         explicit Column(FieldType t) : type(t) {}
         std::size_t rows() const { return present.size(); }
@@ -488,7 +534,15 @@ private:
         /// Adds or removes row `s`'s value(s) from the counts of an indexed column.
         void count_row(NodeId s, bool add) noexcept {
             if (!indexed || s >= rows() || !present[s]) return;
-            auto apply_one = [&](std::uint32_t id) { add ? counts.add(id) : counts.remove(id); };
+            auto apply_one = [&](std::uint32_t id) {
+                if (add) {
+                    counts.add(id);
+                    posting_insert(id, s);
+                } else {
+                    counts.remove(id);
+                    posting_erase(id, s);
+                }
+            };
             switch (type) {  // GCOVR_EXCL_BR_LINE: numeric columns are never indexed
                 case FieldType::Bool: apply_one(bools[s]); break;
                 case FieldType::Keyword: apply_one(keywords[s]); break;
@@ -510,7 +564,18 @@ private:
         /// Moves row `from`'s value into row `to`. The caller has checked that
         /// `from` has a value, `to` exists and `to` is clear.
         void move_row(NodeId from, NodeId to) noexcept {
-            // The value moves between two rows: counts and present_count stay the same.
+            // The value moves between two rows: counts and present_count stay the same, and
+            // each posting list swaps `from` for `to` (one out, one in: never more room).
+            if (indexed) {
+                auto swap_in = [&](std::uint32_t id) {
+                    posting_erase(id, from);
+                    posting_insert(id, to);
+                };
+                if (type == FieldType::Bool) swap_in(bools[from]);
+                if (type == FieldType::Keyword) swap_in(keywords[from]);
+                if (type == FieldType::Tags)
+                    for (std::uint32_t id : tags[from]) swap_in(id);
+            }
             present[to] = 1;
             present[from] = 0;
             switch (type) {
@@ -648,7 +713,13 @@ private:
                 Column& c = cols_[p.field];
                 if (p.clear) continue;
                 c.ensure(std::size_t(slot) + 1);
-                if (c.indexed) c.counts.ensure(c.type == FieldType::Bool ? 2 : strings_.size());
+                if (c.indexed) {
+                    c.counts.ensure(c.type == FieldType::Bool ? 2 : strings_.size());
+                    if (c.type == FieldType::Bool) c.reserve_posting(p.b ? 1 : 0);
+                    if (c.type == FieldType::Keyword) c.reserve_posting(p.id);
+                    if (c.type == FieldType::Tags)
+                        for (std::uint32_t id : p.tags) c.reserve_posting(id);
+                }
             }
         } catch (...) {
             truncate(undo);

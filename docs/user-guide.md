@@ -82,7 +82,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-      |---|---|---|---|---|---|
+    |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -409,6 +409,19 @@ auto capped = hnsw.search_range(query, 0.2f, /*max_results=*/100);     // at mos
 - `FlatIndex` is exact. `HnswIndex` is approximate, like its normal search; pass `Strategy::ForceExact` in the options when every vector within the radius must be found.
 - Filters and predicates work here too.
 
+## The command-line tool
+
+`hnsw-lite` (built with the library; `HNSW_LITE_BUILD_TOOLS`) looks at any file or durable directory without writing code:
+
+```bash
+hnsw-lite inspect index.idx            # kind, format version, size, vectors, settings, metadata fields
+hnsw-lite verify  data.db/             # load (or recover) with every check: "OK", or exit status 1
+hnsw-lite health  index.idx --recall-sample 200
+hnsw-lite export  docs.db/ --format csv --output docs.csv   # or JSON Lines; --limit N, --no-vectors
+```
+
+It reads HNSW, flat, sparse and disk index files, collection files, and durable directories of every kind, and never changes them: a durable directory is recovered from a temporary copy. Exit status: 0 success, 1 a damaged file or a failed operation, 2 a usage error. Exported vectors read back exactly (9 significant digits per float); CSV quotes values with commas, quotes or newlines. In C++, `identify(path)` (`inspect.h`) tells what a file or directory holds from its headers alone.
+
 ## Reading records back
 
 ```cpp
@@ -523,6 +536,28 @@ auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: u
 - Training, saving, truncation and everything else work as for SQ8.
 - Code distances use SIMD instructions (AVX2, AVX-512, NEON) when the CPU has them, like full-precision distances; see [Performance and tuning](performance.md#compression).
 
+## Faceted search
+
+Facets count how many documents hold each value of metadata fields ("120 results in English, 40 in French"), over everything, the matches of a filter, or a given set of documents such as the top hits of a search. `HnswIndex`, `FlatIndex` and `Collection` all have them:
+
+```cpp
+std::vector<FacetRequest> req{
+    {"lang"},                                    // the 10 most frequent values
+    {"price", 0, {10.0, 50.0}},                  // ranges: below 10, [10, 50), from 50 on
+    {"tags", 5, {}, true},                       // the 5 most frequent tags, and how many distinct
+};
+for (const FacetResult& r : index.facets(req, Filter::eq("in_stock", true))) {
+    for (const FacetValue& v : r.values) std::cout << r.field << " " << v.value.s << ": " << v.count << "\n";
+}
+std::vector<std::uint64_t> hits;                 // or over a search's top hits
+for (const auto& h : index.search(query, 100)) hits.push_back(h.id);
+const auto top = index.facets_for(hits, {{"lang"}});
+```
+
+Each result has `total` (documents counted), `missing` (of those, without the field), `values` (most frequent first; `other` sums the rest beyond `limit`), `buckets` for ranges, and `distinct` when asked. A document counts once per distinct tag. A collection never counts expired documents.
+
+**Make it fast with a payload index.** `create_payload_index("lang")` (keyword, boolean and tag fields) keeps exact counts and posting lists for the field: facets over everything then read the counts, and selective filters read only the matching documents. Measured on 300,000 documents with a filter matching 0.1%: facets with the filter 65× faster, facets over everything 1,532×, counting the matches 555×, a filtered search 158×. Collections have `create_payload_index` too (logged when durable).
+
 ## Sparse vectors and hybrid search
 
 ```cpp
@@ -542,6 +577,8 @@ A `SparseVector` is a set of (term, weight) pairs (`indices`, `values`; any orde
 - **BM25:** `Bm25` turns text into sparse vectors whose dot product is the BM25 score: documents carry the term-frequency part (with `k1`, `b` and the average document length, set by `fit()`), queries the IDF part, computed from the index's document frequencies when the query is encoded. Tokens are lowercase runs of letters and digits (UTF-8 bytes count as letters), hashed to 32-bit term IDs; two tokens with the same hash merge, which is rare. Stemming and stop words are left to you: tokenize your way and build `SparseVector`s directly, or use a learned model such as SPLADE.
 - **Fusion:** `hybrid_search(dense_index, dense_query, sparse_index, sparse_query, k, options)` takes `max(4k, 20)` candidates from each side (`dense_k`, `sparse_k`) and fuses them by ID. Reciprocal Rank Fusion (default) scores each document `dense_weight / (rrf_k + dense rank) + sparse_weight / (rrf_k + sparse rank)` with `rrf_k = 60`: robust, since it uses ranks only. `Fusion::Weighted` scales each list's scores to [0, 1] and adds them with the weights instead, keeping how much better one result is than the next. `options.filter` applies to both sides. `fuse()` fuses any two result lists you already have.
 - **Limits:** a `SparseIndex` has no write-ahead log yet (save it, or rebuild it from your data), and search is exact without pruning: very common terms make long posting lists, so drop stop words for large collections.
+
+**A durable sparse index.** `SparseIndex::open_durable(dir)` keeps a standalone sparse index in a directory, as `HnswIndex::open_durable` does: every change is logged before it is applied, `checkpoint()` writes a snapshot, and reopening recovers the snapshot and the log after it (a crash loses no acknowledged change). From Python, sparse vectors are durable through collections.
 
 ## Durability
 

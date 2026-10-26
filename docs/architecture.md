@@ -147,7 +147,7 @@ hnsw-lite/
 │   └── query_planner.cpp       # Compiled filters and the query planner
 ├── tests/
 │   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 905 tests with a built-in runner
+│   └── test_comprehensive.cpp  # All 925 tests with a built-in runner
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
@@ -533,7 +533,9 @@ A filtered HNSW search can either scan the matching vectors exactly, or search t
 
 Settings live in `PlannerParams`, per index (`set_planner_params`) or per query (`SearchOptions::planner`). `Strategy::ForceExact`, `Strategy::ForceGraph` and `Strategy::ForceAcorn` override the choice. `SearchStats` reports the strategy, the reason, the estimate, the beam width, and the work done. On very large indexes lower `max_exact_fraction`: 1% of 100 million vectors is a million exact distance computations.
 
-**Payload index.** `create_payload_index(field)` keeps exact per-value counts for a keyword, boolean or tag-set field, which the planner uses instead of sampling. This first version keeps counts only; posting lists (letting exact search read only the matching vectors) are a later step.
+**Payload index.** `create_payload_index(field)` keeps, for a keyword, boolean or tag-set field, exact per-value counts (the planner uses them instead of sampling) and posting lists: per value, the rows holding it, as a sorted vector, updated in the same step as the counts. Room for an insertion is reserved before the commit (`reserve_posting`), so updating them never allocates; moving a row (a flat index fills a gap with its last row) takes one entry out and puts one in; compacting the dictionary renumbers the lists with it; loading rebuilds them. `CompiledFilter::candidates()` unites and intersects the lists for equality, `in` and tag conditions under `and` and `or` (a superset when an `and` has other parts: `matches()` checks each row), and every matching function reads only those rows.
+
+**Facets** (`facets.h`). One `FacetCounter` counts one field over the documents it is given, so every type counts alike; `count_facets()` validates every request first, then visits the documents once for all of them. Over everything, an indexed keyword, tag or boolean field is counted from its per-value counts without reading documents (proven equal by tests); a collection with expiry counts through its alive filter instead, as those counts include expired documents not yet removed.
 
 ### Batch search
 

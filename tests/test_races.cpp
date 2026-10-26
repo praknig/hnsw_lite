@@ -649,6 +649,62 @@ RACE_TEST(r13_collection_scans_while_writing) {
     CHECK(bad == 0 && scans > 0);
 }
 
+// ---------------------------------------------------------------- r14
+
+RACE_TEST(r14_facets_while_indexed_metadata_changes) {
+    // Facets (over everything, a filter, and given IDs) while writers change indexed
+    // metadata: every result is consistent. A keyword field holds one value or none, so
+    // the counts plus the documents without it always make the total.
+    auto data = random_vectors(200, 8, 14);
+    HnswIndex h(8, Metric::L2);
+    Collection c(manual_options(8));
+    const char* langs[] = {"en", "fr", "de"};
+    auto md = [&](std::size_t i) { return i % 7 == 0 ? Metadata() : Metadata().set("lang", langs[i % 3]).set("tags", std::vector<std::string>{"t" + std::to_string(i % 4)}); };
+    for (std::uint64_t i = 0; i < 100; ++i) {
+        h.add(i, data[i], md(i + 1));
+        Document d;
+        d.vector = data[i];
+        d.metadata = md(i + 1);
+        c.add(i, d);
+    }
+    h.create_payload_index("lang");
+    h.create_payload_index("tags");
+    c.create_payload_index("lang");
+    std::atomic<int> bad{0};
+    auto consistent = [&](const FacetResult& r) {
+        std::size_t sum = 0;
+        for (const auto& v : r.values) sum += v.count;
+        return sum + r.missing + r.other == r.total && r.total <= 200;
+    };
+    const std::vector<FacetRequest> req{FacetRequest{"lang", 0, {}, true}};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = rng() % 200;
+            if (rng() % 4 == 0) {
+                (void)h.remove(i);
+                (void)c.remove(i);
+            } else {
+                (void)h.upsert(i, data[i], md(rng()));
+                Document d;
+                d.vector = data[i];
+                d.metadata = md(rng());
+                (void)c.upsert(i, d);
+            }
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            const Filter f = Filter::has_tag("tags", "t" + std::to_string(rng() % 4));
+            for (const auto& r : {h.facets(req)[0], h.facets(req, f)[0], c.facets(req)[0], c.facets(req, f)[0]})
+                if (!consistent(r)) ++bad;
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            std::vector<std::uint64_t> ids;
+            for (int k = 0; k < 20; ++k) ids.push_back(rng() % 220);
+            if (!consistent(h.facets_for(ids, req)[0]) || !consistent(c.facets_for(ids, req)[0])) ++bad;
+        },
+    });
+    CHECK(bad == 0);
+}
+
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {

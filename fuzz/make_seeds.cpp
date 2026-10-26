@@ -97,6 +97,23 @@ int main(int argc, char** argv) {
         logged.set_metadata(3, Metadata().set("a", std::int64_t(9)));
         (void)logged.detach_log();
     }
+    {  // a sparse index's log: every record it writes
+        const std::string dir = root + "/5/sparse-dir";
+        fs::remove_all(dir);
+        {
+            auto sp = SparseIndex::open_durable(dir);
+            for (std::uint64_t i = 0; i < 6; ++i) sp->add(i, SparseVector{{std::uint32_t(i), 7}, {1.0f, 0.5f}}, Metadata().set("a", std::int64_t(i)));
+            (void)sp->update(1, SparseVector{{2}, {2.0f}});
+            (void)sp->upsert(9, SparseVector{{3}, {1.0f}}, Metadata().set("a", std::int64_t(9)));
+            (void)sp->set_metadata(2, Metadata().set("a", std::int64_t(5)));
+            (void)sp->remove(3);
+            (void)sp->remove_where(Filter::eq("a", std::int64_t(4)));
+            sp->compact();
+        }
+        for (const auto& e : fs::directory_iterator(dir))
+            if (e.path().filename().string().rfind("wal-", 0) == 0) fs::copy_file(e.path(), root + "/5/sparse.wal", fs::copy_options::overwrite_existing);
+        fs::remove_all(dir);
+    }
     fs::create_directories(root + "/6");
     std::vector<std::uint64_t> ids;
     std::vector<float> flat;

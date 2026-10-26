@@ -17,7 +17,7 @@
 
 #include "health.h"
 #include "metadata.h"
-#include "sparse.h"
+#include "sparse_vector.h"
 #include "filter.h"
 
 namespace vecdb::walop {
@@ -44,6 +44,7 @@ enum Type : std::uint8_t {
     kDocumentRemove = 21,      ///< Collection: ids
     kDocumentMetadata = 22,    ///< Collection: ids, metadata changes
     kCollectionSettings = 23,  ///< Collection: expiry enabled, default lifetime, string keys
+    kSparseWrite = 24,         ///< SparseIndex: mode (add, update, upsert), id, sparse vector, metadata (or none: kept)
 };
 
 /// A decoded operation; only the fields its type uses are set.
@@ -64,7 +65,11 @@ struct Op {
     std::uint8_t ttl_enabled = 0;     ///< kCollectionSettings
     std::int64_t ttl_default_ms = 0;
     std::uint8_t string_ids = 0;
+    std::uint8_t mode = 0;            ///< kSparseWrite: kSparseAdd, kSparseUpdate or kSparseUpsert
 };
+
+/// kSparseWrite modes: the SparseIndex call the record replays.
+inline constexpr std::uint8_t kSparseAdd = 0, kSparseUpdate = 1, kSparseUpsert = 2;
 
 std::vector<unsigned char> encode_add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
 std::vector<unsigned char> encode_add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
@@ -78,6 +83,7 @@ std::vector<unsigned char> encode_rebuild(const RebuildOptions& o);
 std::vector<unsigned char> encode_field(std::string_view field);
 std::vector<unsigned char> encode_planner(const PlannerParams& p);
 std::vector<unsigned char> encode_fraction(double fraction);
+std::vector<unsigned char> encode_sparse_write(std::uint8_t mode, std::uint64_t id, const SparseVector& vector, const Metadata* metadata);
 std::vector<unsigned char> encode_collection_settings(bool ttl_enabled, std::int64_t ttl_default_ms, bool string_ids);
 std::vector<unsigned char> encode_document(std::uint64_t id, std::uint8_t parts, std::span<const float> vector, std::string_view text,
                                            const SparseVector& sparse, const Metadata& metadata);

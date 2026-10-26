@@ -285,7 +285,7 @@ jobs:
           -DCMAKE_EXE_LINKER_FLAGS=--coverage
 
       - name: Build
-        run: cmake --build build --parallel --target test_comprehensive test_adversarial test_races
+        run: cmake --build build --parallel --target test_comprehensive test_adversarial test_races test_cli
 
       - name: Test
         # Four groups at a time; GCC locks .gcda files while merging, so parallel

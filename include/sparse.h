@@ -29,6 +29,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "change_log.h"
+#include "sparse_vector.h"
+#include "durable.h"
 #include "filter.h"
 #include "metadata.h"
 #include "search_result.h"
@@ -36,15 +39,6 @@
 
 namespace vecdb {
 
-/// Terms and their weights. Order does not matter; terms must be distinct and
-/// weights finite. Zero weights are dropped when stored.
-struct SparseVector {
-    std::vector<std::uint32_t> indices;
-    std::vector<float> values;
-    std::size_t size() const { return indices.size(); }
-    bool empty() const { return indices.empty(); }
-    friend bool operator==(const SparseVector&, const SparseVector&) = default;
-};
 
 /// Dot product of two sparse vectors (any order).
 double sparse_dot(const SparseVector& a, const SparseVector& b);
@@ -100,6 +94,10 @@ public:
     std::size_t dead_postings() const;
     /// Document slots, live and awaiting compaction.
     std::size_t slots() const;
+    /// The metadata schema in force (for a dynamic schema, the fields seen so far).
+    Schema schema() const;
+    /// The metadata fields with a payload index (none for a sparse index today).
+    std::vector<std::string> payload_indexes() const;
 
     /// Drops removed documents from posting lists and renumbers slots. Runs by
     /// itself once dead entries outnumber live ones; explicit calls are optional.
@@ -110,6 +108,19 @@ public:
     /// Throws FormatError for a damaged or foreign file.
     static std::unique_ptr<SparseIndex> load(const std::string& path);
     static std::unique_ptr<SparseIndex> load(std::istream& in);
+
+    /// A durable index in directory `dir` (durable.h): created if new, or recovered
+    /// (the latest snapshot, then the log after it). Every change is logged before it
+    /// is applied; a second process opening `dir` is refused while this one holds it.
+    static std::unique_ptr<SparseIndex> open_durable(const std::string& dir, Schema schema = Schema::dynamic(),
+                                                     const DurableOptions& options = {}, RecoveryStats* stats = nullptr);
+    /// Durable indexes: writes a snapshot and drops the log it covers. Returns the
+    /// snapshot's LSN. Throws std::logic_error if the index is not durable.
+    std::uint64_t checkpoint();
+    /// Re-applies logged changes (durable.h recovery). Returns true if the last one,
+    /// unfinished when the process stopped, was dropped. Throws FormatError when the log
+    /// does not match the index.
+    bool replay(std::span<const WalRecord> records);
 
 private:
     struct Posting {
@@ -133,6 +144,9 @@ private:
     std::size_t posting_entries_ = 0;
     std::size_t dead_entries_ = 0;
     mutable IndexLock lock_;
+    ChangeLog log_;  // write-ahead log hook (change_log.h)
+    std::shared_ptr<detail::DurableState> durable_;  // the directory, if opened with open_durable
+    void save_unlocked(std::ostream& out) const;
 };
 
 // ---------------------------------------------------------------- BM25

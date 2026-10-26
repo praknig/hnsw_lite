@@ -17,7 +17,7 @@
  *   test_comprehensive --help               show this help
  *
  * Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,
- *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, stress, e2e
+ *         metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, facets, stress, e2e
  *
  * How it works:
  *  - TEST(group, name) defines a test and registers it before main() runs.
@@ -69,6 +69,8 @@
 #include <thread>
 #include <vector>
 
+#include "inspect.h"
+#include "facets.h"
 #include "half.h"
 #include "scoring.h"
 #include "arena.h"
@@ -6746,6 +6748,11 @@ namespace {
 std::string save_bytes(const FlatIndex& f) {
     std::ostringstream out(std::ios::binary);
     f.save(out);
+    return out.str();
+}
+std::string save_bytes(const SparseIndex& x) {
+    std::ostringstream out;
+    x.save(out);
     return out.str();
 }
 std::string save_bytes(const HnswIndex& h) {
@@ -16640,6 +16647,279 @@ TEST(durable, du16_a_crash_while_creating_a_log_segment) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(durable, du17_a_sparse_index_recovers_every_change) {
+    // Every write a SparseIndex logs, with checkpoints along the way: copies of the
+    // directory taken after operations (as a crash leaves the files) each recover that
+    // moment exactly, aborted operations included.
+    const std::string dir = durable_dir("du17");
+    std::vector<std::pair<std::string, std::string>> moments;  // copy, expected bytes
+    auto vec = [](std::mt19937& rng) {
+        SparseVector v;
+        for (std::uint32_t t = 0; t < 30; ++t)
+            if (rng() % 6 == 0) {
+                v.indices.push_back(t);
+                v.values.push_back(float(rng() % 9 + 1) / 4.0f);
+            }
+        if (v.empty()) v = {{1}, {1.0f}};
+        return v;
+    };
+    std::size_t aborted = 0;
+    {
+        auto s = SparseIndex::open_durable(dir);
+        std::mt19937 rng(17);
+        for (int step = 0; step < 160; ++step) {
+            const std::uint64_t id = rng() % 60;
+            const Metadata md = Metadata().set("g", std::int64_t(rng() % 4)).set("lang", rng() % 2 ? "en" : "fr");
+            switch (rng() % 9) {
+                case 0: if (!s->contains(id)) s->add(id, vec(rng), md); break;
+                case 1: (void)s->upsert(id, vec(rng), md); break;
+                case 2: (void)s->upsert(id, vec(rng)); break;       // metadata kept
+                case 3: (void)s->update(id, vec(rng), md); break;
+                case 4: (void)s->update(id, vec(rng)); break;
+                case 5: (void)s->set_metadata(id, Metadata().set("s", std::int64_t(step))); break;
+                case 6: (void)s->remove(id); break;
+                case 7: {
+                    const std::vector<std::uint64_t> ids{id, (id + 1) % 60, 999};
+                    (void)s->remove_batch(ids);
+                    break;
+                }
+                default:
+                    if (rng() % 2) (void)s->remove_where(Filter::eq("g", std::int64_t(rng() % 4)) && Filter::eq("lang", "fr"));
+                    else s->compact();
+            }
+            if (step % 23 == 11 && s->contains(id)) {  // logged, then refused: an abort record
+                try {
+                    (void)s->set_metadata(id, Metadata().set("g", "not an integer"));
+                } catch (const std::invalid_argument&) {
+                    ++aborted;
+                }
+            }
+            if (step % 41 == 40) (void)s->checkpoint();
+            if (step % 8 == 0) moments.push_back({crash_copy(dir, "du17_" + std::to_string(step)), save_bytes(*s)});
+        }
+        moments.push_back({std::string(), save_bytes(*s)});  // the final state, after a normal close
+        CHECK_THROWS_AS(std::runtime_error, (void)SparseIndex::open_durable(dir));  // locked by this process
+    }
+    bool all = true;
+    for (const auto& [copy, bytes] : moments) {
+        if (copy.empty()) continue;
+        all = all && save_bytes(*SparseIndex::open_durable(copy)) == bytes;
+        std::filesystem::remove_all(copy);
+    }
+    RecoveryStats st;
+    auto again = SparseIndex::open_durable(dir, Schema::dynamic(), {}, &st);
+    CHECK(all && aborted > 0 && moments.size() == 21 && save_bytes(*again) == moments.back().second && st.replayed > 0);
+    again.reset();
+    // A directory of another kind is refused.
+    const std::string other = durable_dir("du17_hnsw");
+    (void)HnswIndex::open_durable(other, 4, Metric::L2);
+    CHECK_THROWS_AS(std::invalid_argument, (void)SparseIndex::open_durable(other));  // another kind, as for the other types
+    std::filesystem::remove_all(other);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(durable, du18_identify_without_loading) {
+    // identify() reads headers only: every file kind, durable directories with their
+    // snapshots and log segments, and refusals for anything else.
+    const std::string d = durable_dir("du18");
+    std::filesystem::create_directories(d);
+    HnswIndex h(4, Metric::L2);
+    h.add(1, std::vector<float>{1, 0, 0, 0});
+    h.save(d + "/h.idx");
+    FlatIndex f(4, Metric::L2);
+    f.save(d + "/f.idx");
+    SparseIndex s;
+    s.save(d + "/s.idx");
+    Collection c(CollectionOptions::preset(4));
+    c.save(d + "/c.col");
+    for (const auto& [file, kind] : std::vector<std::pair<std::string, StoredKind>>{
+             {"h.idx", StoredKind::Hnsw}, {"f.idx", StoredKind::Flat}, {"s.idx", StoredKind::Sparse}, {"c.col", StoredKind::Collection}}) {
+        const StoredInfo i = identify(d + "/" + file);
+        CHECK(i.kind == kind && !i.durable && i.version == persist::kVersion && i.bytes == std::filesystem::file_size(d + "/" + file));
+    }
+    CHECK(std::string(stored_kind_name(StoredKind::Collection)) == "collection");
+    {
+        auto x = SparseIndex::open_durable(d + "/sd");
+        x->add(1, SparseVector{{1}, {1.0f}});
+        (void)x->checkpoint();
+        x->add(2, SparseVector{{2}, {1.0f}});
+    }
+    const StoredInfo dir = identify(d + "/sd");
+    CHECK(dir.durable && dir.kind == StoredKind::Sparse && dir.identity != 0 && !dir.snapshots.empty() && !dir.segments.empty() &&
+          dir.version == persist::kVersion && dir.bytes > 0 && std::is_sorted(dir.snapshots.begin(), dir.snapshots.end()));
+    std::ofstream(d + "/notes.txt") << "not an index";
+    std::filesystem::create_directories(d + "/empty");
+    CHECK_THROWS_AS(FormatError, (void)identify(d + "/notes.txt"));
+    CHECK_THROWS_AS(FormatError, (void)identify(d + "/empty"));
+    CHECK_THROWS_AS(std::runtime_error, (void)identify(d + "/missing.idx"));
+    std::filesystem::remove_all(d);
+}
+
+TEST(durable, du19_sparse_index_crash_edges) {
+    // A durable sparse index: an operation unfinished at a crash (dropped, then a
+    // checkpoint), a torn last record at every byte, every durability mode, and refusals.
+    const std::string dir = durable_dir("du19");
+    std::string expected;
+    {
+        auto s = SparseIndex::open_durable(dir);
+        for (std::uint64_t i = 0; i < 10; ++i) s->add(i, SparseVector{{std::uint32_t(i), 50}, {1.0f, 0.5f}}, Metadata().set("n", std::int64_t(i)));
+        expected = save_bytes(*s);
+        CHECK_THROWS_AS(std::logic_error, (void)s->replay({}));  // its log is attached: replayed changes would be logged again
+    }
+    const std::string seg = (std::filesystem::path(dir) / files_of(dir, "wal-").back()).string();
+    const std::uint64_t identity = wal::read_segment(seg).identity;
+    const SparseVector dup{{3}, {1.0f}};
+    {
+        WalWriter w = WalWriter::open(seg, identity);
+        (void)w.append(walop::kSparseWrite, walop::encode_sparse_write(walop::kSparseAdd, 3, dup, nullptr));  // a duplicate: fails on replay
+    }
+    const std::string copy = crash_copy(dir, "du19c");
+    {
+        RecoveryStats st;
+        auto s = SparseIndex::open_durable(dir, Schema::dynamic(), {}, &st);
+        CHECK(st.dropped_unfinished && save_bytes(*s) == expected);
+        s->add(20, SparseVector{{20}, {1.0f}});
+    }
+    CHECK(SparseIndex::open_durable(dir)->contains(20));  // the checkpoint after the drop: recoverable afterwards
+    {
+        WalWriter w = WalWriter::open((std::filesystem::path(copy) / files_of(copy, "wal-").back()).string(), identity);
+        (void)w.append(walop::kSparseWrite, walop::encode_sparse_write(walop::kSparseAdd, 21, dup, nullptr));  // the failure is now not the last
+    }
+    CHECK_THROWS_AS(FormatError, (void)SparseIndex::open_durable(copy));
+    std::filesystem::remove_all(copy);
+    std::filesystem::remove_all(dir);
+    // A torn last record, cut at every byte.
+    const std::string tdir = durable_dir("du19t");
+    std::string before_last;
+    const SparseVector last{{7, 8, 9}, {1.0f, 2.0f, 3.0f}};
+    const Metadata last_md = Metadata().set("n", std::int64_t(99));
+    {
+        auto s = SparseIndex::open_durable(tdir);
+        for (std::uint64_t i = 0; i < 5; ++i) s->add(i, SparseVector{{std::uint32_t(i)}, {1.0f}});
+        before_last = save_bytes(*s);
+        s->add(5, last, last_md);
+    }
+    const std::string tseg = (std::filesystem::path(tdir) / files_of(tdir, "wal-").back()).string();
+    const std::string bytes = read_file(tseg);
+    const std::uint64_t last_start = wal::read_segment(tseg).valid_end -
+                                     (wal::kRecordHeaderSize + walop::encode_sparse_write(walop::kSparseAdd, 5, last, &last_md).size());
+    bool torn_ok = true;
+    for (std::uint64_t cut = last_start; cut < bytes.size(); ++cut) {
+        const std::string c = crash_copy(tdir, "du19tc");
+        write_file((std::filesystem::path(c) / files_of(tdir, "wal-").back()).string(), bytes.substr(0, cut));
+        RecoveryStats st;
+        auto s = SparseIndex::open_durable(c, Schema::dynamic(), {}, &st);
+        torn_ok = torn_ok && save_bytes(*s) == before_last && st.torn_bytes == cut - last_start;
+        s->add(9, SparseVector{{1}, {1.0f}});  // appending continues after the cut
+        s.reset();
+        torn_ok = torn_ok && SparseIndex::open_durable(c)->contains(9);
+        std::filesystem::remove_all(c);
+    }
+    CHECK(torn_ok);
+    std::filesystem::remove_all(tdir);
+    // Every durability mode, and refusals on an index that is not durable.
+    for (const Durability mode : {Durability::Buffered, Durability::Grouped, Durability::Synced}) {
+        const std::string mdir = durable_dir("du19m");
+        DurableOptions o;
+        o.durability = mode;
+        {
+            auto s = SparseIndex::open_durable(mdir, Schema::dynamic(), o);
+            s->add(1, SparseVector{{1}, {1.0f}});
+        }
+        CHECK(SparseIndex::open_durable(mdir, Schema::dynamic(), o)->contains(1));
+        std::filesystem::remove_all(mdir);
+    }
+    SparseIndex plain;
+    CHECK_THROWS_AS(std::logic_error, (void)plain.checkpoint());
+    CHECK(!plain.replay({}));  // nothing to replay, and no log attached: fine
+}
+
+TEST(durable, du20_identify_edges) {
+    const std::string d = durable_dir("du20");
+    std::filesystem::create_directories(d);
+    {  // a disk index file
+        std::vector<std::uint64_t> ids;
+        std::vector<float> flat;
+        for (std::uint64_t i = 0; i < 40; ++i) {
+            ids.push_back(i);
+            for (int j = 0; j < 4; ++j) flat.push_back(float(i * 4 + j));
+        }
+        DiskIndex::build(d + "/disk.idx", ids, flat, 4, Metric::L2);
+    }
+    CHECK(identify(d + "/disk.idx").kind == StoredKind::Disk && std::string(stored_kind_name(StoredKind::Disk)) == "disk");
+    auto write = [&](const std::string& name, const std::string& bytes) { write_file(d + "/" + name, bytes); };
+    write("short.idx", "HNSWLI");                                                  // shorter than a header
+    write("magic-only.idx", std::string("HNSWLITE", 8));                           // the magic, nothing after
+    std::string unknown(24, '\0');
+    std::memcpy(unknown.data(), "HNSWLITE", 8);
+    unknown[16] = 9;                                                               // a kind no version has
+    write("unknown.idx", unknown);
+    for (const char* f : {"short.idx", "magic-only.idx", "unknown.idx"}) CHECK_THROWS_AS(FormatError, (void)identify(d + "/" + f));
+    // Durable directories: a damaged DURABLE file, an unknown kind, no snapshot.
+    {
+        auto x = SparseIndex::open_durable(d + "/ok");
+        x->add(1, SparseVector{{1}, {1.0f}});
+    }
+    const std::string meta = read_file(d + "/ok/DURABLE");
+    std::filesystem::create_directories(d + "/damaged");
+    std::string bad = meta;
+    bad[20] ^= 1;  // the identity changed: the checksum no longer matches
+    write_file(d + "/damaged/DURABLE", bad);
+    CHECK_THROWS_AS(FormatError, (void)identify(d + "/damaged"));
+    std::filesystem::create_directories(d + "/kind");
+    std::string kind = meta;
+    kind[8] = 9;
+    const std::uint32_t crc = persist::crc32(0, reinterpret_cast<const unsigned char*>(kind.data()), 28);
+    for (int i = 0; i < 4; ++i) kind[28 + i] = char((crc >> (8 * i)) & 0xFF);
+    write_file(d + "/kind/DURABLE", kind);
+    CHECK_THROWS_AS(FormatError, (void)identify(d + "/kind"));
+    std::filesystem::create_directories(d + "/short");
+    write_file(d + "/short/DURABLE", meta.substr(0, 20));  // shorter than its 32 bytes
+    CHECK_THROWS_AS(FormatError, (void)identify(d + "/short"));
+    std::filesystem::create_directories(d + "/ok/a-folder");  // not a file: not counted in bytes
+    const StoredInfo with_folder = identify(d + "/ok");
+    std::uint64_t files = 0;
+    for (const auto& e : std::filesystem::directory_iterator(d + "/ok"))
+        if (e.is_regular_file()) files += e.file_size();
+    CHECK(with_folder.bytes == files && files > 0);
+    std::filesystem::create_directories(d + "/nosnap");
+    write_file(d + "/nosnap/DURABLE", meta);
+    const StoredInfo none = identify(d + "/nosnap");
+    CHECK(none.durable && none.kind == StoredKind::Sparse && none.snapshots.empty() && none.segments.empty() && none.version == 0);
+    std::filesystem::remove_all(d);
+}
+
+TEST(durable, du21_sparse_log_record_refusals) {
+    // The sparse write record's own checks, and a sparse index replaying records of
+    // another index type.
+    const Metadata md = Metadata().set("n", std::int64_t(1));
+    const std::vector<unsigned char> good = walop::encode_sparse_write(walop::kSparseUpsert, 7, SparseVector{{1, 2}, {1.0f, 2.0f}}, &md);
+    const walop::Op op = walop::decode(walop::kSparseWrite, good);
+    CHECK(op.mode == walop::kSparseUpsert && op.ids == std::vector<std::uint64_t>{7} && op.sparse.indices.size() == 2 && op.metadata.size() == 1);
+    auto refused = [&](std::size_t at, unsigned char value) {
+        std::vector<unsigned char> bad = good;
+        bad[at] = value;
+        try {
+            (void)walop::decode(walop::kSparseWrite, bad);
+        } catch (const FormatError&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(refused(0, 3));                                // an unknown mode
+    CHECK(refused(1 + 8 + 7, 0x7F));                     // more terms than the record has bytes
+    CHECK(refused(1 + 8 + 8 + 2 * 4 + 2 * 4, 2));        // a metadata flag that is neither 0 nor 1
+    const WalRecord foreign{1, walop::kAdd, walop::encode_add(1, std::vector<float>{1, 0}, {})};
+    const WalRecord sparse_add{2, walop::kSparseWrite, walop::encode_sparse_write(walop::kSparseAdd, 1, SparseVector{{1}, {1.0f}}, nullptr)};
+    // A record of another index type means the log is not this index's: refused anywhere,
+    // even last (only a valid operation that failed can be an unfinished one).
+    SparseIndex s;
+    CHECK_THROWS_AS(FormatError, (void)s.replay(std::vector<WalRecord>{foreign, sparse_add}));
+    SparseIndex t;
+    CHECK_THROWS_AS(FormatError, (void)t.replay(std::vector<WalRecord>{sparse_add, foreign}));
+    CHECK(t.size() == 1);  // what came before the refusal was applied; the caller discards the index
+}
+
 TEST(durable, du15_every_path) {
     auto data = random_vectors(40, 4, 2420);
     const std::string dir = durable_dir("du15");
@@ -18077,6 +18357,30 @@ std::vector<std::uint64_t> scan_all(const Collection& c, CollectionScanOptions o
     return ids;
 }
 }  // namespace
+
+TEST(collection, co18_options_report_the_current_schema) {
+    // Found by the command-line tool: a collection recovered from its log reported the
+    // snapshot's schema in options(), without the fields replay had added.
+    const std::string dir = co_dir("co18");
+    {
+        auto c = Collection::open(dir, co_options(4));
+        Document d;
+        d.vector = std::vector<float>{1, 0, 0, 0};
+        d.metadata = Metadata().set("lang", "en").set("year", std::int64_t(2024));
+        c->add(1, d);  // logged only: no checkpoint after it
+        c->create_payload_index("lang");
+    }
+    auto c = Collection::open(dir, co_options(4));
+    const CollectionOptions options = c->options();  // copies: fields() refers into them
+    const Schema schema = c->schema();
+    std::vector<std::string> names, direct;
+    for (const FieldSpec& f : options.schema.fields()) names.push_back(f.name);
+    for (const FieldSpec& f : schema.fields()) direct.push_back(f.name);
+    CHECK(names == direct && std::count(names.begin(), names.end(), "lang") == 1 && std::count(names.begin(), names.end(), "year") == 1);
+    CHECK(c->payload_indexes() == std::vector<std::string>{"lang"});
+    c.reset();
+    std::filesystem::remove_all(dir);
+}
 
 TEST(collection, co16_scan_pages_filters_and_parts) {
     auto data = random_vectors(40, 8, 4801);
@@ -19943,6 +20247,621 @@ TEST(half, hf06_refusals_and_damaged_files) {
 }
 
 // ===========================================================================
+// Faceted search (FA1-FA6)
+// ===========================================================================
+
+namespace {
+// Brute force: how many of these metadata rows hold each value of `field`, as text.
+std::map<std::string, std::size_t> fa_expected(const std::vector<Metadata>& rows, const std::string& field, std::size_t* missing) {
+    std::map<std::string, std::size_t> out;
+    *missing = 0;
+    for (const Metadata& m : rows) {
+        const std::optional<Value> v = m.get(field);
+        if (!v) {
+            ++*missing;
+            continue;
+        }
+        switch (v->type) {
+            case FieldType::Int: ++out[std::to_string(v->i)]; break;
+            case FieldType::Float: ++out[std::to_string(v->f == 0.0 ? 0.0 : v->f)]; break;
+            case FieldType::Bool: ++out[v->b ? "true" : "false"]; break;
+            case FieldType::Keyword: ++out[v->s]; break;
+            case FieldType::Tags: {
+                std::set<std::string> once(v->tags.begin(), v->tags.end());
+                for (const auto& t : once) ++out[t];
+                break;
+            }
+        }
+    }
+    return out;
+}
+std::string fa_text(const Value& v) {
+    switch (v.type) {
+        case FieldType::Int: return std::to_string(v.i);
+        case FieldType::Float: return std::to_string(v.f);
+        case FieldType::Bool: return v.b ? "true" : "false";
+        default: return v.s;
+    }
+}
+// The result holds exactly the expected values (limit 0: all), in order.
+bool fa_matches(const FacetResult& r, const std::vector<Metadata>& rows, const std::string& field) {
+    std::size_t missing = 0;
+    const auto want = fa_expected(rows, field, &missing);
+    std::map<std::string, std::size_t> got;
+    for (const auto& fv : r.values) got[fa_text(fv.value)] = fv.count;
+    bool ordered = true;
+    for (std::size_t i = 1; i < r.values.size(); ++i) ordered = ordered && r.values[i - 1].count >= r.values[i].count;
+    return got == want && r.total == rows.size() && r.missing == missing && r.other == 0 && ordered;
+}
+Metadata fa_row(std::uint64_t i) {
+    static const char* langs[] = {"en", "en", "en", "fr", "fr", "de"};
+    Metadata m;
+    if (i % 13 != 0) m.set("lang", langs[i % 6]);  // some documents have no language
+    std::vector<std::string> tags;
+    if (i % 2) tags.push_back("odd");
+    if (i % 3 == 0) tags.push_back("three");
+    if (i % 5 == 0) tags = {"five", "five"};  // a repeated tag counts once
+    if (!tags.empty()) m.set("tags", tags);
+    m.set("year", std::int64_t(2000 + i % 7)).set("price", double(i % 10) * 2.5).set("new", i % 4 == 0);
+    return m;
+}
+}  // namespace
+
+TEST(facets, fa01_values_and_counts_on_every_type) {
+    auto data = random_vectors(300, 8, 5001);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    Collection c(co_options(8));
+    std::vector<Metadata> rows;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        rows.push_back(fa_row(i));
+        h.add(i, data[i], rows.back());
+        f.add(i, data[i], rows.back());
+        Document d;
+        d.vector = data[i];
+        d.metadata = rows.back();
+        c.add(i, d);
+    }
+    std::vector<FacetRequest> all;
+    for (const char* field : {"lang", "tags", "year", "price", "new"}) all.push_back(FacetRequest{field, 0, {}, false});
+    for (const auto& results : {h.facets(all), f.facets(all), c.facets(all)}) {
+        bool ok = results.size() == 5;
+        for (std::size_t k = 0; k < results.size() && ok; ++k) ok = fa_matches(results[k], rows, all[k].field) && results[k].field == all[k].field;
+        CHECK(ok);
+    }
+    const auto lang = h.facets({FacetRequest{"lang", 0, {}, false}})[0];
+    CHECK(lang.values.size() == 3 && fa_text(lang.values[0].value) == "en" && lang.values[2].value.s == "de");
+    // A limit keeps the most frequent values and sums the rest; ties go by value.
+    const auto top = h.facets({FacetRequest{"year", 2, {}, false}})[0];
+    std::size_t rest = 0;
+    const auto all_years = h.facets({FacetRequest{"year", 0, {}, false}});  // kept: [0] of a temporary would dangle in the loop
+    for (const auto& fv : all_years[0].values) rest += fv.count;
+    CHECK(top.values.size() == 2 && top.values[0].count >= top.values[1].count && top.values[0].count + top.values[1].count + top.other == rest);
+    CHECK(top.values[0].count > top.values[1].count || top.values[0].value.i < top.values[1].value.i);
+}
+
+TEST(facets, fa02_the_index_counts_equal_counting) {
+    // For an indexed keyword, tag or boolean field, counts over everything come from
+    // the payload index without reading documents: they must equal counting.
+    auto data = random_vectors(400, 8, 5002);
+    HnswIndex plain(8, Metric::L2), indexed(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        plain.add(i, data[i], fa_row(i));
+        indexed.add(i, data[i], fa_row(i));
+        if (i == 5) {  // a field exists once a document uses it (dynamic schema): index them early
+            indexed.create_payload_index("lang");
+            indexed.create_payload_index("tags");
+            indexed.create_payload_index("new");
+        }
+    }
+    for (std::uint64_t i = 0; i + 1 < 400; i += 7) {  // churn: removals and changed metadata (i + 1 stays stored)
+        CHECK(plain.remove(i) && indexed.remove(i));
+        CHECK(plain.update(i + 1, data[i], fa_row(i + 3)) && indexed.update(i + 1, data[i], fa_row(i + 3)));
+    }
+    std::vector<FacetRequest> req;
+    for (const char* field : {"lang", "tags", "new"}) req.push_back(FacetRequest{field, 0, {}, true});
+    const auto a = plain.facets(req), b = indexed.facets(req);
+    bool same = a.size() == b.size();
+    for (std::size_t k = 0; k < a.size() && same; ++k) {
+        same = a[k].total == b[k].total && a[k].missing == b[k].missing && a[k].distinct == b[k].distinct && a[k].values.size() == b[k].values.size();
+        for (std::size_t i = 0; same && i < a[k].values.size(); ++i)
+            same = fa_text(a[k].values[i].value) == fa_text(b[k].values[i].value) && a[k].values[i].count == b[k].values[i].count;
+    }
+    CHECK(same && a[0].total == plain.size());
+}
+
+TEST(facets, fa03_filters_and_top_hits) {
+    auto data = random_vectors(300, 8, 5003);
+    HnswIndex h(8, Metric::L2);
+    Collection c(co_options(8));
+    std::vector<Metadata> rows;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        rows.push_back(fa_row(i));
+        h.add(i, data[i], rows.back());
+        Document d;
+        d.vector = data[i];
+        d.metadata = rows.back();
+        c.add(i, d);
+    }
+    const Filter recent = Filter::ge("year", std::int64_t(2004));
+    std::vector<Metadata> matching;
+    for (const auto& m : rows)
+        if (m.get("year")->i >= 2004) matching.push_back(m);
+    const FacetRequest lang{"lang", 0, {}, false};
+    CHECK(fa_matches(h.facets({lang}, recent)[0], matching, "lang"));
+    CHECK(fa_matches(c.facets({lang}, recent)[0], matching, "lang"));
+    // The top hits of a search, with a repeated and an unknown ID.
+    std::vector<std::uint64_t> hits;
+    for (const auto& r : h.search(data[5], 20)) hits.push_back(r.id);
+    std::vector<Metadata> hit_rows;
+    for (const std::uint64_t id : hits) hit_rows.push_back(rows[id]);
+    std::vector<std::uint64_t> asked = hits;
+    asked.push_back(hits[0]);
+    asked.push_back(99999);
+    CHECK(fa_matches(h.facets_for(asked, {lang})[0], hit_rows, "lang"));
+    CHECK(fa_matches(c.facets_for(asked, {lang})[0], hit_rows, "lang"));
+    CHECK(h.facets_for(std::vector<std::uint64_t>{}, {lang})[0].total == 0);
+}
+
+TEST(facets, fa04_ranges_and_distinct_counts) {
+    FlatIndex f(2, Metric::L2);
+    const std::vector<double> prices{-0.0, 0.0, 5.0, 9.99, 10.0, 10.0, 25.0, 100.0};
+    for (std::uint64_t i = 0; i < prices.size(); ++i)
+        f.add(i, std::vector<float>{float(i), 0}, Metadata().set("price", prices[i]).set("qty", std::int64_t(i % 3)));
+    f.add(100, std::vector<float>{0, 1});  // no metadata: missing
+    const auto r = f.facets({FacetRequest{"price", 10, {0.0, 10.0, 50.0}, true}})[0];
+    // below 0: none; [0, 10): -0, 0, 5, 9.99; [10, 50): 10, 10, 25; from 50: 100.
+    CHECK(r.buckets.size() == 4 && !r.buckets[0].from && r.buckets[0].to == 0.0 && r.buckets[3].from == 50.0 && !r.buckets[3].to);
+    CHECK(r.buckets[0].count == 0 && r.buckets[1].count == 4 && r.buckets[2].count == 3 && r.buckets[3].count == 1);
+    CHECK(r.values.empty() && r.missing == 1 && r.total == 9);
+    CHECK(r.distinct == std::optional<std::size_t>(6));  // -0 and 0 are one value; 10 appears twice
+    const auto q = f.facets({FacetRequest{"qty", 10, {1.0}, true}})[0];  // integer field, one boundary
+    CHECK(q.buckets.size() == 2 && q.buckets[0].count == 3 && q.buckets[1].count == 5 && q.distinct == std::optional<std::size_t>(3));
+}
+
+TEST(facets, fa05_refusals_before_counting) {
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{1, 0}, Metadata().set("lang", "en").set("n", std::int64_t(1)));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.facets({FacetRequest{"", 10, {}, false}}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.facets({FacetRequest{"n", 10, {2.0, 1.0}, false}}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.facets({FacetRequest{"n", 10, {1.0, std::nan("")}, false}}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.facets({FacetRequest{"lang", 10, {1.0}, false}}));  // ranges on a keyword
+    // One invalid request refuses them all.
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.facets({FacetRequest{"lang", 10, {}, false}, FacetRequest{"", 1, {}, false}}));
+    const auto unknown = h.facets({FacetRequest{"nope", 10, {}, true}})[0];  // dynamic schema: every document lacks it
+    CHECK(unknown.total == 1 && unknown.missing == 1 && unknown.values.empty() && unknown.distinct == std::optional<std::size_t>(0));
+    HnswIndex strict(2, Metric::L2, {}, Schema::strict({{"lang", FieldType::Keyword}}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)strict.facets({FacetRequest{"nope", 10, {}, false}}));
+}
+
+TEST(facets, fa06_expired_documents_are_never_counted) {
+    auto data = random_vectors(20, 8, 5006);
+    CollectionOptions o = co_options(8);
+    o.ttl = TtlOptions{true, 0};
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        Document d;
+        d.vector = data[i];
+        d.metadata = Metadata().set("lang", i < 5 ? "old" : "new");
+        if (i < 5) d.expires_at = now_ms() - 1000;  // already expired, not yet removed
+        c.add(i, d);
+    }
+    c.create_payload_index("lang");
+    const auto r = c.facets({FacetRequest{"lang", 0, {}, false}})[0];
+    CHECK(r.total == 15 && r.values.size() == 1 && r.values[0].value.s == "new" && r.values[0].count == 15);
+    const std::vector<std::uint64_t> ids{0, 1, 10, 11};
+    CHECK(c.facets_for(ids, {FacetRequest{"lang", 0, {}, false}})[0].total == 2);
+}
+
+namespace {
+std::vector<Filter> fa_filters() {
+    return {Filter::eq("lang", "fr"),
+            Filter::in("lang", std::vector<std::string>{"fr", "de"}),
+            Filter::has_tag("tags", "odd"),
+            Filter::has_any_tag("tags", {"three", "five"}),
+            Filter::has_all_tags("tags", {"odd", "three"}),
+            Filter::eq("lang", "en") && Filter::ge("year", std::int64_t(2003)),  // indexed part, numeric part
+            Filter::eq("lang", "de") || Filter::has_tag("tags", "five"),          // indexed on both sides
+            Filter::eq("lang", "en") || Filter::ge("year", std::int64_t(2005)),  // not on one side: no lists
+            Filter::ne("lang", "en"),                                             // a complement: no lists
+            Filter::eq("new", true)};
+}
+template <class Index>
+std::vector<SearchResult> fa_search(const Index& x, const std::vector<float>& q, std::size_t k, const SearchOptions& o) {
+    if constexpr (std::is_same_v<Index, FlatIndex>) return x.search(q, k, o);  // exact: no beam
+    else return x.search(q, k, 64, o);
+}
+// Twins (posting lists or not) must agree on every filter: counts, exact search, facets.
+template <class Index>
+bool fa_twins_agree(const Index& plain, const Index& indexed, const std::vector<float>& query) {
+    bool same = true;
+    for (const Filter& f : fa_filters()) {
+        same = same && plain.count_where(f) == indexed.count_where(f);
+        SearchOptions o;
+        o.filter = f;
+        o.strategy = Strategy::ForceExact;
+        std::vector<std::uint64_t> a, b;
+        for (const auto& r : fa_search(plain, query, 15, o)) a.push_back(r.id);
+        for (const auto& r : fa_search(indexed, query, 15, o)) b.push_back(r.id);
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        same = same && a == b;
+        const auto fp = plain.facets({FacetRequest{"year", 0, {}, true}}, f)[0], fi = indexed.facets({FacetRequest{"year", 0, {}, true}}, f)[0];
+        same = same && fp.total == fi.total && fp.distinct == fi.distinct;
+    }
+    return same;
+}
+template <class Index>
+void fa_index_fields(Index& x) {
+    x.create_payload_index("lang");
+    x.create_payload_index("tags");
+    x.create_payload_index("new");
+}
+}  // namespace
+
+TEST(facets, fa07_posting_lists_follow_every_change) {
+    auto data = random_vectors(500, 8, 5007);
+    HnswIndex hp(8, Metric::L2), hi(8, Metric::L2);
+    FlatIndex fp(8, Metric::L2), fi(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        hp.add(i, data[i], fa_row(i));
+        hi.add(i, data[i], fa_row(i));
+        fp.add(i, data[i], fa_row(i));
+        fi.add(i, data[i], fa_row(i));
+    }
+    fa_index_fields(hi);
+    fa_index_fields(fi);
+    CHECK(fa_twins_agree(hp, hi, data[0]) && fa_twins_agree(fp, fi, data[0]));
+    std::mt19937 rng(7);
+    for (int step = 0; step < 400; ++step) {  // churn on both twins: adds, updates, metadata changes, removals
+        const std::uint64_t id = rng() % 450;
+        switch (rng() % 4) {
+            case 0:
+                (void)hp.upsert(id, data[id], fa_row(id + step));
+                (void)hi.upsert(id, data[id], fa_row(id + step));
+                (void)fp.upsert(id, data[id], fa_row(id + step));
+                (void)fi.upsert(id, data[id], fa_row(id + step));
+                break;
+            case 1:
+                (void)hp.remove(id);
+                (void)hi.remove(id);
+                (void)fp.remove(id);  // the flat index moves its last row into the gap
+                (void)fi.remove(id);
+                break;
+            case 2:
+                (void)hp.set_metadata(id, fa_row(id * 3));
+                (void)hi.set_metadata(id, fa_row(id * 3));
+                (void)fp.set_metadata(id, fa_row(id * 3));
+                (void)fi.set_metadata(id, fa_row(id * 3));
+                break;
+            default:
+                (void)hp.remove_where(Filter::eq("lang", "de") && Filter::eq("new", true));
+                (void)hi.remove_where(Filter::eq("lang", "de") && Filter::eq("new", true));
+                (void)fp.remove_where(Filter::eq("lang", "de") && Filter::eq("new", true));
+                (void)fi.remove_where(Filter::eq("lang", "de") && Filter::eq("new", true));
+                break;
+        }
+    }
+    CHECK(fa_twins_agree(hp, hi, data[3]) && fa_twins_agree(fp, fi, data[3]));
+    (void)hp.compact();
+    (void)hi.compact();
+    CHECK(fa_twins_agree(hp, hi, data[4]));
+    std::ostringstream out;  // saved and loaded: the lists are rebuilt
+    hi.save(out);
+    std::istringstream in(out.str());
+    auto loaded = HnswIndex::load(in);
+    CHECK(fa_twins_agree(hp, *loaded, data[5]));
+    // A collection: the same, through its own metadata.
+    Collection cp(co_options(8)), ci(co_options(8));
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        Document d;
+        d.vector = data[i];
+        d.metadata = fa_row(i);
+        cp.add(i, d);
+        ci.add(i, d);
+    }
+    fa_index_fields(ci);
+    for (std::uint64_t i = 0; i < 200; i += 3) {
+        (void)cp.remove(i);
+        (void)ci.remove(i);
+        Document d;
+        d.vector = data[i + 1];
+        d.metadata = fa_row(i + 7);
+        (void)cp.upsert(i + 1, d);
+        (void)ci.upsert(i + 1, d);
+    }
+    bool same = true;
+    for (const Filter& f : fa_filters()) {
+        same = same && cp.count_where(f) == ci.count_where(f);
+        const auto a = cp.facets({FacetRequest{"lang", 0, {}, false}}, f)[0], b = ci.facets({FacetRequest{"lang", 0, {}, false}}, f)[0];
+        same = same && a.total == b.total && a.values.size() == b.values.size();
+    }
+    CHECK(same);
+}
+
+TEST(facets, fa08_dictionary_compaction_renumbers_the_lists) {
+    // Thousands of unique values replaced: the dictionary compacts and renumbers every
+    // string; the posting lists must follow.
+    auto data = random_vectors(50, 8, 5008);
+    HnswIndex plain(8, Metric::L2), indexed(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        const Metadata m = fa_row(i).set("code", "first-" + std::to_string(i));
+        plain.add(i, data[i], m);
+        indexed.add(i, data[i], m);
+    }
+    fa_index_fields(indexed);
+    indexed.create_payload_index("code");
+    for (int round = 0; round < 60; ++round)  // 3,000 unique codes, each soon unused
+        for (std::uint64_t i = 0; i < 50; ++i) {
+            const Metadata m = fa_row(i + std::uint64_t(round)).set("code", "r" + std::to_string(round) + "-" + std::to_string(i));
+            CHECK(plain.set_metadata(i, m) && indexed.set_metadata(i, m));
+        }
+    CHECK(fa_twins_agree(plain, indexed, data[1]));
+    CHECK(indexed.count_where(Filter::eq("code", "r59-7")) == 1 && indexed.count_where(Filter::eq("code", "r10-7")) == 0);
+}
+
+TEST(facets, fa09_writes_stay_all_or_nothing) {
+    // A new value grows its posting list: an allocation failure anywhere in the write
+    // leaves every filtered result as it was.
+    auto data = random_vectors(40, 8, 5009);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 30; ++i) h.add(i, data[i], fa_row(i));
+    fa_index_fields(h);
+    std::vector<std::size_t> before;
+    for (const Filter& f : fa_filters()) before.push_back(h.count_where(f));
+    const long points = sweep_allocation_failures([&] { h.add(35, data[35], fa_row(1).set("lang", "brand-new")); }, [&] {
+        std::size_t k = 0;
+        for (const Filter& f : fa_filters()) CHECK(h.count_where(f) == before[k++]);
+        CHECK(!h.contains(35) && h.count_where(Filter::eq("lang", "brand-new")) == 0);
+    });
+    CHECK(points >= 0 && h.count_where(Filter::eq("lang", "brand-new")) == 1);
+}
+
+TEST(facets, fa10_selective_searches_visit_only_matching_rows) {
+    auto data = random_vectors(2000, 8, 5010);
+    HnswIndex h(8, Metric::L2);
+    FlatIndex f(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 2000; ++i) {
+        const Metadata m = Metadata().set("lang", i % 100 == 0 ? "rare" : "common");
+        h.add(i, data[i], m);
+        f.add(i, data[i], m);
+    }
+    h.create_payload_index("lang");
+    f.create_payload_index("lang");
+    for (const bool flat : {false, true}) {
+        SearchStats st;
+        SearchOptions o;
+        o.filter = Filter::eq("lang", "rare");
+        o.strategy = Strategy::ForceExact;
+        o.stats = &st;
+        const auto r = flat ? fa_search(f, data[0], 5, o) : fa_search(h, data[0], 5, o);
+        std::printf("    %s: %zu rows visited of 2000, %zu matching\n", flat ? "flat" : "hnsw", st.nodes_visited, st.distance_computations);
+        CHECK(r.size() == 5 && st.nodes_visited == 20 && st.distance_computations == 20);
+    }
+}
+
+namespace {
+const char* kPlLangs[] = {"en", "fr", "de", "es"};
+Metadata pl_churn_row(std::mt19937& rng, std::uint64_t serial) {
+    Metadata m;
+    if (rng() % 9) m.set("lang", kPlLangs[rng() % 4]);
+    std::vector<std::string> tags;
+    for (const char* t : {"a", "b", "c"})
+        if (rng() % 3 == 0) tags.push_back(t);
+    if (!tags.empty()) m.set("tags", tags);
+    if (rng() % 5) m.set("flag", rng() % 2 == 0);
+    m.set("n", std::int64_t(rng() % 100));
+    m.set("u", "u" + std::to_string(serial));  // unique values: churn makes the dictionary compact itself
+    return m;
+}
+std::vector<Filter> pl_filters() {
+    return {Filter::eq("lang", "en"),
+            Filter::in("lang", {"fr", "de"}),
+            Filter::has_tag("tags", "a"),
+            Filter::has_any_tag("tags", {"b", "c"}),
+            Filter::has_all_tags("tags", {"a", "b"}),
+            Filter::eq("flag", true),
+            Filter::eq("lang", "en") && Filter::has_tag("tags", "a"),
+            Filter::eq("lang", "fr") || Filter::has_tag("tags", "c"),
+            Filter::eq("lang", "en") && Filter::ge("n", std::int64_t(50)),  // a superset, checked row by row
+            !Filter::eq("lang", "en"),                                       // no list: every row
+            Filter::eq("lang", "zz")};                                       // a value nobody holds
+}
+template <class Index> std::vector<std::uint64_t> pl_ids(const Index& x, const Filter& f) {
+    std::vector<std::uint64_t> ids;
+    ScanOptions o;
+    o.filter = f;
+    o.limit = 100000;
+    for (const auto& r : x.scan(o).records) ids.push_back(r.id);
+    return ids;
+}
+std::vector<std::uint64_t> pl_ids(const Collection& c, const Filter& f) {
+    std::vector<std::uint64_t> ids;
+    CollectionScanOptions o;
+    o.filter = f;
+    o.limit = 100000;
+    o.with_vectors = o.with_text = false;
+    for (const auto& d : c.scan(o).documents) ids.push_back(d.id);
+    return ids;
+}
+template <class X> bool pl_twins_agree(const X& indexed, const X& plain) {
+    bool same = true;
+    for (const Filter& f : pl_filters()) same = same && pl_ids(indexed, f) == pl_ids(plain, f) && indexed.count_where(f) == plain.count_where(f);
+    std::vector<FacetRequest> req;
+    for (const char* field : {"lang", "tags", "flag"}) req.push_back(FacetRequest{field, 0, {}, true});
+    for (const auto& filter : {std::optional<Filter>{}, std::optional<Filter>{Filter::has_tag("tags", "a")}}) {
+        const auto a = indexed.facets(req, filter), b = plain.facets(req, filter);
+        for (std::size_t k = 0; k < a.size() && same; ++k) {
+            same = a[k].total == b[k].total && a[k].missing == b[k].missing && a[k].distinct == b[k].distinct && a[k].values.size() == b[k].values.size();
+            for (std::size_t i = 0; same && i < a[k].values.size(); ++i)
+                same = fa_text(a[k].values[i].value) == fa_text(b[k].values[i].value) && a[k].values[i].count == b[k].values[i].count;
+        }
+    }
+    return same;
+}
+}  // namespace
+
+TEST(facets, fa13_edges) {
+    // Empty indexes; a tag field holding no tags; negative and huge integers in ranges;
+    // a collection with expiry and a filter together; facets_for on a flat index and on
+    // removed HNSW vectors; a limit beyond the values.
+    const std::vector<FacetRequest> lang{FacetRequest{"lang", 10, {}, true}};
+    HnswIndex eh(4, Metric::L2);
+    FlatIndex ef(4, Metric::L2);
+    Collection ec(co_options(4));
+    for (const auto& r : {eh.facets(lang)[0], ef.facets(lang)[0], ec.facets(lang)[0], eh.facets(lang, Filter::eq("lang", "en"))[0]})
+        CHECK(r.total == 0 && r.missing == 0 && r.values.empty() && r.other == 0 && r.distinct == std::optional<std::size_t>(0));
+    FlatIndex f(2, Metric::L2);
+    f.add(1, std::vector<float>{1, 0}, Metadata().set("tags", std::vector<std::string>{}).set("n", std::int64_t(-5)));
+    f.add(2, std::vector<float>{0, 1}, Metadata().set("tags", std::vector<std::string>{"a"}).set("n", std::numeric_limits<std::int64_t>::max()));
+    f.add(3, std::vector<float>{1, 1}, Metadata().set("n", std::numeric_limits<std::int64_t>::min()));
+    const auto tags = f.facets({FacetRequest{"tags", 10, {}, true}})[0];
+    CHECK(tags.total == 3 && tags.missing == 1 && tags.values.size() == 1 && tags.values[0].count == 1 && tags.distinct == std::optional<std::size_t>(1));
+    const auto n = f.facets({FacetRequest{"n", 10, {-1.0, 0.0, 1e18}, false}})[0];  // below -1; [-1, 0); [0, 1e18); from 1e18
+    CHECK(n.buckets.size() == 4 && n.buckets[0].count == 2 && n.buckets[1].count == 0 && n.buckets[2].count == 0 && n.buckets[3].count == 1);
+    const auto top = f.facets({FacetRequest{"n", 100, {}, false}})[0];  // a limit beyond the values: all of them, nothing in other
+    CHECK(top.values.size() == 3 && top.other == 0 && top.values[0].value.i == std::numeric_limits<std::int64_t>::min());
+    // facets_for on a flat index: unknown and repeated IDs.
+    const std::vector<std::uint64_t> ids{2, 2, 77, 1};
+    CHECK(f.facets_for(ids, {FacetRequest{"tags", 10, {}, false}})[0].total == 2);
+    // Removed HNSW vectors are skipped by facets_for, and not counted by facets.
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 10; ++i) h.add(i, std::vector<float>{float(i), 1}, Metadata().set("lang", i % 2 ? "en" : "fr"));
+    CHECK(h.remove(1) && h.remove(2));
+    const std::vector<std::uint64_t> some{0, 1, 2, 3};
+    CHECK(h.facets_for(some, lang)[0].total == 2 && h.facets(lang)[0].total == 8);
+    // A collection with expiry and a filter: both apply.
+    CollectionOptions o = co_options(2);
+    o.ttl = TtlOptions{true, 0};
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(i), 1};
+        d.metadata = Metadata().set("lang", i % 2 ? "en" : "fr");
+        if (i < 2) d.expires_at = now_ms() - 1000;
+        c.add(i, d);
+    }
+    const auto r = c.facets(lang, Filter::eq("lang", "en"))[0];  // en: 1, 3, 5, 7; 1 has expired
+    CHECK(r.total == 3 && r.values.size() == 1 && r.values[0].count == 3);
+    CHECK_THROWS_AS(std::invalid_argument, FacetRequest{}.validate());
+}
+
+TEST(facets, fa14_remaining_paths) {
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 6; ++i)
+        f.add(i, std::vector<float>{float(i), 1}, Metadata().set("price", double(i) * 1.5).set("on", true));
+    // An unknown field with ranges (dynamic schema): every document is missing, every bucket empty,
+    // both over everything (the shortcut) and over given IDs (document by document).
+    const FacetRequest ghost{"ghost", 10, {1.0, 2.0}, true};
+    const std::vector<std::uint64_t> two{0, 1};
+    for (const auto& r : {f.facets({ghost})[0], f.facets_for(two, {ghost})[0]}) {
+        bool empty = r.missing == r.total && r.buckets.size() == 3 && r.distinct == std::optional<std::size_t>(0);
+        for (const auto& b : r.buckets) empty = empty && b.count == 0;
+        CHECK(empty && r.total > 0);
+    }
+    // Float ranges without a distinct count; a boolean field holding one value only.
+    const auto price = f.facets({FacetRequest{"price", 10, {3.0}, false}})[0];  // 0, 1.5 | 3, 4.5, 6, 7.5
+    CHECK(price.buckets.size() == 2 && price.buckets[0].count == 2 && price.buckets[1].count == 4 && !price.distinct && price.values.empty());
+    const auto on = f.facets({FacetRequest{"on", 10, {}, true}})[0];
+    CHECK(on.values.size() == 1 && on.values[0].value.b && on.values[0].count == 6 && on.distinct == std::optional<std::size_t>(1));
+    // posting() on a field without a payload index, and for a value no list exists for.
+    MetadataStore m;
+    (void)m.write(0, Metadata().set("lang", "en"));
+    const std::size_t lang = *m.find_field("lang");
+    CHECK(m.posting(lang, 0).empty());  // not indexed
+    m.index_field("lang");
+    CHECK(m.posting(lang, *m.find_string("en")).size() == 1 && m.posting(lang, 1000).empty());
+}
+
+TEST(facets, fa11_posting_lists_equal_scanning_under_churn) {
+    // Twins receive the same operations: one with indexed fields (filters read the
+    // posting lists), one without (filters read every row). They must always agree.
+    auto data = random_vectors(64, 8, 5007);
+    HnswIndex hi(8, Metric::L2), hp(8, Metric::L2);
+    FlatIndex fi(8, Metric::L2), fp(8, Metric::L2);
+    Collection ci(co_options(8)), cp(co_options(8));
+    std::mt19937 rng(5007);
+    std::uint64_t serial = 0;
+    auto write = [&](std::uint64_t id) {
+        std::mt19937 copy = rng;
+        const Metadata m = pl_churn_row(rng, serial);
+        const Metadata same = pl_churn_row(copy, serial++);
+        const auto& v = data[id % 64];
+        (void)hi.upsert(id, v, m), (void)hp.upsert(id, v, same);
+        (void)fi.upsert(id, v, m), (void)fp.upsert(id, v, same);
+        Document d;
+        d.vector = v;
+        d.metadata = m;
+        (void)ci.upsert(id, d), (void)cp.upsert(id, d);
+    };
+    for (std::uint64_t i = 0; i < 300; ++i) write(i);
+    for (const char* field : {"lang", "tags", "flag", "u"}) {
+        hi.create_payload_index(field);
+        fi.create_payload_index(field);
+        ci.create_payload_index(field);
+    }
+    CHECK(pl_twins_agree(hi, hp) && pl_twins_agree(fi, fp) && pl_twins_agree(ci, cp));
+    for (int round = 0; round < 6; ++round) {
+        for (int k = 0; k < 150; ++k) {
+            const std::uint64_t id = rng() % 400;
+            switch (rng() % 4) {
+                case 0:
+                case 1: write(id); break;  // new rows and changed metadata (fresh unique values)
+                case 2: {
+                    const bool a = hi.remove(id), b = hp.remove(id), c = fi.remove(id), d = fp.remove(id), e = ci.remove(id), f = cp.remove(id);
+                    CHECK(a == b && c == d && e == f);  // the flat index moves its last row into the gap
+                    break;
+                }
+                default: {
+                    const Filter f = Filter::eq("lang", kPlLangs[rng() % 4]);
+                    const Metadata change = Metadata().set("tags", std::vector<std::string>{"c"}).set("flag", false);
+                    CHECK(hi.set_metadata_where(f, change) == hp.set_metadata_where(f, change));
+                    CHECK(fi.set_metadata_where(f, change) == fp.set_metadata_where(f, change));
+                    CHECK(ci.set_metadata_where(f, change) == cp.set_metadata_where(f, change));
+                }
+            }
+        }
+        if (round == 2) {  // compaction, and a save and load (lists rebuilt on load)
+            (void)hi.compact(), (void)hp.compact();
+            std::ostringstream a, b, c;
+            hi.save(a), fi.save(b), ci.save(c);
+            std::istringstream ai(a.str()), bi(b.str()), cin_(c.str());
+            CHECK(pl_twins_agree(*HnswIndex::load(ai), hp) && pl_twins_agree(*FlatIndex::load(bi), fp) && pl_twins_agree(*Collection::load(cin_), cp));
+        }
+        CHECK(pl_twins_agree(hi, hp) && pl_twins_agree(fi, fp) && pl_twins_agree(ci, cp));
+    }
+}
+
+TEST(facets, fa12_posting_lists_survive_out_of_memory_on_updates) {
+    // A failed write to indexed fields changes neither the counts nor the lists.
+    auto data = random_vectors(80, 8, 5008);
+    HnswIndex h(8, Metric::L2);
+    std::mt19937 rng(5008);
+    for (std::uint64_t i = 0; i < 60; ++i) h.add(i, data[i], pl_churn_row(rng, i));
+    for (const char* field : {"lang", "tags", "flag"}) h.create_payload_index(field);
+    auto snapshot = [&] {
+        std::vector<std::size_t> out;
+        for (const Filter& f : pl_filters()) out.push_back(h.count_where(f));
+        for (const auto& r : h.facets({FacetRequest{"lang", 0, {}, false}, FacetRequest{"tags", 0, {}, false}}))
+            for (const auto& v : r.values) out.push_back(v.count);
+        return out;
+    };
+    for (std::uint64_t i = 60; i < 70; ++i) {
+        const Metadata m = pl_churn_row(rng, 1000 + i);
+        const auto before = snapshot();
+        const long points = sweep_allocation_failures([&] { h.add(i, data[i], m); }, [&] { CHECK(snapshot() == before && !h.contains(i)); });
+        CHECK(points >= 0);
+        const auto changed = snapshot();
+        const auto again = snapshot();
+        CHECK(changed == again);
+        const std::uint64_t target = i - 30;
+        const Metadata m2 = pl_churn_row(rng, 2000 + i);
+        const auto before2 = snapshot();
+        (void)sweep_allocation_failures([&] { (void)h.update(target, data[target], m2); }, [&] { CHECK(snapshot() == before2); });
+    }
+}
+
+// ===========================================================================
 // Stress: limits, memory growth under long churn, and fixes from the load audit
 // ===========================================================================
 
@@ -20289,7 +21208,7 @@ void print_usage() {
         "  --help              show this help\n"
         "\n"
         "Groups: layer1, layer2, helpers, flat, hnsw, robustness, deletion, concurrency,\n"
-        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, stress, e2e\n"
+        "        metadata, filter, planner, payload, batch, range, search_e2e, update, hardening, persistence, add_batch, bulk, records, control, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, edges, vamana, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, acorn, reorder, scoring, features, half, facets, stress, e2e\n"
         "Examples:\n"
         "  test_comprehensive --group hnsw\n"
         "  test_comprehensive recall\n"

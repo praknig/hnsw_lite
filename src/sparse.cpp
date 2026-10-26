@@ -8,6 +8,7 @@
  * exact at every step.
  */
 #include "scoring.h"
+#include "wal_ops.h"
 #include "sparse.h"
 
 #include <algorithm>
@@ -127,6 +128,7 @@ void SparseIndex::add(std::uint64_t id, const SparseVector& vector, const Metada
     SparseVector v = normalized(vector);
     const auto guard = lock_.write("add");
     if (slot_of_.count(id)) throw std::invalid_argument("duplicate id " + std::to_string(id));
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSparseWrite, [&] { return walop::encode_sparse_write(walop::kSparseAdd, id, v, &metadata); }));
     insert_unlocked(id, std::move(v), &metadata, false);
 }
 
@@ -147,6 +149,8 @@ bool SparseIndex::remove_unlocked(std::uint64_t id) {
 
 bool SparseIndex::remove(std::uint64_t id) {
     const auto guard = lock_.write("remove");
+    if (!slot_of_.count(id)) return false;
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemove, [&] { return walop::encode_ids(std::span<const std::uint64_t>(&id, 1)); }));
     const bool removed = remove_unlocked(id);
     maybe_compact();
     return removed;
@@ -154,6 +158,7 @@ bool SparseIndex::remove(std::uint64_t id) {
 
 std::size_t SparseIndex::remove_batch(std::span<const std::uint64_t> ids) {
     const auto guard = lock_.write("remove_batch");
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     std::size_t n = 0;
     for (const std::uint64_t id : ids) n += remove_unlocked(id);
     maybe_compact();
@@ -166,6 +171,9 @@ std::size_t SparseIndex::remove_where(const Filter& filter) {
     std::vector<std::uint64_t> ids;
     for (NodeId n = 0; n < id_of_.size(); ++n)
         if (live_[n] && compiled.matches(n)) ids.push_back(id_of_[n]);
+    if (ids.empty()) return 0;
+    // Logged resolved, as IDs: replay never depends on evaluating the filter again.
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     for (const std::uint64_t id : ids) (void)remove_unlocked(id);
     maybe_compact();
     return ids.size();
@@ -175,6 +183,7 @@ bool SparseIndex::update(std::uint64_t id, const SparseVector& vector) {
     SparseVector v = normalized(vector);
     const auto guard = lock_.write("update");
     if (!slot_of_.count(id)) return false;
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSparseWrite, [&] { return walop::encode_sparse_write(walop::kSparseUpdate, id, v, nullptr); }));
     insert_unlocked(id, std::move(v), nullptr, true);
     maybe_compact();
     return true;
@@ -184,6 +193,7 @@ bool SparseIndex::update(std::uint64_t id, const SparseVector& vector, const Met
     SparseVector v = normalized(vector);
     const auto guard = lock_.write("update");
     if (!slot_of_.count(id)) return false;
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSparseWrite, [&] { return walop::encode_sparse_write(walop::kSparseUpdate, id, v, &metadata); }));
     insert_unlocked(id, std::move(v), &metadata, false);
     maybe_compact();
     return true;
@@ -193,6 +203,7 @@ bool SparseIndex::upsert(std::uint64_t id, const SparseVector& vector) {
     SparseVector v = normalized(vector);
     const auto guard = lock_.write("upsert");
     const bool added = !slot_of_.count(id);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSparseWrite, [&] { return walop::encode_sparse_write(walop::kSparseUpsert, id, v, nullptr); }));
     insert_unlocked(id, std::move(v), nullptr, true);
     maybe_compact();
     return added;
@@ -202,6 +213,7 @@ bool SparseIndex::upsert(std::uint64_t id, const SparseVector& vector, const Met
     SparseVector v = normalized(vector);
     const auto guard = lock_.write("upsert");
     const bool added = !slot_of_.count(id);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSparseWrite, [&] { return walop::encode_sparse_write(walop::kSparseUpsert, id, v, &metadata); }));
     insert_unlocked(id, std::move(v), &metadata, false);
     maybe_compact();
     return added;
@@ -211,6 +223,8 @@ bool SparseIndex::set_metadata(std::uint64_t id, const Metadata& metadata) {
     const auto guard = lock_.write("set_metadata");
     const auto it = slot_of_.find(id);
     if (it == slot_of_.end()) return false;
+    const auto payload = [&] { return walop::encode_set_metadata(std::span<const std::uint64_t>(&id, 1), metadata); };
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kSetMetadata, payload));
     metadata_.update(it->second, metadata);
     return true;
 }
@@ -268,6 +282,16 @@ std::size_t SparseIndex::postings() const {
 std::size_t SparseIndex::dead_postings() const {
     const auto guard = lock_.read();
     return dead_entries_;
+}
+
+Schema SparseIndex::schema() const {
+    const auto guard = lock_.read();
+    return metadata_.current_schema();
+}
+
+std::vector<std::string> SparseIndex::payload_indexes() const {
+    const auto guard = lock_.read();
+    return metadata_.indexed_fields();
 }
 
 std::size_t SparseIndex::slots() const {
@@ -383,6 +407,7 @@ void SparseIndex::maybe_compact() {
 
 void SparseIndex::compact() {
     const auto guard = lock_.write("compact");
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCompact, [] { return std::vector<unsigned char>{}; }));
     compact_unlocked();
 }
 
@@ -429,6 +454,10 @@ void SparseIndex::compact_unlocked() {
 
 void SparseIndex::save(std::ostream& out) const {
     const auto guard = lock_.read();
+    save_unlocked(out);
+}
+
+void SparseIndex::save_unlocked(std::ostream& out) const {
     persist::StreamErrorsThrow errors(out);
     persist::write_header(out, persist::IndexKind::Sparse);
     // Live documents only, in slot order: what loading produces (a compacted

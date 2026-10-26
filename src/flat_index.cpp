@@ -359,9 +359,35 @@ Page FlatIndex::scan(const ScanOptions& options) const {
 std::vector<NodeId> FlatIndex::matching_slots(const Filter& filter) const {
     const CompiledFilter compiled(filter, metadata_);  // throws for an unknown field under a strict schema
     std::vector<NodeId> slots;
+    if (const auto rows = compiled.candidates()) {  // posting lists: only rows that can match
+        for (const NodeId n : *rows)
+            if (n < vectors_.size() && compiled.matches(n)) slots.push_back(n);
+        return slots;
+    }
     for (NodeId n = 0; n < vectors_.size(); ++n)
         if (compiled.matches(n)) slots.push_back(n);
     return slots;
+}
+
+std::vector<FacetResult> FlatIndex::facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter) const {
+    const auto guard = lock_.read();
+    if (filter) return count_facets(metadata_, requests, matching_slots(*filter));
+    const std::function<std::vector<NodeId>()> all_live = [&] {  // every slot is live
+        std::vector<NodeId> slots(vectors_.size());
+        for (NodeId n = 0; n < slots.size(); ++n) slots[n] = n;
+        return slots;
+    };
+    return count_facets(metadata_, requests, vectors_.size(), all_live);
+}
+
+std::vector<FacetResult> FlatIndex::facets_for(std::span<const std::uint64_t> external, const std::vector<FacetRequest>& requests) const {
+    const auto guard = lock_.read();
+    std::vector<NodeId> slots;
+    std::unordered_set<std::uint64_t> seen;
+    for (const std::uint64_t id : external)
+        if (seen.insert(id).second)
+            if (const auto n = ids_.find(id)) slots.push_back(*n);
+    return count_facets(metadata_, requests, slots);
 }
 
 std::size_t FlatIndex::count_where(const Filter& filter) const {
@@ -637,7 +663,10 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
                                   : index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
             top.push({d, node});
         };
-        if (!ivf_trained()) {
+        const auto rows = eligible.filter && !ivf_trained() ? eligible.filter->candidates() : std::nullopt;
+        if (rows) {  // posting lists: only rows that can match
+            for (std::size_t i = 0; i < rows->size() && (*rows)[i] < count && !stop; ++i) visit((*rows)[i]);
+        } else if (!ivf_trained()) {
             for (NodeId node = 0; node < count && !stop; ++node) visit(node);
         } else {
             // The nearest lists first: at least `probes`, and more until k matching
