@@ -180,6 +180,25 @@ void bf16_decode_neon(const std::uint16_t* c, float* out, std::size_t n) {
     for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
 }
 
+// SQ8 in integers: 16 bytes per step, widened to 16 bits and multiplied into 32-bit sums.
+std::int32_t sq8_dot_i8_neon(const std::int8_t* w, const std::uint8_t* c, std::size_t n) {
+    int32x4_t acc = vdupq_n_s32(0);
+    std::size_t j = 0;
+    for (; j + 16 <= n; j += 16) {
+        const uint8x16_t cb = vld1q_u8(c + j);
+        const int8x16_t wb = vld1q_s8(w + j);
+        const int16x8_t c_lo = vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(cb))), c_hi = vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(cb)));
+        const int16x8_t w_lo = vmovl_s8(vget_low_s8(wb)), w_hi = vmovl_s8(vget_high_s8(wb));
+        acc = vmlal_s16(acc, vget_low_s16(c_lo), vget_low_s16(w_lo));
+        acc = vmlal_s16(acc, vget_high_s16(c_lo), vget_high_s16(w_lo));
+        acc = vmlal_s16(acc, vget_low_s16(c_hi), vget_low_s16(w_hi));
+        acc = vmlal_s16(acc, vget_high_s16(c_hi), vget_high_s16(w_hi));
+    }
+    std::int32_t sum = vaddvq_s32(acc);
+    for (; j < n; ++j) sum += std::int32_t(c[j]) * std::int32_t(w[j]);
+    return sum;
+}
+
 }  // namespace vecdb::kernels
 
 #endif  // 64-bit ARM

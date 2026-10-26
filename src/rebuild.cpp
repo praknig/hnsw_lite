@@ -20,6 +20,7 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
         std::uint64_t id;
         std::vector<float> vector;  // as given if kept, otherwise as stored (prepared)
         Metadata metadata;
+        std::vector<std::uint8_t> code;  // codes only, codec kept: the code, copied as it is
     };
     std::vector<Snapshot> records;
     std::vector<float> sample;  // stored (prepared) vectors to train a codec on
@@ -38,10 +39,15 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
         fields = metadata_.indexed_fields();
         st.reclaimed = deleted_count();
         records.reserve(live_);
+        // With codes only, the codec is never retrained (training needs the floats): each
+        // code is carried over byte for byte rather than re-encoded from its decoded vector.
+        const std::size_t cs = codes_only_now && codec_ && codec_->trained() && !as_given ? codec_->code_size() : 0;
         for (NodeId n = 0; n < storage_.size(); ++n)
             if (!ids.is_deleted(n))
                 records.push_back({ids.external(n), as_given ? std::vector<float>(storage_.original(n).begin(), storage_.original(n).end()) : stored_copy(n),
-                                   metadata_.read(n)});
+                                   metadata_.read(n),
+                                   cs ? std::vector<std::uint8_t>(codes_.begin() + std::ptrdiff_t(std::size_t(n) * cs), codes_.begin() + std::ptrdiff_t(std::size_t(n + 1) * cs))
+                                      : std::vector<std::uint8_t>{}});
         if (codec_ && codec_->trained()) {
             retrain = rebuild_options.retrain && storage_.vectors().has_values();
             if (retrain) {
@@ -78,7 +84,9 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
         for (const std::string& f : fields) fresh.metadata_.index_field(f);
         detail::OperationControl control(options, records.size());
         for (const Snapshot& r : records) {
+            fresh.code_given_ = r.code.empty() ? nullptr : r.code.data();
             fresh.add_unlocked(r.id, r.vector, r.metadata, !as_given);
+            fresh.code_given_ = nullptr;
             control.advance();
         }
         control.finish();
@@ -102,7 +110,11 @@ RebuildStats HnswIndex::rebuild(const RebuildOptions& rebuild_options, const Ope
             if (const auto there = fresh.storage_.ids().find(id)) fresh.remove_slots({*there});
             if (const auto node = ids.find(id)) {
                 if (storage_.originals()) fresh.add_unlocked(id, storage_.original(*node), metadata_.read(*node));
-                else fresh.add_unlocked(id, stored_copy(*node), metadata_.read(*node), true);
+                else {  // codes only: the current code, carried over as it is
+                    fresh.code_given_ = codes_only() && codec_ && codec_->trained() ? codes_.data() + std::size_t(*node) * codec_->code_size() : nullptr;
+                    fresh.add_unlocked(id, stored_copy(*node), metadata_.read(*node), true);
+                    fresh.code_given_ = nullptr;
+                }
             }
             ++st.caught_up;
         }

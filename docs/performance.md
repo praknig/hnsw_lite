@@ -125,7 +125,18 @@ Measured recall@10 on synthetic clustered data (see the `sq8`, `binary`, `pq` an
 | Plain C++ | 467 | 471 | 459 | 4,169 |
 | AVX2 | 149 | 93 | 79 | 99 |
 
-With AVX2, SQ8 distances were 1.6 to 1.9 times faster than full-precision ones and binary distances 1.5 times faster, while reading 4 and 32 times less memory; binary distances without SIMD were about 9 times slower than floats (the AVX2 kernel is 42 times faster). An earlier run on a shared cloud machine with AVX-512 gave a similar picture (floats 115 ns; SQ8 70 and 57 ns; binary 51 ns). Whole-search speed has not been measured yet.
+With AVX2, SQ8 distances were 1.6 to 1.9 times faster than full-precision ones and binary distances 1.5 times faster, while reading 4 and 32 times less memory.
+
+**Integer kernels for SQ8 (inner product and cosine).** These distances run in integer SIMD: the query's weights are quantized to integers in [-63, 63] once per search, and the codes multiply them 32 at a time (AVX2's `vpmaddubsw`; 64 with AVX-512BW, 16 with NEON). The sums are exact, so results are identical on every CPU. Nanoseconds per distance with `bench_codecs` (Release build, a shared 2.1 GHz Xeon; 20,000 vectors visited in order):
+
+| Dimensions | Kernels | Float L2 | SQ8 dot (floats) | SQ8 dot (integers) | Faster by |
+|---|---|---|---|---|---|
+| 128 | AVX2 | 23.4 | 19.9 | **10.3** | 1.9× |
+| 128 | AVX-512 | 22.5 | 14.3 | **8.2** | 1.7× |
+| 768 | AVX2 | 644.9 | 127.6 | **44.4** | 2.9× |
+| 768 | AVX-512 | 473.2 | 55.5 | **28.7** | 1.9× |
+
+A whole search gains less, as graph traversal and memory access take the rest of the time: on 8,000 vectors of 384 dimensions (cosine, SQ8, re-ranked), a search took 164 µs against 219 µs with float SQ8 kernels, **1.33× faster**. Re-ranked recall is unchanged; searches over codes alone moved by -0.005 to +0.002 (the quantized weights add at most max|weight| / 126 per code unit to a distance). L2 distances stay in floating point: an exact integer form needs a per-vector term the file format does not store.
 
 | Setting | Recall@10 | Memory for vectors |
 |---|---|---|

@@ -213,6 +213,43 @@ ADV_TEST(a1_absurd_k_ef_and_limits) {
     CHECK(c.search(q, kHuge).size() == 50);
 }
 
+ADV_TEST(a4_absurd_planner_and_codec_settings) {
+    // The exact fallback's budget with absurd factors (its conversion saturates: 1e300
+    // used to be undefined behavior), and values near float's limit through RaBitQ and
+    // integer SQ8: results come back, distances are never NaN.
+    auto data = random_vectors(300, 8, 44);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)));
+    for (const double factor : {1e300, std::numeric_limits<double>::max(), 1e-300, std::numeric_limits<double>::denorm_min()}) {
+        PlannerParams p;
+        p.fallback_factor = factor;
+        p.max_exact_matches = 0;
+        p.acorn_below = 0;
+        SearchOptions o;
+        o.filter = Filter::lt("c", std::int64_t(3));
+        o.planner = p;
+        const auto r = h.search(data[0], 10, 16, o);
+        CHECK(!r.empty());
+    }
+    for (const CodecKind kind : {CodecKind::RaBitQ, CodecKind::SQ8})
+        for (const Metric m : {Metric::L2, Metric::InnerProduct}) {
+            QuantizationParams qp;
+            qp.codec = kind;
+            qp.train_after = 20;
+            qp.rerank = false;
+            FlatIndex f(4, m, Schema::dynamic(), qp);
+            std::mt19937 rng(9);
+            for (std::uint64_t i = 0; i < 40; ++i) {
+                std::vector<float> v(4);
+                for (float& x : v) x = (rng() % 2 ? 3e38f : -3e38f) * (float(rng() % 100) / 100.0f);  // scaled first: no overflow
+                f.add(i, v);
+            }
+            bool clean = true;
+            for (const auto& r : f.search(std::vector<float>{3e38f, -3e38f, 3e38f, -3e38f}, 40)) clean = clean && !std::isnan(r.distance);
+            CHECK(clean);
+        }
+}
+
 ADV_TEST(a2_absurd_dimensions) {
     // Refused before any allocation: a dimension near 2^64 would otherwise wrap a
     // size computation around to a tiny buffer.
@@ -571,7 +608,26 @@ ADV_TEST(e1_every_truncation_and_byte_flips) {
     f.save(fs);
     s.save(ss);
     c.save(cs);
+    // RaBitQ, codes only: whatever loads is also searched, so damage that loads but would
+    // make distances NaN shows under the sanitizers.
+    QuantizationParams rq;
+    rq.codec = CodecKind::RaBitQ;
+    rq.train_after = 20;
+    rq.keep_full_vectors = false;
+    rq.rerank = false;
+    HnswParams rp;
+    rp.quantization = rq;
+    HnswIndex r(4, Metric::L2, rp);
+    for (std::uint64_t i = 0; i < 40; ++i) r.add(i, data[i]);
+    std::ostringstream rs;
+    r.save(rs);
     std::vector<Loader> loaders = {{"hnsw", hs.str(), [](std::istream& in) { (void)HnswIndex::load(in); }},
+                                   {"rabitq", rs.str(), [&](std::istream& in) {
+                                        const auto x = HnswIndex::load(in);
+                                        for (std::uint64_t q = 0; q < 5; ++q)
+                                            for (const auto& res : x->search(data[q], 5))
+                                                if (std::isnan(res.distance)) throw std::logic_error("a NaN distance");
+                                    }},
                                    {"flat", fs.str(), [](std::istream& in) { (void)FlatIndex::load(in); }},
                                    {"sparse", ss.str(), [](std::istream& in) { (void)SparseIndex::load(in); }},
                                    {"collection", cs.str(), [](std::istream& in) { (void)Collection::load(in); }}};

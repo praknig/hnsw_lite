@@ -205,7 +205,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                const std::vector<Candidate>& entries,
                                                std::size_t ef, int level, VisitedList& visited,
                                                NodeId exclude, const Eligibility& eligible,
-                                               SearchStats* stats, LinkLocks* locks) const {
+                                               SearchStats* stats, LinkLocks* locks, std::size_t budget, bool* over_budget) const {
     const NodeDistance dist = node_distance(query);
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
@@ -249,6 +249,10 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
             candidates.push({d, neighbor});                       // ineligible nodes are traversed...
             if (eligible(neighbor)) results.push({d, neighbor});  // ...but never returned
         }
+        if (budget && computed >= budget) {  // the caller falls back to an exact scan
+            if (over_budget) *over_budget = true;
+            break;
+        }
     }
     if (stats) {
         stats->nodes_visited += expanded;
@@ -258,7 +262,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
 }
 
 std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
-                                               const Eligibility& eligible, SearchStats* stats) const {
+                                               const Eligibility& eligible, SearchStats* stats, std::size_t budget, bool* over_budget) const {
     const NodeDistance dist = node_distance(query);
     // ACORN-1 (Patel et al., SIGMOD 2024), on the existing graph: the beam holds
     // eligible nodes only, so no distance is spent on vectors a filter rejects; a
@@ -298,6 +302,10 @@ std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candida
                     if (eligible(second)) consider(second);
                 }
             }
+        }
+        if (budget && computed >= budget) {  // the caller falls back to an exact scan
+            if (over_budget) *over_budget = true;
+            break;
         }
     }
     if (stats) {
@@ -959,7 +967,10 @@ void HnswIndex::reserve_code(NodeId slot) {
 void HnswIndex::encode_slot(NodeId slot) {
     // From the vector just prepared and stored (scratch_): with codes only there
     // are no stored floats to read back.
-    if (codec_ && codec_->trained()) codec_->encode(scratch_.values(), codes_.data() + std::size_t(slot) * codec_->code_size());
+    if (!codec_ || !codec_->trained()) return;
+    std::uint8_t* to = codes_.data() + std::size_t(slot) * codec_->code_size();
+    if (code_given_) std::copy_n(code_given_, codec_->code_size(), to);  // compaction or rebuild: kept exactly
+    else codec_->encode(scratch_.values(), to);
 }
 
 void HnswIndex::maybe_train() noexcept {
@@ -1317,6 +1328,19 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
     }
     const bool rerank = coded && params_.quantization.rerank && !codes_only();  // nothing to re-rank with otherwise
 
+    // A filtered graph or ACORN search the planner chose gets a budget of distances: past
+    // it, an exact scan of the estimated matches is cheaper (PlannerParams::fallback_factor).
+    std::size_t budget = 0;
+    bool over_budget = false;
+    if (strategy == Strategy::Auto && eligible.filtered() && run != Strategy::ForceExact && params.fallback_factor > 0)
+    {
+        // Saturated: any finite factor is valid, and a double beyond size_t's range would
+        // make the conversion undefined (found reviewing adversarial settings: 1e300).
+        const double wanted = params.fallback_factor * double(stats.estimated_matches);
+        constexpr double kMax = double(std::numeric_limits<std::size_t>::max());  // 2^64 (or 2^32): at or above it, out of range
+        const std::size_t scaled = wanted >= kMax ? std::numeric_limits<std::size_t>::max() : static_cast<std::size_t>(wanted);
+        budget = std::max<std::size_t>(saturating_mul(4, ef), scaled);
+    }
     std::vector<Candidate> found;
     if (run == Strategy::ForceExact) {
         const std::size_t wanted = rerank ? std::min(live_, saturating_mul(k, params_.quantization.rerank_factor)) : k;
@@ -1332,28 +1356,37 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
     if (run == Strategy::ForceAcorn) {
         stats.ef = ef;
         start = descend();
-        found = acorn_level0(query, *start, ef, eligible, &stats);
-        if (found.size() < k) {
+        found = acorn_level0(query, *start, ef, eligible, &stats, budget, &over_budget);
+        if (!over_budget && found.size() < k) {
             // The matches are scattered beyond two hops of where the search went:
             // fall back to the ordinary filtered search, with a widened beam.
             stats.strategy = run = Strategy::ForceGraph;
             ef = clamped_count(double(ef) * params.max_ef_multiplier, storage_.size());
         }
     }
-    if (run == Strategy::ForceGraph) {
+    if (run == Strategy::ForceGraph && !over_budget) {
         stats.ef = ef;
         const Candidate current = start ? *start : descend();
         // Beam search on level 0, returning only eligible nodes.
         auto visited = visited_pool_.acquire(storage_.size());
-        found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats);
-        if (found.size() < k) {
+        found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget);
+        if (!over_budget && found.size() < k) {
             // The descent ended where few eligible nodes are reachable (possible
             // after many removals without repair, or with a selective filter; links
             // are one-directional). Search again from the entry point too, which is
             // always live.
             found = search_level(query, {current, {distance_to(query, entry_), entry_}}, ef, 0,
-                                 *visited, kEmpty, eligible, &stats);
+                                 *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget);
         }
+    }
+    if (over_budget) {
+        // The graph search crossed more nodes than an exact scan of the matches costs (a
+        // filter correlated with the vectors): scan them exactly instead. Never worse in
+        // recall; in cost, at most fallback_factor + 1 times the exact scan.
+        stats.strategy = run = Strategy::ForceExact;
+        stats.reason = PlanReason::ExactFallback;
+        const std::size_t wanted = rerank ? std::min(live_, saturating_mul(k, params_.quantization.rerank_factor)) : k;
+        found = exact_scan(query, wanted, eligible, stats);
     }
     code_scope.reset();  // full precision from here on
     if (rerank) {
@@ -1631,7 +1664,11 @@ CompactStats HnswIndex::compact_unlocked(const OperationOptions& options) {
             // at their first insert; without them, the stored vectors are copied exactly
             // (normalizing an already normalized vector again could change its last bits).
             if (storage_.originals()) fresh.add_unlocked(ids.external(n), storage_.original(n), metadata_.read(n));
-            else fresh.add_unlocked(ids.external(n), stored_copy(n), metadata_.read(n), true);  // decoded, with codes only
+            else {  // codes only: the decoded vector places the node, and its code is kept as it is
+                fresh.code_given_ = codes_only() ? codes_.data() + std::size_t(n) * codec_->code_size() : nullptr;
+                fresh.add_unlocked(ids.external(n), stored_copy(n), metadata_.read(n), true);
+                fresh.code_given_ = nullptr;
+            }
             control.advance();
         }
 

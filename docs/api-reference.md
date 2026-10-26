@@ -197,7 +197,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
 | `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |
 | `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
-| `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32, acorn_below = 0.2, acorn_ef_multiplier = 4 }` | Planner settings; `Strategy` is `Auto`, `ForceExact`, `ForceGraph` or `ForceAcorn` |
+| `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32, acorn_below = 0.2, acorn_ef_multiplier = 4, fallback_factor = 1 }` | Planner settings (`fallback_factor`: a graph or ACORN search past that many times the estimated matches in distances scans them exactly instead, `PlanReason::ExactFallback`); `Strategy` is `Auto`, `ForceExact`, `ForceGraph` or `ForceAcorn` |
 | `SearchStats` | Strategy, reason, selectivity, estimated matches, `ef`, nodes visited, distances computed |
 
 ## New index methods (`FlatIndex` and `HnswIndex`)
@@ -262,9 +262,9 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `SQ8Codec` | 8-bit scalar quantization: one byte per dimension; `minimum()`, `step()`, `set_range()` |
 | `BinaryCodec` | Binary quantization: one bit per dimension, with a learned threshold and spread per dimension |
 | `PQCodec(dim, metric, parts = 0)` | Product quantization: one byte per part, 256 centroids per part learned by k-means; `parts()`, `centroids()` |
-| `CodecKind`, `make_codec(kind, dim, metric, pq_subspaces = 0)` | Codec kinds (`None`, `SQ8`, `Binary`, `PQ`) and a factory |
-| `get_code_kernels()`, `get_code_kernels(isa)`, `CodeKernels` | The SIMD kernels behind code distances (`sq8_l2`, `sq8_dot`, `bits_sum`): the fastest for this CPU, or one instruction set (for tests and benchmarks) |
-| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`, `PQ`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given), `pq_subspaces` (PQ parts; 0: one per 8 dimensions); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
+| `CodecKind`, `make_codec(kind, dim, metric, pq_subspaces = 0)` | Codec kinds (`None`, `SQ8`, `Binary`, `PQ`, `F16`, `BF16`, `RaBitQ`) and a factory |
+| `get_code_kernels()`, `get_code_kernels(isa)`, `CodeKernels` | The SIMD kernels behind code distances (`sq8_l2`, `sq8_dot`, `sq8_dot_i8`, `bits_sum`): the fastest for this CPU, or one instruction set (for tests and benchmarks) |
+| `QuantizationParams` | `codec` (`None`, `SQ8`, `Binary`, `PQ`, `F16`, `BF16`, `RaBitQ`), `train_after` (default 1,000; 0: only explicit), `rerank` (default on), `rerank_factor` (default 4), `truncate_to` (Matryoshka truncation; 0: off), `keep_full_vectors` (default on; off drops the copy of each vector as given), `pq_subspaces` (PQ parts; 0: one per 8 dimensions); in `HnswParams::quantization`, and the last `FlatIndex` constructor argument |
 | `train_codec()`, `codec_trained()`, `get_code(id)`, `codec()`, `has_vector_values()` | On both indexes: train now (all or nothing; refused once only codes are kept), whether searches use codes, one stored code, the codec itself (for inspection), and whether full-precision vectors are still kept |
 | `VectorCodec::state()`, `restore(state)`, `clone()` | The trained state as numbers (saved in files), restoring it, and a copy |
 | `dim()`, `indexed_dim()` | On both indexes: the dimension of vectors and queries as given, and the dimensions stored and searched (fewer with truncation) |
@@ -293,6 +293,7 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `search_batch`, `search_by_id`, `contains`, `get_vector`, `get`, `scan` | As for the in-memory indexes |
 | `read_node(node)`, `blocks_read()`, `medoid()`, `codec()`, `metadata()` | Inspection: one node as stored, blocks read since opening, the entry point, the PQ codec, the metadata |
 | `DiskIndexParams` | `graph` (`VamanaParams`), `pq_subspaces` (0: one part per 2 dimensions) |
+| `DiskIndexParams::vectors`, `DiskVectorFormat`, `DiskIndex::vector_format()` | Node vectors as `Float32`, `Float16` or `BFloat16` (format version 2): smaller files; half the reads for wide vectors |
 | `DiskSearchStats` | `nodes_read`, `blocks_read`, `rounds`, `stopped_early` |
 | `VamanaGraph::build(vectors, dim, metric, VamanaParams{R, L, alpha, seed})` | The Vamana graph alone, built and searched in memory (`search`, `neighbors`, `medoid`) |
 | `BlockFile` | Positional reads from a read-only file, safe from many threads |

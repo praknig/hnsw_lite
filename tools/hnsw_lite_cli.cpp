@@ -76,7 +76,8 @@ const char* codec_name(CodecKind c) {
         case CodecKind::Binary: return "binary";
         case CodecKind::PQ: return "PQ";
         case CodecKind::F16: return "float16";
-        default: return "bfloat16";
+        case CodecKind::BF16: return "bfloat16";
+        default: return "RaBitQ";
     }
 }
 

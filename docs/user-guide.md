@@ -342,6 +342,8 @@ Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact sea
 
 Where the matches cluster away from the query, ACORN can miss a few (recall 0.98 at 5% above); set `PlannerParams::acorn_below = 0` to turn it off, or `acorn_ef_multiplier` higher for more recall.
 
+**Filters that follow the data.** When a filter's matches sit in a few regions ("only this category", where categories group in vector space), a graph search can cross much of the graph before reaching them. The planner gives such a search a budget, the estimated number of matches in distance computations; past it, the search stops and scans the matches exactly (`stats.reason == PlanReason::ExactFallback`). Measured with a filter matching 10% of 30,000 vectors by cluster: 4.3× faster (6.2× on an indexed field), recall unchanged. `PlannerParams::fallback_factor` sets the budget (0 turns it off).
+
 You can see and steer the decision:
 
 ```cpp
@@ -530,6 +532,17 @@ HnswIndex index(768, Metric::Cosine, p);
 auto results = index.search(query, 10, 400);  // HNSW re-ranks its whole beam: use a larger ef
 ```
 
+**RaBitQ** (`CodecKind::RaBitQ`) also stores one bit per dimension, plus two numbers per vector (the residual's length from a centroid, and how well the bits align with it), and estimates distances with RaBitQ's method (Gao and Long, 2024): a random rotation spreads each vector's energy across dimensions before the signs are taken, and the estimate is corrected by the alignment, so its error shrinks as 1/sqrt(dimensions) (measured: 0.147 at 24 dimensions, 0.065 at 96, 0.033 at 384). Against the binary codec, at the same bits and re-ranked 10x, recall@10:
+
+| Data | Dimensions | Binary | RaBitQ |
+|---|---|---|---|
+| Unstructured, L2 | 128 / 768 | 0.688 / 0.660 | **0.885 / 0.863** |
+| Clustered, L2 | 128 / 768 | 0.853 / 0.810 | 0.850 / **0.863** |
+| Clustered, cosine | 128 / 768 | 0.820 / 0.793 | 0.818 / **0.840** |
+| Unstructured, cosine | 128 / 768 | **0.863 / 0.800** | 0.810 / 0.775 |
+
+So it helps most for L2 and for wide vectors, and can lose on cosine: measure on your own data before switching. The binary codec stays the default one-bit choice. Like the others, it trains once on a sample; codes are identical on every platform (the rotation is a randomized Hadamard transform from fixed random signs).
+
 - **One bit per dimension**, 32 times smaller than floats. Each dimension gets a threshold (its mean in the training sample); a bit records whether a value lies above it. Distances compare the full-precision query with each code's reconstruction (threshold plus or minus the dimension's average spread).
 - **Binary codes are coarse, so re-ranking at full precision is essential, with many candidates.** Measured recall@10 on 3,000 clustered vectors: Flat with `rerank_factor` 4 (the default, suited to SQ8) reached 0.63 to 0.73, with 16 about 0.86, and with 32 0.96 to 0.99; HNSW re-ranks its whole beam, and reached 0.74 to 0.79 at `ef` 64 and 0.98 to 0.99 at `ef` 400.
 - **Keep the full vectors** (the default). Without them (`keep_full_vectors = false`) nothing can be re-ranked: recall was 0.34 to 0.39, and at low dimensions many vectors share the same code (12 dimensions allow only 4,096 codes), which also weakens the graph.
@@ -648,6 +661,7 @@ Updates and removals also repair better as they happen: each removed vector's fo
 DiskIndexParams params;
 params.graph.R = 64;      // neighbors per node
 params.graph.L = 100;     // beam while building
+params.vectors = DiskVectorFormat::Float16;  // optional: half precision, files about 29% smaller
 DiskIndex::build("vectors.idx", ids, vectors, 768, Metric::Cosine, params, metadata);
 
 auto index = DiskIndex::open("vectors.idx");  // loads only PQ codes, IDs and metadata
@@ -659,6 +673,7 @@ auto results = index->search(query, 10, DiskSearchParams{100, 4}, options, &stat
 ```
 
 - **For indexes larger than memory** (DiskANN-style): the graph and the full vectors stay on disk in 4 KB blocks, one read per node; memory holds only compact PQ codes (by default one byte per 2 dimensions, an eighth of the floats), the IDs and the metadata.
+- **Half-precision vectors** (`params.vectors = DiskVectorFormat::Float16` or `BFloat16`): about 29% smaller files, so more of the index stays in the page cache. A search reads one 4 KB block per node, so reads drop only for wide vectors: at 1536 dimensions a float32 node spans 2 blocks and a float16 one fits in 1, halving the blocks read (measured: 93.2 to 46.6 per search, same recall). Float16 holds values up to 65504 in magnitude (cosine vectors are normalized, so always fit); bfloat16 has float32's range with less precision.
 - **Searching:** PQ codes rank the candidates; the best unread ones are read from disk, `beam_width` (W) per round, their exact distances computed from the vectors read, their neighbors added; the search ends when the best `L` candidates were all read. Results carry exact distances. Measured on 5,000 vectors of 32 dimensions: `L` 50 read 56 nodes (1.1%) for recall@10 0.98, `L` 100 read 105 for 1.00. Raise `L` for recall, `W` for fewer round trips (W 4 needed 3 times fewer rounds than W 1, for the same reads).
 - **The PQ codes guide which nodes are read**, so they are finer than PQ's general default: with one part per 8 dimensions, recall at `L` 50 fell to 0.71 for the same number of reads. Set `DiskIndexParams::pq_subspaces` to trade memory for fewer wasted reads.
 - **Filters and predicates:** only matching vectors are returned, never fewer than `k` if `k` match. A filter matching at most `L` vectors reads exactly those (an exact answer); a broader one searches the graph, widening `L` until it finds `k`.

@@ -89,8 +89,23 @@ struct DiskSearchStats {
     bool stopped_early = false;    ///< a deadline or cancel flag stopped it
 };
 
+/// How a disk index stores each node's vector. Half precision halves the vectors' bytes:
+/// files are smaller (measured: 71% of float32 at 64 dimensions), so more of an index fits
+/// in the page cache. A search reads one 4 KB block per node, so reads drop only where a
+/// float32 record spans blocks and a half one does not: from about 1000 dimensions with
+/// R = 32 (measured at 1536: half the blocks read). Distances use the vectors rounded to
+/// half precision (re-ranking included); recall measured unchanged.
+enum class DiskVectorFormat : std::uint8_t {
+    Float32 = 0,   ///< 4 bytes a value, exact (format version 1, as before)
+    Float16 = 1,   ///< 2 bytes, about 3 significant digits; values up to 65504 in magnitude
+    BFloat16 = 2,  ///< 2 bytes, about 2 to 3 significant digits; the float32 range
+};
+
 struct DiskIndexParams {
     VamanaParams graph;            ///< the graph (R, L, alpha, seed)
+    /// The stored vectors' format (Float16 and BFloat16 write format version 2, which
+    /// versions of the library before it refuse cleanly).
+    DiskVectorFormat vectors = DiskVectorFormat::Float32;
     /// PQ parts of the in-memory codes that guide searches (0: one per 2
     /// dimensions). Finer than PQ's general default: here the codes choose which
     /// nodes to read, and coarse codes waste reads (measured: 32 dimensions with 4
@@ -158,6 +173,8 @@ public:
     std::size_t dim() const { return dim_; }
     Metric metric() const { return metric_; }
     std::size_t max_degree() const { return R_; }
+    /// How the vectors are stored (DiskIndexParams::vectors).
+    DiskVectorFormat vector_format() const { return format_; }
     NodeId medoid() const { return medoid_; }
     const MetadataStore& metadata() const { return metadata_; }
     const PQCodec& codec() const { return *codec_; }
@@ -228,6 +245,7 @@ private:
     std::unique_ptr<detail::IoPool> io_;  // after file_: destroyed first, as its reads use file_
     std::size_t dim_ = 0, R_ = 0, node_bytes_ = 0, nodes_per_block_ = 0, blocks_per_node_ = 0;
     Metric metric_ = Metric::L2;
+    DiskVectorFormat format_ = DiskVectorFormat::Float32;
     DistanceFn distance_ = nullptr;
     NodeId medoid_ = 0;
     std::vector<std::uint32_t> block_crc_;

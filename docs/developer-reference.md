@@ -563,7 +563,7 @@ Compression ("quantization") stores each vector as a compact **code** and search
 
 | Field | Default | What it does |
 |---|---|---|
-| `codec` | `CodecKind::None` | `None`: full precision only. `SQ8`: one byte per dimension (4× smaller than floats), very little recall lost. `Binary`: one bit per dimension (32× smaller), coarse: use with re-ranking. `PQ` (product quantization): one byte per *part* of the vector (with the default of one part per 8 dimensions, 32× smaller than floats); needs training, and re-ranking for good recall. `F16` and `BF16` (half precision): two bytes per dimension (2× smaller), no training; with `keep_full_vectors = false` they replace the float32 vectors from the first insert. Recall@10 within 0.005 of float32 in our tests. `F16` (IEEE float16) keeps about 3.3 significant digits and refuses values beyond ±65504 (`std::invalid_argument`, before any change); `BF16` (bfloat16) keeps float32's range with about 2.4 digits. |
+| `codec` | `CodecKind::None` | `None`: full precision only. `SQ8`: one byte per dimension (4× smaller than floats), very little recall lost. `Binary`: one bit per dimension (32× smaller), coarse: use with re-ranking. `PQ` (product quantization): one byte per *part* of the vector (with the default of one part per 8 dimensions, 32× smaller than floats); needs training, and re-ranking for good recall. `F16` and `BF16` (half precision): two bytes per dimension (2× smaller), no training; with `keep_full_vectors = false` they replace the float32 vectors from the first insert. Recall@10 within 0.005 of float32 in our tests. `F16` (IEEE float16) keeps about 3.3 significant digits and refuses values beyond ±65504 (`std::invalid_argument`, before any change); `BF16` (bfloat16) keeps float32's range with about 2.4 digits. `RaBitQ`: one bit per dimension plus two numbers per vector (8 bytes), with RaBitQ's estimator, whose error shrinks as 1/sqrt(dimensions); see the user guide for when it beats `Binary`. |
 | `train_after` | 1000 | Train the codec automatically once this many vectors are stored; until then searches use full precision. 0: only when you call `train_codec()`. |
 | `rerank` | `true` | Re-rank the best candidates found with codes at full precision. Better recall for a little more work. Needs the full vectors kept. |
 | `rerank_factor` | 4 | Exact searches with re-ranking compare k × this many candidates by code first (at least 1). |
@@ -661,6 +661,7 @@ struct SearchOptions {
 - **scans exactly** when at most `max_exact_matches` vectors (2000) **or** at most `max_exact_fraction` of them (1%) are expected to match;
 - otherwise, below `acorn_below` (20%) matching, searches the graph **the ACORN way**: only matching vectors are scored and enter the beam, and a neighbor that fails the filter is looked through to its own neighbors (two hops) without computing its distance, which keeps the graph connected as the filter sees it. Its beam is `ef` × `acorn_ef_multiplier` (4). If it finds fewer than k matches (they lie beyond two hops of where it went), it falls back to the next strategy, so results are never worse than without it;
 - otherwise **searches the graph**, scoring every vector it visits, with `ef` multiplied by 1/selectivity, up to `max_ef_multiplier` (32) times.
+- **Exact fallback:** a graph or ACORN search the planner chose stops once it has computed more distances than `fallback_factor` (1) times the estimated matches (at least 4 × `ef`), and scans the matches exactly instead (`PlanReason::ExactFallback`, `strategy` `ForceExact`). This bounds filters correlated with the vectors, whose matches sit in a few regions the graph search reaches only after crossing much of the graph: measured on 30,000 vectors with a filter matching 10% of them by cluster, 16,876 distances and 5.9 ms became 3,803 and 1.4 ms (4.3× faster; 6.2× on an indexed field), recall unchanged. Results are the exact search's. Forced strategies are never changed; `fallback_factor = 0` turns it off.
 
 Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact search, ACORN against the widened graph search:
 
@@ -680,6 +681,7 @@ struct PlannerParams {
     double max_ef_multiplier = 32.0;
     double acorn_below = 0.2;          // 0: never ACORN (the graph search, as before)
     double acorn_ef_multiplier = 4.0;  // at least 1
+    double fallback_factor = 1.0;      // graph or ACORN past this many times the estimated matches: exact (0: never)
 };
 ```
 
@@ -690,7 +692,7 @@ Advanced: `plan_search(capacity, live, eligible, exact_matches, ef, forced, para
 ```cpp
 struct SearchStats {
     Strategy strategy;              // ForceExact, ForceAcorn or ForceGraph: what actually ran (ForceGraph after an ACORN fallback)
-    PlanReason reason;              // NoFilter, Forced, MatchCount, MatchFraction, Acorn, Graph or FlatIndex
+    PlanReason reason;              // NoFilter, Forced, MatchCount, MatchFraction, Acorn, Graph, FlatIndex or ExactFallback
     double selectivity;             // estimated fraction of vectors matching
     std::size_t estimated_matches;
     bool exact_count;               // the estimate came from a payload index
@@ -887,6 +889,7 @@ Builds from a **vectors file** that need not fit in memory: the `.fbin` layout u
 | `graph.alpha` | 1.2 | Pruning strength (at least 1): higher keeps more long-range links. |
 | `graph.seed` | 1 | Same seed, same graph. |
 | `pq_subspaces` | 0 | Parts of the in-memory codes; 0: one per 2 dimensions. Finer codes than PQ's usual default, because here they decide which blocks to read (measured: 32 dimensions with 4 parts reached recall 0.71, with 16 parts 1.00, for the same reads). |
+| `vectors` | `DiskVectorFormat::Float32` | How node vectors are stored: `Float32` (exact), `Float16` (values up to 65504 in magnitude; L2 builds beyond it are refused) or `BFloat16` (the float32 range). Half precision makes files about 29% smaller and, where a float32 record spans two 4 KB blocks (from about 1000 dimensions with R = 32), halves the blocks a search reads; measured recall unchanged. Half-precision files are format version 2. `DiskIndex::vector_format()` reports it. |
 
 | `LargeBuildParams` field | Default | What it does |
 |---|---|---|
@@ -1640,7 +1643,7 @@ enum class Strategy { Auto, ForceExact, ForceGraph, ForceAcorn };
 **`PlanReason`** (enumeration)
 
 ```cpp
-enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn };
+enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn, ExactFallback };
 ```
 
 **`PlannerParams`**
@@ -1653,6 +1656,7 @@ struct PlannerParams {
     double max_ef_multiplier = 32.0;
     double acorn_below = 0.2;
     double acorn_ef_multiplier = 4.0;
+    double fallback_factor = 1.0;
 };
 ```
 
@@ -1830,7 +1834,7 @@ struct CompactStats {
 **`CodecKind`** (enumeration)
 
 ```cpp
-enum class CodecKind { None, SQ8, Binary, PQ, F16, BF16 };
+enum class CodecKind { None, SQ8, Binary, PQ, F16, BF16, RaBitQ };
 ```
 
 **`QuantizationParams`**
@@ -2023,11 +2027,18 @@ struct VamanaParams {
 };
 ```
 
+**`DiskVectorFormat`** (enumeration)
+
+```cpp
+enum class DiskVectorFormat { Float32, Float16, BFloat16 };
+```
+
 **`DiskIndexParams`**
 
 ```cpp
 struct DiskIndexParams {
     VamanaParams graph;
+    DiskVectorFormat vectors = DiskVectorFormat::Float32;
     std::size_t pq_subspaces = 0;
 };
 ```
@@ -2093,6 +2104,7 @@ class DiskIndex {
     std::size_t dim() const;
     Metric metric() const;
     std::size_t max_degree() const;
+    DiskVectorFormat vector_format() const;
     NodeId medoid() const;
     const MetadataStore& metadata() const;
     const PQCodec& codec() const;

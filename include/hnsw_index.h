@@ -571,7 +571,8 @@ private:
     std::vector<Candidate> search_level(const float* query, const std::vector<Candidate>& entries,
                                         std::size_t ef, int level, VisitedList& visited,
                                         NodeId exclude, const Eligibility& eligible,
-                                        SearchStats* stats = nullptr, LinkLocks* locks = nullptr) const;
+                                        SearchStats* stats = nullptr, LinkLocks* locks = nullptr,
+                                        std::size_t budget = 0, bool* over_budget = nullptr) const;  // budget: distances (0: none)
 
     /// Eligibility with no filter: "not removed".
     Eligibility live_only() const { return Eligibility{&storage_.ids()}; }
@@ -594,7 +595,8 @@ private:
     /// Level 0 the ACORN way (filtered searches): only eligible nodes are scored
     /// and kept; an ineligible neighbor is looked through to its own neighbors.
     std::vector<Candidate> acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
-                                        const Eligibility& eligible, SearchStats* stats) const;
+                                        const Eligibility& eligible, SearchStats* stats,
+                                        std::size_t budget = 0, bool* over_budget = nullptr) const;
     /// The distance from one query to stored nodes, its path decided once when it is
     /// made: full vectors, the code table of the search running on this thread, or
     /// decoded codes (codes only). A search's hot loops call it thousands of times;
@@ -665,6 +667,11 @@ private:
     /// this index (indexed_dim() values, already normalized), copied exactly; for
     /// compact() without originals, so rebuilding never changes a stored vector.
     void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared = false);
+    // Compaction and rebuild with codes only re-add decoded vectors: the node's code is
+    // copied (set here for the add) instead of encoding the decoded vector again, which
+    // not every codec reproduces exactly (RaBitQ's factors change). Byte for byte, as
+    // reorder() copies codes.
+    const std::uint8_t* code_given_ = nullptr;
 
     /// Sets `node`'s links on `level` and adds the reverse link to each neighbor,
     /// re-selecting a neighbor's list with the heuristic when it is full.

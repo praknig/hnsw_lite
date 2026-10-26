@@ -63,7 +63,8 @@ float bits_sum_neon(const float* w, const std::uint8_t* c, std::size_t n);
     float bf16_l2_##isa(const float* q, const std::uint16_t* c, std::size_t n);  \
     float bf16_dot_##isa(const float* q, const std::uint16_t* c, std::size_t n);  \
     void f16_decode_##isa(const std::uint16_t* c, float* out, std::size_t n);     \
-    void bf16_decode_##isa(const std::uint16_t* c, float* out, std::size_t n);
+    void bf16_decode_##isa(const std::uint16_t* c, float* out, std::size_t n);    \
+    std::int32_t sq8_dot_i8_##isa(const std::int8_t* w, const std::uint8_t* c, std::size_t n);
 VECDB_HALF_KERNELS(scalar)
 VECDB_HALF_KERNELS(avx2)
 VECDB_HALF_KERNELS(avx512)

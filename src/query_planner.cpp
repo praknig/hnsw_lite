@@ -377,6 +377,8 @@ void validate(const PlannerParams& p) {
     if (!(p.acorn_below >= 0.0 && p.acorn_below <= 1.0)) throw std::invalid_argument("PlannerParams::acorn_below must be in [0, 1]");
     if (!(p.acorn_ef_multiplier >= 1.0) || !std::isfinite(p.acorn_ef_multiplier))
         throw std::invalid_argument("PlannerParams::acorn_ef_multiplier must be a finite number >= 1");
+    if (!(p.fallback_factor >= 0.0) || !std::isfinite(p.fallback_factor))
+        throw std::invalid_argument("PlannerParams::fallback_factor must be a finite number >= 0");
 }
 
 PlanDecision plan_search(std::size_t capacity, std::size_t live, const Eligibility& eligible,

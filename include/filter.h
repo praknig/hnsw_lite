@@ -230,7 +230,7 @@ private:
 enum class Strategy { Auto, ForceExact, ForceGraph, ForceAcorn };
 
 /// Why the planner chose what it chose (reported in SearchStats).
-enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn };
+enum class PlanReason { NoFilter, Forced, MatchCount, MatchFraction, Graph, FlatIndex, Acorn, ExactFallback };
 
 /**
  * @brief Settings of the query planner.
@@ -257,6 +257,13 @@ struct PlannerParams {
     /// ACORN's beam: the requested ef times this (at least 1). Matches clustered
     /// away from the query need it (4: recall at least 0.984 where 1 gave 0.966).
     double acorn_ef_multiplier = 4.0;
+    /// A graph or ACORN search the planner chose stops once its distance computations
+    /// exceed this many times the estimated matches (at least 4 * ef), and the matches
+    /// are scanned exactly instead (PlanReason::ExactFallback). It bounds the cost of a
+    /// filter correlated with the vectors, whose matches a graph search finds only
+    /// after crossing much of the graph (measured: 16,876 distances for 2,936 matches).
+    /// 0: never. Forced strategies are never changed.
+    double fallback_factor = 1.0;
 };
 
 /// Throws std::invalid_argument for settings outside their valid range.
