@@ -160,6 +160,23 @@ struct DocumentRecord {
     std::optional<std::int64_t> expires_at;  ///< with expiry: when it expires
 };
 
+/// Options of Collection::scan().
+struct CollectionScanOptions {
+    std::optional<Filter> filter;        ///< only documents matching it (all if empty)
+    std::size_t limit = 100;             ///< documents per page, at least 1
+    std::optional<std::uint64_t> after;  ///< continue after this ID (CollectionPage::next of the previous page)
+    bool with_vectors = true;            ///< the dense and sparse vectors
+    bool with_text = true;
+    bool with_metadata = true;           ///< keys and expiry times come back either way
+};
+
+/// One page of Collection::scan(): pass `next` as CollectionScanOptions::after to get
+/// the following page; it is empty on the last page.
+struct CollectionPage {
+    std::vector<DocumentRecord> documents;
+    std::optional<std::uint64_t> next;
+};
+
 struct CollectionQuery {
     std::vector<float> vector;  ///< dense query (empty: none)
     std::string text;           ///< BM25 query (empty: none)
@@ -236,6 +253,13 @@ public:
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
+    /// Lists documents a page at a time, in ascending ID order, optionally only those
+    /// matching a filter; expired documents are left out, as everywhere. Pass the page's
+    /// `next` as `after` for the following page. Each page is read under one lock, so it
+    /// is consistent; changes between pages never repeat or skip a document that stays
+    /// stored. Each page costs one pass over the collection: use large pages (thousands)
+    /// to read a large collection. Throws std::invalid_argument if limit is 0.
+    CollectionPage scan(const CollectionScanOptions& options = {}) const;
     /// A copy of the options, taken under the lock (set_ttl and set_string_ids may
     /// change them from another thread).
     CollectionOptions options() const;
@@ -319,6 +343,8 @@ private:
     void check_changeable() const;
     bool searching_here() const;  // inside a search of this collection, on this thread
     std::vector<NodeId> matching(const Filter& filter) const;
+    /// The document in `slot` (live), with the parts asked for. Under the lock.
+    DocumentRecord record_unlocked(NodeId slot, bool vectors, bool text, bool metadata) const;
     void save_unlocked(std::ostream& out) const;
 
     CollectionOptions options_;

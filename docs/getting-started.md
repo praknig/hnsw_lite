@@ -65,7 +65,7 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### What a successful run looks like
 
-CTest runs the tests as 61 entries (one per group, the heaviest in shards). Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 903 tests selected`: that entry's share, not tests left out. Together the 61 entries run all 903 tests; `test_comprehensive` on its own runs them all in one process.
+CTest runs the tests as 61 entries (one per group, the heaviest in shards). Each CTest entry runs one group, or one shard of a heavy group, so its log starts with a line such as `12 of 905 tests selected`: that entry's share, not tests left out. Together the 61 entries run all 905 tests; `test_comprehensive` on its own runs them all in one process.
 
 ```
 100% tests passed, 0 tests failed out of 60
@@ -74,7 +74,7 @@ CTest runs the tests as 61 entries (one per group, the heaviest in shards). Each
 The same tests can be run directly, which shows each test by name. See [Testing](testing.md) for everything the test runner can do.
 
 ```bash
-./build/test_comprehensive                   # all 903 tests
+./build/test_comprehensive                   # all 905 tests
 ./build/test_comprehensive --group filter    # one group
 ./build/test_comprehensive --list            # every test name
 ```

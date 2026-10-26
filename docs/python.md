@@ -88,6 +88,9 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `set_metadata(id, metadata)` → `bool` | Changes only the given fields; `None` clears a field. With string keys, `id` may be a key (only that exact key's document changes). |
 | `set_metadata_where(filter, changes)` → `int` | The same for every match. |
 | `get(id)` → `dict` or `None` | `{"id", "vector" (NumPy array or None), "text", "sparse" (dict or None), "metadata"}`. |
+| `scan(*, filter=None, limit=100, after=None, with_vectors=True, with_text=True, with_metadata=True)` → `(list, next)` | One page of documents (dicts as from `get`), in ascending ID order; pass `next` as `after` for the following page, `None` on the last one. Changes between pages never repeat or skip a document that stays stored; expired documents are left out. |
+| `documents(*, filter=None, batch=1000, ...)` → iterator | Every document (or those matching `filter`), in ascending ID order, read `batch` at a time so memory stays bounded. Same `with_*` switches as `scan`. |
+| `to_pandas(*, filter=None, with_vectors=True, with_text=True, with_metadata=True, batch=10000)` → `DataFrame` | The documents as a DataFrame in the shape `upsert_dataframe` reads (see [pandas](#pandas)). |
 | `search(vector=None, text=None, sparse=None, *, k=10, filter=None, ...)` | Below. |
 | `checkpoint()` → `int` | Durable collections: a snapshot. |
 | `maintain(budget_ms=0)` → `dict` | Runs the maintenance that is due; returns what it did (`upkept`, `rebuilt`, `checkpointed`, `notes`, ...). |
@@ -123,11 +126,11 @@ docs.count_where(hl.Filter.ge("published", hl.to_ms("2024-01-01")))
 
 ```python
 hits = docs.search(vector=q, text="pricing", k=10, modifiers={
-   "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
-   "multiply": "provenance_confidence",                           # times a field (0 to 1)
-   "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
-             ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
-   "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
+    "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
+    "multiply": "provenance_confidence",                           # times a field (0 to 1)
+    "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
+              ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
+    "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
 })
 ```
 
@@ -173,6 +176,15 @@ results = docs.search(vector=q, text="fox", k=20, filter={"lang": "en"}, as_data
 ```
 
 `as_dataframe=True` returns a DataFrame: `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank` (pandas' nullable `Int64`, so missing ranks show as `<NA>`), `vector_distance`, `text_score`, `sparse_score`, optionally `text`, then **one column per metadata field**. A metadata field whose name collides with a result column (such as `score`) is renamed `metadata_score`.
+
+The other way, `docs.to_pandas()` returns the documents as a DataFrame: an `id` column; `key` and `expires_at` (milliseconds since 1970 UTC) when the collection uses them; `vector` (one NumPy array per cell) and `sparse` (a dict per cell) for the sides the collection has; `text`; then one column per metadata field, missing values as `NaN` or `None` (a metadata field named like one of those columns gets a `metadata_` prefix). It is the shape `upsert_dataframe` reads, so a collection can be exported and loaded back:
+
+```python
+df = docs.to_pandas(filter={"lang": "en"})
+copy.upsert_dataframe(df, id_column="id", vector_column="vector", text_column="text", metadata_columns=["year", "lang"])
+```
+
+It reads the collection `batch` documents per call (10,000 by default), then builds the DataFrame; for a collection too large to hold twice, iterate with `docs.documents()` instead.
 
 ## HnswIndex and FlatIndex
 
@@ -285,4 +297,4 @@ The `Wheels` workflow (`.github/workflows/wheels.yml`) builds and tests every wh
 
 3. The workflow builds the 25 wheels and the source distribution, tests each wheel in a clean environment, checks that the tag matches `__version__` (refusing to publish otherwise), checks the files with `twine`, and uploads them.
 
-PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.
+PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.s

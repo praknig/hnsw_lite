@@ -600,6 +600,55 @@ RACE_TEST(r12_snapshots_taken_during_writes) {
     CHECK(inconsistent == 0 && snapshots > 0);
 }
 
+// ---------------------------------------------------------------- r13
+
+RACE_TEST(r13_collection_scans_while_writing) {
+    // Full scans, a page at a time, while writers add, update and remove documents:
+    // always ascending, never a duplicate, never a half-written document, and every
+    // document the writers never touch (IDs below 100) appears exactly once per scan.
+    auto data = random_vectors(300, 8, 13);
+    CollectionOptions o = manual_options(8);
+    Collection c(o);
+    auto doc = [&](std::size_t i) {
+        Document d;
+        d.vector = data[i];
+        d.text = "word" + std::to_string(i % 3);
+        d.metadata = Metadata().set("g", std::int64_t(i % 5));
+        return d;
+    };
+    for (std::uint64_t i = 0; i < 100; ++i) c.add(i, doc(i));
+    std::atomic<int> bad{0}, scans{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = 100 + rng() % 200;
+            if (rng() % 3) (void)c.upsert(i, doc(i));
+            else (void)c.remove(i);
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            CollectionScanOptions so;
+            so.limit = 1 + rng() % 40;
+            std::vector<std::uint64_t> ids;
+            for (;;) {
+                const CollectionPage page = c.scan(so);
+                for (const auto& d : page.documents) {
+                    ids.push_back(d.id);
+                    const auto g = d.metadata.get("g");
+                    if (!d.vector || d.vector->size() != 8 || !g || g->i != std::int64_t(d.id % 5) || d.text != "word" + std::to_string(d.id % 3)) ++bad;
+                }
+                if (!page.next) break;
+                so.after = page.next;
+            }
+            if (!std::is_sorted(ids.begin(), ids.end()) || std::adjacent_find(ids.begin(), ids.end()) != ids.end()) ++bad;
+            std::size_t stable = 0;
+            for (const std::uint64_t id : ids) stable += id < 100;
+            if (stable != 100) ++bad;
+            ++scans;
+        },
+    });
+    std::printf("    %d full scans checked\n", scans.load());
+    CHECK(bad == 0 && scans > 0);
+}
+
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {

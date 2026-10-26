@@ -82,7 +82,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-    |---|---|---|---|---|---|
+      |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -94,6 +94,25 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Durability:** `Collection::open(dir, options)` creates or recovers a durable directory with one write-ahead log for the whole collection, so text and sparse vectors are as safe as the dense side (see [Durability](#durability) for modes and checkpoints). Reopening requires the same dimension, metric and sides; other settings come from the directory. In memory, `save` and `load` write and read one file.
 - **Maintenance:** with `options.maintenance.mode = Maintenance::Background`, a background thread does what is due every `interval` (1 s): upkeep of the dense side when it has churned (vectors replaced or removed: a quick reachability check past 5%, upkeep if it finds damage; upkeep regardless past 20%), a rebuild when a compressed side's codec has drifted (checked past 50% churn; rebuilt when its error exceeds 4 times a retrained one's), and, for durable collections, a checkpoint when the log reaches 64 MiB or 100,000 records, or a record has waited 10 minutes. Each round has a time budget (250 ms); upkeep stops at it after at least one repair, so work left over continues next round. With the default `Maintenance::Manual`, call `maintain(budget)` when convenient: it does the same, only what is due. `last_maintenance()` reports what the last round did and why (in `notes`), `maintenance_status()` the counters it decides from, and `set_maintenance()` changes the policy while running. Maintenance is not logged: the next snapshot keeps its effect. Loading from a file starts with manual maintenance.
 - **Limits:** changes run one at a time; searches run in parallel. A predicate may read the collection (`get`, `contains`, even a nested search) but not change it or any other index. BM25 document weights use `bm25.avg_doc_length` as set at creation: set it near your corpus' mean. `dense_index()`, `text_index()` and `sparse_index()` give read-only access to the sides, for example for `health()`.
+
+### Reading every document
+
+`scan()` lists a collection's documents a page at a time, in ascending ID order, optionally only those matching a filter, and with only the parts you need:
+
+```cpp
+CollectionScanOptions o;
+o.filter = Filter::eq("lang", "en");
+o.with_vectors = false;  // text and metadata only
+o.limit = 1000;
+for (;;) {
+    const CollectionPage page = docs.scan(o);
+    for (const DocumentRecord& d : page.documents) std::cout << d.id << " " << d.text << "\n";
+    if (!page.next) break;
+    o.after = page.next;  // continue after the last document of this page
+}
+```
+
+Each page is consistent, and changes between pages never repeat or skip a document that stays stored, so a scan can run while the collection is being written. Expired documents are left out. From Python, `docs.documents()` iterates over every document and `docs.to_pandas()` returns a DataFrame (see [Python](python.md)).
 
 ## Expiry and string keys (collections)
 

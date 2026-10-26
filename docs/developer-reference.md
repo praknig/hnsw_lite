@@ -222,6 +222,7 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t size() const` | Number of documents. |
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
+| `CollectionPage scan(const CollectionScanOptions& options = {}) const` | Lists documents **a page at a time, in ascending ID order**, optionally only those matching a filter (see *Reading every document* below). Throws `std::invalid_argument` if `limit` is 0, or for an unknown field under a strict schema. |
 | `CollectionOptions options() const` | A copy of the collection's settings, taken under its lock, since `set_ttl` and `set_string_ids` may change them from another thread (for a recovered collection, the stored ones). |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only pointers to the sides (null if absent), for example to call `health()` on the dense side. Do not keep them beyond the collection's lifetime. |
 
@@ -237,7 +238,35 @@ struct DocumentRecord {
 
 `DocumentRecord` also reports `key` (with string keys) and `expires_at` (with expiry), taken from reserved metadata fields, which are **not** included in `metadata`.
 
-`vector` is the vector as you gave it, except with a codes-only preset (`LowMemory`), where it is decoded from the codes and therefore approximate. The **BM25 terms of the text are not returned** (they are derived from the text).
+`vector` is the vector as you gave it, except when only codes are kept (the `LowMemory` preset, or half precision with `keep_full_vectors = false`), where it is decoded from the codes and therefore approximate. The **BM25 terms of the text are not returned** (they are derived from the text).
+
+**Reading every document.** `scan()` returns a page of documents and the cursor to the next:
+
+```cpp
+struct CollectionScanOptions {
+    std::optional<Filter> filter;        // only documents matching it (all if empty)
+    std::size_t limit = 100;             // documents per page, at least 1
+    std::optional<std::uint64_t> after;  // continue after this ID: the previous page's `next`
+    bool with_vectors = true;            // the dense and sparse vectors
+    bool with_text = true;
+    bool with_metadata = true;           // keys and expiry times come back either way
+};
+struct CollectionPage {
+    std::vector<DocumentRecord> documents;
+    std::optional<std::uint64_t> next;   // empty on the last page
+};
+
+CollectionScanOptions o;
+o.limit = 1000;
+for (;;) {
+    const CollectionPage page = docs.scan(o);
+    for (const DocumentRecord& d : page.documents) { /* ... */ }
+    if (!page.next) break;
+    o.after = page.next;
+}
+```
+
+Documents come in ascending ID order. Expired documents are left out, as everywhere. Each page is read under one lock, so it is consistent, and changes between pages never repeat or skip a document that stays stored: a document removed ahead of the cursor is not listed, one added ahead of it is, and one added behind it is not. A document in a page is the same as `get()` returns for it. Each page costs one pass over the collection, so read a large collection in large pages (thousands of documents).
 
 ### 2.7 Searching
 
@@ -1280,6 +1309,28 @@ struct DocumentRecord {
 };
 ```
 
+**`CollectionScanOptions`**
+
+```cpp
+struct CollectionScanOptions {
+    std::optional<Filter> filter;
+    std::size_t limit = 100;
+    std::optional<std::uint64_t> after;
+    bool with_vectors = true;
+    bool with_text = true;
+    bool with_metadata = true;
+};
+```
+
+**`CollectionPage`**
+
+```cpp
+struct CollectionPage {
+    std::vector<DocumentRecord> documents;
+    std::optional<std::uint64_t> next;
+};
+```
+
 **`CollectionQuery`**
 
 ```cpp
@@ -1351,6 +1402,7 @@ class Collection {
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
+    CollectionPage scan(const CollectionScanOptions& options = {}) const;
     CollectionOptions options() const;
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
     void save(const std::string& path) const;

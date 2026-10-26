@@ -176,6 +176,20 @@ py::dict from_sparse(const SparseVector& v) {
     return d;
 }
 
+/// A document as a dict, the same for get() and scan(): "id", "vector" (NumPy array or
+/// None), "text", "sparse" (dict or None), "metadata", plus "key" and "expires_at" when set.
+py::dict from_record(const DocumentRecord& r) {
+    py::dict d;
+    d["id"] = r.id;
+    d["vector"] = r.vector ? py::object(py::array_t<float>(static_cast<py::ssize_t>(r.vector->size()), r.vector->data())) : py::none();
+    d["text"] = r.text;
+    d["sparse"] = r.sparse ? py::object(from_sparse(*r.sparse)) : py::none();
+    d["metadata"] = from_metadata(r.metadata);
+    if (r.key) d["key"] = *r.key;
+    if (r.expires_at) d["expires_at"] = *r.expires_at;
+    return d;
+}
+
 Schema to_schema(const py::handle& fields, bool strict) {
     std::vector<FieldSpec> specs;
     if (!fields.is_none())
@@ -778,16 +792,27 @@ PYBIND11_MODULE(_core, m) {
                 r = c.get(n);
             }
             if (!r) return py::none();
-            py::dict d;
-            d["id"] = r->id;
-            d["vector"] = r->vector ? py::object(py::array_t<float>(static_cast<py::ssize_t>(r->vector->size()), r->vector->data())) : py::none();
-            d["text"] = r->text;
-            d["sparse"] = r->sparse ? py::object(from_sparse(*r->sparse)) : py::none();
-            d["metadata"] = from_metadata(r->metadata);
-            if (r->key) d["key"] = *r->key;
-            if (r->expires_at) d["expires_at"] = *r->expires_at;
-            return d;
+            return py::object(from_record(*r));
         }, py::arg("id"))
+        .def("scan", [](const Collection& c, const std::optional<Filter>& filter, std::size_t limit, const py::object& after,
+                        bool with_vectors, bool with_text, bool with_metadata) {
+            CollectionScanOptions o;
+            o.filter = filter;
+            o.limit = limit;
+            if (!after.is_none()) o.after = to_ids(after).at(0);
+            o.with_vectors = with_vectors;
+            o.with_text = with_text;
+            o.with_metadata = with_metadata;
+            CollectionPage page;
+            {
+                py::gil_scoped_release free;
+                page = c.scan(o);
+            }
+            py::list docs;
+            for (const DocumentRecord& r : page.documents) docs.append(from_record(r));
+            return py::make_tuple(docs, page.next ? py::object(py::int_(*page.next)) : py::none());
+        }, py::arg("filter") = py::none(), py::arg("limit") = 100, py::arg("after") = py::none(), py::arg("with_vectors") = true,
+           py::arg("with_text") = true, py::arg("with_metadata") = true)
         .def("_search", [](const Collection& c, const py::handle& vector, const py::handle& text, const py::handle& sparse, std::size_t k,
                            std::optional<Filter> filter, Fusion fusion, double rrf_k, double vector_weight, double text_weight, double sparse_weight,
                            std::size_t candidates, std::size_t ef, bool with_metadata, bool with_text, std::optional<double> timeout_s,

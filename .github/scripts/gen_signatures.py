@@ -13,7 +13,7 @@ HEADERS = ["scoring.h", "collection.h", "hnsw_index.h", "flat_index.h", "disk_in
 # Public API by header, in reference order. Records whose public members are listed in full.
 GROUPS = [
     ("Collections (collection.h)", ["Preset", "Maintenance", "MaintenancePolicy", "MaintenanceReport", "MaintenanceStatus", "TtlOptions", "CollectionOptions",
-                                    "Document", "DocumentRecord", "CollectionQuery", "CollectionSearchOptions", "CollectionHit", "Collection"]),
+                                    "Document", "DocumentRecord", "CollectionScanOptions", "CollectionPage", "CollectionQuery", "CollectionSearchOptions", "CollectionHit", "Collection"]),
     ("Metadata and filters (metadata.h, filter.h)", ["FieldType", "Value", "Metadata", "FieldSpec", "SchemaMode", "Schema", "CompareOp", "Filter",
                                                      "Strategy", "PlanReason", "PlannerParams", "DecayShape", "RecencyDecay", "FieldMultiplier", "MatchBoost",
                                                      "ScoreModifiers", "SearchStats", "SearchOptions", "OperationOptions",

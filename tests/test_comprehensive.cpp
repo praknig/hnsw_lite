@@ -18060,6 +18060,124 @@ TEST(collection, co15_deadlines_and_cancellation) {
     std::filesystem::remove(path);
 }
 
+namespace {
+std::vector<std::uint64_t> scan_all(const Collection& c, CollectionScanOptions o, std::size_t* pages = nullptr) {
+    std::vector<std::uint64_t> ids;
+    std::size_t n = 0;
+    for (;;) {
+        const CollectionPage page = c.scan(o);
+        ++n;
+        CHECK(page.documents.size() <= o.limit);
+        for (const auto& d : page.documents) ids.push_back(d.id);
+        if (!page.next) break;
+        CHECK(page.next == page.documents.back().id);
+        o.after = page.next;
+    }
+    if (pages) *pages = n;
+    return ids;
+}
+}  // namespace
+
+TEST(collection, co16_scan_pages_filters_and_parts) {
+    auto data = random_vectors(40, 8, 4801);
+    CollectionOptions o = co_options(8, true);
+    o.string_ids = true;
+    o.ttl = TtlOptions{true, 0};
+    Collection c(o);
+    std::vector<std::uint64_t> live;
+    for (std::uint64_t i = 0; i < 120; ++i) {
+        Document d = co_doc(data, i * 3 + 5, true);  // IDs not contiguous, inserted in descending order below
+        c.add("k" + std::to_string(i), d);
+    }
+    for (std::uint64_t i = 0; i < 120; ++i) live.push_back(Collection::id_of("k" + std::to_string(i)));
+    for (std::uint64_t i = 0; i < 120; i += 9) {
+        CHECK(c.remove("k" + std::to_string(i)));
+        live.erase(std::find(live.begin(), live.end(), Collection::id_of("k" + std::to_string(i))));
+    }
+    Document gone = co_doc(data, 1, true);
+    gone.expires_at = now_ms() - 1000;  // expired: never listed
+    c.add("expired", gone);
+    std::sort(live.begin(), live.end());
+    // Every live document exactly once, ascending, a page at a time.
+    CollectionScanOptions so;
+    so.limit = 7;
+    std::size_t pages = 0;
+    CHECK(scan_all(c, so, &pages) == live);
+    CHECK(pages == (live.size() + 6) / 7);  // a next cursor only while documents remain: exactly ceil(n / 7) pages
+    so.limit = 100000;
+    CHECK(scan_all(c, so) == live);
+    // scan() and get() give the same document.
+    so.limit = 50;
+    bool same = true;
+    for (const auto& d : c.scan(so).documents) {
+        const auto g = c.get(d.id);
+        same = same && g && g->vector == d.vector && g->text == d.text && g->metadata == d.metadata && g->key == d.key &&
+               g->sparse.has_value() == d.sparse.has_value() && (!g->sparse || g->sparse->indices == d.sparse->indices);
+    }
+    CHECK(same);
+    // A filter: only matching documents, still in order.
+    so.filter = Filter::exists("category");
+    std::vector<std::uint64_t> want;
+    for (const std::uint64_t id : live)
+        if (c.get(id)->metadata.get("category")) want.push_back(id);
+    so.limit = 3;
+    CHECK(!want.empty() && scan_all(c, so) == want);
+    // Leaving parts out; the key comes back either way.
+    CollectionScanOptions lean;
+    lean.with_vectors = lean.with_text = lean.with_metadata = false;
+    const auto page = c.scan(lean);
+    bool bare = !page.documents.empty();
+    for (const auto& d : page.documents)
+        bare = bare && !d.vector && !d.sparse && d.text.empty() && d.metadata.empty() && d.key && Collection::id_of(*d.key) == d.id;
+    CHECK(bare);
+    // Edges.
+    CollectionScanOptions zero;
+    zero.limit = 0;
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.scan(zero));
+    CollectionScanOptions past;
+    past.after = live.back();
+    CHECK(c.scan(past).documents.empty() && !c.scan(past).next);
+    Collection empty(co_options());
+    CHECK(empty.scan().documents.empty() && !empty.scan().next);
+    CollectionOptions strict = co_options();
+    strict.schema = Schema::strict({{"year", FieldType::Int}});
+    Collection sc(strict);
+    CollectionScanOptions unknown;
+    unknown.filter = Filter::eq("nope", std::int64_t(1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)sc.scan(unknown));
+}
+
+TEST(collection, co17_scan_with_changes_between_pages) {
+    // Changes between pages never repeat or skip a document that stays stored.
+    auto data = random_vectors(20, 8, 4802);
+    Collection c(co_options());
+    for (std::uint64_t i = 0; i < 100; ++i) c.add(i * 2, co_doc(data, i));  // 0, 2, ..., 198
+    CollectionScanOptions so;
+    so.limit = 30;
+    std::vector<std::uint64_t> seen;
+    CollectionPage page = c.scan(so);
+    for (const auto& d : page.documents) seen.push_back(d.id);
+    const std::uint64_t cursor = *page.next;  // 58
+    CHECK(c.remove(100));                    // ahead of the cursor: removed, so never listed
+    CHECK(c.remove(10));                     // behind it: already listed
+    c.add(5, co_doc(data, 5));               // added behind the cursor: not listed now
+    c.add(199, co_doc(data, 6));             // added ahead of it: listed
+    (void)c.upsert(80, co_doc(data, 7));     // updated ahead of it: listed once, as updated
+    so.after = cursor;
+    for (;;) {
+        page = c.scan(so);
+        for (const auto& d : page.documents) seen.push_back(d.id);
+        if (!page.next) break;
+        so.after = page.next;
+    }
+    std::set<std::uint64_t> unique(seen.begin(), seen.end());
+    bool stayed_once = unique.size() == seen.size() && std::is_sorted(seen.begin(), seen.end());
+    for (std::uint64_t id = 0; id < 200; id += 2)
+        if (id != 100 && id != 10) stayed_once = stayed_once && unique.count(id) == 1;
+    CHECK(stayed_once && unique.count(100) == 0 && unique.count(199) == 1 && unique.count(5) == 0);
+}
+
+
 // ===========================================================================
 // Automatic maintenance of collections (MT1-MT7)
 // ===========================================================================
