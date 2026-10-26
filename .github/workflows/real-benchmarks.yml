@@ -53,7 +53,36 @@ jobs:
           path: ~/.cache/hnsw-lite-bench
           key: ann-benchmarks-${{ env.DATASETS }}
 
+      - name: Download the datasets
+        # Before the comparison, with curl: some hosts refuse Python's default client
+        # (HTTP 403). A mirror set in the repository variable BENCHMARK_DATASET_URL, with
+        # {name} for the dataset's name, is tried first.
+        run: |
+          mkdir -p ~/.cache/hnsw-lite-bench
+          for dataset in $DATASETS; do
+            file=~/.cache/hnsw-lite-bench/$dataset.hdf5
+            [ -s "$file" ] && { echo "$dataset: cached"; continue; }
+            urls="https://ann-benchmarks.com/$dataset.hdf5 http://ann-benchmarks.com/$dataset.hdf5"
+            [ -n "$MIRROR" ] && urls="${MIRROR//\{name\}/$dataset} $urls"
+            for url in $urls; do
+              echo "$dataset: trying $url"
+              if curl -fL --retry 3 --retry-delay 10 --connect-timeout 30 -A "hnsw-lite-benchmark/1.0 (+${{ github.server_url }}/${{ github.repository }})" -o "$file.part" "$url"; then
+                mv "$file.part" "$file"
+                break
+              fi
+              rm -f "$file.part"
+            done
+            if [ ! -s "$file" ]; then
+              echo "::error::Could not download $dataset from: $urls. Set the repository variable BENCHMARK_DATASET_URL to a mirror ({name} for the dataset's name)."
+              exit 1
+            fi
+          done
+        env:
+          MIRROR: ${{ vars.BENCHMARK_DATASET_URL }}
+
       - name: Run the comparison
+        env:
+          HNSW_BENCH_DATASET_URL: ${{ vars.BENCHMARK_DATASET_URL }}
         run: |
           for dataset in $DATASETS; do
             python bench/python/compare.py --dataset "$dataset" --queries "$QUERIES" --out real-results

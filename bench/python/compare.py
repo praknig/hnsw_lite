@@ -27,6 +27,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -61,6 +62,40 @@ def exact_neighbors(train: np.ndarray, test: np.ndarray, metric: str, k: int, ma
     return out
 
 
+USER_AGENT = "hnsw-lite-benchmark/1.0 (+https://github.com/praknig/hnsw_lite)"
+
+
+def download(name: str, dest: Path, mirror: str | None) -> None:
+    """Downloads an ann-benchmarks file: from the mirror if given ("{name}" stands for the
+    dataset's name), then ann-benchmarks.com over HTTPS, then HTTP; each up to 3 times.
+    Some hosts refuse Python's default User-Agent (HTTP 403), so it names itself. The
+    file is written beside its final name and renamed when complete, so an interrupted
+    download never leaves a damaged file in the cache."""
+    urls = ([mirror.replace("{name}", name)] if mirror else []) + [f"https://ann-benchmarks.com/{name}.hdf5",
+                                                                   f"http://ann-benchmarks.com/{name}.hdf5"]
+    part = dest.with_name(dest.name + ".part")
+    errors = []
+    for url in urls:
+        for attempt in range(3):
+            try:
+                print(f"downloading {url} ...", flush=True)
+                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                with urllib.request.urlopen(request, timeout=120) as response, open(part, "wb") as out:
+                    while chunk := response.read(1 << 20):
+                        out.write(chunk)
+                part.replace(dest)
+                return
+            except (urllib.error.URLError, OSError) as e:  # HTTPError is a URLError
+                errors.append(f"{url}: {e}")
+                part.unlink(missing_ok=True)
+                if isinstance(e, urllib.error.HTTPError) and e.code in (403, 404):
+                    break  # refused or missing: retrying the same URL will not help
+                time.sleep(5 * (attempt + 1))
+    raise SystemExit(f"could not download {name}:\n  " + "\n  ".join(errors) +
+                     f"\nDownload the file yourself into {dest}, or pass --dataset-url (or set "
+                     "HNSW_BENCH_DATASET_URL) to a mirror, with {{name}} where the dataset's name goes.")
+
+
 def load_dataset(args) -> Path:
     """The dataset as an .npz in the cache: train, test, neighbors, metric, and the
     filter buckets with their exact filtered neighbors."""
@@ -86,9 +121,7 @@ def load_dataset(args) -> Path:
         import h5py
         hdf5 = cache / f"{name}.hdf5"
         if not hdf5.exists():
-            url = f"http://ann-benchmarks.com/{name}.hdf5"
-            print(f"downloading {url} ...", flush=True)
-            urllib.request.urlretrieve(url, hdf5)
+            download(name, hdf5, args.dataset_url)
         with h5py.File(hdf5, "r") as f:
             train = np.asarray(f["train"], dtype=np.float32)
             test = np.asarray(f["test"], dtype=np.float32)[: args.queries]
@@ -99,6 +132,9 @@ def load_dataset(args) -> Path:
     fq = test[: min(len(test), args.filtered_queries)]
     filtered = {}
     for pct in SELECTIVITIES:
+        if int((buckets < pct).sum()) < K:  # a small dataset: too few matches for K neighbors
+            print(f"skipping the {pct}% filter: fewer than {K} vectors match", flush=True)
+            continue
         print(f"computing exact neighbors for the {pct}% filter...", flush=True)
         filtered[f"filtered_{pct}"] = exact_neighbors(train, fq, metric, K, buckets < pct)
     np.savez(npz, train=train, test=test, neighbors=neighbors, metric=metric, buckets=buckets, **filtered)
@@ -327,6 +363,8 @@ def worker(args) -> dict:
     if args.with_filters and lib.filtered:
         lib.prepare_filters(train, threads)
         for pct in SELECTIVITIES:
+            if f"filtered_{pct}" not in data:  # skipped while preparing the data (too few matches)
+                continue
             ftruth = data[f"filtered_{pct}"]
             fq = test[: len(ftruth)]
             for beam in [b for b in lib.sweep() if b >= 16][:6]:
@@ -371,6 +409,10 @@ def report(results: list, meta: dict, out: Path) -> None:
     if filtered:
         fig, axes = plt.subplots(1, len(SELECTIVITIES), figsize=(6 * len(SELECTIVITIES), 5))
         for ax, pct in zip(axes, SELECTIVITIES):
+            if not any(p["selectivity"] == pct for res in filtered for p in res["filtered"]):
+                ax.set_title(f"{name}: filter matching {pct}%"), ax.set_axis_off()  # skipped: too few matches
+                ax.text(0.5, 0.5, "not measured:\nfewer than 10 vectors match", ha="center", va="center", transform=ax.transAxes)
+                continue
             for res in filtered:
                 pts = [p for p in res["filtered"] if p["selectivity"] == pct]
                 ax.plot([p["recall"] for p in pts], [p["qps"] for p in pts], marker="o", label=res["library"])
@@ -441,6 +483,8 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=0, help="for building and batches (0: every core)")
     ap.add_argument("--repeat", type=int, default=3, help="timed runs per point; the median is reported")
     ap.add_argument("--cache", default=os.path.expanduser("~/.cache/hnsw-lite-bench"))
+    ap.add_argument("--dataset-url", default=os.environ.get("HNSW_BENCH_DATASET_URL"),
+                    help="a mirror for the dataset files, with {name} for the dataset's name (tried first)")
     ap.add_argument("--out", default="bench-results")
     ap.add_argument("--worker", dest="library", help=argparse.SUPPRESS)
     ap.add_argument("--data", help=argparse.SUPPRESS)
