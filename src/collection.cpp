@@ -426,14 +426,50 @@ std::optional<DocumentRecord> Collection::get(std::uint64_t id) const {
     const auto lock = read_lock(mutex_, this);
     const auto it = slot_of_.find(id);
     if (it == slot_of_.end() || expired(it->second)) return std::nullopt;
+    return record_unlocked(it->second, true, true, true);
+}
+
+DocumentRecord Collection::record_unlocked(NodeId slot, bool vectors, bool text, bool metadata) const {
     DocumentRecord r;
-    r.id = id;
-    if (dense_) r.vector = dense_->get_vector(id);
-    if (sparse_) r.sparse = sparse_->get_vector(id);
-    r.text = texts_[it->second];
-    r.metadata = metadata_.read(it->second);
-    fill_reserved(r.metadata, r.key, &r.expires_at);
+    r.id = id_of_[slot];
+    if (vectors && dense_) r.vector = dense_->get_vector(r.id);
+    if (vectors && sparse_) r.sparse = sparse_->get_vector(r.id);
+    if (text) r.text = texts_[slot];
+    r.metadata = metadata_.read(slot);
+    fill_reserved(r.metadata, r.key, &r.expires_at);  // the key and expiry time come back either way
+    if (!metadata) r.metadata = Metadata();
     return r;
+}
+
+CollectionPage Collection::scan(const CollectionScanOptions& options) const {
+    const auto lock = read_lock(mutex_, this);
+    if (options.limit == 0) throw std::invalid_argument("scan: limit must be at least 1");
+    const std::optional<Filter> alive = alive_filter();  // expiry: expired documents are never listed
+    std::optional<Filter> filter = options.filter;
+    if (alive) filter = filter ? *filter && *alive : *alive;
+    // Every candidate after the cursor; then the `limit` smallest IDs, in order.
+    std::vector<std::pair<std::uint64_t, NodeId>> candidates;
+    auto consider = [&](NodeId n) {
+        if (!options.after || id_of_[n] > *options.after) candidates.emplace_back(id_of_[n], n);
+    };
+    if (filter) {
+        for (const NodeId n : matching(*filter)) consider(n);  // throws for an unknown field under a strict schema
+    } else {
+        for (NodeId n = 0; n < id_of_.size(); ++n)
+            if (live_[n]) consider(n);
+    }
+    const bool more = candidates.size() > options.limit;
+    if (more) {
+        std::nth_element(candidates.begin(), candidates.begin() + std::ptrdiff_t(options.limit), candidates.end());
+        candidates.resize(options.limit);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    CollectionPage page;
+    page.documents.reserve(candidates.size());
+    for (const auto& [id, n] : candidates)
+        page.documents.push_back(record_unlocked(n, options.with_vectors, options.with_text, options.with_metadata));
+    if (more) page.next = page.documents.back().id;
+    return page;
 }
 
 std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o) const {

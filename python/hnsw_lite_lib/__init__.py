@@ -14,7 +14,7 @@ pandas is optional: upsert_dataframe() and search(..., as_dataframe=True) use it
 from __future__ import annotations
 
 import math
-from typing import Any, Iterable, Mapping, Optional, Sequence, Union
+from typing import Iterator, Any, Iterable, Mapping, Optional, Sequence, Union
 
 import numpy as np
 
@@ -450,6 +450,55 @@ class Collection:
 
     def remove_where(self, filter) -> int:
         return self._core.remove_where(as_filter(filter))
+
+    # -- reading everything
+    def scan(self, *, filter=None, limit: int = 100, after: Optional[int] = None, with_vectors: bool = True,
+             with_text: bool = True, with_metadata: bool = True) -> tuple:
+        """One page of documents in ascending ID order: (documents, next). Each document is
+        a dict as from get(). Pass next as after for the following page; it is None on the
+        last one. Expired documents are left out; changes between pages never repeat or
+        skip a document that stays stored."""
+        return self._core.scan(as_filter(filter), limit, after, with_vectors, with_text, with_metadata)
+
+    def documents(self, *, filter=None, batch: int = 1000, with_vectors: bool = True, with_text: bool = True,
+                  with_metadata: bool = True) -> Iterator[dict]:
+        """Every document (or those matching filter), in ascending ID order, read batch
+        documents at a time: a page per call to the collection, so memory stays bounded."""
+        after = None
+        while True:
+            docs, after = self.scan(filter=filter, limit=batch, after=after, with_vectors=with_vectors,
+                                    with_text=with_text, with_metadata=with_metadata)
+            yield from docs
+            if after is None:
+                return
+
+    def to_pandas(self, *, filter=None, with_vectors: bool = True, with_text: bool = True, with_metadata: bool = True,
+                  batch: int = 10000):
+        """The documents as a DataFrame, in the shape upsert_dataframe() reads: an "id"
+        column, "key" and "expires_at" when the collection uses them, "vector" (one array
+        per cell) and "sparse" (a dict per cell) for the sides the collection has, "text",
+        as asked, then one column per metadata field
+        (missing values as NaN or None). Read batch documents per call to the collection."""
+        try:
+            import pandas as pd
+        except ImportError as e:  # pragma: no cover - depends on the environment
+            raise ImportError("to_pandas() needs pandas: pip install pandas") from e
+        docs = list(self.documents(filter=filter, batch=batch, with_vectors=with_vectors, with_text=with_text,
+                                   with_metadata=with_metadata))
+        columns = ["id"] + [c for c in ("key", "expires_at") if any(c in d for d in docs)]
+        if with_vectors:  # a column per side the collection has
+            options = self._core.options
+            columns += (["vector"] if options.dim else []) + (["sparse"] if options.sparse else [])
+        if with_text:
+            columns.append("text")
+        df = pd.DataFrame([{c: d.get(c) for c in columns} for d in docs], columns=columns)
+        if "expires_at" in df.columns:
+            df["expires_at"] = df["expires_at"].astype("Int64")  # ms since 1970 UTC; missing for documents without one
+        if with_metadata:
+            meta = pd.DataFrame([d["metadata"] for d in docs], index=df.index)
+            meta.columns = [c if c not in df.columns else f"metadata_{c}" for c in meta.columns]
+            df = pd.concat([df, meta], axis=1)
+        return df
 
     def count_where(self, filter) -> int:
         return self._core.count_where(as_filter(filter))

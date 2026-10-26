@@ -593,3 +593,40 @@ def test_half_precision_vectors(tmp_path):
     with pytest.raises(ValueError, match="65504"):
         f16.add(1, big)
     assert len(f16) == 0
+
+
+# ---------------------------------------------------------------- scan and export
+
+def test_scan_documents_and_dataframe_round_trip():
+    pd = pytest.importorskip("pandas")
+    data = rng.random((50, 8)).astype(np.float32)
+    col = hl.Collection(dim=8, metric="l2", maintenance="manual", schema={"year": int, "lang": "keyword"})
+    for i in range(50):
+        col.upsert(i * 2, vector=data[i], text=f"doc {i}", metadata={"year": 2000 + i % 3, "lang": "en" if i % 2 else "fr"})
+    col.remove(10)
+    ids = [i * 2 for i in range(50) if i * 2 != 10]
+    docs, nxt = col.scan(limit=7)
+    assert [d["id"] for d in docs] == ids[:7] and nxt == ids[6]
+    assert [d["id"] for d in col.documents(batch=6)] == ids
+    assert [d["id"] for d in col.documents(filter={"lang": "fr"})] == [i * 2 for i in range(0, 50, 2) if i * 2 != 10]
+    assert col.documents(with_vectors=False).__next__()["vector"] is None
+    df = col.to_pandas()
+    assert list(df["id"]) == ids and {"vector", "text", "year", "lang"} <= set(df.columns)
+    assert np.allclose(df.loc[df["id"] == 4, "vector"].iloc[0], data[2])
+    again = hl.Collection(dim=8, metric="l2", maintenance="manual", schema={"year": int, "lang": "keyword"})
+    again.upsert_dataframe(df, id_column="id", vector_column="vector", text_column="text", metadata_columns=["year", "lang"])
+    for d in col.documents():
+        e = again.get(d["id"])
+        assert e is not None and np.array_equal(e["vector"], d["vector"]) and e["text"] == d["text"] and e["metadata"] == d["metadata"]
+    assert len(again) == len(col)
+    assert "sparse" not in df.columns and "key" not in df.columns  # no sparse side, no string keys
+    keyed = hl.Collection(dim=4, metric="l2", maintenance="manual", sparse=True, string_ids=True)
+    keyed.upsert("alpha", vector=np.ones(4, dtype=np.float32), sparse={3: 1.0, 9: 0.5})
+    keyed.upsert("beta", vector=np.zeros(4, dtype=np.float32), text="b")
+    kf = keyed.to_pandas()
+    assert {"id", "key", "vector", "sparse", "text"} <= set(kf.columns)
+    assert sorted(kf["key"]) == ["alpha", "beta"]
+    row = kf[kf["key"] == "alpha"].iloc[0]
+    assert row["sparse"] == {3: 1.0, 9: 0.5} and row["id"] == hl.Collection.id_of("alpha")
+    lean = keyed.to_pandas(with_vectors=False, with_text=False, with_metadata=False)
+    assert list(lean.columns) == ["id", "key"]

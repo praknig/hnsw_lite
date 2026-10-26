@@ -365,6 +365,7 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `Document` | `vector`, `text`, `sparse`, `metadata`, each optional |
 | `CollectionSearchOptions` | `filter`, `predicate`, `fusion`, `rrf_k`, `vector_weight`, `text_weight`, `sparse_weight`, `candidates` (0: max(4k, 20)), `ef`, `with_metadata`, `with_text`, `deadline`, `cancel`, `stopped_early` |
 | `CollectionHit` | `id`, `score`, `vector_rank`, `text_rank`, `sparse_rank`, `vector_distance`, `text_score`, `sparse_score`, `metadata`, `text` |
+| `Collection::scan(options)` → `CollectionPage { documents, next }` | Every document, a page at a time in ascending ID order, optionally filtered; `CollectionScanOptions { filter, limit, after, with_vectors, with_text, with_metadata }` |
 
 ### Maintenance of collections
 

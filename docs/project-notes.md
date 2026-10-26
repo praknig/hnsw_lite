@@ -78,7 +78,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
 - [x] Half-precision vectors (float16, bfloat16), a compact ID map, and collection settings (expiry, string keys) saved with the collection
 - [ ] Benchmark results on SIFT1M and GloVe, published
-- [ ] Collections: scanning every document, and exporting to a DataFrame
+- [x] Collections: scanning every document, and exporting to a DataFrame (`scan()`, `documents()`, `to_pandas()`)
 - [ ] Faceted search: counts by field over the top hits and the whole corpus (then filtered counts, numeric ranges)
 - [ ] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
 - [ ] A first release on PyPI (v0.1.0), with a changelog
