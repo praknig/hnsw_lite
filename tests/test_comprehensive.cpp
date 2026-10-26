@@ -11072,7 +11072,7 @@ TEST(codec, q0_22_rabitq_edges) {
     };
     const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
     CHECK(v.valid_code(with(1, 0.8f).data()) && v.valid_code(with(0, 0).data()) && v.valid_code(with(0, 1).data()) && v.valid_code(with(3e38f, 1).data()));
-    for (const auto& [length, alignment] : std::vector<std::pair<float, float>>{{nan, 0.5f}, {inf, 0.5f}, {-1, 0.5f}, {1, nan}, {1, inf}, {1, -0.1f}, {1, 1.5f}})
+    for (const auto& [length, alignment] : std::vector<std::pair<float, float>>{{nan, 0.5f}, {inf, 0.5f}, {-1.0f, 0.5f}, {1.0f, nan}, {1.0f, inf}, {1.0f, -0.1f}, {1.0f, 1.5f}})
         CHECK(!v.valid_code(with(length, alignment).data()));
     // An alignment of 0 (never written by encode, but possible in a zeroed slot): a finite distance.
     v.prepare(std::vector<float>(8, 1.0f), table);
