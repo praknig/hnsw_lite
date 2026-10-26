@@ -1,0 +1,96 @@
+# Real-dataset comparison: hnsw-lite against hnswlib, FAISS (HNSW and IVF-PQ) and
+# USearch on standard ann-benchmarks datasets (SIFT1M and GloVe by default), whose
+# files include the exact neighbors of every query. bench/python/compare.py measures
+# recall@10 against queries per second, build time, memory and filtered search;
+# bench/python/publish_comparison.py publishes the results to the benchmarks branch
+# (real-datasets/), next to the nightly benchmark. The datasets are cached between runs.
+#
+# On demand (Actions -> Real-dataset benchmark -> Run workflow), and monthly so the
+# numbers follow the code. For a quieter, faster machine, set the repository variable
+# BENCHMARK_RUNNER to a larger runner's label, as for the nightly benchmark.
+name: Real-dataset benchmark
+
+on:
+  schedule:
+    - cron: "0 4 1 * *"  # 04:00 UTC on the 1st of each month
+  workflow_dispatch:
+    inputs:
+      datasets:
+        description: "ann-benchmarks datasets, separated by spaces"
+        default: "sift-128-euclidean glove-100-angular"
+      queries:
+        description: "Queries per dataset (the files have 10,000)"
+        default: "10000"
+
+permissions:
+  contents: write  # to push the benchmarks branch
+
+concurrency:
+  group: benchmark  # shared with the nightly benchmark: never two pushes to the branch at once
+  cancel-in-progress: false
+
+jobs:
+  compare:
+    name: Real-dataset benchmark
+    runs-on: ${{ vars.BENCHMARK_RUNNER || 'ubuntu-24.04' }}
+    timeout-minutes: 345
+    env:
+      DATASETS: ${{ inputs.datasets || 'sift-128-euclidean glove-100-angular' }}
+      QUERIES: ${{ inputs.queries || '10000' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build and install the package, and the libraries compared
+        run: python -m pip install . hnswlib faiss-cpu usearch h5py matplotlib psutil numpy
+
+      - name: Cache the datasets
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/hnsw-lite-bench
+          key: ann-benchmarks-${{ env.DATASETS }}
+
+      - name: Run the comparison
+        run: |
+          for dataset in $DATASETS; do
+            python bench/python/compare.py --dataset "$dataset" --queries "$QUERIES" --out real-results
+          done
+
+      - name: Check out the benchmarks branch
+        run: |
+          if git ls-remote --exit-code --heads origin benchmarks > /dev/null; then
+            git fetch --depth 1 origin benchmarks
+            git worktree add site FETCH_HEAD
+          else
+            # The first publication: a branch of its own, with no code history.
+            git worktree add --detach site
+            git -C site checkout --orphan benchmarks
+            git -C site rm -rf --quiet .
+          fi
+
+      - name: Publish the results and charts
+        run: >
+          python bench/python/publish_comparison.py --results real-results --site site
+          --commit "${{ github.sha }}"
+          --commit-url "${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }}"
+          --run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          --repo-url "${{ github.server_url }}/${{ github.repository }}"
+
+      - name: Commit to the benchmarks branch
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit --quiet -m "Real-dataset benchmark $(date -u +%Y-%m-%d) for ${GITHUB_SHA::7}"
+          git push origin HEAD:benchmarks
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: real-dataset-results
+          path: real-results/
+          if-no-files-found: ignore
