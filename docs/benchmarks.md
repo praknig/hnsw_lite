@@ -98,6 +98,16 @@ On the branch: `README.md` (the latest run, the charts, a table of the last 30 r
 
 **Locally:** `python bench/python/publish_benchmark.py --results stress-results --site <a directory>` draws the same charts and page from a `stress.py` run.
 
+## Real-dataset benchmark
+
+`.github/workflows/real-benchmarks.yml` runs `compare.py` on **SIFT1M** (`sift-128-euclidean`: 1,000,000 image descriptors, 128 dimensions, L2) and **GloVe** (`glove-100-angular`: 1,183,514 word vectors, 100 dimensions, cosine), with all 10,000 queries of each file, against hnswlib, FAISS (HNSW and IVF-PQ) and USearch. It runs on demand (*Actions > Real-dataset benchmark > Run workflow*, with the datasets and the number of queries as inputs) and on the 1st of each month, so the numbers follow the code. The datasets are downloaded once from ann-benchmarks and cached between runs.
+
+`bench/python/publish_comparison.py` publishes each run to the same **`benchmarks` branch** as the nightly benchmark, under `real-datasets/`: the [latest results](https://github.com/praknig/hnsw_lite/blob/benchmarks/real-datasets/README.md) (each dataset's summary table, charts and raw JSON, with the commit and the workflow run that produced them) and every earlier run in `real-datasets/history/`. A dataset rerun on its own keeps the others' latest results. The two workflows share a concurrency group, so they never push to the branch at the same time. Like the nightly benchmark, it uses `BENCHMARK_RUNNER` when set.
+
+**What the published numbers show:** a fair comparison on one machine class (each summary names the CPU, the core count and every library's version), on data with real structure. **What they don't:** your hardware, your data or your filters. A shared cloud runner also adds some noise, so treat differences of a few percent as level, and rerun on your own machine (`python bench/python/compare.py --dataset sift-128-euclidean`) before deciding on numbers alone.
+
+**Locally:** `python bench/python/publish_comparison.py --results <compare.py's --out> --site <a directory> --commit <sha>` builds the same pages from your own runs.
+
 ## Publishing results
 
 State the machine (CPU, cores, memory), the operating system, the library versions (the summary lists them), the dataset and every setting, and publish the JSON with the charts, so anyone can reproduce or reanalyze them. The standard public comparison is [ann-benchmarks](https://github.com/erikbern/ann-benchmarks): an adapter for hnsw-lite there is a natural next step.

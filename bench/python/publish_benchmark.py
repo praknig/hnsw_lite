@@ -145,7 +145,7 @@ def history_chart(runs: list[dict], site: Path) -> None:
     save(fig, site / "history.png")
 
 
-def page(runs: list[dict], charts: list[str]) -> str:
+def page(runs: list[dict], charts: list[str], real_datasets: bool = False) -> str:
     r = runs[-1]
     a, m = r["settings"], r["machine"]
     checks = r["checks"]
@@ -153,6 +153,8 @@ def page(runs: list[dict], charts: list[str]) -> str:
     lines = ["# hnsw-lite benchmarks", "",
              "Published by the nightly workflow (`.github/workflows/benchmark.yml`) from `bench/python/stress.py`. "
              "Every run is kept in `runs/`; this page shows the newest and the trends.", "",
+             *(["Comparisons on real datasets (SIFT1M, GloVe) against hnswlib, FAISS and USearch: "
+                "[real-datasets](real-datasets/README.md).", ""] if real_datasets else []),
              f"## Latest: {r['published_at'][:16].replace('T', ' ')} UTC, commit "
              + (f"[`{r['commit'][:7]}`]({r['commit_url']})" if r.get("commit_url") else f"`{r['commit'][:7]}`"), "",
              f"**{a['vectors']:,} vectors of {a['dim']} dimensions**, M {a['M']}, ef_construction {a['ef_construction']}; "
@@ -196,7 +198,7 @@ def main():
     runs.sort(key=lambda r: r["published_at"])
     charts = latest_charts(run, site)
     history_chart(runs, site)
-    (site / "README.md").write_text(page(runs, charts))
+    (site / "README.md").write_text(page(runs, charts, (site / "real-datasets" / "README.md").exists()))
     print(f"published {name}: {len(runs)} runs in the history; charts: {', '.join(charts + ['history.png'])}")
 
 
