@@ -111,6 +111,12 @@ extern "C" int LLVMFuzzerTestOneInput(const unsigned char* data, unsigned long s
             } catch (const FormatError&) {
             } catch (const std::invalid_argument&) {
             }
+            SparseIndex sparse;  // the sparse index's own records (and every other kind, refused cleanly)
+            try {
+                (void)sparse.replay(scan.records);
+            } catch (const FormatError&) {
+            } catch (const std::invalid_argument&) {
+            }
         } catch (...) {
             std::filesystem::remove(path);
             throw;

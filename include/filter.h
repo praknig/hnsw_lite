@@ -186,6 +186,13 @@ public:
     /// payload index or presence counts; otherwise nothing.
     std::optional<std::size_t> exact_count() const;
 
+    /// Rows that include every match, in ascending order, read from posting lists
+    /// (indexed fields): for equality, `in` and tag conditions on indexed fields, their
+    /// intersection under `and`, and their union under `or` when every branch has one.
+    /// Nothing when the filter has no such part. Callers still check each row with
+    /// matches() (and liveness): an `and` with unindexed parts returns a superset.
+    std::optional<std::vector<NodeId>> candidates() const { return candidates_of(root_); }
+
     /// True if the filter can never match (decided while compiling).
     bool always_false() const { return nodes_[static_cast<std::size_t>(root_)].kind == K::False; }
 
@@ -212,6 +219,7 @@ private:
         return static_cast<int>(nodes_.size()) - 1;
     }
     bool eval(int n, NodeId slot) const;
+    std::optional<std::vector<NodeId>> candidates_of(int n) const;
 
     const MetadataStore* store_;
     std::vector<CNode> nodes_;

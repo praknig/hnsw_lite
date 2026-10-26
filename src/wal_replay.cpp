@@ -5,6 +5,7 @@
 #include <unordered_set>
 
 #include "flat_index.h"
+#include "sparse.h"
 #include "hnsw_index.h"
 #include "serialize.h"
 #include "wal_ops.h"
@@ -13,10 +14,12 @@ namespace vecdb {
 
 namespace {
 
-/// Replays records onto an index: the operations both index types have, plus
-/// `own(op)` for the others (false: a type this index cannot replay).
-template <class Index, class Own>
-bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own) {
+/// Replays records: skips aborted operations, and calls apply(op) for the others,
+/// which succeeded when they were made, so they must again. Only the final operation
+/// may fail (a stop can have left it unfinished): then it is dropped and this returns
+/// true. Any other failure means the log does not match: FormatError.
+template <class Apply>
+bool replay_loop(std::span<const WalRecord> records, Apply&& apply) {
     std::unordered_set<std::uint64_t> aborted;
     for (const WalRecord& r : records)
         if (r.type == walop::kAbort) aborted.insert(walop::decode(r.type, r.payload).lsn);
@@ -29,6 +32,27 @@ bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own)
         const walop::Op op = walop::decode(r.type, r.payload);
         // Logged and not aborted: it succeeded when it was made, so it must again.
         try {
+            apply(op);
+        } catch (const FormatError&) {  // GCOVR_EXCL_START: no index operation throws FormatError
+            throw;
+        }  // GCOVR_EXCL_STOP
+        catch (const std::exception& e) {
+            // The final operation may have been in progress when the process stopped:
+            // logged, failed, and stopped before its abort record. Anywhere else, the
+            // log does not match the index.
+            if (r.lsn == final_lsn) return true;
+            throw FormatError("replaying log record " + std::to_string(r.lsn) + " failed: " + e.what() +
+                              " (the log does not match the index it is replayed onto)");
+        }
+    }
+    return false;
+}
+
+/// Replays records onto an index: the operations both index types have, plus
+/// `own(op)` for the others (false: a type this index cannot replay).
+template <class Index, class Own>
+bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own) {
+    return replay_loop(records, [&](const walop::Op& op) {
             switch (op.type) {
                 case walop::kAdd: index.add(op.ids.at(0), op.vectors, op.metadata.at(0)); break;
                 case walop::kAddBatch:
@@ -51,19 +75,7 @@ bool replay_records(Index& index, std::span<const WalRecord> records, Own&& own)
                 default:
                     if (!own(op)) throw FormatError("log record of a type this index cannot replay");
             }
-        } catch (const FormatError&) {  // GCOVR_EXCL_START: no index operation throws FormatError
-            throw;
-        }  // GCOVR_EXCL_STOP
-        catch (const std::exception& e) {
-            // The final operation may have been in progress when the process stopped:
-            // logged, failed, and stopped before its abort record. Anywhere else, the
-            // log does not match the index.
-            if (r.lsn == final_lsn) return true;
-            throw FormatError("replaying log record " + std::to_string(r.lsn) + " failed: " + e.what() +
-                              " (the log does not match the index it is replayed onto)");
-        }
-    }
-    return false;
+    });
 }
 
 }  // namespace
@@ -122,6 +134,32 @@ bool FlatIndex::replay(std::span<const WalRecord> records) {
         if (op.type != walop::kTrainLists) return false;
         train_lists();
         return true;
+    });
+}
+
+// ---------------------------------------------------------------- SparseIndex
+
+bool SparseIndex::replay(std::span<const WalRecord> records) {
+    {
+        const auto guard = lock_.read();
+        if (log_.attached()) throw std::logic_error("replay: detach the log first (replayed changes must not be logged again)");
+    }
+    return replay_loop(records, [&](const walop::Op& op) {
+        switch (op.type) {
+            case walop::kSparseWrite: {
+                const std::uint64_t id = op.ids.at(0);
+                const Metadata* md = op.metadata.empty() ? nullptr : &op.metadata[0];
+                if (op.mode == walop::kSparseAdd) add(id, op.sparse, md ? *md : Metadata());
+                else if (op.mode == walop::kSparseUpdate) (void)(md ? update(id, op.sparse, *md) : update(id, op.sparse));
+                else (void)(md ? upsert(id, op.sparse, *md) : upsert(id, op.sparse));
+                break;
+            }
+            case walop::kRemove: (void)remove(op.ids.at(0)); break;
+            case walop::kRemoveBatch: (void)remove_batch(op.ids); break;
+            case walop::kSetMetadata: (void)set_metadata(op.ids.at(0), op.metadata.at(0)); break;
+            case walop::kCompact: compact(); break;
+            default: throw FormatError("log record of a type a sparse index cannot replay");
+        }
     });
 }
 

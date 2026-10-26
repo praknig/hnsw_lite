@@ -630,3 +630,47 @@ def test_scan_documents_and_dataframe_round_trip():
     assert row["sparse"] == {3: 1.0, 9: 0.5} and row["id"] == hl.Collection.id_of("alpha")
     lean = keyed.to_pandas(with_vectors=False, with_text=False, with_metadata=False)
     assert list(lean.columns) == ["id", "key"]
+
+
+# ---------------------------------------------------------------- facets, payload indexes, identify
+
+def test_facets_on_indexes_and_collections(tmp_path):
+    data = rng.random((60, 8)).astype(np.float32)
+    langs = ["en", "en", "fr", "de"]
+    idx = hl.HnswIndex(8, hl.Metric.L2)
+    col = hl.Collection(dim=8, metric="l2", maintenance="manual")
+    for i in range(60):
+        md = {"lang": langs[i % 4], "price": float(i), "tags": ["a"] if i % 2 else ["a", "b"]}
+        idx.add(i, data[i], md)
+        col.upsert(i, vector=data[i], metadata=md)
+    for x in (idx, col):
+        r = x.facets(["lang", {"field": "price", "ranges": [10, 50], "distinct": True}, {"field": "tags", "limit": 1}])
+        assert r["lang"]["values"] == [("en", 30), ("de", 15), ("fr", 15)] and r["lang"]["total"] == 60
+        assert [b["count"] for b in r["price"]["buckets"]] == [10, 40, 10] and r["price"]["distinct"] == 60
+        assert r["price"]["buckets"][0]["from"] is None and r["price"]["buckets"][2]["to"] is None
+        assert r["tags"]["values"] == [("a", 60)] and r["tags"]["other"] == 30
+        assert x.facets(["lang"], filter={"lang": "fr"})["lang"]["values"] == [("fr", 15)]
+        assert x.facets(["lang"], ids=[0, 1, 2, 2, 999])["lang"]["total"] == 3
+        with pytest.raises(ValueError):
+            x.facets(["lang"], filter={"lang": "fr"}, ids=[1])
+        with pytest.raises(ValueError):
+            x.facets([{"field": "lang", "bogus": 1}])
+        with pytest.raises(TypeError):
+            x.facets("lang")
+        with pytest.raises(ValueError, match="twice"):
+            x.facets(["lang", {"field": "lang", "limit": 2}])
+        assert x.facets([]) == {}
+    idx.create_payload_index("lang")
+    col.create_payload_index("lang")
+    assert idx.payload_indexes() == ["lang"] and col.payload_indexes() == ["lang"]
+    assert idx.facets(["lang"]) == hl.HnswIndex.facets(idx, ["lang"])
+    assert col.schema() == {"lang": "keyword", "price": "float", "tags": "tags"} == idx.schema()
+    path = str(tmp_path / "i.idx")
+    idx.save(path)
+    info = hl.identify(path)
+    assert info["kind"] == "hnsw" and not info["durable"] and info["bytes"] > 0
+    durable = hl.Collection(dim=8, metric="l2", maintenance="manual", path=str(tmp_path / "c.db"))
+    durable.upsert(1, vector=data[0])
+    durable.close()
+    d = hl.identify(str(tmp_path / "c.db"))
+    assert d["kind"] == "collection" and d["durable"] and d["snapshots"] and d["segments"]

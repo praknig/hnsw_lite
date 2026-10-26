@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "distance.h"
+#include "facets.h"
 #include "filter.h"
 #include "health.h"
 #include "wal_ops.h"
@@ -311,6 +312,25 @@ public:
     /// How many vectors match `filter`: a preview of remove_where or
     /// set_metadata_where. Same filter rules as those.
     std::size_t count_where(const Filter& filter) const;
+    /// The metadata schema in force: its mode, and every field with its type (for a
+    /// dynamic schema, the fields seen so far).
+    Schema schema() const {
+        const auto guard = lock_.read();
+        return metadata_.current_schema();
+    }
+    /// The metadata fields with a payload index (create_payload_index).
+    std::vector<std::string> payload_indexes() const {
+        const auto guard = lock_.read();
+        return metadata_.indexed_fields();
+    }
+    /// Faceted counts (see facets.h): for each request, how many vectors hold each value
+    /// of a metadata field, over every vector or those matching `filter`. Throws
+    /// std::invalid_argument for an invalid request, or an unknown field under a strict
+    /// schema, before counting anything.
+    std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const;
+    /// Faceted counts over the vectors with these IDs, such as a search's top hits. IDs
+    /// not stored are skipped; a repeated ID is counted once.
+    std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const;
 
     /// Deletes `id` for real: repairs the graph around it (if enabled), frees
     /// the ID for reuse and puts its slot on the free list. Returns false if the

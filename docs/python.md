@@ -91,6 +91,8 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `scan(*, filter=None, limit=100, after=None, with_vectors=True, with_text=True, with_metadata=True)` → `(list, next)` | One page of documents (dicts as from `get`), in ascending ID order; pass `next` as `after` for the following page, `None` on the last one. Changes between pages never repeat or skip a document that stays stored; expired documents are left out. |
 | `documents(*, filter=None, batch=1000, ...)` → iterator | Every document (or those matching `filter`), in ascending ID order, read `batch` at a time so memory stays bounded. Same `with_*` switches as `scan`. |
 | `to_pandas(*, filter=None, with_vectors=True, with_text=True, with_metadata=True, batch=10000)` → `DataFrame` | The documents as a DataFrame in the shape `upsert_dataframe` reads (see [pandas](#pandas)). |
+| `facets(fields, *, filter=None, ids=None)` → `dict` | How many documents hold each value of metadata fields, over everything, those matching `filter`, or those with these `ids` (such as search hits). Each field is a name, or `{"field", "limit": 10, "ranges": [boundaries], "distinct": bool}`. Returns `{field: {"total", "missing", "values": [(value, count)], "other", "buckets": [{"from", "to", "count"}], "distinct"}}`. Expired documents never count. `HnswIndex` and `FlatIndex` have it too. |
+| `create_payload_index(field)`, `payload_indexes()`, `schema()` | Exact counts and posting lists for a keyword, bool or tag field (fast facets and selective filters; logged when durable); the indexed fields; the fields and their types (`{name: "int" | "float" | "bool" | "keyword" | "tags"}`). |
 | `search(vector=None, text=None, sparse=None, *, k=10, filter=None, ...)` | Below. |
 | `checkpoint()` → `int` | Durable collections: a snapshot. |
 | `maintain(budget_ms=0)` → `dict` | Runs the maintenance that is due; returns what it did (`upkept`, `rebuilt`, `checkpointed`, `notes`, ...). |
@@ -186,6 +188,8 @@ copy.upsert_dataframe(df, id_column="id", vector_column="vector", text_column="t
 
 It reads the collection `batch` documents per call (10,000 by default), then builds the DataFrame; for a collection too large to hold twice, iterate with `docs.documents()` instead.
 
+**What a file holds.** `hl.identify(path)` reads only headers: `{"kind": "hnsw" | "flat" | "sparse" | "collection" | "disk", "durable", "version", "bytes"}`, plus `"identity"`, `"snapshots"` and `"segments"` for a durable directory. The `hnsw-lite` program does more (see the [user guide](user-guide.md)).
+
 ## HnswIndex and FlatIndex
 
 For plain vector indexes with metadata, in the style of hnswlib and FAISS:
@@ -207,7 +211,7 @@ I, D = index.search_batch(queries, k=10, ef=64)                # shape (len(quer
 | `search_by_id(id, k=10, ef=64, filter=None)` | Like `search`, with the stored vector; the record itself is left out; `None` if not stored. |
 | `upsert`, `update`, `remove`, `remove_where`, `count_where`, `set_metadata`, `set_metadata_where`, `get_vector`, `get_metadata` | As for collections. |
 | `reorder()` (HnswIndex) | Opt-in: renumbers the graph so neighbors are stored together; same results, about 24% faster searches on clustered data. Call it after building or bulk loading (it blocks while it runs). |
-| `create_payload_index(field)`, `train_codec()`, `health(recall_sample=100)`, `upkeep()`, `compact()`, `rebuild()`, `train_lists()` (flat) | See the [developer reference](developer-reference.md#4-hnswindex-the-graph-index). `health()` returns a dict. |
+| `create_payload_index(field)`, `facets(...)`, `schema()`, `payload_indexes()`, `train_codec()`, `health(recall_sample=100)`, `upkeep()`, `compact()`, `rebuild()`, `train_lists()` (flat) | See the [developer reference](developer-reference.md#4-hnswindex-the-graph-index). `health()` returns a dict. |
 | `save(path)`, `HnswIndex.load(path)`, `HnswIndex.open_durable(dir, dim, metric, options=DurableOptions())`, `checkpoint()` | Files and durability. |
 | `len(index)`, `id in index`, `index.dim`, `index.metric` | |
 
@@ -297,4 +301,4 @@ The `Wheels` workflow (`.github/workflows/wheels.yml`) builds and tests every wh
 
 3. The workflow builds the 25 wheels and the source distribution, tests each wheel in a clean environment, checks that the tag matches `__version__` (refusing to publish otherwise), checks the files with `twine`, and uploads them.
 
-PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.s
+PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.

@@ -39,6 +39,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "facets.h"
 #include "change_log.h"
 #include "durable.h"
 #include "hnsw_index.h"
@@ -252,6 +253,24 @@ public:
     bool contains(std::uint64_t id) const;
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
+    /// Faceted counts (see facets.h): for each request, how many documents hold each value
+    /// of a metadata field, over every document or those matching `filter`; expired
+    /// documents are never counted. Throws std::invalid_argument for an invalid request,
+    /// or an unknown field under a strict schema, before counting anything.
+    /// Keeps exact value counts for a keyword, boolean or tag-set metadata field: facets
+    /// over every document then read the counts instead of the documents, and the query
+    /// planner counts matches exactly. Logged for durable collections, kept by save().
+    /// Throws std::invalid_argument for an unknown field, or an integer or float one.
+    void create_payload_index(std::string_view field);
+    /// The metadata schema in force: its mode, and every field with its type (for a
+    /// dynamic schema, the fields seen so far). Also in options().schema.
+    Schema schema() const;
+    /// The metadata fields with a payload index.
+    std::vector<std::string> payload_indexes() const;
+    std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const;
+    /// Faceted counts over the documents with these IDs, such as a search's top hits. IDs
+    /// not stored (or expired) are skipped; a repeated ID is counted once.
+    std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
     /// Lists documents a page at a time, in ascending ID order, optionally only those
     /// matching a filter; expired documents are left out, as everywhere. Pass the page's

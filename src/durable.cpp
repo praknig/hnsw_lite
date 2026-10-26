@@ -20,6 +20,8 @@
 #include <random>
 
 #include "collection.h"
+#include "inspect.h"
+#include "sparse.h"
 #include "flat_index.h"
 #include "hnsw_index.h"
 #include "serialize.h"
@@ -31,7 +33,7 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr char kMetaMagic[8] = {'H', 'N', 'S', 'W', 'D', 'U', 'R', '1'};
-enum Kind : std::uint32_t { kHnsw = 1, kFlat = 2, kCollection = 3 };
+enum Kind : std::uint32_t { kHnsw = 1, kFlat = 2, kCollection = 3, kSparse = 4 };
 
 std::string join(const std::string& dir, const std::string& name) { return (fs::path(dir) / name).string(); }
 
@@ -279,6 +281,31 @@ std::uint64_t FlatIndex::checkpoint() {
     return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out, {}); });
 }
 
+// ---------------------------------------------------------------- SparseIndex
+
+std::unique_ptr<SparseIndex> SparseIndex::open_durable(const std::string& dir, Schema schema, const DurableOptions& options,
+                                                       RecoveryStats* stats) {
+    Opened<SparseIndex> o = open_dir<SparseIndex>(
+        dir, kSparse, [&] { return std::make_unique<SparseIndex>(std::move(schema)); },
+        [](const std::string& path) { return SparseIndex::load(path); }, options, stats);
+    {
+        const auto guard = o.index->lock_.write("open_durable");
+        o.index->log_.set_sync_each(options.durability == Durability::Synced);
+        o.index->log_.attach(std::move(*o.log));
+    }
+    o.index->durable_ = std::move(o.state);
+    o.index->durable_->start([raw = o.index.get()] { raw->log_.flush(); });
+    if (o.dropped) (void)o.index->checkpoint();  // never replay the dropped record again
+    return std::move(o.index);
+}
+
+std::uint64_t SparseIndex::checkpoint() {
+    if (!durable_) throw std::logic_error("checkpoint: not a durable index (open it with open_durable)");
+    const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
+    const auto guard = lock_.read();
+    return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out); });
+}
+
 // ---------------------------------------------------------------- Collection
 
 std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionOptions options, RecoveryStats* stats) {
@@ -328,6 +355,70 @@ std::uint64_t Collection::checkpoint() {
     checkpoint_lsn_ = lsn;
     checkpoint_time_ = std::chrono::steady_clock::now().time_since_epoch().count();
     return lsn;
+}
+
+// ---------------------------------------------------------------- identify (inspect.h)
+
+const char* stored_kind_name(StoredKind kind) {
+    switch (kind) {
+        case StoredKind::Flat: return "flat";
+        case StoredKind::Hnsw: return "hnsw";
+        case StoredKind::Sparse: return "sparse";
+        case StoredKind::Collection: return "collection";
+        default: return "disk";
+    }
+}
+
+namespace {
+/// A file's kind and format version, from its first 24 bytes.
+StoredInfo identify_file(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot read " + path);
+    unsigned char h[24] = {};
+    in.read(reinterpret_cast<char*>(h), sizeof h);
+    StoredInfo info;
+    info.bytes = fs::file_size(path);
+    if (in.gcount() >= 24 && std::memcmp(h, persist::kMagic, 8) == 0) {
+        info.version = persist::from_little_endian<std::uint32_t>(h + 8);
+        switch (persist::from_little_endian<std::uint32_t>(h + 16)) {
+            case 1: info.kind = StoredKind::Flat; return info;
+            case 2: info.kind = StoredKind::Hnsw; return info;
+            case 3: info.kind = StoredKind::Sparse; return info;
+            case 4: info.kind = StoredKind::Collection; return info;
+            default: throw FormatError("an hnsw-lite file of an unknown kind: " + path);
+        }
+    }
+    if (in.gcount() >= 8 && std::memcmp(h, "HNSWDISK", 8) == 0) {
+        info.kind = StoredKind::Disk;
+        return info;
+    }
+    throw FormatError("not an hnsw-lite file or durable directory: " + path);
+}
+}  // namespace
+
+StoredInfo identify(const std::string& path) {
+    if (!fs::is_directory(path)) return identify_file(path);
+    std::ifstream in(join(path, "DURABLE"), std::ios::binary);
+    unsigned char m[32];
+    if (!in.read(reinterpret_cast<char*>(m), sizeof m) || std::memcmp(m, kMetaMagic, 8) != 0 ||
+        persist::from_little_endian<std::uint32_t>(m + 28) != persist::crc32(0, m, 28))
+        throw FormatError("not an hnsw-lite durable directory (no valid DURABLE file): " + path);
+    StoredInfo info;
+    info.durable = true;
+    switch (persist::from_little_endian<std::uint32_t>(m + 8)) {
+        case kHnsw: info.kind = StoredKind::Hnsw; break;
+        case kFlat: info.kind = StoredKind::Flat; break;
+        case kCollection: info.kind = StoredKind::Collection; break;
+        case kSparse: info.kind = StoredKind::Sparse; break;
+        default: throw FormatError("a durable directory of an unknown kind: " + path);
+    }
+    info.identity = persist::from_little_endian<std::uint64_t>(m + 16);
+    info.snapshots = numbered_files(path, "snapshot-", ".idx");
+    info.segments = numbered_files(path, "wal-", ".log");
+    for (const auto& e : fs::directory_iterator(path))
+        if (e.is_regular_file()) info.bytes += e.file_size();
+    if (!info.snapshots.empty()) info.version = identify_file(join(path, snapshot_name(info.snapshots.back()))).version;
+    return info;
 }
 
 }  // namespace vecdb

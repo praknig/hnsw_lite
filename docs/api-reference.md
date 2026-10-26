@@ -207,7 +207,11 @@ Not copyable, movable. Frees its memory in the destructor.
 | `FlatIndex(dim, metric, schema)`, `HnswIndex(dim, metric, params, schema)` | The schema is optional (dynamic by default) |
 | `add(id, vector, metadata = {})` | Stores a vector with optional metadata |
 | `set_metadata(id, metadata)`, `get_metadata(id)` | Changes given fields only / reads a vector's metadata |
-| `create_payload_index(field)` | Exact value counts for a keyword, boolean or tag-set field |
+| `create_payload_index(field)` | Exact value counts and posting lists for a keyword, boolean or tag-set field (collections too) |
+| `facets(requests, filter)`, `facets_for(ids, requests)` | Faceted counts: `FacetRequest { field, limit, boundaries, distinct }` → `FacetResult { total, missing, values, other, buckets, distinct }` (indexes and collections) |
+| `schema()`, `payload_indexes()` | The metadata schema in force, and the indexed fields |
+| `SparseIndex::open_durable(dir, schema, options, stats)`, `checkpoint()` | A durable sparse index (snapshots and a write-ahead log) |
+| `identify(path)` → `StoredInfo { kind, durable, version, bytes, identity, snapshots, segments }` (`inspect.h`) | What a file or durable directory holds, from its headers |
 | `search(query, k, options)` (Flat), `search(query, k, ef, options)` (HNSW) | Filtered search |
 | `search_batch(queries, k, threads, options)` (Flat), `search_batch(queries, k, ef, threads, options)` (HNSW) | Batch search |
 | `search_range(query, radius, max_results = kNoLimit, options)` | Range search |

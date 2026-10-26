@@ -223,6 +223,9 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
 | `CollectionPage scan(const CollectionScanOptions& options = {}) const` | Lists documents **a page at a time, in ascending ID order**, optionally only those matching a filter (see *Reading every document* below). Throws `std::invalid_argument` if `limit` is 0, or for an unknown field under a strict schema. |
+| `std::vector<FacetResult> facets(requests, filter)`, `facets_for(ids, requests)` | Faceted counts, as for `HnswIndex` (see *Faceted search*); expired documents are never counted. |
+| `void create_payload_index(std::string_view field)` | Counts and posting lists for a keyword, boolean or tag field (as for `HnswIndex`); logged for durable collections. |
+| `Schema schema() const`, `std::vector<std::string> payload_indexes() const` | The schema in force (also in `options().schema`, which always reports the current one) and the indexed fields. |
 | `CollectionOptions options() const` | A copy of the collection's settings, taken under its lock, since `set_ttl` and `set_string_ids` may change them from another thread (for a recovered collection, the stored ones). |
 | `dense_index()`, `text_index()`, `sparse_index()` | Read-only pointers to the sides (null if absent), for example to call `health()` on the dense side. Do not keep them beyond the collection's lifetime. |
 
@@ -267,6 +270,8 @@ for (;;) {
 ```
 
 Documents come in ascending ID order. Expired documents are left out, as everywhere. Each page is read under one lock, so it is consistent, and changes between pages never repeat or skip a document that stays stored: a document removed ahead of the cursor is not listed, one added ahead of it is, and one added behind it is not. A document in a page is the same as `get()` returns for it. Each page costs one pass over the collection, so read a large collection in large pages (thousands of documents).
+
+**What a file holds** (`inspect.h`). `StoredInfo identify(const std::string& path)` reads only headers: `kind` (`StoredKind::Flat`, `Hnsw`, `Sparse`, `Collection` or `Disk`; `stored_kind_name()` gives its name), `durable`, the format `version`, `bytes`, and for a durable directory its `identity` and the LSNs of its `snapshots` and log `segments`. Throws `FormatError` for anything else, `std::runtime_error` if the path cannot be read.
 
 ### 2.7 Searching
 
@@ -702,7 +707,10 @@ Other searches:
 | `search_batch(queries, k, ef = 64, threads = 0, options = {})` | Many queries at once (`dim` floats each, back to back), on `threads` threads (0: one per hardware thread). Results are identical to separate `search()` calls. Every query is checked before any work starts. `options.stats` is ignored. |
 | `search_range(query, radius, max_results = kNoLimit, options = {})` | Every vector within `radius` (in distance units: **squared** for L2, use `l2_radius(r)`; negative for inner product), closest first, at most `max_results`. Approximate: grows a region from the nearest vectors through graph links (see `range_expand_outside`). `Strategy::ForceExact` scans everything instead. A NaN radius throws. |
 | `search_by_id(id, k, ef = 64, options = {}, include_self = false)` | "More like this": searches with the vector stored for `id`, which cannot change in between. The record itself is left out unless `include_self`. Nothing if `id` is not stored. |
-| `void create_payload_index(std::string_view field)` | Keeps exact value counts for a **keyword, boolean or tag-set** field, so the planner counts matches exactly instead of sampling. Worth it for fields you filter on often. Other field types throw `std::invalid_argument`. |
+| `void create_payload_index(std::string_view field)` | Keeps exact value counts and **posting lists** for a **keyword, boolean or tag-set** field: the planner counts matches exactly, and filters on it read only the matching rows (much faster when few match), as do facets. Worth it for fields you filter or facet on often. Other field types throw `std::invalid_argument`. Collections have it too. |
+| `std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = {}) const` | **Faceted counts**: per request, how many vectors hold each value of a field, over every vector or those matching `filter` (see *Faceted search* below). |
+| `std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const` | The same over the vectors with these IDs, such as a search's top hits (unknown IDs skipped, repeats counted once). |
+| `Schema schema() const`, `std::vector<std::string> payload_indexes() const` | The metadata schema in force (its fields so far, for a dynamic schema), and the fields with a payload index. |
 | `void set_planner_params(const PlannerParams& p)`, `PlannerParams planner_params() const` | The index's default planner settings. |
 
 **Score modifiers (opt-in): re-ranking by metadata.** `SearchOptions::modifiers` (also in `HybridOptions` and `CollectionSearchOptions`) re-scores the results by metadata, in C++, with no callback per node:
@@ -726,6 +734,27 @@ o.modifiers = m;
 | `ScoreModifiers::pool` | 0: max(4k, 20) | Candidates re-scored before the best k are kept: a boost can promote a result that ranked below k only if it is in the pool. `pool_for(k)` returns the pool a search of k uses. |
 
 Invalid rules (an empty field, a half-life that is not positive, a negative minimum, a floor outside [0, 1], min above max, non-finite numbers) throw `std::invalid_argument` when the search runs. Keyword and tag values count as missing for decays and multipliers.
+
+**Faceted search** (`facets.h`): counts by value of metadata fields ("120 in English, 40 in French"), the same on `HnswIndex`, `FlatIndex` and `Collection`:
+
+```cpp
+struct FacetRequest {
+    std::string field;
+    std::size_t limit = 10;            // the most frequent values (0: all); the rest summed in `other`
+    std::vector<double> boundaries;    // integer and float fields: n boundaries make n + 1 range buckets
+    bool distinct = false;             // also count the distinct values (exact)
+};
+struct FacetResult {
+    std::string field;
+    std::size_t total, missing;        // documents counted, and of those without the field
+    std::vector<FacetValue> values;    // {Value value; std::size_t count}: most frequent first, ties by value
+    std::size_t other;                 // summed counts of the values beyond `limit`
+    std::vector<FacetBucket> buckets;  // {optional<double> from, to; count}: [from, to), open at the ends
+    std::optional<std::size_t> distinct;
+};
+```
+
+Every type of field has values (a document counts once per distinct tag); boundaries need an integer or float field and replace the value list. Every request is checked before anything is counted: an empty field name, boundaries not finite and strictly ascending, boundaries on another type, or an unknown field under a strict schema throw `std::invalid_argument`; under a dynamic schema an unknown field is missing everywhere. A collection never counts expired documents. With a payload index on the field and no filter, counts come from the index without reading documents.
 
 **Limitations:** HNSW is approximate: a true neighbor can be missed (raise `ef`, or `M` at build time). ACORN can miss a few matches when they cluster away from the query (recall 0.98 at 5% matching above): raise `acorn_ef_multiplier`, or set `acorn_below = 0`. Range search is approximate as well. Filters on a field without a payload index are estimated by sampling, so a rare value can be misjudged; the planner then still returns correct results, only more slowly.
 
@@ -938,6 +967,10 @@ An **inverted index**: for each term, the list of documents containing it. Searc
 | `set_metadata(id, metadata)` | Change only the given fields. |
 | `contains`, `size`, `get_vector`, `get_metadata` | Reading. `get_vector` returns the terms sorted. |
 | `std::vector<SparseRecord> records() const` | Every record (`id`, `vector`, `metadata`) in ID order. |
+| `static std::unique_ptr<SparseIndex> open_durable(dir, schema = dynamic, options = {}, stats = nullptr)` | A **durable** sparse index in `dir`, as for `HnswIndex::open_durable`: created if new, or recovered (the newest snapshot, then the log after it). Every change is logged before it is applied (`remove_where` as the IDs it removed); a second process is refused while this one holds `dir`. |
+| `std::uint64_t checkpoint()` | Durable indexes: writes a snapshot and drops the log it covers. Throws `std::logic_error` otherwise. |
+| `bool replay(std::span<const WalRecord> records)` | Re-applies logged changes (recovery uses it); true if an unfinished last one was dropped. |
+| `Schema schema() const`, `std::vector<std::string> payload_indexes() const` | The metadata schema in force, and the indexed fields (none). |
 | `search(query, k, options = {})` | The `k` documents with the highest dot product, best first. `distance` is **minus** the score (smaller is better, as everywhere). Only documents sharing at least one term with the query are candidates. Honors `filter`, `predicate`, `deadline`, `cancel` and `stats` from `SearchOptions`; other options do not apply. |
 | `document_frequency(term)` | Documents containing `term` (used for BM25's IDF). |
 | `terms()`, `postings()`, `dead_postings()`, `slots()` | Distinct terms; posting entries (live and awaiting compaction); entries of removed documents; document slots. |
@@ -1283,6 +1316,65 @@ struct CollectionOptions {
 };
 ```
 
+**`FacetRequest`**
+
+```cpp
+struct FacetRequest {
+    std::string field;
+    std::size_t limit = 10;
+    std::vector<double> boundaries;
+    bool distinct = false;
+    void validate() const;
+};
+```
+
+**`FacetValue`**
+
+```cpp
+struct FacetValue {
+    Value value;
+    std::size_t count = 0;
+};
+```
+
+**`FacetBucket`**
+
+```cpp
+struct FacetBucket {
+    std::optional<double> from;
+    std::optional<double> to;
+    std::size_t count = 0;
+};
+```
+
+**`FacetResult`**
+
+```cpp
+struct FacetResult {
+    std::string field;
+    std::size_t total = 0;
+    std::size_t missing = 0;
+    std::vector<FacetValue> values;
+    std::size_t other = 0;
+    std::vector<FacetBucket> buckets;
+    std::optional<std::size_t> distinct;
+};
+```
+
+**`StoredInfo`**
+
+```cpp
+struct StoredInfo {
+    StoredKind kind = StoredKind::Hnsw;
+    bool durable = false;
+    std::uint32_t version = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t identity = 0;
+    std::vector<std::uint64_t> snapshots;
+    std::vector<std::uint64_t> segments;
+};
+```
+
 **`Document`**
 
 ```cpp
@@ -1401,6 +1493,11 @@ class Collection {
     bool contains(std::uint64_t id) const;
     std::size_t size() const;
     std::size_t count_where(const Filter& filter) const;
+    void create_payload_index(std::string_view field);
+    Schema schema() const;
+    std::vector<std::string> payload_indexes() const;
+    std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const;
+    std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const;
     std::optional<DocumentRecord> get(std::uint64_t id) const;
     CollectionPage scan(const CollectionScanOptions& options = {}) const;
     CollectionOptions options() const;
@@ -1794,6 +1891,10 @@ class HnswIndex {
     std::size_t remove_where(const Filter& filter);
     std::size_t set_metadata_where(const Filter& filter, const Metadata& changes);
     std::size_t count_where(const Filter& filter) const;
+    Schema schema() const;
+    std::vector<std::string> payload_indexes() const;
+    std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const;
+    std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const;
     bool remove(std::uint64_t id);
     bool update(std::uint64_t id, std::span<const float> vector);
     bool update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
@@ -1877,6 +1978,10 @@ class FlatIndex {
     std::size_t remove_where(const Filter& filter);
     std::size_t set_metadata_where(const Filter& filter, const Metadata& changes);
     std::size_t count_where(const Filter& filter) const;
+    Schema schema() const;
+    std::vector<std::string> payload_indexes() const;
+    std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const;
+    std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const;
     bool remove(std::uint64_t id);
     bool update(std::uint64_t id, std::span<const float> vector);
     bool update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
@@ -2066,11 +2171,16 @@ class SparseIndex {
     std::size_t postings() const;
     std::size_t dead_postings() const;
     std::size_t slots() const;
+    Schema schema() const;
+    std::vector<std::string> payload_indexes() const;
     void compact();
     void save(const std::string& path) const;
     void save(std::ostream& out) const;
     static std::unique_ptr<SparseIndex> load(const std::string& path);
     static std::unique_ptr<SparseIndex> load(std::istream& in);
+    static std::unique_ptr<SparseIndex> open_durable(const std::string& dir, Schema schema = Schema::dynamic(), const DurableOptions& options = {}, RecoveryStats* stats = nullptr);
+    std::uint64_t checkpoint();
+    bool replay(std::span<const WalRecord> records);
 };
 ```
 
@@ -2340,6 +2450,8 @@ inline std::uint16_t float_to_f16(float f) noexcept;
 inline float f16_to_float(std::uint16_t h) noexcept;
 inline std::uint16_t float_to_bf16(float f) noexcept;
 inline float bf16_to_float(std::uint16_t h) noexcept;
+StoredInfo identify(const std::string& path);
+const char* stored_kind_name(StoredKind kind);
 ```
 
 <!-- END GENERATED -->

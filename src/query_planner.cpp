@@ -5,6 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+
+#include <iterator>
+#include <span>
 #include "filter.h"
 
 namespace vecdb {
@@ -271,6 +274,73 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
             return true;
         }
         default: return false;  // GCOVR_EXCL_LINE: unreachable, every kind is handled above
+    }
+}
+
+std::optional<std::vector<NodeId>> CompiledFilter::candidates_of(int n) const {
+    const CNode& c = nodes_[static_cast<std::size_t>(n)];
+    const MetadataStore& s = *store_;
+    auto unite = [](std::vector<NodeId>& out, std::span<const NodeId> more) {
+        std::vector<NodeId> merged;
+        merged.reserve(out.size() + more.size());
+        std::set_union(out.begin(), out.end(), more.begin(), more.end(), std::back_inserter(merged));
+        out.swap(merged);
+    };
+    auto postings_of = [&](std::span<const std::uint32_t> ids) {  // the union of these values' lists
+        std::vector<NodeId> out;
+        for (const std::uint32_t id : ids) unite(out, s.posting(c.field, id));
+        return out;
+    };
+    switch (c.kind) {
+        case K::False: return std::vector<NodeId>{};
+        case K::Key:
+            if (c.op != CompareOp::Eq || !s.is_indexed(c.field)) return std::nullopt;  // "not equal": a complement
+            return postings_of(std::span<const std::uint32_t>(&c.id, 1));
+        case K::Bool: {
+            if (c.op != CompareOp::Eq || !s.is_indexed(c.field)) return std::nullopt;
+            const std::uint32_t id = c.b ? 1 : 0;
+            return postings_of(std::span<const std::uint32_t>(&id, 1));
+        }
+        case K::KeyIn:
+        case K::Tag:
+        case K::AnyTag:
+            if (!s.is_indexed(c.field)) return std::nullopt;
+            return postings_of(c.ids);
+        case K::AllTags: {
+            if (!s.is_indexed(c.field) || c.ids.empty()) return std::nullopt;
+            std::vector<NodeId> out(s.posting(c.field, c.ids[0]).begin(), s.posting(c.field, c.ids[0]).end());
+            for (std::size_t i = 1; i < c.ids.size() && !out.empty(); ++i) {
+                const auto more = s.posting(c.field, c.ids[i]);
+                std::vector<NodeId> both;
+                std::set_intersection(out.begin(), out.end(), more.begin(), more.end(), std::back_inserter(both));
+                out.swap(both);
+            }
+            return out;
+        }
+        case K::And: {  // the children that have lists, smallest first; the rest are checked by matches()
+            std::vector<std::vector<NodeId>> parts;
+            for (const int child : c.children)
+                if (auto p = candidates_of(child)) parts.push_back(std::move(*p));
+            if (parts.empty()) return std::nullopt;
+            std::sort(parts.begin(), parts.end(), [](const auto& a, const auto& b) { return a.size() < b.size(); });
+            std::vector<NodeId> out = std::move(parts[0]);
+            for (std::size_t i = 1; i < parts.size() && !out.empty(); ++i) {
+                std::vector<NodeId> both;
+                std::set_intersection(out.begin(), out.end(), parts[i].begin(), parts[i].end(), std::back_inserter(both));
+                out.swap(both);
+            }
+            return out;
+        }
+        case K::Or: {  // only when every branch has a list
+            std::vector<NodeId> out;
+            for (const int child : c.children) {
+                auto p = candidates_of(child);
+                if (!p) return std::nullopt;
+                unite(out, *p);
+            }
+            return out;
+        }
+        default: return std::nullopt;  // numeric conditions, exists, not, everything
     }
 }
 

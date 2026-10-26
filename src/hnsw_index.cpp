@@ -1067,9 +1067,40 @@ std::vector<NodeId> HnswIndex::matching_slots(const Filter& filter) const {
     const CompiledFilter compiled(filter, metadata_);  // throws for an unknown field under a strict schema
     const IdMap& ids = storage_.ids();
     std::vector<NodeId> slots;
+    if (const auto rows = compiled.candidates()) {  // posting lists: only rows that can match
+        for (const NodeId n : *rows)
+            if (n < storage_.size() && !ids.is_deleted(n) && compiled.matches(n)) slots.push_back(n);
+        return slots;
+    }
     for (NodeId n = 0; n < storage_.size(); ++n)
         if (!ids.is_deleted(n) && compiled.matches(n)) slots.push_back(n);
     return slots;
+}
+
+std::vector<FacetResult> HnswIndex::facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter) const {
+    const auto guard = lock_.read();
+    if (filter) return count_facets(metadata_, requests, matching_slots(*filter));
+    const IdMap& ids = storage_.ids();
+    const std::function<std::vector<NodeId>()> all_live = [&] {
+        std::vector<NodeId> slots;
+        for (NodeId n = 0; n < storage_.size(); ++n)
+            if (!ids.is_deleted(n)) slots.push_back(n);
+        return slots;
+    };
+    std::size_t live = 0;
+    for (NodeId n = 0; n < storage_.size(); ++n) live += !ids.is_deleted(n);
+    return count_facets(metadata_, requests, live, all_live);
+}
+
+std::vector<FacetResult> HnswIndex::facets_for(std::span<const std::uint64_t> external, const std::vector<FacetRequest>& requests) const {
+    const auto guard = lock_.read();
+    const IdMap& ids = storage_.ids();
+    std::vector<NodeId> slots;
+    std::unordered_set<std::uint64_t> seen;
+    for (const std::uint64_t id : external)
+        if (seen.insert(id).second)
+            if (const auto n = ids.find(id); n && !ids.is_deleted(*n)) slots.push_back(*n);
+    return count_facets(metadata_, requests, slots);
 }
 
 std::size_t HnswIndex::count_where(const Filter& filter) const {
@@ -1228,13 +1259,25 @@ std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, 
                                              SearchStats& stats) const {
     const NodeDistance dist = node_distance(query);
     TopK top(k);
-    for (NodeId n = 0; n < storage_.size(); ++n) {
-        if ((n & 255) == 255 && detail::search_should_stop()) break;
-        if (!eligible(n)) continue;
+    std::size_t visited = 0;
+    auto visit = [&](NodeId n) {
+        ++visited;
+        if (!eligible(n)) return;
         ++stats.distance_computations;
         top.push({dist(n), n});
+    };
+    if (const auto rows = eligible.filter ? eligible.filter->candidates() : std::nullopt) {  // posting lists: only rows that can match
+        for (std::size_t i = 0; i < rows->size() && (*rows)[i] < storage_.size(); ++i) {
+            if ((i & 255) == 255 && detail::search_should_stop()) break;
+            visit((*rows)[i]);
+        }
+    } else {
+        for (NodeId n = 0; n < storage_.size(); ++n) {
+            if ((n & 255) == 255 && detail::search_should_stop()) break;
+            visit(n);
+        }
     }
-    stats.nodes_visited += storage_.size();
+    stats.nodes_visited += visited;
     return top.take_sorted();
 }
 

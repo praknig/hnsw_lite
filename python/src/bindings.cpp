@@ -21,6 +21,8 @@
 #include <cmath>
 #include <limits>
 
+#include "inspect.h"
+#include "facets.h"
 #include "collection.h"
 #include "flat_index.h"
 #include "hnsw_index.h"
@@ -117,6 +119,77 @@ py::object value_to_py(const Value& v) {
         case FieldType::Tags: return py::cast(v.tags);
     }
     return py::none();  // GCOVR_EXCL_LINE
+}
+
+/// Facet requests from Python: each a field name (the defaults) or a dict with "field"
+/// and optionally "limit", "ranges" (boundaries) and "distinct".
+std::vector<FacetRequest> to_facet_requests(const py::handle& fields) {
+    if (py::isinstance<py::str>(fields)) throw py::type_error("facets: give a list of fields (or dicts), not one string");
+    std::vector<FacetRequest> out;
+    for (const py::handle item : fields) {
+        FacetRequest r;
+        if (py::isinstance<py::str>(item)) {
+            r.field = item.cast<std::string>();
+        } else if (py::isinstance<py::dict>(item)) {
+            const py::dict d = py::reinterpret_borrow<py::dict>(item);
+            for (const auto& [k, v] : d) {
+                const std::string key = py::str(k);
+                if (key == "field") r.field = v.cast<std::string>();
+                else if (key == "limit") {
+                    if (v.cast<long long>() < 0) throw py::value_error("facets: limit must not be negative");
+                    r.limit = v.cast<std::size_t>();
+                } else if (key == "ranges") {
+                    for (const py::handle b : v) r.boundaries.push_back(b.cast<double>());
+                } else if (key == "distinct") r.distinct = v.cast<bool>();
+                else throw py::value_error("facets: unknown option '" + key + "' (field, limit, ranges, distinct)");
+            }
+            if (r.field.empty()) throw py::value_error("facets: each dict needs a \"field\"");
+        } else {
+            throw py::type_error("facets: each request is a field name or a dict");
+        }
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+py::object value_to_py(const Value& v);
+
+/// The results as {field: {"total", "missing", "values": [(value, count), ...], "other",
+/// "buckets": [{"from", "to", "count"}, ...], "distinct"}}, in request order.
+py::dict from_facets(const std::vector<FacetResult>& results) {
+    py::dict out;
+    for (const FacetResult& r : results) {
+        py::dict d;
+        d["total"] = r.total;
+        d["missing"] = r.missing;
+        py::list values;
+        for (const FacetValue& v : r.values) values.append(py::make_tuple(value_to_py(v.value), v.count));
+        d["values"] = values;
+        d["other"] = r.other;
+        py::list buckets;
+        for (const FacetBucket& b : r.buckets) {
+            py::dict bucket;
+            bucket["from"] = b.from ? py::object(py::float_(*b.from)) : py::none();
+            bucket["to"] = b.to ? py::object(py::float_(*b.to)) : py::none();
+            bucket["count"] = b.count;
+            buckets.append(bucket);
+        }
+        d["buckets"] = buckets;
+        d["distinct"] = r.distinct ? py::object(py::int_(*r.distinct)) : py::none();
+        out[py::str(r.field)] = d;
+    }
+    return out;
+}
+
+/// A schema as {field: "int" | "float" | "bool" | "keyword" | "tags"}.
+py::dict from_schema(const Schema& schema) {
+    py::dict d;
+    for (const FieldSpec& f : schema.fields()) {
+        const char* t = f.type == FieldType::Int ? "int" : f.type == FieldType::Float ? "float" : f.type == FieldType::Bool ? "bool"
+                      : f.type == FieldType::Keyword ? "keyword" : "tags";
+        if (f.name != "_key" && f.name != "_expires_at") d[py::str(f.name)] = t;  // a collection's own fields stay hidden
+    }
+    return d;
 }
 
 py::dict from_metadata(const Metadata& m) {
@@ -413,6 +486,27 @@ void bind_records(Class& c) {
             return m ? py::object(from_metadata(*m)) : py::none();
         }, py::arg("id"))
         .def("create_payload_index", &Index::create_payload_index, py::arg("field"))
+        .def("_facets", [](const Index& x, const py::object& fields, const std::optional<Filter>& filter) {
+            const std::vector<FacetRequest> requests = to_facet_requests(fields);
+            std::vector<FacetResult> out;
+            {
+                py::gil_scoped_release free;
+                out = x.facets(requests, filter);
+            }
+            return from_facets(out);
+        })
+        .def("_facets_for", [](const Index& x, const py::object& ids, const py::object& fields) {
+            const std::vector<std::uint64_t> wanted = to_ids(ids);
+            const std::vector<FacetRequest> requests = to_facet_requests(fields);
+            std::vector<FacetResult> out;
+            {
+                py::gil_scoped_release free;
+                out = x.facets_for(wanted, requests);
+            }
+            return from_facets(out);
+        })
+        .def("schema", [](const Index& x) { return from_schema(x.schema()); }, "The metadata fields and their types: {name: type}.")
+        .def("payload_indexes", &Index::payload_indexes, "The metadata fields with a payload index.")
         .def("health", [](const Index& x, std::size_t recall_sample) {
             HealthOptions o;
             o.recall_sample = recall_sample;
@@ -542,6 +636,21 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("rebuild_drift", &MaintenancePolicy::rebuild_drift);
 
     // ------------------------------------------------------------ HnswIndex
+    m.def("identify", [](const std::string& path) {
+        const StoredInfo i = identify(path);
+        py::dict d;
+        d["kind"] = stored_kind_name(i.kind);
+        d["durable"] = i.durable;
+        d["version"] = i.version;
+        d["bytes"] = i.bytes;
+        if (i.durable) {
+            d["identity"] = i.identity;
+            d["snapshots"] = i.snapshots;
+            d["segments"] = i.segments;
+        }
+        return d;
+    }, py::arg("path"), "What a file or durable directory holds, from its headers: kind, durable, version, bytes (and for a directory its identity, snapshot and log LSNs).");
+
     py::class_<HnswIndex> hnsw(m, "HnswIndex", "Approximate nearest-neighbor index (HNSW graph) with metadata.");
     hnsw.def(py::init([](std::size_t dim, Metric metric, const HnswParams& params, const py::handle& fields, bool strict) {
              return std::make_unique<HnswIndex>(dim, metric, params, to_schema(fields, strict));
@@ -794,6 +903,31 @@ PYBIND11_MODULE(_core, m) {
             if (!r) return py::none();
             return py::object(from_record(*r));
         }, py::arg("id"))
+        .def("facets", [](const Collection& c, const py::object& fields, const std::optional<Filter>& filter) {
+            const std::vector<FacetRequest> requests = to_facet_requests(fields);
+            std::vector<FacetResult> out;
+            {
+                py::gil_scoped_release free;
+                out = c.facets(requests, filter);
+            }
+            return from_facets(out);
+        })
+        .def("facets_for", [](const Collection& c, const py::object& ids, const py::object& fields) {
+            const std::vector<std::uint64_t> wanted = to_ids(ids);
+            const std::vector<FacetRequest> requests = to_facet_requests(fields);
+            std::vector<FacetResult> out;
+            {
+                py::gil_scoped_release free;
+                out = c.facets_for(wanted, requests);
+            }
+            return from_facets(out);
+        })
+        .def("create_payload_index", [](Collection& c, const std::string& field) {
+            py::gil_scoped_release free;
+            c.create_payload_index(field);
+        }, py::arg("field"))
+        .def("schema", [](const Collection& c) { return from_schema(c.schema()); })
+        .def("payload_indexes", &Collection::payload_indexes)
         .def("scan", [](const Collection& c, const std::optional<Filter>& filter, std::size_t limit, const py::object& after,
                         bool with_vectors, bool with_text, bool with_metadata) {
             CollectionScanOptions o;

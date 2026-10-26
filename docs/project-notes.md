@@ -21,11 +21,10 @@ These are deliberate for the current stage:
 - **A plain `save()` does not force data onto the physical disk:** it is atomic (temporary file, then rename), but a power cut right after it returns could lose it. Durable directories (`open_durable()`) flush their log and snapshots to the disk itself.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
-- **A standalone `SparseIndex` has no write-ahead log** (a `Collection` logs its text and sparse sides) (save it, or rebuild it from your data), and its search is exact without pruning: very common terms make long posting lists.
+- **Sparse search is exact without pruning:** very common terms make long posting lists (MaxScore pruning is on the roadmap). A standalone `SparseIndex` can be durable (`open_durable`), as collections are.
 - **One process per durable directory**, enforced with a lock file; a checkpoint holds changes (not searches) while its snapshot is written.
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
 - **Dynamic metadata fields are never removed**, even when no vector uses them: field names are the schema, and removing one automatically would silently forget its type. Unused strings, by contrast, are reclaimed.
-- **The payload index keeps counts, not posting lists.** It makes the planner's estimates exact, but exact filtered search still checks every vector's metadata (a fast column read) rather than reading only the matching ones.
 - **Filter-aware graph construction is not implemented.** Very selective filters go to exact search; between roughly 1% and 10% selectivity the planner's thresholds matter most, and may need tuning per dataset.
 - **HNSW range search is approximate**, like k-nearest search; use `Strategy::ForceExact` when every vector in the radius must be found.
 - **Custom predicates must be thread-safe** when used with batch search, and the planner can only estimate them by sampling.
@@ -62,7 +61,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Rebuilds while in use, with an atomic swap, retraining codecs and IVF lists (step 3)
 - [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
 - [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
-- [ ] Write-ahead log for `SparseIndex`; MaxScore pruning for long posting lists
+- [x] Write-ahead log for `SparseIndex`
+- [ ] MaxScore pruning for long posting lists
 - [x] Fuzzing the file and log loaders
 - [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
 - [x] Automatic maintenance of collections (`MaintenancePolicy`, `maintain()`, a background thread)
@@ -73,14 +73,15 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Python wheels for Linux, macOS and Windows (`pip install hnsw-lite-lib`)
 - [ ] C++ packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
-- [ ] Payload index posting lists, and filter-aware graph construction
+- [x] Payload index posting lists; faceted search (top values, numeric ranges, distinct counts)
+- [ ] Filter-aware graph construction
 - [x] Graph reordering for memory locality (`reorder()`), score modifiers (recency decay, confidence, boosts), dates, MMR diversity, document expiry (TTL), string keys
 - [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
 - [x] Half-precision vectors (float16, bfloat16), a compact ID map, and collection settings (expiry, string keys) saved with the collection
 - [ ] Benchmark results on SIFT1M and GloVe, published
 - [x] Collections: scanning every document, and exporting to a DataFrame (`scan()`, `documents()`, `to_pandas()`)
-- [ ] Faceted search: counts by field over the top hits and the whole corpus (then filtered counts, numeric ranges)
-- [ ] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
+- [x] Faceted search: counts by field over the top hits and the whole corpus, filtered counts, numeric ranges
+- [x] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
 - [ ] A first release on PyPI (v0.1.0), with a changelog
 - [ ] LangChain and LlamaIndex integrations; an ann-benchmarks adapter
 - [ ] Integer SIMD kernels for SQ8 distances; half precision for the disk index

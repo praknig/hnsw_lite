@@ -104,7 +104,7 @@ Cosine and L2 give the best HNSW recall. Inner product is not a true distance, s
 ### Filters
 
 - The planner's defaults (exact scan for at most 2,000 matches or 1% of vectors) suit most data. On very large indexes, lower `max_exact_fraction`: 1% of 100 million vectors is a million distance computations.
-- Call `create_payload_index(field)` for keyword, boolean or tag fields you filter on often, so the planner counts matches exactly instead of estimating them.
+- Call `create_payload_index(field)` for keyword, boolean or tag fields you filter or facet on often: the planner counts matches exactly, and selective filters and facets read only the matching rows. **Posting lists** (with `create_payload_index`): for each value of an indexed keyword, boolean or tag field, the sorted rows holding it, kept with the counts. Filters of equality, `in` and tag conditions (and their `and`/`or`) read them instead of every row: measured on 300,000 documents with a filter matching 0.1%, counting matches 555× faster, a filtered search 158×, facets with the filter 65×, facets over everything 1,532×.
 - Prefer `in` and `has_any_tag` over long chains of `||`: they are evaluated in one step.
 - `SearchStats` shows what the planner chose and how much work the search did; use it to check a slow query.
 

@@ -215,6 +215,18 @@ std::vector<unsigned char> encode_document(std::uint64_t id, std::uint8_t parts,
     return std::move(o.bytes);
 }
 
+std::vector<unsigned char> encode_sparse_write(std::uint8_t mode, std::uint64_t id, const SparseVector& vector, const Metadata* metadata) {
+    Out o;
+    o.put<std::uint8_t>(mode);
+    o.put<std::uint64_t>(id);
+    o.put<std::uint64_t>(vector.size());
+    for (const std::uint32_t t : vector.indices) o.put<std::uint32_t>(t);
+    for (const float w : vector.values) o.put<float>(w);
+    o.put<std::uint8_t>(metadata ? 1 : 0);
+    if (metadata) o.put_metadata(*metadata);
+    return std::move(o.bytes);
+}
+
 std::vector<unsigned char> encode_fraction(double fraction) {
     Out o;
     o.put<double>(fraction);
@@ -282,6 +294,21 @@ Op decode(std::uint8_t type, std::span<const unsigned char> payload) {
             break;
         }
         case kSetAutoCompact: op.fraction = in.get<double>(); break;
+        case kSparseWrite: {
+            op.mode = in.get<std::uint8_t>();
+            if (op.mode > kSparseUpsert) throw FormatError("log record: unknown sparse write mode");
+            op.ids.push_back(in.get<std::uint64_t>());
+            const std::uint64_t n = in.get<std::uint64_t>();
+            if (n > payload.size() / 8) throw FormatError("log record: more sparse terms than bytes");
+            op.sparse.indices.resize(static_cast<std::size_t>(n));
+            op.sparse.values.resize(static_cast<std::size_t>(n));
+            for (auto& t : op.sparse.indices) t = in.get<std::uint32_t>();
+            for (auto& w : op.sparse.values) w = in.get<float>();
+            const std::uint8_t has_metadata = in.get<std::uint8_t>();
+            if (has_metadata > 1) throw FormatError("log record: invalid metadata flag");
+            if (has_metadata) op.metadata.push_back(in.get_metadata());
+            break;
+        }
         case kCollectionSettings:
             op.ttl_enabled = in.get<std::uint8_t>();
             op.ttl_default_ms = in.get<std::int64_t>();

@@ -167,7 +167,14 @@ void Collection::check_changeable() const {
 
 CollectionOptions Collection::options() const {
     const auto lock = read_lock(mutex_, this);
-    return options_;
+    CollectionOptions o = options_;
+    o.schema = metadata_.current_schema();  // as stored now: a dynamic schema gains fields with every new one
+    return o;
+}
+
+Schema Collection::schema() const {
+    const auto lock = read_lock(mutex_, this);
+    return metadata_.current_schema();
 }
 
 Collection::Runtime Collection::runtime() const {
@@ -357,6 +364,11 @@ std::size_t Collection::remove_batch(std::span<const std::uint64_t> ids) {
 std::vector<NodeId> Collection::matching(const Filter& filter) const {
     const CompiledFilter compiled(filter, metadata_);
     std::vector<NodeId> out;
+    if (const auto rows = compiled.candidates()) {  // posting lists: only rows that can match
+        for (const NodeId n : *rows)
+            if (n < id_of_.size() && live_[n] && compiled.matches(n)) out.push_back(n);
+        return out;
+    }
     for (NodeId n = 0; n < id_of_.size(); ++n)
         if (live_[n] && compiled.matches(n)) out.push_back(n);
     return out;
@@ -414,6 +426,43 @@ bool Collection::contains(std::uint64_t id) const {
 std::size_t Collection::size() const {
     const auto lock = read_lock(mutex_, this);
     return slot_of_.size();
+}
+
+std::vector<std::string> Collection::payload_indexes() const {
+    const auto lock = read_lock(mutex_, this);
+    return metadata_.indexed_fields();
+}
+
+void Collection::create_payload_index(std::string_view field) {
+    const auto lock = write_lock(mutex_, this);
+    const ChangeLog::Scope logged(log_, log_.begin(walop::kCreatePayloadIndex, [&] { return walop::encode_field(field); }));
+    metadata_.index_field(field);
+}
+
+std::vector<FacetResult> Collection::facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter) const {
+    const auto lock = read_lock(mutex_, this);
+    const std::optional<Filter> alive = alive_filter();  // expiry: expired documents are never counted
+    if (filter && alive) return count_facets(metadata_, requests, matching(*filter && *alive));
+    if (filter || alive) return count_facets(metadata_, requests, matching(filter ? *filter : *alive));  // counts include expired rows: read them
+    const std::function<std::vector<NodeId>()> all_live = [&] {
+        std::vector<NodeId> slots;
+        for (NodeId n = 0; n < id_of_.size(); ++n)
+            if (live_[n]) slots.push_back(n);
+        return slots;
+    };
+    std::size_t live = 0;
+    for (NodeId n = 0; n < id_of_.size(); ++n) live += live_[n] ? 1 : 0;
+    return count_facets(metadata_, requests, live, all_live);
+}
+
+std::vector<FacetResult> Collection::facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const {
+    const auto lock = read_lock(mutex_, this);
+    std::vector<NodeId> slots;
+    std::unordered_set<std::uint64_t> seen;
+    for (const std::uint64_t id : ids)
+        if (seen.insert(id).second)
+            if (const auto it = slot_of_.find(id); it != slot_of_.end() && !expired(it->second)) slots.push_back(it->second);
+    return count_facets(metadata_, requests, slots);
 }
 
 std::size_t Collection::count_where(const Filter& filter) const {
@@ -630,6 +679,7 @@ bool Collection::replay(std::span<const WalRecord> records) {
                     break;
                 }
                 case walop::kDocumentRemove: (void)remove_batch(op.ids); break;
+                case walop::kCreatePayloadIndex: metadata_.index_field(op.field); break;
                 case walop::kCollectionSettings: {  // applied as logged (the log is not attached while replaying)
                     const TtlOptions ttl{op.ttl_enabled == 1, op.ttl_default_ms};
                     check_runtime(ttl, op.string_ids == 1);

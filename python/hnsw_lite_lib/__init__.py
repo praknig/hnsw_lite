@@ -19,7 +19,7 @@ from typing import Iterator, Any, Iterable, Mapping, Optional, Sequence, Union
 import numpy as np
 
 from . import _core
-from ._core import format_date, now_ms, parse_date  # noqa: F401  (re-exported)
+from ._core import format_date, identify, now_ms, parse_date  # noqa: F401  (re-exported)
 from ._core import (  # noqa: F401  (re-exported)
     Cancelled,
     Codec,
@@ -43,7 +43,7 @@ from ._core import (  # noqa: F401  (re-exported)
     FormatError,
 )
 
-__all__ = [
+__all__ = ["identify", 
     "to_ms", "parse_date", "format_date", "now_ms",
     "Collection", "HnswIndex", "FlatIndex", "Filter", "Metric", "Preset", "Fusion", "Durability", "Maintenance", "Strategy",
     "FieldType", "Codec", "HnswParams", "QuantizationParams", "IvfParams", "DurableOptions", "MaintenancePolicy",
@@ -262,6 +262,38 @@ HnswIndex.search = _hnsw_search
 FlatIndex.search = _flat_search
 
 
+def _facet_fields(fields):
+    """The requests, refusing a field asked for twice (results are keyed by field)."""
+    if isinstance(fields, (str, bytes)):
+        raise TypeError("facets: give a list of fields (or dicts), not one string")
+    fields = list(fields)
+    names = [f if isinstance(f, str) else f.get("field") if isinstance(f, dict) else None for f in fields]
+    seen = set()
+    for n in names:
+        if n is not None and n in seen:
+            raise ValueError(f"facets: field {n!r} asked for twice (results are keyed by field)")
+        seen.add(n)
+    return fields
+
+
+def _index_facets(self, fields, *, filter=None, ids=None) -> dict:
+    """How many vectors hold each value of metadata fields: over every vector, those
+    matching filter, or those with the given ids (such as search hits). Each field is a
+    name, or a dict {"field", "limit" (10; 0: all), "ranges" (numeric boundaries),
+    "distinct" (bool)}. Returns {field: {"total", "missing", "values": [(value, count)],
+    "other", "buckets": [{"from", "to", "count"}], "distinct"}}."""
+    fields = _facet_fields(fields)
+    if ids is not None:
+        if filter is not None:
+            raise ValueError("facets: give filter or ids, not both")
+        return self._facets_for(ids, fields)
+    return self._facets(fields, as_filter(filter))
+
+
+HnswIndex.facets = _index_facets
+FlatIndex.facets = _index_facets
+
+
 # ---------------------------------------------------------------- Collection
 
 def _ttl_ms(default_ttl) -> int:
@@ -450,6 +482,32 @@ class Collection:
 
     def remove_where(self, filter) -> int:
         return self._core.remove_where(as_filter(filter))
+
+    # -- facets and payload indexes
+    def facets(self, fields, *, filter=None, ids=None) -> dict:
+        """How many documents hold each value of metadata fields, over every document,
+        those matching filter, or those with the given ids (such as search hits); expired
+        documents are never counted. See HnswIndex.facets for the requests and results."""
+        fields = _facet_fields(fields)
+        if ids is not None:
+            if filter is not None:
+                raise ValueError("facets: give filter or ids, not both")
+            return self._core.facets_for(ids, fields)
+        return self._core.facets(fields, as_filter(filter))
+
+    def create_payload_index(self, field: str) -> None:
+        """Keeps exact value counts and posting lists for a keyword, bool or tag field:
+        facets over everything and selective filters then read them instead of every
+        document. Durable collections log it."""
+        self._core.create_payload_index(field)
+
+    def schema(self) -> dict:
+        """The metadata fields and their types: {name: "int" | "float" | "bool" | "keyword" | "tags"}."""
+        return self._core.schema()
+
+    def payload_indexes(self) -> list:
+        """The metadata fields with a payload index."""
+        return self._core.payload_indexes()
 
     # -- reading everything
     def scan(self, *, filter=None, limit: int = 100, after: Optional[int] = None, with_vectors: bool = True,
