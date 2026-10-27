@@ -45,10 +45,12 @@ int main(int argc, char** argv) {
     for (float& x : floats) x = u(rng);
     for (float& x : query) x = u(rng);
     std::vector<std::uint8_t> sq8(n * dim), bits(n * ((dim + 7) / 8));
+    std::vector<std::int8_t> w8(dim);  // integer weights, as SQ8 prepares them for inner product and cosine
+    for (auto& w : w8) w = std::int8_t(byte(rng) % 127 - 63);
     for (auto& b : sq8) b = std::uint8_t(byte(rng));
     for (auto& b : bits) b = std::uint8_t(byte(rng));
     std::printf("dimension %zu, %zu vectors; nanoseconds per distance (best of 5)\n\n", dim, n);
-    std::printf("%-8s %12s %12s %12s %12s\n", "kernels", "float L2", "SQ8 L2", "SQ8 dot", "binary");
+    std::printf("%-8s %12s %12s %12s %14s %12s\n", "kernels", "float L2", "SQ8 L2", "SQ8 dot", "SQ8 dot (int)", "binary");
     volatile float sink = 0;
     for (Isa isa : {Isa::Scalar, Isa::Avx2, Isa::Avx512, Isa::Neon}) {
         if (!isa_supported(isa)) continue;
@@ -57,9 +59,10 @@ int main(int argc, char** argv) {
         const double f = ns_per_call(n, [&] { for (std::size_t i = 0; i < n; ++i) sink = sink + l2(query.data(), &floats[i * dim], dim); });
         const double a = ns_per_call(n, [&] { for (std::size_t i = 0; i < n; ++i) sink = sink + k.sq8_l2(table.data(), step.data(), &sq8[i * dim], dim); });
         const double b = ns_per_call(n, [&] { for (std::size_t i = 0; i < n; ++i) sink = sink + k.sq8_dot(table.data(), &sq8[i * dim], dim); });
+        const double bi = ns_per_call(n, [&] { for (std::size_t i = 0; i < n; ++i) sink = sink + float(k.sq8_dot_i8(w8.data(), &sq8[i * dim], dim)); });
         const std::size_t cs = (dim + 7) / 8;
         const double c = ns_per_call(n, [&] { for (std::size_t i = 0; i < n; ++i) sink = sink + k.bits_sum(table.data(), &bits[i * cs], dim); });
-        std::printf("%-8s %12.1f %12.1f %12.1f %12.1f\n", isa_name(isa), f, a, b, c);
+        std::printf("%-8s %12.1f %12.1f %12.1f %14.1f %12.1f\n", isa_name(isa), f, a, b, bi, c);
     }
     std::printf("\nMemory per vector: floats %zu bytes, SQ8 %zu bytes, binary %zu bytes\n", dim * 4, dim, (dim + 7) / 8);
     return 0;

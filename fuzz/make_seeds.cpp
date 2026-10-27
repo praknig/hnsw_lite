@@ -44,6 +44,19 @@ int main(int argc, char** argv) {
     HnswIndex hh(4, Metric::L2, half);
     for (std::uint64_t i = 0; i < 20; ++i) hh.add(i, vec(4));
     write(root + "/1", "hnsw_f16.idx", hh);
+    HnswParams rq;  // RaBitQ, codes only, 6 dimensions (not a power of two): its state and codes
+    rq.quantization.codec = CodecKind::RaBitQ;
+    rq.quantization.keep_full_vectors = false;
+    rq.quantization.rerank = false;
+    rq.quantization.train_after = 10;
+    HnswIndex hr(6, Metric::L2, rq);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        auto v = vec(4);
+        v.push_back(v[0] - v[1]);
+        v.push_back(v[2] + v[3]);
+        hr.add(i, v);
+    }
+    write(root + "/1", "hnsw_rabitq.idx", hr);
     IvfParams ivf;
     ivf.lists = 3;
     ivf.train_after = 10;
@@ -57,6 +70,12 @@ int main(int argc, char** argv) {
     FlatIndex fb(4, Metric::L2, Schema::dynamic(), bq, ivf);
     for (std::uint64_t i = 0; i < 20; ++i) fb.add(i, vec(4));
     write(root + "/2", "flat_bf16.idx", fb);
+    QuantizationParams fr;  // RaBitQ with full vectors, cosine
+    fr.codec = CodecKind::RaBitQ;
+    fr.train_after = 10;
+    FlatIndex frq(4, Metric::Cosine, Schema::dynamic(), fr);
+    for (std::uint64_t i = 0; i < 20; ++i) frq.add(i, vec(4));
+    write(root + "/2", "flat_rabitq.idx", frq);
     SparseIndex s;
     for (std::uint64_t i = 0; i < 20; ++i) s.add(i, {{std::uint32_t(i % 5), std::uint32_t(7 + i % 3)}, {1.0f, 0.5f}}, Metadata().set("b", true));
     (void)s.remove(4);
@@ -126,5 +145,9 @@ int main(int argc, char** argv) {
     dp.graph.R = 8;
     dp.graph.L = 16;
     DiskIndex::build(root + "/6/disk.idx", ids, flat, 4, Metric::L2, dp);
+    dp.vectors = DiskVectorFormat::Float16;  // format version 2: half-precision nodes
+    DiskIndex::build(root + "/6/disk_f16.idx", ids, flat, 4, Metric::L2, dp);
+    dp.vectors = DiskVectorFormat::BFloat16;
+    DiskIndex::build(root + "/6/disk_bf16.idx", ids, flat, 4, Metric::Cosine, dp);
     return 0;
 }

@@ -4808,6 +4808,7 @@ TEST(planner, pl05_otherwise_graph_with_wider_beam) {
     SearchStats st;
     SearchOptions o = with_filter(Filter::lt("bucket", 25));
     o.planner = PlannerParams{10, 0.01, 256, 32.0};
+    o.planner->fallback_factor = 0;  // the decision itself (the exact fallback has its own test, pl20)
     o.stats = &st;
     fx.hnsw->search(fx.queries[0], 10, 64, o);
     CHECK(st.strategy == Strategy::ForceGraph && st.reason == PlanReason::Graph);
@@ -5691,6 +5692,120 @@ TEST(filter, fl64_options_variants) {
     const auto r = fx.hnsw->search_range(fx.queries[0], 4.0f, kNoLimit, exact);
     for (const auto& x : r) CHECK(x.id % 100 < 10);
     CHECK(!fx.flat->set_metadata(999999, Metadata().set("year", 1)));
+}
+
+TEST(planner, pl20_exact_fallback_bounds_correlated_filters) {
+    // A filter matching whole clusters: a graph search crosses much of the graph to find
+    // them. Past fallback_factor times the estimated matches in distances, the planner
+    // scans them exactly: the same results as exact search, reported as ExactFallback.
+    const std::size_t n = 6000, d = 16, clusters = 30;
+    std::mt19937 rng(2020);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<std::vector<float>> centers(clusters, std::vector<float>(d));
+    for (auto& c : centers) for (float& x : c) x = nd(rng) * 6;
+    HnswIndex h(d, Metric::L2);
+    for (std::uint64_t i = 0; i < n; ++i) {
+        const std::size_t c = i % clusters;
+        std::vector<float> v(d);
+        for (std::size_t j = 0; j < d; ++j) v[j] = centers[c][j] + nd(rng);
+        h.add(i, v, Metadata().set("c", std::int64_t(c)));
+    }
+    const Filter f = Filter::lt("c", std::int64_t(3));  // 3 of 30 clusters: 10%, beyond exact search's limits
+    PlannerParams tight = h.planner_params();
+    tight.fallback_factor = 0.25;  // a budget of a quarter of the matches: the fallback happens reliably here
+    tight.acorn_below = 0;  // a graph search (ACORN counts only matching neighbors, staying within budget here)
+    tight.max_exact_matches = 0;  // 600 matches would otherwise be scanned exactly from the start
+    h.set_planner_params(tight);
+    std::size_t fell_back = 0, same = 0;
+    for (int qi = 0; qi < 40; ++qi) {
+        std::vector<float> q(d);
+        const auto& c = centers[10 + std::size_t(qi) % 20];  // queries far from the matching clusters
+        for (std::size_t j = 0; j < d; ++j) q[j] = c[j] + nd(rng);
+        SearchStats st;
+        SearchOptions o;
+        o.filter = f;
+        o.stats = &st;
+        const auto got = h.search(q, 10, 16, o);
+        SearchOptions e;
+        e.filter = f;
+        e.strategy = Strategy::ForceExact;
+        const auto truth = h.search(q, 10, 16, e);
+        if (st.reason == PlanReason::ExactFallback) {
+            ++fell_back;
+            bool equal = got.size() == truth.size() && st.strategy == Strategy::ForceExact;
+            for (std::size_t i = 0; equal && i < got.size(); ++i) equal = got[i].id == truth[i].id && got[i].distance == truth[i].distance;
+            same += equal;
+        }
+    }
+    std::printf("    %zu of 40 searches fell back to an exact scan\n", fell_back);
+    CHECK(fell_back > 0 && same == fell_back);
+    // Off, and never for a forced strategy.
+    PlannerParams off = h.planner_params();
+    off.fallback_factor = 0;
+    h.set_planner_params(off);
+    std::vector<float> q(centers[15]);
+    SearchStats st;
+    SearchOptions o;
+    o.filter = f;
+    o.stats = &st;
+    (void)h.search(q, 10, 64, o);
+    CHECK(st.reason != PlanReason::ExactFallback);
+    off.fallback_factor = 1.0;
+    h.set_planner_params(off);
+    o.strategy = Strategy::ForceGraph;
+    (void)h.search(q, 10, 64, o);
+    CHECK(st.reason == PlanReason::Forced && st.strategy == Strategy::ForceGraph);
+    for (const double bad : {-1.0, std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        PlannerParams p;
+        p.fallback_factor = bad;
+        CHECK_THROWS_AS(std::invalid_argument, validate(p));
+    }
+}
+
+TEST(planner, pl21_exact_fallback_from_acorn_and_with_codecs) {
+    // The fallback from an ACORN search, and from a graph search over SQ8 codes with
+    // re-ranking: both give exactly the exact search's results.
+    const std::size_t n = 3000, d = 16, clusters = 30;
+    std::mt19937 rng(2121);
+    std::normal_distribution<float> nd(0, 1);
+    std::vector<std::vector<float>> centers(clusters, std::vector<float>(d));
+    for (auto& c : centers) for (float& x : c) x = nd(rng) * 6;
+    std::vector<std::vector<float>> data(n, std::vector<float>(d));
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t j = 0; j < d; ++j) data[i][j] = centers[i % clusters][j] + nd(rng);
+    HnswParams coded;
+    coded.quantization.codec = CodecKind::SQ8;
+    coded.quantization.train_after = 500;  // re-ranking on, full vectors kept
+    for (const bool acorn : {true, false}) {
+        HnswIndex h(d, Metric::L2, acorn ? HnswParams{} : coded);
+        for (std::uint64_t i = 0; i < n; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % clusters)));
+        PlannerParams p = h.planner_params();
+        p.fallback_factor = 0.05;  // a tiny budget: the fallback happens
+        p.max_exact_matches = 0;
+        p.max_exact_fraction = 0;
+        p.acorn_below = acorn ? 1.0 : 0.0;  // ACORN for this filter, or the graph search
+        h.set_planner_params(p);
+        const Filter f = Filter::lt("c", std::int64_t(3));
+        std::size_t fell_back = 0, same = 0;
+        for (int qi = 0; qi < 20; ++qi) {
+            const auto& q = data[std::size_t(rng() % n)];
+            SearchStats st;
+            SearchOptions o;
+            o.filter = f;
+            o.stats = &st;
+            const auto got = h.search(q, 10, 16, o);
+            SearchOptions e;
+            e.filter = f;
+            e.strategy = Strategy::ForceExact;
+            const auto truth = h.search(q, 10, 16, e);
+            if (st.reason != PlanReason::ExactFallback) continue;
+            ++fell_back;
+            bool equal = got.size() == truth.size();
+            for (std::size_t i = 0; equal && i < got.size(); ++i) equal = got[i].id == truth[i].id;
+            same += equal;
+        }
+        CHECK(fell_back > 0 && same == fell_back);
+    }
 }
 
 TEST(planner, pl17_exact_counts_for_every_filter_kind) {
@@ -10472,7 +10587,16 @@ TEST(codec, q0_09_sq8_distances_match_decoded_vectors) {
         std::vector<float> table, back(24);
         const std::span<const float> q(&sample[0], 24);
         c.prepare(q, table);
-        bool close = true;
+        // Inner product and cosine quantize the query's weights q * step to integers in
+        // [-63, 63] (integer kernels): each weight is off by at most half a scale step, so a
+        // distance by at most max|q * step| / 126 * sum(code). The steps, from decoding.
+        std::vector<std::uint8_t> zeros(24, 0), ones(24, 1);
+        std::vector<float> at0(24), at1(24);
+        c.decode(zeros.data(), at0);
+        c.decode(ones.data(), at1);
+        double largest = 0;
+        for (std::size_t j = 0; j < 24; ++j) largest = std::max(largest, std::abs(double(q[j]) * (double(at1[j]) - at0[j])));
+        bool close = true, used_slack = false;
         for (std::size_t i = 1; i < 400; ++i) {
             const std::span<const float> v(&sample[i * 24], 24);
             c.encode(v, code.data());
@@ -10482,9 +10606,18 @@ TEST(codec, q0_09_sq8_distances_match_decoded_vectors) {
                 expected += m == Metric::L2 ? double(q[j] - back[j]) * (q[j] - back[j]) : double(q[j]) * back[j];
             if (m == Metric::InnerProduct) expected = -expected;
             if (m == Metric::Cosine) expected = 1.0 - expected;
-            close = close && std::abs(c.distance(table, code.data()) - expected) < 1e-4 * (1 + std::abs(expected));
+            double bound = 1e-4 * (1 + std::abs(expected));  // floating point alone (L2 is computed in floats)
+            if (m != Metric::L2) {
+                double codes = 0;
+                for (const std::uint8_t b : code) codes += b;
+                bound += largest / 126.0 * codes;
+            }
+            const double error = std::abs(c.distance(table, code.data()) - expected);
+            close = close && error <= bound;
+            used_slack = used_slack || error > 1e-4 * (1 + std::abs(expected));
         }
         CHECK(close);
+        CHECK(used_slack == (m != Metric::L2));  // the bound is needed, and only where integers are used
     }
 }
 
@@ -10618,6 +10751,141 @@ TEST(codec, q0_15_code_kernels_match_plain_cpp) {
     if (!isa_supported(Isa::Neon)) CHECK_THROWS_AS(std::invalid_argument, (void)get_code_kernels(Isa::Neon));
 }
 
+TEST(codec, q0_17_integer_sq8_kernels_are_exact) {
+    // The integer SQ8 kernel on every instruction set this CPU supports: equal to plain
+    // C++ exactly (integers: no rounding), every length 0 to 200 (all tails of 16, 32
+    // and 64 bytes), unaligned, and at the extremes where 16-bit pair sums would
+    // saturate if weights went beyond [-63, 63].
+    std::mt19937 rng(17);
+    std::uniform_int_distribution<int> weight(-63, 63), byte(0, 255);
+    std::vector<std::int8_t> w(210);
+    std::vector<std::uint8_t> c(210);
+    const CodeKernels plain = get_code_kernels(Isa::Scalar);
+    long compared = 0, wrong = 0;
+    for (Isa isa : {Isa::Avx2, Isa::Avx512, Isa::Neon}) {
+        if (!isa_supported(isa)) continue;
+        const CodeKernels k = get_code_kernels(isa);
+        for (std::size_t n = 0; n <= 200; ++n)
+            for (int round = 0; round < 4; ++round) {
+                for (std::size_t j = 0; j < n + 1; ++j) {
+                    w[j] = std::int8_t(round == 0 ? 63 : round == 1 ? -63 : weight(rng));  // all at the limit, then random
+                    c[j] = std::uint8_t(round < 2 ? 255 : byte(rng));
+                }
+                const std::int32_t expected = plain.sq8_dot_i8(w.data() + 1, c.data() + 1, n);
+                ++compared;
+                wrong += k.sq8_dot_i8(w.data() + 1, c.data() + 1, n) != expected;
+            }
+    }
+    // Fixed answers, and the extremes by hand: 200 * 255 * 63 and its negative.
+    const std::int8_t fw[4] = {1, -2, 3, -63};
+    const std::uint8_t fc[4] = {10, 20, 30, 255};
+    CHECK(plain.sq8_dot_i8(fw, fc, 4) == 10 - 40 + 90 - 16065);
+    std::fill(w.begin(), w.end(), std::int8_t(63));
+    std::fill(c.begin(), c.end(), std::uint8_t(255));
+    const CodeKernels active = get_code_kernels(active_isa());
+    CHECK(active.sq8_dot_i8(w.data(), c.data(), 200) == 200 * 255 * 63);
+    std::fill(w.begin(), w.end(), std::int8_t(-63));
+    CHECK(active.sq8_dot_i8(w.data(), c.data(), 200) == -200 * 255 * 63);
+    CHECK(wrong == 0);
+    std::printf("    %ld comparisons with plain C++, every one exact\n", compared);
+}
+
+TEST(codec, q0_18_rabitq) {
+    // The rotation is orthonormal (lengths kept, undone exactly up to rounding); codes are
+    // deterministic; the estimator's error shrinks with the dimension; state round-trips.
+    std::mt19937 rng(18);
+    std::normal_distribution<float> nd(0, 1);
+    double previous_error = 1e9;
+    for (const std::size_t d : {std::size_t(24), std::size_t(96), std::size_t(384)}) {  // not powers of two: no padding
+        std::vector<float> sample(500 * d);
+        for (float& x : sample) x = nd(rng);
+        RaBitQCodec c(d, Metric::L2), again(d, Metric::L2);
+        c.train(sample);
+        again.train(sample);
+        CHECK(c.code_size() == (d + 7) / 8 + 8);  // one bit per dimension, as the binary codec, plus two floats
+        std::vector<std::uint8_t> code(c.code_size()), code2(c.code_size());
+        std::vector<float> table, back(d);
+        double error = 0;
+        bool identical = true;
+        for (std::size_t i = 0; i < 100; ++i) {
+            const std::span<const float> v(&sample[i * d], d), q(&sample[(i + 200) * d], d);
+            c.encode(v, code.data());
+            again.encode(v, code2.data());
+            identical = identical && code == code2;
+            c.prepare(q, table);
+            double exact = 0, rq = 0, rv = 0;
+            for (std::size_t j = 0; j < d; ++j) {
+                exact += double(v[j] - q[j]) * (v[j] - q[j]);
+            }
+            (void)rq;
+            (void)rv;
+            error += std::abs(c.distance(table, code.data()) - exact) / exact;
+        }
+        error /= 100;
+        std::printf("    %3zu dimensions: mean relative L2 distance error %.3f\n", d, error);
+        CHECK(identical && error < previous_error && error < 0.35);
+        previous_error = error;
+        // State: round trip, and refusals.
+        RaBitQCodec r(d, Metric::L2);
+        r.restore(c.state());
+        std::vector<std::uint8_t> code3(c.code_size());
+        r.encode(std::span<const float>(&sample[0], d), code3.data());
+        c.encode(std::span<const float>(&sample[0], d), code.data());
+        CHECK(code3 == code);
+        auto bad = c.state();
+        bad[d] = 0.5f;  // a sign that is not +-1
+        CHECK_THROWS_AS(std::invalid_argument, r.restore(bad));
+        CHECK_THROWS_AS(std::invalid_argument, r.restore(std::vector<float>(3)));
+    }
+    // A vector at the centroid: zero residual, distance the query's own residual length.
+    RaBitQCodec z(8, Metric::L2);
+    std::vector<float> two(16, 0.0f);
+    two[8] = 2.0f;  // vectors 0 and (2, 0, ...): centroid (1, 0, ...)
+    z.train(two);
+    std::vector<std::uint8_t> code(z.code_size());
+    const std::vector<float> at{1, 0, 0, 0, 0, 0, 0, 0}, q{4, 0, 0, 0, 0, 0, 0, 0};
+    z.encode(at, code.data());
+    std::vector<float> table, back(8);
+    z.prepare(q, table);
+    z.decode(code.data(), back);
+    CHECK(std::abs(z.distance(table, code.data()) - 9.0f) < 1e-4f && back == at);
+    RaBitQCodec u(8, Metric::L2);
+    CHECK_THROWS_AS(std::logic_error, u.encode(at, code.data()));
+    CHECK_THROWS_AS(std::invalid_argument, u.train(std::vector<float>(5)));
+}
+
+TEST(codec, q0_19_rabitq_recall_against_binary) {
+    // RaBitQ against the binary codec at the same bits (one per dimension), re-ranked 10x,
+    // on unstructured data: where RaBitQ's estimator helps most (measured on 768
+    // dimensions: L2 0.863 against 0.660; on clustered data and cosine the two are closer,
+    // and either can win, so this checks the case with a clear margin).
+    std::mt19937 rng(1919);
+    std::normal_distribution<float> nd(0, 1);
+    const std::size_t d = 192, n = 3000;
+    std::vector<std::vector<float>> data(n, std::vector<float>(d)), queries(40, std::vector<float>(d));
+    for (auto& v : data) for (float& x : v) x = nd(rng);
+    for (auto& v : queries) for (float& x : v) x = nd(rng);
+    FlatIndex exact(d, Metric::L2);
+    for (std::uint64_t i = 0; i < n; ++i) exact.add(i, data[i]);
+    double recall[2] = {0, 0};
+    for (int which = 0; which < 2; ++which) {
+        QuantizationParams qp;
+        qp.codec = which == 0 ? CodecKind::Binary : CodecKind::RaBitQ;
+        qp.rerank_factor = 10;
+        qp.train_after = 1000;
+        FlatIndex f(d, Metric::L2, Schema::dynamic(), qp);
+        for (std::uint64_t i = 0; i < n; ++i) f.add(i, data[i]);
+        for (const auto& q : queries) {
+            std::set<std::uint64_t> t;
+            for (const auto& r : exact.search(q, 10)) t.insert(r.id);
+            for (const auto& r : f.search(q, 10)) recall[which] += t.count(r.id) / 10.0;
+        }
+        recall[which] /= double(queries.size());
+    }
+    std::printf("    %zu dimensions, L2, re-ranked 10x: recall@10 binary %.3f, RaBitQ %.3f\n", d, recall[0], recall[1]);
+    CHECK(recall[1] >= recall[0] + 0.1);
+}
+
 TEST(codec, q0_16_binary_kernel_bit_order) {
     // Exactly the set bits count, bit j being c[j / 8] >> (j % 8): one bit at a time.
     std::vector<float> w(64);
@@ -10693,6 +10961,224 @@ bool codes_match(const FlatIndex& f) {  // L2: the stored vector is the vector a
 }
 
 }  // namespace
+
+TEST(codec, q0_20_rabitq_every_path) {
+    // Every way codes change, with and without full vectors: codes always match their
+    // vectors; compaction keeps them; searches of every kind work.
+    auto data = clustered(1500, 40, 6, 1920);  // 40: not a power of two, two overlapping blocks
+    for (const Metric m : {Metric::L2, Metric::Cosine})
+        for (const bool keep_full : {true, false}) {
+            QuantizationParams qp;
+            qp.codec = CodecKind::RaBitQ;
+            qp.train_after = 200;
+            qp.keep_full_vectors = keep_full;
+            HnswParams hp;
+            hp.quantization = qp;
+            HnswIndex h(40, m, hp);
+            FlatIndex f(40, m, Schema::dynamic(), qp);
+            for (std::uint64_t i = 0; i < 400; ++i) {
+                h.add(i, data[i]);
+                f.add(i, data[i]);
+            }
+            for (std::uint64_t i = 0; i < 400; i += 5) {
+                h.remove(i);
+                f.remove(i);
+            }
+            for (std::uint64_t i = 1000; i < 1050; ++i) {
+                h.add(i, data[i]);
+                f.add(i, data[i]);
+            }
+            for (std::uint64_t i = 1; i < 400; i += 7) {
+                h.update(i, data[i + 1000]);
+                f.update(i, data[i + 1000]);
+            }
+            h.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)), 4);
+            f.add_batch(id_range(5000, 60), flatten(Vectors(data.begin() + 1400, data.begin() + 1460)));
+            // codes_match re-encodes: from the stored vector, or with codes only from the
+            // decoded code, a round trip RaBitQ does not keep exactly (its factors change):
+            // checked with full vectors here; codes-only paths are traced separately. The
+            // flat helper compares vectors as given, which cosine normalizes: L2 only.
+            CHECK(h.codec_trained() && h.has_vector_values() == keep_full);
+            CHECK(!keep_full || codes_match(h));
+            CHECK(m != Metric::L2 || !keep_full || codes_match(f));
+            // Every code, by ID: compaction and rebuild must keep them byte for byte. With
+            // codes only, re-encoding a decoded vector would change RaBitQ's factors (found
+            // while building it: compaction and rebuild used to re-encode).
+            auto codes_of = [](const HnswIndex& x) {
+                std::map<std::uint64_t, std::vector<std::uint8_t>> m;
+                ScanOptions all;
+                all.limit = 100000;
+                all.with_vectors = false;
+                for (const Record& r : x.scan(all).records) m[r.id] = *x.get_code(r.id);
+                return m;
+            };
+            const auto before = codes_of(h);
+            h.compact();
+            CHECK(h.deleted_count() == 0 && codes_of(h) == before && (!keep_full || codes_match(h)));
+            RebuildOptions keep;
+            keep.retrain = false;  // the codec kept: from the floats, or copied with codes only
+            (void)h.rebuild(keep);
+            CHECK(codes_of(h) == before);
+            check_graph(h, 0.8);
+            CHECK(h.search_by_id(5001, 5, 64)->size() == 5 && f.search(data[1401], 5).size() == 5);
+        }
+}
+
+TEST(codec, q0_21_rabitq_save_and_load) {
+    // Saved and loaded: identical bytes when saved again, identical searches; inner
+    // product too.
+    auto data = clustered(500, 48, 6, 1921);
+    for (const bool keep_full : {true, false}) {
+        QuantizationParams qp;
+        qp.codec = CodecKind::RaBitQ;
+        qp.train_after = 100;
+        qp.keep_full_vectors = keep_full;
+        HnswParams hp;
+        hp.quantization = qp;
+        HnswIndex h(48, Metric::Cosine, hp);
+        FlatIndex f(48, Metric::InnerProduct, Schema::dynamic(), qp);
+        for (std::uint64_t i = 0; i < 500; ++i) {
+            h.add(i, data[i]);
+            f.add(i, data[i]);
+        }
+        const std::string hb = save_bytes(h), fb = save_bytes(f);
+        std::istringstream hi(hb), fi(fb);
+        const auto h2 = HnswIndex::load(hi);
+        const auto f2 = FlatIndex::load(fi);
+        auto equal = [](const std::vector<SearchResult>& a, const std::vector<SearchResult>& b) {
+            if (a.size() != b.size()) return false;
+            for (std::size_t i = 0; i < a.size(); ++i)
+                if (a[i].id != b[i].id || a[i].distance != b[i].distance) return false;
+            return true;
+        };
+        bool same = save_bytes(*h2) == hb && save_bytes(*f2) == fb && h2->params().quantization.codec == CodecKind::RaBitQ;
+        for (std::size_t i = 0; i < 20; ++i) {
+            same = same && equal(h.search(data[i * 7], 10, 64), h2->search(data[i * 7], 10, 64));
+            same = same && equal(f.search(data[i * 7], 10), f2->search(data[i * 7], 10));
+        }
+        CHECK(same);
+    }
+}
+
+TEST(codec, q0_22_rabitq_edges) {
+    // Every block shape (dimensions 1 to 17), identical training vectors, a zero query,
+    // values near float's limit (distances never NaN), and every boundary of valid_code.
+    std::mt19937 rng(22);
+    std::normal_distribution<float> nd(0, 1);
+    bool finite = true;
+    for (const std::size_t d : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(5), std::size_t(7), std::size_t(8), std::size_t(9), std::size_t(17)})
+        for (const Metric m : {Metric::L2, Metric::InnerProduct}) {
+            std::vector<float> sample(50 * d);
+            for (float& x : sample) x = nd(rng);
+            RaBitQCodec c(d, m);
+            c.train(sample);
+            std::vector<std::uint8_t> code(c.code_size());
+            std::vector<float> table, back(d);
+            for (std::size_t i = 0; i < 50; ++i) {
+                const std::span<const float> v(&sample[i * d], d);
+                c.encode(v, code.data());
+                c.decode(code.data(), back);
+                c.prepare(std::span<const float>(&sample[((i + 7) % 50) * d], d), table);
+                const float dist = c.distance(table, code.data());
+                finite = finite && std::isfinite(dist) && (m != Metric::L2 || dist >= 0) && c.valid_code(code.data());
+                for (const float x : back) finite = finite && std::isfinite(x);
+            }
+        }
+    CHECK(finite);
+    // Identical training vectors: every residual from the centroid is zero.
+    RaBitQCodec same(4, Metric::L2);
+    same.train(std::vector<float>(40, 1.5f));
+    std::vector<std::uint8_t> code(same.code_size());
+    std::vector<float> table;
+    same.encode(std::vector<float>(4, 1.5f), code.data());
+    same.prepare(std::vector<float>{2.5f, 1.5f, 1.5f, 1.5f}, table);
+    CHECK(same.distance(table, code.data()) == 1.0f);
+    // A zero query for inner product: a finite distance.
+    RaBitQCodec ip(4, Metric::InnerProduct);
+    ip.train(std::vector<float>{1, 2, 3, 4, -1, 0, 2, 1});
+    ip.encode(std::vector<float>{1, 1, 1, 1}, code.data());
+    ip.prepare(std::vector<float>(4, 0.0f), table);
+    CHECK(ip.distance(table, code.data()) == 0.0f);
+    // Values near float's limit: lengths square past it; distances overflow to infinity, never NaN.
+    for (const Metric m : {Metric::L2, Metric::InnerProduct}) {
+        RaBitQCodec big(4, m);
+        big.train(std::vector<float>{3e38f, -3e38f, 3e38f, -3e38f, -3e38f, 3e38f, -3e38f, 3e38f});
+        big.encode(std::vector<float>{3e38f, 3e38f, -3e38f, -3e38f}, code.data());
+        big.prepare(std::vector<float>{-3e38f, 3e38f, 3e38f, -3e38f}, table);
+        CHECK(!std::isnan(big.distance(table, code.data())));
+    }
+    // valid_code at every boundary: length finite and >= 0; alignment finite in [0, 1].
+    RaBitQCodec v(8, Metric::L2);
+    v.train(std::vector<float>(16, 0.5f));
+    auto with = [&](float length, float alignment) {
+        std::vector<std::uint8_t> c(v.code_size(), 0);
+        std::memcpy(c.data() + 1, &length, 4);
+        std::memcpy(c.data() + 5, &alignment, 4);
+        return c;
+    };
+    const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+    CHECK(v.valid_code(with(1, 0.8f).data()) && v.valid_code(with(0, 0).data()) && v.valid_code(with(0, 1).data()) && v.valid_code(with(3e38f, 1).data()));
+    for (const auto& [length, alignment] : std::vector<std::pair<float, float>>{{nan, 0.5f}, {inf, 0.5f}, {-1.0f, 0.5f}, {1.0f, nan}, {1.0f, inf}, {1.0f, -0.1f}, {1.0f, 1.5f}})
+        CHECK(!v.valid_code(with(length, alignment).data()));
+    // Refusals: a centroid that is not finite, samples of the wrong size or with NaN, decoding
+    // into the wrong size, a codec kind beyond the last; and SQ8 with a zero inner-product query.
+    {
+        RaBitQCodec r(4, Metric::L2);
+        auto state = std::vector<float>(16, 1.0f);
+        state[1] = nan;
+        CHECK_THROWS_AS(std::invalid_argument, r.restore(state));
+        CHECK_THROWS_AS(std::invalid_argument, r.train(std::vector<float>{}));
+        CHECK_THROWS_AS(std::invalid_argument, r.train(std::vector<float>(6, 1.0f)));
+        std::vector<float> bad_sample(8, 1.0f);
+        bad_sample[5] = inf;
+        CHECK_THROWS_AS(std::invalid_argument, r.train(bad_sample));
+        r.train(std::vector<float>{1, 2, 3, 4, 4, 3, 2, 1});
+        std::vector<std::uint8_t> c4(r.code_size());
+        r.encode(std::vector<float>{1, 1, 1, 1}, c4.data());
+        std::vector<float> wrong(3);
+        CHECK_THROWS_AS(std::invalid_argument, r.decode(c4.data(), wrong));
+        QuantizationParams beyond;
+        beyond.codec = static_cast<CodecKind>(static_cast<int>(CodecKind::RaBitQ) + 1);
+        CHECK_THROWS_AS(std::invalid_argument, validate(beyond));
+        SQ8Codec s8(4, Metric::InnerProduct);
+        s8.train(std::vector<float>{1, 2, 3, 4, -1, 0, 2, 1});
+        std::vector<std::uint8_t> sc(s8.code_size());
+        s8.encode(std::vector<float>{1, 1, 1, 1}, sc.data());
+        s8.prepare(std::vector<float>(4, 0.0f), table);
+        CHECK(s8.distance(table, sc.data()) == 0.0f);  // a zero query: no scale, a zero distance
+    }
+    // An alignment of 0 (never written by encode, but possible in a zeroed slot): a finite distance.
+    v.prepare(std::vector<float>(8, 1.0f), table);
+    CHECK(std::isfinite(v.distance(table, with(2, 0).data())));
+}
+
+TEST(codec, q0_23_rabitq_damaged_codes_behind_valid_checksums) {
+    // A file whose RaBitQ codes hold impossible numbers, with every checksum valid: refused.
+    // CODC: codec (1), train_after (8), rerank (1), factor (8), trained (1), state size (8),
+    // state (4 * dim floats), count (8), then the codes: bits (1 byte at 8 dimensions), length, alignment.
+    QuantizationParams qp;
+    qp.codec = CodecKind::RaBitQ;
+    qp.train_after = 10;
+    qp.keep_full_vectors = false;
+    qp.rerank = false;
+    FlatIndex f(8, Metric::L2, Schema::dynamic(), qp);
+    auto data = random_vectors(20, 8, 23);
+    for (std::uint64_t i = 0; i < 20; ++i) f.add(i, data[i]);
+    const ParsedFile base = ParsedFile::parse(save_bytes(f));
+    const std::size_t codes = 27 + 4 * 32 + 8, length = codes + 1, alignment = codes + 5;
+    CHECK(load_flat(base.assemble())->size() == 20);
+    const float nan = std::numeric_limits<float>::quiet_NaN(), inf = std::numeric_limits<float>::infinity();
+    for (const auto& [at, value] : std::vector<std::pair<std::size_t, float>>{{length, nan}, {length, inf}, {length, -2.0f}, {alignment, nan}, {alignment, 1.5f}, {alignment, -0.5f}}) {
+        ParsedFile e = base;
+        poke<float>(e.payload("CODC"), at, value);
+        try {
+            (void)load_flat(e.assemble());
+            CHECK(false);  // accepted
+        } catch (const FormatError& err) {
+            CHECK(std::string(err.what()).find("RaBitQ code") != std::string::npos);
+        }
+    }
+}
 
 TEST(sq8, s8_01_untrained_means_full_precision) {
     auto data = clustered(500, 16, 6, 970);
@@ -14298,6 +14784,200 @@ TEST(disk, dk39_search_paths_not_yet_covered) {
 // Upkeep step 1a: health reports (HE1-HE8)
 // ===========================================================================
 
+TEST(disk, dk40_half_precision_vectors) {
+    // Both half formats, both metrics, against float32: the same graph, every vector
+    // rounded exactly once, smaller files, fewer blocks read, recall within a point.
+    auto data = clustered(3000, 64, 12, 1940);
+    auto queries = clustered(40, 64, 12, 1941);
+    for (const Metric m : {Metric::L2, Metric::Cosine}) {
+        DiskIndexParams p;
+        p.graph = VamanaParams{32, 64, 1.2f, 5};
+        const std::string full_path = temp_path("dk40f");
+        DiskIndex::build(full_path, id_range(0, 3000), flatten(data), 64, m, p);
+        const auto full = DiskIndex::open(full_path);
+        FlatIndex exact(64, m);
+        for (std::uint64_t i = 0; i < 3000; ++i) exact.add(i, data[i]);
+        const DiskRun base = disk_run(*full, exact, queries, DiskSearchParams{60, 4});
+        for (const DiskVectorFormat f : {DiskVectorFormat::Float16, DiskVectorFormat::BFloat16}) {
+            const std::string path = temp_path("dk40h");
+            p.vectors = f;
+            DiskIndex::build(path, id_range(0, 3000), flatten(data), 64, m, p);
+            const auto half = DiskIndex::open(path);
+            bool same = half->vector_format() == f && full->vector_format() == DiskVectorFormat::Float32 && half->medoid() == full->medoid();
+            for (NodeId i = 0; i < 3000; ++i) {
+                const auto a = full->read_node(i), b = half->read_node(i);
+                same = same && a.neighbors == b.neighbors;
+                for (std::size_t j = 0; j < 64; ++j) {
+                    const float rounded = f == DiskVectorFormat::Float16 ? f16_to_float(float_to_f16(a.vector[j])) : bf16_to_float(float_to_bf16(a.vector[j]));
+                    same = same && b.vector[j] == rounded;
+                }
+            }
+            const DiskRun run = disk_run(*half, exact, queries, DiskSearchParams{60, 4});
+            const auto full_bytes = std::filesystem::file_size(full_path), half_bytes = std::filesystem::file_size(path);
+            std::printf("    %s %s: file %.0f%% of float32; blocks read %.1f vs %.1f; recall@10 %.3f vs %.3f\n", m == Metric::L2 ? "L2    " : "cosine",
+                        f == DiskVectorFormat::Float16 ? "float16 " : "bfloat16", 100.0 * double(half_bytes) / double(full_bytes), run.blocks,
+                        base.blocks, run.recall, base.recall);
+            CHECK(same);
+            CHECK(half_bytes < full_bytes * 3 / 4 && run.blocks <= base.blocks && run.recall >= base.recall - 0.01);
+            std::filesystem::remove(path);
+        }
+        p.vectors = DiskVectorFormat::Float32;
+        std::filesystem::remove(full_path);
+    }
+}
+
+TEST(disk, dk43_half_precision_halves_reads_for_wide_vectors) {
+    // A search reads whole 4 KB blocks per node. At 1536 dimensions a float32 record
+    // (6212 bytes) spans 2 blocks and a half-precision one (3140 bytes) fits in 1: half the reads.
+    auto data = clustered(600, 1536, 6, 1945);
+    auto queries = clustered(20, 1536, 6, 1946);
+    DiskIndexParams p;
+    p.graph = VamanaParams{16, 32, 1.2f, 6};
+    FlatIndex exact(1536, Metric::Cosine);
+    for (std::uint64_t i = 0; i < 600; ++i) exact.add(i, data[i]);
+    DiskRun runs[2];
+    for (const DiskVectorFormat f : {DiskVectorFormat::Float32, DiskVectorFormat::Float16}) {
+        const std::string path = temp_path("dk43");
+        p.vectors = f;
+        DiskIndex::build(path, id_range(0, 600), flatten(data), 1536, Metric::Cosine, p);
+        runs[f == DiskVectorFormat::Float16] = disk_run(*DiskIndex::open(path), exact, queries, DiskSearchParams{40, 4});
+        std::filesystem::remove(path);
+    }
+    std::printf("    1536 dimensions: blocks read %.1f (float32) vs %.1f (float16); nodes read %.1f vs %.1f; recall@10 %.3f vs %.3f\n",
+                runs[0].blocks, runs[1].blocks, runs[0].nodes, runs[1].nodes, runs[0].recall, runs[1].recall);
+    CHECK(std::abs(runs[0].blocks - 2 * runs[1].blocks) <= 0.5 && runs[1].recall >= runs[0].recall - 0.01);
+}
+
+TEST(disk, dk44_half_precision_damage) {
+    // NaN in a node, behind valid checksums: refused when read (never a NaN distance), for
+    // both half formats; and float32 alike. Then byte flips and truncations: refused cleanly.
+    auto data = random_vectors(60, 8, 1944);
+    for (const DiskVectorFormat f : {DiskVectorFormat::Float32, DiskVectorFormat::Float16, DiskVectorFormat::BFloat16}) {
+        const std::string good = temp_path("dk44_good"), path = temp_path("dk44");
+        DiskIndexParams p;
+        p.graph = VamanaParams{8, 16, 1.2f, 1};
+        p.vectors = f;
+        DiskIndex::build(good, id_range(0, 60), flatten(data), 8, Metric::L2, p);
+        const std::string bytes = read_file(good);
+        std::string bad = bytes;  // the first value of the first node, at block 1
+        if (f == DiskVectorFormat::Float32) bad.replace(4096, 4, le<float>(std::numeric_limits<float>::quiet_NaN()));
+        else bad.replace(4096, 2, le<std::uint16_t>(f == DiskVectorFormat::Float16 ? 0x7E00 : 0x7FC0));
+        resign_disk(bad);
+        write_file(path, bad);
+        const auto d = DiskIndex::open(path);  // nodes are read when searched
+        CHECK_THROWS_AS(FormatError, (void)d->read_node(0));
+        bool refused = false;
+        try {
+            for (std::uint64_t i = 0; i < 60; ++i) (void)d->search(data[i], 5);
+        } catch (const FormatError&) {
+            refused = true;
+        }
+        CHECK(refused);  // some search reads node 0
+        // Byte flips (with and without valid checksums) and truncations: a clean outcome every time.
+        std::mt19937 rng(44);
+        std::size_t outcomes = 0;
+        for (int i = 0; i < 120; ++i) {
+            std::string b = bytes;
+            b[rng() % b.size()] ^= static_cast<char>(1 + rng() % 255);
+            if (i % 2) resign_disk(b);
+            if (i % 7 == 0) b.resize(rng() % b.size());
+            write_file(path, b);
+            try {
+                const auto x = DiskIndex::open(path);
+                for (std::uint64_t q = 0; q < 10; ++q) (void)x->search(data[q], 5);
+            } catch (const std::exception&) {
+            }
+            ++outcomes;
+        }
+        CHECK(outcomes == 120);
+        std::filesystem::remove(good);
+        std::filesystem::remove(path);
+    }
+}
+
+TEST(disk, dk41_half_precision_format_rules) {
+    auto data = random_vectors(200, 8, 1942);
+    DiskIndexParams p;
+    p.graph = VamanaParams{8, 16, 1.2f, 1};
+    // float16 holds values up to 65504: refused for L2, fine for cosine (normalized) and bfloat16.
+    auto big = data;
+    big[5][3] = 70000.0f;
+    const std::string path = temp_path("dk41");
+    p.vectors = DiskVectorFormat::Float16;
+    CHECK_THROWS_AS(std::invalid_argument, DiskIndex::build(path, id_range(0, 200), flatten(big), 8, Metric::L2, p));
+    CHECK(!std::filesystem::exists(path));  // nothing left behind
+    DiskIndex::build(path, id_range(0, 200), flatten(big), 8, Metric::Cosine, p);
+    CHECK(DiskIndex::open(path)->vector_format() == DiskVectorFormat::Float16);
+    p.vectors = DiskVectorFormat::BFloat16;
+    DiskIndex::build(path, id_range(0, 200), flatten(big), 8, Metric::L2, p);
+    CHECK(std::abs(*DiskIndex::open(path)->get_vector(5).value().begin() - big[5][0]) <= std::abs(big[5][0]) / 128 + 1e-6f);
+    // Version and format in the header: float32 is version 1 with the field 0; half, version 2.
+    p.vectors = DiskVectorFormat::Float32;
+    DiskIndex::build(path, id_range(0, 200), flatten(data), 8, Metric::L2, p);
+    const std::string full = read_file(path);
+    p.vectors = DiskVectorFormat::Float16;
+    const std::string half_path = temp_path("dk41h");
+    DiskIndex::build(half_path, id_range(0, 200), flatten(data), 8, Metric::L2, p);
+    const std::string half = read_file(half_path);
+    auto u32 = [](const std::string& b, std::size_t at) { return persist::from_little_endian<std::uint32_t>(reinterpret_cast<const unsigned char*>(b.data()) + at); };
+    CHECK(u32(full, 8) == 1 && u32(full, 28) == 0 && u32(half, 8) == 2 && u32(half, 28) == 1);
+    // Where the header's checksum sits: the offset whose value is the checksum of what precedes it.
+    std::size_t crc_at = 0;
+    for (std::size_t s = 32; s + 4 <= 4096 && !crc_at; ++s)
+        if (u32(full, s) == persist::crc32(0, reinterpret_cast<const unsigned char*>(full.data()), s)) crc_at = s;
+    CHECK(crc_at > 0);
+    auto tampered = [&](std::string b, std::uint32_t version, std::uint32_t format) {
+        for (int i = 0; i < 4; ++i) {
+            b[8 + i] = char((version >> (8 * i)) & 0xFF);
+            b[28 + i] = char((format >> (8 * i)) & 0xFF);
+        }
+        const std::uint32_t crc = persist::crc32(0, reinterpret_cast<const unsigned char*>(b.data()), crc_at);  // valid checksum: the rule itself must refuse
+        for (int i = 0; i < 4; ++i) b[crc_at + std::size_t(i)] = char((crc >> (8 * i)) & 0xFF);
+        write_file(path, b);
+        try {
+            (void)DiskIndex::open(path);
+        } catch (const FormatError&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(tampered(full, 1, 1));   // version 1 with a half format
+    CHECK(tampered(full, 2, 0));   // version 2 saying float32
+    CHECK(tampered(half, 1, 1));   // a half file claiming version 1
+    CHECK(tampered(half, 2, 3));   // an unknown format
+    CHECK(tampered(half, 3, 1));   // a version no library wrote
+    CHECK(!tampered(half, 2, 1));  // untouched values: opens
+    std::filesystem::remove(path);
+    std::filesystem::remove(half_path);
+}
+
+TEST(disk, dk42_half_precision_large_builds_and_reads) {
+    // The large-file build path, and every way vectors are read back.
+    auto data = clustered(1500, 16, 6, 1943);
+    const std::string vec = temp_path("dk42v"), path = temp_path("dk42");
+    write_vectors_file(vec, flatten(data), 16);
+    LargeBuildParams lp;
+    lp.index.graph = VamanaParams{16, 32, 1.2f, 2};
+    lp.index.vectors = DiskVectorFormat::BFloat16;
+    lp.memory_budget = 200000;  // several partitions
+    DiskIndex::build_from_file(path, vec, Metric::L2, lp);
+    const auto d = DiskIndex::open(path);
+    bool rounded = d->vector_format() == DiskVectorFormat::BFloat16 && d->size() == 1500;
+    for (std::uint64_t i = 0; i < 1500; i += 37) {
+        const auto v = *d->get_vector(i);
+        for (std::size_t j = 0; j < 16; ++j) rounded = rounded && v[j] == bf16_to_float(float_to_bf16(data[i][j]));
+    }
+    FlatIndex exact(16, Metric::L2);
+    for (std::uint64_t i = 0; i < 1500; ++i) exact.add(i, data[i]);
+    const DiskRun run = disk_run(*d, exact, clustered(30, 16, 6, 1944), DiskSearchParams{60, 4});
+    HealthOptions ho;
+    ho.recall_sample = 20;
+    const HealthReport h = d->health(ho);
+    CHECK(rounded && run.recall >= 0.9 && h.live == 1500 && h.unreachable == 0);
+    std::filesystem::remove(vec);
+    std::filesystem::remove(path);
+}
+
 TEST(health, he01_a_fresh_index_is_healthy) {
     auto data = clustered(3000, 16, 10, 2000);
     HnswParams p;
@@ -17339,6 +18019,82 @@ TEST(sparse, sp09_deadlines_and_stats) {
     CHECK(empty.search(q, 10).empty() && empty.size() == 0 && empty.records().empty());
 }
 
+TEST(sparse, sp14_search_equals_a_brute_force_reference) {
+    // Search against a brute-force reference: identical IDs and bit-identical scores,
+    // with weights of both signs, ties (repeated documents), filters, predicates, every
+    // k, after removals and after compaction.
+    std::mt19937 rng(3014);
+    std::uniform_real_distribution<float> weight(-1.0f, 2.0f);
+    // Zipf-like terms: a few very common, most rare, as in text.
+    auto doc = [&](std::size_t terms) {
+        std::map<std::uint32_t, float> m;
+        while (m.size() < terms) m[std::uint32_t(std::pow(std::uniform_real_distribution<double>(0, 1)(rng), 3.0) * 400)] = weight(rng);
+        SparseVector v;
+        for (const auto& [t, w] : m) {
+            v.indices.push_back(t);
+            v.values.push_back(w);
+        }
+        return v;
+    };
+    SparseIndex s;
+    std::map<std::uint64_t, SparseVector> model;
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        const SparseVector v = (i % 50 == 7 && i > 7) ? model[i - 7] : doc(5 + rng() % 25);  // some exact repeats: ties
+        s.add(i, v, Metadata().set("g", std::int64_t(i % 3)));
+        model[i] = v;
+    }
+    auto reference = [&](const SparseVector& q, std::size_t k, const std::function<bool(std::uint64_t)>& keep) {
+        std::vector<SearchResult> all;
+        for (const auto& [id, v] : model) {
+            if (!keep(id)) continue;
+            float score = 0.0f;
+            bool touched = false;
+            for (std::size_t i = 0; i < q.size(); ++i)  // the query's term order, as the index sums
+                for (std::size_t j = 0; j < v.size(); ++j)
+                    if (v.indices[j] == q.indices[i]) {
+                        score += q.values[i] * v.values[j];
+                        touched = true;
+                    }
+            if (touched) all.push_back({id, -score});
+        }
+        std::sort(all.begin(), all.end(), [](const SearchResult& a, const SearchResult& b) { return a.distance < b.distance || (a.distance == b.distance && a.id < b.id); });
+        if (all.size() > k) all.resize(k);
+        return all;
+    };
+    auto same = [](const std::vector<SearchResult>& a, const std::vector<SearchResult>& b) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (a[i].id != b[i].id || std::bit_cast<std::uint32_t>(a[i].distance) != std::bit_cast<std::uint32_t>(b[i].distance)) return false;
+        return true;
+    };
+    std::size_t compared = 0, mismatches = 0;
+    auto run_all = [&] {
+        for (int round = 0; round < 60; ++round) {
+            const SparseVector q = doc(2 + rng() % 8);
+            for (const std::size_t k : {std::size_t(1), std::size_t(10), std::size_t(100), std::size_t(5000)}) {
+                mismatches += !same(s.search(q, k), reference(q, k, [](std::uint64_t) { return true; }));
+                ++compared;
+                SearchOptions f;
+                f.filter = Filter::eq("g", std::int64_t(1));
+                mismatches += !same(s.search(q, k, f), reference(q, k, [&](std::uint64_t id) { return model.count(id) && id % 3 == 1; }));
+                SearchOptions p;
+                p.predicate = [](std::uint64_t id) { return id % 7 != 0; };
+                mismatches += !same(s.search(q, k, p), reference(q, k, [](std::uint64_t id) { return id % 7 != 0; }));
+                compared += 2;
+            }
+        }
+    };
+    run_all();
+    for (std::uint64_t i = 0; i < 3000; i += 3) {  // removals leave dead entries in the posting lists
+        CHECK(s.remove(i));
+        model.erase(i);
+    }
+    run_all();
+    s.compact();  // posting lists rebuilt
+    run_all();
+    CHECK(mismatches == 0 && compared == 3 * 60 * 4 * 3);
+}
+
 TEST(sparse, sp10_concurrent_searches_and_changes) {
     std::mt19937 seed(3006);
     std::vector<SparseVector> pool;
@@ -18953,6 +19709,7 @@ TEST(acorn, ac01_the_planner_chooses_it_between_exact_and_graph) {
     CHECK(plan(Filter::lt("spread", std::int64_t(10))).strategy == Strategy::ForceExact);
     PlannerParams few;  // the exact scan only by fraction (1%), so that ACORN's range shows at this size
     few.max_exact_matches = 0;
+    few.fallback_factor = 0;  // the decision itself (the exact fallback has its own test, pl20)
     PlannerParams fraction = few;  // 1% matching, well inside an exact fraction of 5% (a sample may estimate 1% a little above 1%)
     fraction.max_exact_fraction = 0.05;
     CHECK(plan(Filter::lt("spread", std::int64_t(1)), fraction).strategy == Strategy::ForceExact);

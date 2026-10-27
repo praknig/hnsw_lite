@@ -3,6 +3,7 @@
  * @brief Building, opening and reading a disk-based index; see disk_index.h.
  */
 #include "disk_index.h"
+#include "half.h"
 
 #include <algorithm>
 #include <cmath>
@@ -168,7 +169,8 @@ DiskIndex::~DiskIndex() = default;
 namespace {
 
 constexpr char kMagic[8] = {'H', 'N', 'S', 'W', 'D', 'I', 'S', 'K'};
-constexpr std::uint32_t kDiskVersion = 1;
+constexpr std::uint32_t kDiskVersion = 1;      // float32 vectors
+constexpr std::uint32_t kDiskVersionHalf = 2;  // half-precision vectors (DiskVectorFormat in the reserved field)
 constexpr std::uint32_t kByteOrder = 0x01020304;
 constexpr std::uint32_t kNoNeighbor = 0xFFFFFFFFu;
 enum Section { kBlockCrc = 0, kPq = 1, kIds = 2, kMeta = 3, kSections = 4 };
@@ -190,8 +192,8 @@ template <class T> T load_le(const unsigned char* p) { return persist::from_litt
 struct Layout {
     std::size_t node_bytes, nodes_per_block, blocks_per_node;
     std::uint64_t node_blocks;
-    Layout(std::size_t dim, std::size_t R, std::uint64_t n) {
-        node_bytes = 4 * dim + 4 + 4 * R;
+    Layout(std::size_t dim, std::size_t R, std::uint64_t n, DiskVectorFormat format) {
+        node_bytes = (format == DiskVectorFormat::Float32 ? 4 : 2) * dim + 4 + 4 * R;
         if (node_bytes <= DiskIndex::kBlock) {
             nodes_per_block = DiskIndex::kBlock / node_bytes;
             blocks_per_node = 1;
@@ -292,9 +294,9 @@ using NodeSource = std::function<void(NodeId, std::vector<float>&, std::vector<N
 /// `path` only once complete. Every builder goes through here, so every builder
 /// writes the same format.
 void write_index(const std::string& path, std::size_t dim, Metric metric, std::size_t R, NodeId medoid, std::size_t n,
-                 const NodeSource& next, const PQCodec& pq, const std::vector<std::uint8_t>& codes,
+                 DiskVectorFormat format, const NodeSource& next, const PQCodec& pq, const std::vector<std::uint8_t>& codes,
                  std::span<const std::uint64_t> ids, const MetadataStore& store) {
-    const Layout layout(dim, R, n);
+    const Layout layout(dim, R, n, format);
     write_atomically(path, [&](std::ofstream& out) {
         std::vector<std::uint32_t> crcs;
         std::vector<float> vec;
@@ -302,7 +304,15 @@ void write_index(const std::string& path, std::size_t dim, Metric metric, std::s
         auto record = [&](NodeId i, char* at) {
             next(i, vec, nbs);
             Bytes r;
-            r.put_floats(vec.data(), dim);
+            if (format == DiskVectorFormat::Float32) {
+                r.put_floats(vec.data(), dim);
+            } else {
+                for (std::size_t j = 0; j < dim; ++j) {
+                    if (format == DiskVectorFormat::Float16 && std::fabs(vec[j]) > kF16Max)  // L2 values only: cosine ones are at most 1
+                        throw std::invalid_argument("DiskIndex: float16 holds values up to 65504 in magnitude; use DiskVectorFormat::BFloat16");
+                    r.put<std::uint16_t>(format == DiskVectorFormat::Float16 ? float_to_f16(vec[j]) : float_to_bf16(vec[j]));
+                }
+            }
             r.put<std::uint32_t>(static_cast<std::uint32_t>(nbs.size()));
             for (std::size_t s = 0; s < R; ++s) r.put<std::uint32_t>(s < nbs.size() ? nbs[s] : kNoNeighbor);
             std::memcpy(at, r.data.data(), r.data.size());
@@ -345,11 +355,12 @@ void write_index(const std::string& path, std::size_t dim, Metric metric, std::s
         std::uint64_t offset = DiskIndex::kBlock * (1 + layout.node_blocks);
         Bytes header;
         header.data.append(kMagic, 8);
-        header.put<std::uint32_t>(kDiskVersion);
+        // Float32 files stay version 1, byte for byte as before; half precision is version 2.
+        header.put<std::uint32_t>(format == DiskVectorFormat::Float32 ? kDiskVersion : kDiskVersionHalf);
         header.put<std::uint32_t>(kByteOrder);
         header.put<std::uint64_t>(dim);
         header.put<std::uint32_t>(static_cast<std::uint32_t>(metric));
-        header.put<std::uint32_t>(0);
+        header.put<std::uint32_t>(static_cast<std::uint32_t>(format));  // reserved (0) in version 1
         header.put<std::uint64_t>(n);
         header.put<std::uint64_t>(R);
         header.put<std::uint64_t>(medoid);
@@ -407,7 +418,7 @@ void DiskIndex::build(const std::string& path, std::span<const std::uint64_t> id
     }
     std::vector<std::uint8_t> codes(n * pq.code_size());
     for (NodeId i = 0; i < n; ++i) pq.encode(g.vector(i), codes.data() + std::size_t(i) * pq.code_size());
-    write_index(path, dim, metric, params.graph.R, g.medoid(), n,
+    write_index(path, dim, metric, params.graph.R, g.medoid(), n, params.vectors,
                 [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& nbs) {
                     const auto x = g.vector(i);
                     v.assign(x.begin(), x.end());
@@ -742,7 +753,7 @@ void DiskIndex::build_from_file(const std::string& path, const std::string& vect
         }
     }
     // 4c. Write, one sequential pass in ID order.
-    write_index(path, dim, metric, R, medoid, n,
+    write_index(path, dim, metric, R, medoid, n, params.index.vectors,
                 [&](NodeId i, std::vector<float>& v, std::vector<NodeId>& list) {
                     read_raw(i, raw.data());
                     pv.prepare(raw, metric);
@@ -764,7 +775,8 @@ std::unique_ptr<DiskIndex> DiskIndex::open(const std::string& path, const DiskOp
     std::vector<unsigned char> h(kBlock);
     f.read(0, h.data(), kBlock);
     if (std::memcmp(h.data(), kMagic, 8) != 0) throw FormatError("not a disk index (wrong magic)");
-    if (load_le<std::uint32_t>(&h[8]) != kDiskVersion) throw FormatError("unsupported disk index version");
+    const auto version = load_le<std::uint32_t>(&h[8]);
+    if (version != kDiskVersion && version != kDiskVersionHalf) throw FormatError("unsupported disk index version");
     if (load_le<std::uint32_t>(&h[12]) != kByteOrder) throw FormatError("wrong byte order mark");
     const std::size_t header_size = 8 + 4 + 4 + 8 + 4 + 4 + 8 * 7 + kSections * 20;
     if (persist::kVerifyChecksums && load_le<std::uint32_t>(&h[header_size]) != persist::crc32(0, h.data(), header_size)) throw FormatError("header checksum mismatch");
@@ -776,7 +788,12 @@ std::unique_ptr<DiskIndex> DiskIndex::open(const std::string& path, const DiskOp
     if (dim == 0 || dim > (1u << 20) || R == 0 || R > (1u << 16) || n == 0 || n >= kNoNeighbor || medoid >= n)
         throw FormatError("invalid disk index sizes");
     if (metric != std::uint32_t(Metric::L2) && metric != std::uint32_t(Metric::Cosine)) throw FormatError("invalid metric");
-    const Layout layout(dim, R, n);
+    // Version 1: float32, the field reserved (0). Version 2: a half-precision format.
+    const auto format = load_le<std::uint32_t>(&h[28]);
+    if (version == kDiskVersion ? format != 0 : (format != std::uint32_t(DiskVectorFormat::Float16) && format != std::uint32_t(DiskVectorFormat::BFloat16)))
+        throw FormatError("invalid vector format for this disk index version");
+    d->format_ = static_cast<DiskVectorFormat>(format);
+    const Layout layout(dim, R, n, d->format_);
     if (load_le<std::uint64_t>(&h[56]) != layout.node_bytes || load_le<std::uint64_t>(&h[64]) != layout.nodes_per_block ||
         load_le<std::uint64_t>(&h[72]) != layout.blocks_per_node || load_le<std::uint64_t>(&h[80]) != layout.node_blocks)
         throw FormatError("inconsistent node layout");
@@ -878,11 +895,19 @@ DiskIndex::Node DiskIndex::read_node(NodeId node) const {
     const unsigned char* r = buf.data() + (node_offset(node) - kBlock * (1 + first));
     Node out;
     out.vector.resize(dim_);
-    for (std::size_t j = 0; j < dim_; ++j) out.vector[j] = load_le<float>(r + 4 * j);
-    const auto degree = load_le<std::uint32_t>(r + 4 * dim_);
+    const std::size_t value_bytes = format_ == DiskVectorFormat::Float32 ? 4 : 2;
+    if (format_ == DiskVectorFormat::Float32)
+        for (std::size_t j = 0; j < dim_; ++j) out.vector[j] = load_le<float>(r + 4 * j);
+    else if (format_ == DiskVectorFormat::Float16)
+        for (std::size_t j = 0; j < dim_; ++j) out.vector[j] = f16_to_float(load_le<std::uint16_t>(r + 2 * j));
+    else
+        for (std::size_t j = 0; j < dim_; ++j) out.vector[j] = bf16_to_float(load_le<std::uint16_t>(r + 2 * j));
+    for (const float v : out.vector)  // behind a valid checksum, still a NaN or infinity would poison distances
+        if (!std::isfinite(v)) throw FormatError("a stored vector is not finite");
+    const auto degree = load_le<std::uint32_t>(r + value_bytes * dim_);
     if (degree > R_) throw FormatError("invalid node degree");
     for (std::size_t s = 0; s < degree; ++s) {
-        const auto nb = load_le<std::uint32_t>(r + 4 * dim_ + 4 + 4 * s);
+        const auto nb = load_le<std::uint32_t>(r + value_bytes * dim_ + 4 + 4 * s);
         if (nb >= size()) throw FormatError("a neighbor does not exist");
         out.neighbors.push_back(nb);
     }

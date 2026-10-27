@@ -546,7 +546,8 @@ PYBIND11_MODULE(_core, m) {
         .value("KEYWORD", FieldType::Keyword).value("TAGS", FieldType::Tags);
     py::enum_<CodecKind>(m, "Codec").value("NONE", CodecKind::None).value("SQ8", CodecKind::SQ8).value("BINARY", CodecKind::Binary).value("PQ", CodecKind::PQ)
         .value("F16", CodecKind::F16)
-        .value("BF16", CodecKind::BF16);
+        .value("BF16", CodecKind::BF16)
+        .value("RABITQ", CodecKind::RaBitQ);
     py::enum_<Strategy>(m, "Strategy").value("AUTO", Strategy::Auto).value("EXACT", Strategy::ForceExact).value("GRAPH", Strategy::ForceGraph)
         .value("ACORN", Strategy::ForceAcorn);
     py::enum_<Preset>(m, "Preset").value("BALANCED", Preset::Balanced).value("HIGH_RECALL", Preset::HighRecall).value("LOW_MEMORY", Preset::LowMemory);

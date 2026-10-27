@@ -103,4 +103,10 @@ void bf16_decode_scalar(const std::uint16_t* c, float* out, std::size_t n) {
     for (std::size_t j = 0; j < n; ++j) out[j] = bf16_to_float(c[j]);
 }
 
+std::int32_t sq8_dot_i8_scalar(const std::int8_t* w, const std::uint8_t* c, std::size_t n) {
+    std::int32_t sum = 0;
+    for (std::size_t j = 0; j < n; ++j) sum += std::int32_t(c[j]) * std::int32_t(w[j]);
+    return sum;
+}
+
 }  // namespace vecdb::kernels

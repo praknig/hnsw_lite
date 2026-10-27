@@ -705,6 +705,67 @@ RACE_TEST(r14_facets_while_indexed_metadata_changes) {
     CHECK(bad == 0);
 }
 
+// ---------------------------------------------------------------- r15
+
+RACE_TEST(r15_fallbacks_rabitq_compaction_and_half_disk) {
+    // Filtered searches falling back to exact scans while writers change the filtered field
+    // and a thread compacts a codes-only RaBitQ index (codes copied, not re-encoded), with
+    // readers sharing a half-precision disk index. Every result respects its filter.
+    auto data = random_vectors(400, 8, 15);
+    QuantizationParams qp;
+    qp.codec = CodecKind::RaBitQ;
+    qp.train_after = 50;
+    qp.keep_full_vectors = false;
+    HnswParams hp;
+    hp.quantization = qp;
+    HnswIndex h(8, Metric::L2, hp);
+    // "fixed" never changes (the ID's last digit): results are checked against it from the
+    // ID alone, with no read-back race. "c" changes under every write.
+    for (std::uint64_t i = 0; i < 300; ++i) h.add(i, data[i], Metadata().set("c", std::int64_t(i % 10)).set("fixed", std::int64_t(i % 10)));
+    PlannerParams tight;
+    tight.fallback_factor = 0.25;
+    tight.max_exact_matches = 0;
+    tight.acorn_below = 0;
+    h.set_planner_params(tight);
+    const std::string disk = (std::filesystem::temp_directory_path() / "r15_disk.idx").string();
+    DiskIndexParams dp;
+    dp.graph = VamanaParams{8, 16, 1.2f, 1};
+    dp.vectors = DiskVectorFormat::Float16;
+    std::vector<std::uint64_t> ids(400);
+    std::vector<float> flat;
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        ids[i] = i;
+        flat.insert(flat.end(), data[i].begin(), data[i].end());
+    }
+    DiskIndex::build(disk, ids, flat, 8, Metric::L2, dp);
+    const auto d = DiskIndex::open(disk);
+    std::atomic<int> bad{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {  // writers: the filtered field and the vectors change
+            const std::uint64_t i = rng() % 400;
+            if (rng() % 3 == 0) (void)h.remove(i);
+            else (void)h.upsert(i, data[i], Metadata().set("c", std::int64_t(rng() % 10)).set("fixed", std::int64_t(i % 10)));
+        },
+        [&](std::size_t, std::mt19937& rng) {  // searches: correlated filters, many falling back
+            SearchOptions o;
+            const std::int64_t below = std::int64_t(1 + rng() % 4);
+            const bool stable = rng() % 2 == 0;  // the stable field, or the one changing under writes
+            o.filter = stable ? Filter::lt("fixed", below) : Filter::lt("c", below);
+            for (const auto& r : h.search(data[rng() % 400], 10, 16, o)) {
+                if (stable && std::int64_t(r.id % 10) >= below) ++bad;  // a result outside its filter
+                if (std::isnan(r.distance) || r.id >= 400) ++bad;
+            }
+        },
+        [&](std::size_t, std::mt19937&) { (void)h.compact(); },  // codes-only compaction, copying codes
+        [&](std::size_t, std::mt19937& rng) {  // the half-precision disk index, shared
+            for (const auto& r : d->search(data[rng() % 400], 5))
+                if (std::isnan(r.distance) || r.id >= 400) ++bad;
+        },
+    });
+    std::filesystem::remove(disk);
+    CHECK(bad == 0);
+}
+
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {

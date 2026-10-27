@@ -62,19 +62,19 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Durability: a write-ahead log with snapshots and crash recovery (`open_durable()`)
 - [x] Sparse vectors, BM25 and hybrid search with rank fusion (`SparseIndex`, `hybrid_search()`)
 - [x] Write-ahead log for `SparseIndex`
-- [ ] MaxScore pruning for long posting lists
+- [ ] MaxScore pruning for long posting lists. Tried: an exact document-at-a-time MaxScore read 29% fewer postings but searched 4× slower than the term-at-a-time loop (measured on 50,000 SPLADE-like documents, k = 10 and 100): finding the next document across the query's cursors costs more than the postings it saves. A faster version needs block-max indexes or skip structures.
 - [x] Fuzzing the file and log loaders
 - [x] Collections: documents over dense, text and sparse sides, durable as a whole (`Collection`)
 - [x] Automatic maintenance of collections (`MaintenancePolicy`, `maintain()`, a background thread)
 - [x] Presets for collections (`CollectionOptions::preset`)
 - [x] ACORN filtered graph search, chosen by the query planner
-- [ ] RaBitQ compression
+- [x] RaBitQ compression (one bit per dimension and two numbers; helps most for L2 and wide vectors)
 - [x] Python bindings with NumPy and pandas integration (`hnsw_lite_lib`)
 - [x] Python wheels for Linux, macOS and Windows (`pip install hnsw-lite-lib`)
 - [ ] C++ packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [x] Payload index posting lists; faceted search (top values, numeric ranges, distinct counts)
-- [ ] Filter-aware graph construction
+- [ ] Filter-aware graph construction. Measured first (30,000 vectors, filters from 0.5% to 30%, correlated with the clusters or not, indexed or ranges): recall was already 0.995 or better everywhere; the gap was cost, for correlated filters past exact search's limits. Built instead: the planner's exact fallback (4.3 to 6.2× faster there). Construction changes stay open for data where recall does fall.
 - [x] Graph reordering for memory locality (`reorder()`), score modifiers (recency decay, confidence, boosts), dates, MMR diversity, document expiry (TTL), string keys
 - [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
 - [x] Half-precision vectors (float16, bfloat16), a compact ID map, and collection settings (expiry, string keys) saved with the collection
@@ -84,7 +84,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
 - [ ] A first release on PyPI (v0.1.0), with a changelog
 - [ ] LangChain and LlamaIndex integrations; an ann-benchmarks adapter
-- [ ] Integer SIMD kernels for SQ8 distances; half precision for the disk index
+- [x] Integer SIMD kernels for SQ8 distances (inner product and cosine)
+- [x] Half precision for the disk index (float16, bfloat16)
 
 The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) were planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 

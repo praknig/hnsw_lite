@@ -66,6 +66,10 @@ struct CodeKernels {
     /// Half precision: n codes widened to float32 (decoding, for comparing two stored vectors).
     void (*f16_decode)(const std::uint16_t* c, float* out, std::size_t n);
     void (*bf16_decode)(const std::uint16_t* c, float* out, std::size_t n);
+    /// SQ8 inner product in integers: sum of c[j] * w[j], the codes times weights in
+    /// [-63, 63] (so pairs of products never saturate 16 bits). Exact: the same result
+    /// on every instruction set.
+    std::int32_t (*sq8_dot_i8)(const std::int8_t* w, const std::uint8_t* c, std::size_t n);
 };
 
 /// The fastest code kernels this CPU supports (the same choice as get_distance).

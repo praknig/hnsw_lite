@@ -91,7 +91,7 @@ struct LoadedCodec {
 LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t slots) {
     LoadedCodec c;
     const auto kind = r.get<std::uint8_t>();
-    if (kind > static_cast<std::uint8_t>(CodecKind::BF16)) throw FormatError("unknown codec");
+    if (kind > static_cast<std::uint8_t>(CodecKind::RaBitQ)) throw FormatError("unknown codec");
     c.params.codec = static_cast<CodecKind>(kind);
     c.params.train_after = static_cast<std::size_t>(r.get<std::uint64_t>());
     const auto rerank = r.get<std::uint8_t>();
@@ -125,6 +125,11 @@ LoadedCodec read_codec(Reader& r, std::size_t dim, Metric metric, std::size_t sl
             const std::size_t k = static_cast<PQCodec&>(*c.codec).centroids();
             for (std::uint8_t b : c.codes)
                 if (b >= k) throw FormatError("a code refers to a centroid that does not exist");
+        }
+        if (c.params.codec == CodecKind::RaBitQ) {  // its two numbers: NaN, infinity or impossible values would too
+            const auto& q = static_cast<const RaBitQCodec&>(*c.codec);
+            for (std::size_t s = 0; s < slots; ++s)
+                if (!q.valid_code(c.codes.data() + s * q.code_size())) throw FormatError("a RaBitQ code holds an impossible length or alignment");
         }
         if (half) {  // infinity and NaN bit patterns would break the no-NaN guarantee
             const auto& h = static_cast<const HalfCodec&>(*c.codec);

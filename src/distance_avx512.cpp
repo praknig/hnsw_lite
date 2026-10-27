@@ -177,4 +177,18 @@ void bf16_decode_avx512(const std::uint16_t* c, float* out, std::size_t n) {
     for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
 }
 
+// SQ8 in integers, 64 bytes per step (see the AVX2 version for the bounds).
+std::int32_t sq8_dot_i8_avx512(const std::int8_t* w, const std::uint8_t* c, std::size_t n) {
+    __m512i acc = _mm512_setzero_si512();
+    const __m512i ones = _mm512_set1_epi16(1);
+    std::size_t j = 0;
+    for (; j + 64 <= n; j += 64) {
+        const __m512i pairs = _mm512_maddubs_epi16(_mm512_loadu_si512(c + j), _mm512_loadu_si512(w + j));
+        acc = _mm512_add_epi32(acc, _mm512_madd_epi16(pairs, ones));
+    }
+    std::int32_t sum = _mm512_reduce_add_epi32(acc);
+    for (; j < n; ++j) sum += std::int32_t(c[j]) * std::int32_t(w[j]);
+    return sum;
+}
+
 }  // namespace vecdb::kernels

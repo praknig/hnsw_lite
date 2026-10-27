@@ -190,4 +190,24 @@ void bf16_decode_avx2(const std::uint16_t* c, float* out, std::size_t n) {
     for (; j < n; ++j) out[j] = bf16_to_float(c[j]);
 }
 
+// SQ8 in integers: 32 code bytes times 32 signed weights per step. vpmaddubsw adds
+// pairs of products into 16 bits: with weights in [-63, 63], at most 2 * 255 * 63 =
+// 32130, so never saturated; vpmaddwd then widens to 32-bit sums.
+std::int32_t sq8_dot_i8_avx2(const std::int8_t* w, const std::uint8_t* c, std::size_t n) {
+    __m256i acc = _mm256_setzero_si256();
+    const __m256i ones = _mm256_set1_epi16(1);
+    std::size_t j = 0;
+    for (; j + 32 <= n; j += 32) {
+        const __m256i pairs = _mm256_maddubs_epi16(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(c + j)),
+                                                   _mm256_loadu_si256(reinterpret_cast<const __m256i*>(w + j)));
+        acc = _mm256_add_epi32(acc, _mm256_madd_epi16(pairs, ones));
+    }
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    s = _mm_hadd_epi32(s, s);
+    s = _mm_hadd_epi32(s, s);
+    std::int32_t sum = _mm_cvtsi128_si32(s);
+    for (; j < n; ++j) sum += std::int32_t(c[j]) * std::int32_t(w[j]);
+    return sum;
+}
+
 }  // namespace vecdb::kernels

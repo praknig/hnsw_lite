@@ -21,7 +21,7 @@ GROUPS = [
     ("Results and distances (search_result.h, distance.h)", ["Metric", "SearchResult", "CompactStats"]),
     ("HnswIndex (hnsw_index.h, codec.h)", ["CodecKind", "QuantizationParams", "HnswParams", "HnswIndex"]),
     ("FlatIndex (flat_index.h)", ["IvfParams", "FlatIndex"]),
-    ("DiskIndex (disk_index.h, vamana.h)", ["VamanaParams", "DiskIndexParams", "LargeBuildParams", "LargeBuildStats", "DiskOpenOptions",
+    ("DiskIndex (disk_index.h, vamana.h)", ["VamanaParams", "DiskVectorFormat", "DiskIndexParams", "LargeBuildParams", "LargeBuildStats", "DiskOpenOptions",
                                             "DiskSearchParams", "DiskSearchStats", "DiskIndex", "BlockFile"]),
     ("Sparse vectors, BM25 and hybrid search (sparse.h)", ["SparseVector", "SparseRecord", "SparseIndex", "Bm25Params", "Bm25", "Fusion",
                                                            "HybridOptions", "HybridResult"]),

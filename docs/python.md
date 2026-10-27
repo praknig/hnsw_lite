@@ -252,7 +252,7 @@ Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [20
 
 ## Enumerations and option classes
 
-`hl.Metric` (`L2`, `INNER_PRODUCT`, `COSINE`), `hl.Codec` (`NONE`, `SQ8`, `BINARY`, `PQ`, `F16`, `BF16`, for `QuantizationParams.codec`; `F16` and `BF16` with `keep_full_vectors = False` halve vector memory), `hl.Strategy` (`AUTO`, `EXACT`, `GRAPH`, `ACORN`), `hl.Preset`, `hl.Fusion`, `hl.Durability`, `hl.Maintenance` (`MANUAL`, `BACKGROUND`) and `hl.FieldType` mirror the C++ enumerations. The option classes `hl.HnswParams`, `hl.QuantizationParams`, `hl.IvfParams`, `hl.DurableOptions`, `hl.MaintenancePolicy` and `hl.CollectionOptions` have the C++ fields as attributes (durations in milliseconds: `interval_ms`, `budget_ms`, `group_interval_ms`; `checkpoint_age_s` in seconds):
+`hl.Metric` (`L2`, `INNER_PRODUCT`, `COSINE`), `hl.Codec` (`NONE`, `SQ8`, `BINARY`, `PQ`, `F16`, `BF16`, `RABITQ`, for `QuantizationParams.codec`; `F16` and `BF16` with `keep_full_vectors = False` halve vector memory), `hl.Strategy` (`AUTO`, `EXACT`, `GRAPH`, `ACORN`), `hl.Preset`, `hl.Fusion`, `hl.Durability`, `hl.Maintenance` (`MANUAL`, `BACKGROUND`) and `hl.FieldType` mirror the C++ enumerations. The option classes `hl.HnswParams`, `hl.QuantizationParams`, `hl.IvfParams`, `hl.DurableOptions`, `hl.MaintenancePolicy` and `hl.CollectionOptions` have the C++ fields as attributes (durations in milliseconds: `interval_ms`, `budget_ms`, `group_interval_ms`; `checkpoint_age_s` in seconds):
 
 ```python
 p = hl.HnswParams()

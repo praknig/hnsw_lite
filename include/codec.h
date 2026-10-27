@@ -36,6 +36,7 @@ enum class CodecKind : std::uint8_t {
     PQ = 3,      ///< product quantization: one byte per part of the vector
     F16 = 4,     ///< half precision (IEEE float16): two bytes per dimension, values up to 65504
     BF16 = 5,    ///< bfloat16: two bytes per dimension, float32's range with 8 bits of precision
+    RaBitQ = 6,  ///< RaBitQ: one bit per dimension (rounded up to a power of two) and two numbers per vector
 };
 
 /// How an index stores its vectors in compact form (see the compression and
@@ -111,7 +112,7 @@ inline std::size_t saturating_mul(std::size_t a, std::size_t b) {
 
 /// Throws std::invalid_argument for settings that cannot work.
 inline void validate(const QuantizationParams& q) {
-    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::BF16)) throw std::invalid_argument("QuantizationParams: unknown codec");
+    if (static_cast<int>(q.codec) > static_cast<int>(CodecKind::RaBitQ)) throw std::invalid_argument("QuantizationParams: unknown codec");
     if (q.rerank_factor < 1) throw std::invalid_argument("QuantizationParams::rerank_factor must be at least 1");
 }
 
@@ -273,6 +274,50 @@ public:
 private:
     float high(std::size_t j) const;  // what a set bit decodes to
     std::vector<float> threshold_, spread_;
+};
+
+/**
+ * @brief RaBitQ (Gao and Long, SIGMOD 2024): each vector's residual from a centroid,
+ * rotated at random, stored as its signs (one bit per dimension) plus two numbers,
+ * the residual's length and <x, u> (the bits as a unit vector x against the rotated
+ * unit residual u). Distances use RaBitQ's estimator <u_o, u_q> ~ <x, u_q> / <x, u_o>,
+ * whose error shrinks as 1 / sqrt(dimensions), unlike plain sign bits.
+ *
+ * The rotation is a randomized Hadamard transform without padding: three rounds of
+ * random signs, then a fast Walsh-Hadamard transform on the first P coordinates and
+ * another on the last P (P the largest power of two not above the dimension; they
+ * overlap). Each step is orthonormal, so the whole is a rotation of the d dimensions
+ * themselves, taking O(d log d), stored as its signs (from std::mt19937's raw output),
+ * with additions and one scaling: codes are identical on every platform. A code holds
+ * one bit per dimension, as the binary codec does, plus two floats.
+ */
+class RaBitQCodec final : public VectorCodec {
+public:
+    RaBitQCodec(std::size_t dim, Metric metric);
+
+    CodecKind kind() const override { return CodecKind::RaBitQ; }
+    std::unique_ptr<VectorCodec> clone() const override { return std::make_unique<RaBitQCodec>(*this); }
+    /// The centroid (dim values), then the rotation's signs (3 * dim values, each +1 or -1).
+    std::vector<float> state() const override;
+    void restore(std::span<const float> state) override;
+    std::size_t code_size() const override { return bit_bytes() + 2 * sizeof(float); }
+    bool trained() const override { return !centroid_.empty(); }
+    void train(std::span<const float> sample) override;
+    void encode(std::span<const float> v, std::uint8_t* code) const override;
+    void decode(const std::uint8_t* code, std::span<float> out) const override;
+    void prepare(std::span<const float> query, std::vector<float>& table) const override;
+    float distance(const std::vector<float>& table, const std::uint8_t* code) const override;
+    /// Whether a code's two numbers are possible: a finite length >= 0 and <x, u> finite
+    /// in [0, 1] (up to rounding). The loader refuses files with any other code, which
+    /// could make distances NaN.
+    bool valid_code(const std::uint8_t* code) const;
+
+private:
+    std::size_t bit_bytes() const { return (dim() + 7) / 8; }
+    void rotate(std::vector<float>& x) const;    // dim values, in place
+    void unrotate(std::vector<float>& x) const;  // its inverse
+    std::size_t block_;  // P: the largest power of two not above dim
+    std::vector<float> centroid_, signs_;
 };
 
 /**

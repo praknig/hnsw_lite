@@ -130,9 +130,9 @@ void make_fixtures() {
         for (const auto& e : fs::directory_iterator(d + "sparse.dir")) fs::copy_file(e.path(), d + "broken.dir/" + e.path().filename().string());
         for (const auto& e : fs::directory_iterator(d + "broken.dir"))
             if (e.path().filename().string().rfind("wal-", 0) == 0) {
-                std::fstream f(e.path(), std::ios::in | std::ios::out | std::ios::binary);
-                f.seekp(60);
-                f.put('\x5A');  // inside the first record: damage, not a torn tail
+                std::fstream log(e.path(), std::ios::in | std::ios::out | std::ios::binary);
+                log.seekp(60);
+                log.put('\x5A');  // inside the first record: damage, not a torn tail
             }
         fs::create_directories(d + "nosnap.dir");
         fs::copy_file(d + "sparse.dir/DURABLE", d + "nosnap.dir/DURABLE");
