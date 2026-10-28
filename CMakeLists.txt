@@ -28,7 +28,7 @@ file(GLOB HNSW_LITE_HEADERS CONFIGURE_DEPENDS include/*.h src/*.h)
 add_library(hnsw_lite STATIC
         src/dispatch.cpp src/distance_scalar.cpp src/distance_neon.cpp   # Layer 2
         src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
-        src/kmeans.cpp src/codec.cpp src/facets.cpp src/vamana.cpp src/disk_index.cpp src/health.cpp src/upkeep.cpp src/rebuild.cpp src/wal.cpp src/wal_ops.cpp src/wal_replay.cpp src/durable.cpp src/sparse.cpp src/collection.cpp src/scoring.cpp  # ..., durability, sparse and hybrid search, collections
+        src/kmeans.cpp src/codec.cpp src/facets.cpp src/text_analysis.cpp src/vamana.cpp src/disk_index.cpp src/health.cpp src/upkeep.cpp src/rebuild.cpp src/wal.cpp src/wal_ops.cpp src/wal_replay.cpp src/durable.cpp src/sparse.cpp src/collection.cpp src/scoring.cpp  # ..., durability, sparse and hybrid search, collections
         ${HNSW_LITE_HEADERS})
 target_include_directories(hnsw_lite PUBLIC include)
 target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
@@ -68,7 +68,10 @@ function(hnsw_lite_setup target)
   # format: test_comprehensive.cpp, with every test in one file, exceeds it under MSVC
   # (error C1128). Harmless for smaller files; MinGW's assembler has the same limit.
   if(MSVC)
-    target_compile_options(${target} PRIVATE /bigobj)
+    # Source files and string literals as UTF-8, as GCC and Clang read them: without it,
+    # MSVC uses the system's code page, and literals such as the tests' "\u2019" or
+    # "École" become other bytes (often '?').
+    target_compile_options(${target} PRIVATE /bigobj /utf-8)
   elseif(MINGW)
     target_compile_options(${target} PRIVATE -Wa,-mbig-obj)
   endif()

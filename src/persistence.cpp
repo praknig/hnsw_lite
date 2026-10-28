@@ -332,9 +332,9 @@ MetadataStore MetadataStore::load(Reader& r, std::size_t slots, const std::funct
                     for (std::uint32_t t = 0; t < count; ++t) {
                         const auto id = r.get<std::uint32_t>();
                         if (id >= string_count) throw FormatError("string reference out of range");
-                        if (std::find(ids.begin(), ids.end(), id) != ids.end()) throw FormatError("repeated tag");
                         ids.push_back(id);
                     }
+                    if (has_repeats(ids)) throw FormatError("repeated tag");
                     c.tags[slot] = std::move(ids);
                     break;
                 }

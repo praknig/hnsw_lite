@@ -1083,8 +1083,10 @@ std::vector<NodeId> HnswIndex::matching_slots(const Filter& filter) const {
             if (n < storage_.size() && !ids.is_deleted(n) && compiled.matches(n)) slots.push_back(n);
         return slots;
     }
+    std::vector<std::uint8_t> match;  // every row: the filter a column at a time
+    compiled.matches_all(static_cast<NodeId>(storage_.size()), match);
     for (NodeId n = 0; n < storage_.size(); ++n)
-        if (!ids.is_deleted(n) && compiled.matches(n)) slots.push_back(n);
+        if (match[n] && !ids.is_deleted(n)) slots.push_back(n);
     return slots;
 }
 
@@ -1150,6 +1152,7 @@ std::size_t HnswIndex::remove_slots(const std::vector<NodeId>& slots) {
 
     // 1. Remove every match. Nothing here allocates, so this always completes.
     IdMap& ids = storage_.ids();
+    const MetadataStore::BulkRemoval bulk(metadata_, slots.size());
     for (NodeId n : slots) {
         ids.release(ids.external(n));
         metadata_.clear(n);
@@ -1281,6 +1284,18 @@ std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, 
         for (std::size_t i = 0; i < rows->size() && (*rows)[i] < storage_.size(); ++i) {
             if ((i & 255) == 255 && detail::search_should_stop()) break;
             visit((*rows)[i]);
+        }
+    } else if (eligible.filter) {  // every row: the filter evaluated a column at a time, the rest per row
+        std::vector<std::uint8_t> match;
+        eligible.filter->matches_all(static_cast<NodeId>(storage_.size()), match);
+        Eligibility rest = eligible;
+        rest.filter = nullptr;
+        for (NodeId n = 0; n < storage_.size(); ++n) {
+            if ((n & 255) == 255 && detail::search_should_stop()) break;
+            ++visited;
+            if (!match[n] || !rest(n)) continue;
+            ++stats.distance_computations;
+            top.push({dist(n), n});
         }
     } else {
         for (NodeId n = 0; n < storage_.size(); ++n) {

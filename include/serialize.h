@@ -74,20 +74,37 @@ constexpr std::uint32_t tag(const char (&s)[5]) {
            std::uint32_t(std::uint8_t(s[2])) << 16 | std::uint32_t(std::uint8_t(s[3])) << 24;
 }
 
-/// Updates a CRC-32 (the IEEE polynomial, as in zlib, PNG and Ethernet) with `n` bytes.
+namespace detail {
+/// Tables for CRC-32 slicing-by-8: t[0] is the classic byte table, t[k] advances t[k-1]
+/// by one more byte, so eight bytes are folded in one step. Built at compile time.
+constexpr std::array<std::array<std::uint32_t, 256>, 8> make_crc_tables() {
+    std::array<std::array<std::uint32_t, 256>, 8> t{};
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        std::uint32_t c = i;
+        for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        t[0][i] = c;
+    }
+    for (std::size_t k = 1; k < 8; ++k)
+        for (std::uint32_t i = 0; i < 256; ++i) t[k][i] = (t[k - 1][i] >> 8) ^ t[0][t[k - 1][i] & 0xFFu];
+    return t;
+}
+inline constexpr auto kCrcTables = make_crc_tables();
+}  // namespace detail
+
+/// Updates a CRC-32 (the IEEE polynomial, as in zlib, PNG and Ethernet) with `n` bytes:
+/// eight bytes per step (slicing-by-8), the same result as one byte at a time. Bytes are
+/// read in little-endian order explicitly, so the result is the same on any machine.
 inline std::uint32_t crc32(std::uint32_t crc, const void* data, std::size_t n) {
-    static const std::array<std::uint32_t, 256> table = [] {
-        std::array<std::uint32_t, 256> t{};
-        for (std::uint32_t i = 0; i < 256; ++i) {
-            std::uint32_t c = i;
-            for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
-            t[i] = c;
-        }
-        return t;
-    }();
+    const auto& t = detail::kCrcTables;
     const auto* p = static_cast<const unsigned char*>(data);
     crc = ~crc;
-    for (std::size_t i = 0; i < n; ++i) crc = table[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    for (; n >= 8; p += 8, n -= 8) {
+        const std::uint32_t lo = crc ^ (std::uint32_t(p[0]) | std::uint32_t(p[1]) << 8 | std::uint32_t(p[2]) << 16 | std::uint32_t(p[3]) << 24);
+        const std::uint32_t hi = std::uint32_t(p[4]) | std::uint32_t(p[5]) << 8 | std::uint32_t(p[6]) << 16 | std::uint32_t(p[7]) << 24;
+        crc = t[7][lo & 0xFFu] ^ t[6][(lo >> 8) & 0xFFu] ^ t[5][(lo >> 16) & 0xFFu] ^ t[4][lo >> 24] ^
+              t[3][hi & 0xFFu] ^ t[2][(hi >> 8) & 0xFFu] ^ t[1][(hi >> 16) & 0xFFu] ^ t[0][hi >> 24];
+    }
+    for (; n > 0; --n, ++p) crc = t[0][(crc ^ *p) & 0xFFu] ^ (crc >> 8);
     return ~crc;
 }
 

@@ -61,6 +61,7 @@ For most applications, start here: a `Collection` holds documents, each with any
 ```cpp
 CollectionOptions options = CollectionOptions::preset(768, Preset::Balanced, 1'000'000);  // see Presets below
 options.bm25.avg_doc_length = 200;        // near your corpus' mean token count
+options.bm25.stem = true;                 // optional text analysis: "runs" finds "running" (also stop_words, unicode)
 auto docs = Collection::open("docs.db", options);   // durable; or Collection docs(options) in memory
 
 Document d;
@@ -82,7 +83,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-    |---|---|---|---|---|---|
+      |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -94,6 +95,28 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Durability:** `Collection::open(dir, options)` creates or recovers a durable directory with one write-ahead log for the whole collection, so text and sparse vectors are as safe as the dense side (see [Durability](#durability) for modes and checkpoints). Reopening requires the same dimension, metric and sides; other settings come from the directory. In memory, `save` and `load` write and read one file.
 - **Maintenance:** with `options.maintenance.mode = Maintenance::Background`, a background thread does what is due every `interval` (1 s): upkeep of the dense side when it has churned (vectors replaced or removed: a quick reachability check past 5%, upkeep if it finds damage; upkeep regardless past 20%), a rebuild when a compressed side's codec has drifted (checked past 50% churn; rebuilt when its error exceeds 4 times a retrained one's), and, for durable collections, a checkpoint when the log reaches 64 MiB or 100,000 records, or a record has waited 10 minutes. Each round has a time budget (250 ms); upkeep stops at it after at least one repair, so work left over continues next round. With the default `Maintenance::Manual`, call `maintain(budget)` when convenient: it does the same, only what is due. `last_maintenance()` reports what the last round did and why (in `notes`), `maintenance_status()` the counters it decides from, and `set_maintenance()` changes the policy while running. Maintenance is not logged: the next snapshot keeps its effect. Loading from a file starts with manual maintenance.
 - **Limits:** changes run one at a time; searches run in parallel. A predicate may read the collection (`get`, `contains`, even a nested search) but not change it or any other index. BM25 document weights use `bm25.avg_doc_length` as set at creation: set it near your corpus' mean. `dense_index()`, `text_index()` and `sparse_index()` give read-only access to the sides, for example for `health()`.
+
+### The best documents, not ten chunks of one (group-by)
+
+When documents are split into chunks, a plain top-10 can return ten chunks of one document. `search_groups` returns the best values of a field (here, the document each chunk came from), each with its best chunks:
+
+```cpp
+GroupBy by{"doc_id", 5, 2};  // 5 documents, the 2 best chunks of each
+for (const CollectionGroup& g : collection.search_groups(query, by, options))
+    std::cout << g.value.s << ": " << g.hits.size() << " chunks, best score " << g.hits[0].score << "\n";
+```
+
+It ranks exactly as `search()` would with the same query and options (any mix of vector, text and sparse, filters, modifiers), and groups by a keyword, integer or boolean field; documents without the field are in no group. The search widens until the groups are found and filled, or every match was seen (`max_candidates` caps it), so with an exact search the result equals grouping the full ranking. A document's group is read under the same lock as its rank, so a concurrent change cannot move it between groups mid-search. In Python: `collection.search_groups(text="...", group_by="doc_id", groups=5, per_group=2)`.
+
+### More like these (recommendations)
+
+`recommend` finds documents like some examples and unlike others, without a query: "more like the three articles the reader liked, less like the one they dismissed".
+
+```cpp
+const auto hits = collection.recommend(Recommend{{liked_a, liked_b, liked_c}, {dismissed}}, 10, options);
+```
+
+It searches from the average of the positive examples' vectors, pushed away from the negatives' (2 avg(positive) - avg(negative)); for cosine, each example is normalized first, so no long vector dominates. The examples are never returned, and options apply as in `search()` (filters, `ef`, metadata and text in the hits). It refuses a call without a positive example, an unknown or expired document, one without a vector, one given as both positive and negative, and a collection without vectors. In Python, examples may be IDs or string keys: `collection.recommend(["doc-1", "doc-2"], ["doc-9"], k=10)`.
 
 ### Reading every document
 
@@ -291,6 +314,8 @@ Filter f = Filter::eq("topic", "tech") && (Filter::ge("year", 2020) || Filter::h
 | `in(field, {a, b, c})` | Integers, floats, keywords, booleans | Equal to any of the values |
 | `has_tag`, `has_any_tag`, `has_all_tags` | Tags | Contains the tag, any of them, all of them |
 | `exists(field)` | All types | The vector has a value for the field |
+| `geo_radius(lat_field, lon_field, lat, lon, meters)` | Two numeric fields (degrees) | Within `meters` of the point, by great-circle distance |
+| `geo_box(lat_field, lon_field, south, west, north, east)` | Two numeric fields (degrees) | Inside the box, edges included; west > east crosses the antimeridian |
 | `&&`, `\|\|`, `!` | Filters | And, or, not |
 
 Rules worth knowing:
@@ -298,6 +323,7 @@ Rules worth knowing:
 - **Missing fields:** a comparison never matches a vector that lacks the field, including `ne`. Use `!` to include them: `!Filter::eq("topic", "tech")` matches everything not about tech, including vectors with no topic.
 - **Numbers:** integers and floats compare exactly with each other.
 - **Nesting** is limited to 256 levels. To combine many alternatives, use `in` or `has_any_tag`, which are also faster.
+- **Places:** latitude and longitude live in two ordinary numeric fields, so existing data can be filtered by place without migration: `Filter::geo_radius("lat", "lon", 51.5, -0.13, 5000)` keeps vectors within 5 km of central London. Distance is the haversine great-circle distance on a sphere of the mean Earth radius (6,371,008.8 m; within about 0.5% of the true ellipsoid). A box across the antimeridian is written with west > east (`geo_box("lat", "lon", -20, 175, -10, -170)` covers Fiji to Samoa). A vector missing either coordinate, or holding one out of range, does not match; a center or box out of range, or a negative radius, throws `std::invalid_argument`. The planner estimates how many match by sampling, as for ranges.
 - Filters are checked against the index's schema when used: a type mismatch (comparing a keyword with a number, say) throws `std::invalid_argument`.
 
 ### Searching with a filter
@@ -572,6 +598,16 @@ Each result has `total` (documents counted), `missing` (of those, without the fi
 **Make it fast with a payload index.** `create_payload_index("lang")` (keyword, boolean and tag fields) keeps exact counts and posting lists for the field: facets over everything then read the counts, and selective filters read only the matching documents. Measured on 300,000 documents with a filter matching 0.1%: facets with the filter 65× faster, facets over everything 1,532×, counting the matches 555×, a filtered search 158×. Collections have `create_payload_index` too (logged when durable).
 
 ## Sparse vectors and hybrid search
+
+**Better keyword matching.** A collection's text side scores documents with BM25 over tokens. Three settings in `options.bm25` improve matching; they are off by default, fixed when the collection is created, and saved with it:
+
+| Setting | Effect | Example |
+|---|---|---|
+| `stem` | Words reduced to their stems (Snowball English) | `runs` finds `running`; `connection` finds `connected` |
+| `stop_words` | Very common English words ignored | `the`, `and`, `of` no longer count |
+| `unicode` | Lowercasing beyond ASCII; Unicode punctuation separates words | `école` finds `École`; `word—word` is two words |
+
+For English text, `stem` and `stop_words` together usually improve keyword recall; for other languages use `unicode` alone (stemming applies only to plain a-to-z words). A durable collection must be reopened with the same settings.
 
 ```cpp
 SparseIndex sparse;                                   // same IDs as the dense index

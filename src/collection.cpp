@@ -2,6 +2,7 @@
  * @file collection.cpp
  * @brief Collections of documents over dense, text and sparse sides; see collection.h.
  */
+#include "common.h"
 #include "scoring.h"
 #include "collection.h"
 
@@ -241,9 +242,9 @@ bool Collection::apply_upsert(std::uint64_t id, const Prepared& p) {
     if (existed) {
         slot = it->second;
     } else {
-        id_of_.reserve(id_of_.size() + 1);
-        live_.reserve(live_.size() + 1);
-        texts_.reserve(texts_.size() + 1);
+        reserve_one_more(id_of_);
+        reserve_one_more(live_);
+        reserve_one_more(texts_);
         slot = free_.empty() ? static_cast<NodeId>(id_of_.size()) : free_.back();
         slot_of_.emplace(id, slot);  // may throw: nothing changed yet
     }
@@ -304,7 +305,7 @@ bool Collection::apply_remove(std::uint64_t id) {
     const auto it = slot_of_.find(id);
     if (it == slot_of_.end()) return false;  // GCOVR_EXCL_BR_LINE: callers pass known IDs only
     const NodeId slot = it->second;
-    free_.reserve(free_.size() + 1);
+    reserve_one_more(free_);
     // Removals never fail on these indexes' side (they free memory).
     if (dense_ && dense_->remove(id)) {
         ++changed_since_upkeep_;
@@ -357,6 +358,7 @@ std::size_t Collection::remove_batch(std::span<const std::uint64_t> ids) {
     if (known.empty()) return 0;
     const ChangeLog::Scope logged(log_, log_.begin(walop::kDocumentRemove, [&] { return walop::encode_ids(known); }));
     std::size_t n = 0;
+    const MetadataStore::BulkRemoval bulk(metadata_, known.size());
     for (const std::uint64_t id : known) n += apply_remove(id);
     return n;
 }
@@ -369,8 +371,10 @@ std::vector<NodeId> Collection::matching(const Filter& filter) const {
             if (n < id_of_.size() && live_[n] && compiled.matches(n)) out.push_back(n);
         return out;
     }
+    std::vector<std::uint8_t> match;  // every row: the filter a column at a time
+    compiled.matches_all(static_cast<NodeId>(id_of_.size()), match);
     for (NodeId n = 0; n < id_of_.size(); ++n)
-        if (live_[n] && compiled.matches(n)) out.push_back(n);
+        if (live_[n] && match[n]) out.push_back(n);
     return out;
 }
 
@@ -521,7 +525,7 @@ CollectionPage Collection::scan(const CollectionScanOptions& options) const {
     return page;
 }
 
-std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o) const {
+void Collection::check_query(const CollectionQuery& q, const CollectionSearchOptions& o) const {
     const bool use_vector = !q.vector.empty(), use_text = !q.text.empty(), use_sparse = !q.sparse.empty() || !q.sparse.values.empty();
     if (!use_vector && !use_text && !use_sparse) throw std::invalid_argument("Collection::search: the query has no vector, text or sparse vector");
     if (use_vector && !dense_) throw std::invalid_argument("Collection::search: a vector query, but the collection has no dense side");
@@ -535,8 +539,17 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     (void)fuse({}, {}, 0, check);  // validates rrf_k and weights
     if (!(o.text_weight >= 0) || !(o.sparse_weight >= 0) || !std::isfinite(o.text_weight) || !std::isfinite(o.sparse_weight))
         throw std::invalid_argument("CollectionSearchOptions: weights must be finite and non-negative");
+}
+
+std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o) const {
+    check_query(q, o);
     const auto lock = read_lock(mutex_, this);
     const Searching guard(this);
+    return search_unlocked(q, k, o);
+}
+
+std::vector<CollectionHit> Collection::search_unlocked(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o) const {
+    const bool use_vector = !q.vector.empty(), use_text = !q.text.empty(), use_sparse = !q.sparse.empty() || !q.sparse.values.empty();
     if (o.stopped_early) *o.stopped_early = false;
     if (k == 0 || slot_of_.empty()) return {};
     // The filter runs on the collection's metadata, for every side, as a predicate.
@@ -581,12 +594,26 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     if (use_text) lists.push_back({run([&](const SearchOptions& so) { return text_->search(bm25_.encode_query(q.text, *text_), depth, so); }), o.text_weight, 1});
     if (use_sparse) lists.push_back({run([&](const SearchOptions& so) { return sparse_->search(q.sparse, depth, so); }), o.sparse_weight, 2});
     if (o.stopped_early) *o.stopped_early = stopped;
-    // Fusion over any number of lists, as fuse() does for two.
-    std::unordered_map<std::uint64_t, CollectionHit> by_id;
+    // Fusion over any number of lists, as fuse() does for two: candidates as light records
+    // (ranked, re-scored and ordered as such); full hits only for those returned.
+    struct Fused {
+        std::uint64_t id;
+        double score = 0;
+        double base = 0;                       // before modifiers
+        std::uint32_t rank[3] = {0, 0, 0};     // 1-based per side; 0: not in that list
+        float side[3] = {0, 0, 0};             // vector distance, text score, sparse score
+    };
+    std::vector<Fused> fused;
+    std::unordered_map<std::uint64_t, std::uint32_t> at;  // ID -> its record
+    std::size_t total = 0;
+    for (const List& l : lists) total += l.results.size();
+    fused.reserve(total);
+    at.reserve(total);
     for (const List& l : lists) {
         for (std::size_t i = 0; i < l.results.size(); ++i) {
-            CollectionHit& h = by_id[l.results[i].id];
-            h.id = l.results[i].id;
+            const auto [it, fresh] = at.try_emplace(l.results[i].id, static_cast<std::uint32_t>(fused.size()));
+            if (fresh) fused.push_back(Fused{l.results[i].id});
+            Fused& h = fused[it->second];
             double part = 0;
             if (o.fusion == Fusion::Rrf) part = l.weight / (o.rrf_k + double(i + 1));
             else {
@@ -594,45 +621,55 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
                 part = l.weight * (hi == lo ? 1.0 : (-double(l.results[i].distance) - lo) / (hi - lo));
             }
             h.score += part;
-            if (l.which == 0) {
-                h.vector_rank = i + 1;
-                h.vector_distance = l.results[i].distance;
-            } else if (l.which == 1) {
-                h.text_rank = i + 1;
-                h.text_score = -l.results[i].distance;
-            } else {
-                h.sparse_rank = i + 1;
-                h.sparse_score = -l.results[i].distance;
-            }
+            h.rank[l.which] = static_cast<std::uint32_t>(i + 1);
+            h.side[l.which] = l.which == 0 ? l.results[i].distance : -l.results[i].distance;
         }
     }
-    std::vector<CollectionHit> out;
-    out.reserve(by_id.size());
-    for (auto& [id, h] : by_id) out.push_back(std::move(h));
-    if (o.modifiers && !o.modifiers->empty()) {  // opt-in: every fused candidate re-scored by its metadata
-        for (CollectionHit& h : out) {
-            h.base_score = h.score;
+    const bool modified = o.modifiers && !o.modifiers->empty();
+    if (modified) {  // opt-in: every fused candidate re-scored by its metadata
+        for (Fused& h : fused) {
+            h.base = h.score;
             h.score = o.modifiers->apply(h.score, metadata_.read(slot_of_.at(h.id)));
         }
     }
-    const std::size_t n = std::min(k, out.size());
-    const auto better = [](const CollectionHit& a, const CollectionHit& b) { return a.score > b.score || (a.score == b.score && a.id < b.id); };
+    const std::size_t n = std::min(k, fused.size());
+    const auto better = [](const Fused& a, const Fused& b) { return a.score > b.score || (a.score == b.score && a.id < b.id); };
     if (o.diversity) {  // opt-in: maximal marginal relevance over every fused candidate
-        std::sort(out.begin(), out.end(), better);
-        std::vector<double> relevance(out.size());
-        std::vector<std::optional<std::vector<float>>> vectors(out.size());
-        for (std::size_t i = 0; i < out.size(); ++i) {
-            relevance[i] = out[i].score;
-            vectors[i] = dense_->get_vector(out[i].id);
+        std::sort(fused.begin(), fused.end(), better);
+        std::vector<double> relevance(fused.size());
+        std::vector<std::optional<std::vector<float>>> vectors(fused.size());
+        for (std::size_t i = 0; i < fused.size(); ++i) {
+            relevance[i] = fused[i].score;
+            vectors[i] = dense_->get_vector(fused[i].id);
         }
         const std::vector<std::size_t> order = mmr_order(relevance, vectors, n, *o.diversity);
-        std::vector<CollectionHit> chosen;
+        std::vector<Fused> chosen;
         chosen.reserve(order.size());
-        for (const std::size_t i : order) chosen.push_back(std::move(out[i]));
-        out.swap(chosen);
+        for (const std::size_t i : order) chosen.push_back(fused[i]);
+        fused.swap(chosen);
     } else {
-        std::partial_sort(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(n), out.end(), better);
-        out.resize(n);
+        std::partial_sort(fused.begin(), fused.begin() + static_cast<std::ptrdiff_t>(n), fused.end(), better);
+        fused.resize(n);
+    }
+    std::vector<CollectionHit> out(fused.size());
+    for (std::size_t i = 0; i < fused.size(); ++i) {
+        const Fused& f = fused[i];
+        CollectionHit& h = out[i];
+        h.id = f.id;
+        h.score = f.score;
+        if (modified) h.base_score = f.base;
+        if (f.rank[0]) {
+            h.vector_rank = f.rank[0];
+            h.vector_distance = f.side[0];
+        }
+        if (f.rank[1]) {
+            h.text_rank = f.rank[1];
+            h.text_score = f.side[1];
+        }
+        if (f.rank[2]) {
+            h.sparse_rank = f.rank[2];
+            h.sparse_score = f.side[2];
+        }
     }
     for (CollectionHit& h : out) {
         const NodeId slot = slot_of_.at(h.id);
@@ -642,6 +679,101 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
             if (o.with_metadata) h.metadata = std::move(md);
         }
         if (o.with_text) h.text = texts_[slot];
+    }
+    return out;
+}
+
+std::vector<CollectionHit> Collection::recommend(const Recommend& r, std::size_t k, const CollectionSearchOptions& o) const {
+    if (r.positive.empty()) throw std::invalid_argument("recommend: give at least one positive example");
+    if (!dense_) throw std::invalid_argument("recommend: the collection has no vectors");
+    std::unordered_set<std::uint64_t> examples(r.positive.begin(), r.positive.end());
+    for (const std::uint64_t id : r.negative)  // the set holds the positives so far
+        if (examples.count(id))
+            throw std::invalid_argument("recommend: document " + std::to_string(id) + " is both a positive and a negative example");
+    examples.insert(r.negative.begin(), r.negative.end());
+    const auto lock = read_lock(mutex_, this);
+    const Searching guard(this);
+    // The examples' vectors, read with the search under one lock; averaged in double.
+    const std::size_t d = options_.dim;
+    auto average = [&](const std::vector<std::uint64_t>& ids) {
+        std::vector<double> sum(d, 0.0);
+        for (const std::uint64_t id : ids) {
+            const auto it = slot_of_.find(id);
+            if (it == slot_of_.end() || expired(it->second)) throw std::invalid_argument("recommend: unknown document " + std::to_string(id));
+            const DocumentRecord rec = record_unlocked(it->second, true, false, false);
+            if (!rec.vector) throw std::invalid_argument("recommend: document " + std::to_string(id) + " has no vector");
+            double norm = 0;
+            for (const float x : *rec.vector) norm += double(x) * x;
+            norm = std::sqrt(norm);
+            const double scale = options_.metric == Metric::Cosine && norm > 0 ? 1.0 / norm : 1.0;  // cosine: each example counts alike
+            for (std::size_t j = 0; j < d; ++j) sum[j] += double((*rec.vector)[j]) * scale;
+        }
+        for (double& x : sum) x /= double(ids.size());
+        return sum;
+    };
+    const std::vector<double> pos = average(r.positive);
+    const std::vector<double> neg = r.negative.empty() ? std::vector<double>{} : average(r.negative);
+    CollectionQuery q;
+    q.vector.resize(d);
+    for (std::size_t j = 0; j < d; ++j) {
+        const double v = neg.empty() ? pos[j] : 2.0 * pos[j] - neg[j];  // away from the negatives
+        constexpr double kMax = double(std::numeric_limits<float>::max());
+        q.vector[j] = static_cast<float>(std::clamp(v, -kMax, kMax));  // finite: 2 max - (-max) would overflow a float
+    }
+    check_query(q, o);
+    // The examples take places in the ranking: ask for that many more, then drop them.
+    const std::size_t wanted = k > std::numeric_limits<std::size_t>::max() - examples.size() ? std::numeric_limits<std::size_t>::max() : k + examples.size();
+    std::vector<CollectionHit> hits = search_unlocked(q, wanted, o);
+    std::erase_if(hits, [&](const CollectionHit& h) { return examples.count(h.id) != 0; });
+    if (hits.size() > k) hits.resize(k);
+    return hits;
+}
+
+std::vector<CollectionGroup> Collection::search_groups(const CollectionQuery& q, const GroupBy& g, const CollectionSearchOptions& o) const {
+    if (g.field.empty()) throw std::invalid_argument("search_groups: the field name is empty");
+    check_query(q, o);
+    const auto lock = read_lock(mutex_, this);
+    const Searching guard(this);
+    if (g.groups == 0 || g.per_group == 0 || slot_of_.empty()) return {};
+    const auto f = metadata_.find_field(g.field);
+    if (!f) {
+        if (metadata_.current_schema().mode() == SchemaMode::Strict) throw std::invalid_argument("search_groups: unknown field " + g.field);
+        return {};  // a dynamic schema: no document holds it yet
+    }
+    const FieldType type = metadata_.field_type(*f);
+    if (type != FieldType::Keyword && type != FieldType::Int && type != FieldType::Bool)
+        throw std::invalid_argument("search_groups: group by a keyword, integer or boolean field (" + g.field + " is not)");
+    const std::size_t cap = g.max_candidates ? std::min(g.max_candidates, slot_of_.size()) : slot_of_.size();
+    std::size_t fetch = std::min(cap, std::max<std::size_t>(16, saturating_mul(saturating_mul(g.groups, g.per_group), 2)));
+    std::vector<CollectionGroup> out;
+    while (true) {
+        const std::vector<CollectionHit> hits = search_unlocked(q, fetch, o);
+        out.clear();
+        std::unordered_map<std::uint64_t, std::size_t> where;  // a value's group, by position
+        for (const CollectionHit& h : hits) {
+            const NodeId slot = slot_of_.at(h.id);
+            if (!metadata_.has(*f, slot)) continue;  // without the field: in no group
+            const std::uint64_t key = type == FieldType::Int    ? static_cast<std::uint64_t>(metadata_.int_at(*f, slot))
+                                      : type == FieldType::Bool ? std::uint64_t(metadata_.bool_at(*f, slot))
+                                                                : std::uint64_t(metadata_.keyword_at(*f, slot));
+            auto it = where.find(key);
+            if (it == where.end()) {
+                if (out.size() == g.groups) continue;  // a value beyond the groups wanted
+                it = where.emplace(key, out.size()).first;
+                out.push_back({type == FieldType::Int    ? Value::of_int(metadata_.int_at(*f, slot))
+                               : type == FieldType::Bool ? Value::of_bool(metadata_.bool_at(*f, slot))
+                                                         : Value::of_keyword(metadata_.string_at(metadata_.keyword_at(*f, slot))),
+                               {}});
+            }
+            std::vector<CollectionHit>& group = out[it->second].hits;
+            if (group.size() < g.per_group) group.push_back(h);
+        }
+        bool full = out.size() == g.groups;
+        for (const CollectionGroup& group : out) full = full && group.hits.size() == g.per_group;
+        const bool exhausted = hits.size() < fetch;  // every match was ranked
+        const bool stopped = o.stopped_early && *o.stopped_early;
+        if (full || exhausted || stopped || fetch >= cap) break;
+        fetch = std::min(cap, saturating_mul(fetch, 4));
     }
     return out;
 }
@@ -732,6 +864,12 @@ void Collection::save_unlocked(std::ostream& out) const {
             w.put<std::int64_t>(options_.ttl.default_ms);
             w.put<std::uint8_t>(options_.string_ids ? 1 : 0);
         }
+        // Text analysis likewise: only when used, so other collections are written as before.
+        const Bm25Params& t = options_.bm25;
+        if (t.unicode || t.stop_words || t.stem) {
+            w.put<std::uint8_t>(2);  // the text-analysis block
+            w.put<std::uint8_t>(static_cast<std::uint8_t>((t.unicode ? 1 : 0) | (t.stop_words ? 2 : 0) | (t.stem ? 4 : 0)));
+        }
     });
     persist::write_section(out, kDocs, [&](persist::Writer& w) {
         w.put<std::uint64_t>(id_of_.size());
@@ -795,14 +933,25 @@ std::unique_ptr<Collection> Collection::load(std::istream& in) {
     o.bm25.k1 = r.get<double>();
     o.bm25.b = r.get<double>();
     o.bm25.avg_doc_length = r.get<double>();
-    if (r.section_left() > 0) {  // the runtime settings (written only when not the defaults)
-        if (r.get<std::uint8_t>() != 1) throw FormatError("collection: unknown settings block");
-        const std::uint8_t ttl = r.get<std::uint8_t>();
-        const std::int64_t default_ms = r.get<std::int64_t>();
-        const std::uint8_t keys = r.get<std::uint8_t>();
-        if (ttl > 1 || keys > 1 || default_ms < 0) throw FormatError("collection: invalid settings");
-        o.ttl = TtlOptions{ttl == 1, default_ms};
-        o.string_ids = keys == 1;
+    std::uint8_t last_block = 0;
+    while (r.section_left() > 0) {  // optional blocks, each written only when not the defaults, in order
+        const std::uint8_t block = r.get<std::uint8_t>();
+        if (block <= last_block || block > 2) throw FormatError("collection: unknown settings block");
+        last_block = block;
+        if (block == 1) {  // runtime settings
+            const std::uint8_t ttl = r.get<std::uint8_t>();
+            const std::int64_t default_ms = r.get<std::int64_t>();
+            const std::uint8_t keys = r.get<std::uint8_t>();
+            if (ttl > 1 || keys > 1 || default_ms < 0) throw FormatError("collection: invalid settings");
+            o.ttl = TtlOptions{ttl == 1, default_ms};
+            o.string_ids = keys == 1;
+        } else {  // text analysis
+            const std::uint8_t flags = r.get<std::uint8_t>();
+            if (flags == 0 || flags > 7) throw FormatError("collection: invalid text analysis");
+            o.bm25.unicode = flags & 1;
+            o.bm25.stop_words = flags & 2;
+            o.bm25.stem = flags & 4;
+        }
     }
     r.end_section();
     std::unique_ptr<Collection> c;

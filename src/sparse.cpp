@@ -7,6 +7,8 @@
  * posting lists are rebuilt and slots renumbered. Document frequencies are kept
  * exact at every step.
  */
+#include "common.h"
+#include "text_analysis.h"
 #include "scoring.h"
 #include "wal_ops.h"
 #include "sparse.h"
@@ -77,13 +79,13 @@ void SparseIndex::insert_unlocked(std::uint64_t id, SparseVector v, const Metada
     if (id_of_.size() >= std::size_t(kEmpty)) throw std::length_error("sparse index: too many slots (compact it)");  // GCOVR_EXCL_LINE: 4 billion slots
     const NodeId slot = static_cast<NodeId>(id_of_.size());
     // Every allocation first: once the metadata is written, nothing can fail.
-    id_of_.reserve(id_of_.size() + 1);
-    live_.reserve(live_.size() + 1);
-    docs_.reserve(docs_.size() + 1);
+    reserve_one_more(id_of_);
+    reserve_one_more(live_);
+    reserve_one_more(docs_);
     for (const std::uint32_t t : v.indices) {
         Posting& p = postings_[t];
-        p.slots.reserve(p.slots.size() + 1);
-        p.weights.reserve(p.weights.size() + 1);
+        reserve_one_more(p.slots);
+        reserve_one_more(p.weights);
         df_.try_emplace(t, 0);  // incremented below without allocating
     }
     auto unreserve = [&]() noexcept {  // drop the counts created above if this fails
@@ -160,7 +162,10 @@ std::size_t SparseIndex::remove_batch(std::span<const std::uint64_t> ids) {
     const auto guard = lock_.write("remove_batch");
     const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     std::size_t n = 0;
-    for (const std::uint64_t id : ids) n += remove_unlocked(id);
+    {
+        const MetadataStore::BulkRemoval bulk(metadata_, ids.size());  // posting lists rebuilt before compaction moves rows
+        for (const std::uint64_t id : ids) n += remove_unlocked(id);
+    }
     maybe_compact();
     return n;
 }
@@ -174,7 +179,10 @@ std::size_t SparseIndex::remove_where(const Filter& filter) {
     if (ids.empty()) return 0;
     // Logged resolved, as IDs: replay never depends on evaluating the filter again.
     const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
-    for (const std::uint64_t id : ids) (void)remove_unlocked(id);
+    {
+        const MetadataStore::BulkRemoval bulk(metadata_, ids.size());
+        for (const std::uint64_t id : ids) (void)remove_unlocked(id);
+    }
     maybe_compact();
     return ids.size();
 }
@@ -573,6 +581,19 @@ std::vector<std::string> Bm25::tokenize(std::string_view text) {
     return tokens;
 }
 
+std::vector<std::string> Bm25::analyze(std::string_view text) const {
+    std::vector<std::string> tokens = params_.unicode ? tokenize_unicode(text) : tokenize(text);
+    if (!params_.stop_words && !params_.stem) return tokens;
+    std::vector<std::string> out;
+    out.reserve(tokens.size());
+    for (std::string& t : tokens) {
+        if (params_.stop_words && is_english_stop_word(t)) continue;
+        const bool english = std::all_of(t.begin(), t.end(), [](char c) { return unsigned(static_cast<unsigned char>(c) - 'a') < 26u || c == '\''; });
+        out.push_back(params_.stem && english ? stem_english(t) : std::move(t));
+    }
+    return out;
+}
+
 std::uint32_t Bm25::term_id(std::string_view token) {
     std::uint32_t h = 2166136261u;
     for (const char c : token) {
@@ -585,12 +606,12 @@ std::uint32_t Bm25::term_id(std::string_view token) {
 void Bm25::fit(std::span<const std::string_view> documents) {
     if (documents.empty()) return;
     double total = 0;
-    for (const std::string_view d : documents) total += double(tokenize(d).size());
+    for (const std::string_view d : documents) total += double(analyze(d).size());
     if (total > 0) params_.avg_doc_length = total / double(documents.size());
 }
 
 SparseVector Bm25::encode_document(std::string_view text) const {
-    const auto tokens = tokenize(text);
+    const auto tokens = analyze(text);
     std::map<std::uint32_t, double> tf;
     for (const auto& t : tokens) tf[term_id(t)] += 1;
     const double norm = params_.k1 * (1 - params_.b + params_.b * double(tokens.size()) / params_.avg_doc_length);
@@ -605,7 +626,7 @@ SparseVector Bm25::encode_document(std::string_view text) const {
 SparseVector Bm25::encode_query(std::string_view text, const SparseIndex& index) const {
     const double n = double(index.size());
     std::map<std::uint32_t, double> weight;
-    for (const auto& t : tokenize(text)) {
+    for (const auto& t : analyze(text)) {
         const std::uint32_t term = term_id(t);
         const double df = double(index.document_frequency(term));
         if (df == 0) continue;

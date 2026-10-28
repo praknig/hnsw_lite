@@ -59,6 +59,18 @@ CompiledFilter::CompiledFilter(const Filter& filter, const MetadataStore& store)
     root_ = build(filter.root());
 }
 
+namespace {
+/// Great-circle distance in meters (haversine, mean Earth radius). The intermediate is
+/// clamped to [0, 1]: rounding near antipodal points must not give asin a value above 1.
+double geo_distance_m(double lat1, double lon1, double lat2, double lon2) {
+    constexpr double kEarthRadius = 6371008.8;  // meters: the mean radius (IUGG)
+    constexpr double kRad = 3.14159265358979323846 / 180.0;
+    const double dlat = (lat2 - lat1) * kRad, dlon = (lon2 - lon1) * kRad;
+    const double a = std::sin(dlat / 2) * std::sin(dlat / 2) + std::cos(lat1 * kRad) * std::cos(lat2 * kRad) * std::sin(dlon / 2) * std::sin(dlon / 2);
+    return 2.0 * kEarthRadius * std::asin(std::sqrt(std::clamp(a, 0.0, 1.0)));
+}
+}  // namespace
+
 int CompiledFilter::build(const Filter::Node& n) {
     using NK = Filter::Node::Kind;
     CNode c;
@@ -98,6 +110,23 @@ int CompiledFilter::build(const Filter::Node& n) {
         case NK::Exists:
             c.kind = K::Exists;
             return add(c);
+        case NK::GeoRadius:
+        case NK::GeoBox: {
+            if (ft != FieldType::Int && ft != FieldType::Float) type_error(n.field, "a geo filter needs numeric latitude and longitude fields");
+            const auto f2 = store_->find_field(n.field2);
+            if (!f2) {
+                if (store_->mode() == SchemaMode::Strict) type_error(n.field2, "unknown field");
+                c.kind = K::False;  // dynamic schema: the field may not exist yet
+                return add(c);
+            }
+            const FieldType ft2 = store_->field_type(*f2);
+            if (ft2 != FieldType::Int && ft2 != FieldType::Float) type_error(n.field2, "a geo filter needs numeric latitude and longitude fields");
+            c.kind = n.kind == NK::GeoRadius ? K::GeoRadius : K::GeoBox;
+            c.field2 = *f2;
+            c.field2_is_int = ft2 == FieldType::Int;
+            for (int i = 0; i < 4; ++i) c.g[i] = n.geo[i];
+            return add(c);
+        }
 
         case NK::Compare: {
             const Value& v = n.a;
@@ -108,6 +137,8 @@ int CompiledFilter::build(const Filter::Node& n) {
                 c.lit_is_int = v.type == FieldType::Int;
                 c.i = v.i;
                 c.f = v.f;
+                // Field and literal of one type: compared inline, as compare_num would.
+                if (c.field_is_int == c.lit_is_int) c.kind = c.field_is_int ? K::IntCmp : K::FloatCmp;
                 return add(c);
             }
             if (n.op != CompareOp::Eq && n.op != CompareOp::Ne)
@@ -162,10 +193,10 @@ int CompiledFilter::build(const Filter::Node& n) {
             if (ft == FieldType::Keyword) {
                 for (const Value& v : n.values) {
                     if (v.type != FieldType::Keyword) type_error(n.field, "keyword field compared with a non-string");
-                    if (auto id = store_->find_string(v.s))
-                        if (std::find(c.ids.begin(), c.ids.end(), *id) == c.ids.end()) c.ids.push_back(*id);
+                    if (auto id = store_->find_string(v.s)) c.ids.push_back(*id);
                 }
-                std::sort(c.ids.begin(), c.ids.end());  // binary search per vector
+                std::sort(c.ids.begin(), c.ids.end());  // binary search per vector; repeats once
+                c.ids.erase(std::unique(c.ids.begin(), c.ids.end()), c.ids.end());
                 c.kind = c.ids.empty() ? K::False : K::KeyIn;
                 return add(std::move(c));
             }
@@ -197,13 +228,11 @@ int CompiledFilter::build(const Filter::Node& n) {
             }
             bool unknown = false;
             for (const std::string& t : n.tags) {
-                if (auto id = store_->find_string(t)) {
-                    if (std::find(c.ids.begin(), c.ids.end(), *id) == c.ids.end()) c.ids.push_back(*id);
-                } else {
-                    unknown = true;
-                }
+                if (auto id = store_->find_string(t)) c.ids.push_back(*id);
+                else unknown = true;
             }
-            std::sort(c.ids.begin(), c.ids.end());  // binary search per vector
+            std::sort(c.ids.begin(), c.ids.end());  // binary search per vector; repeats once
+            c.ids.erase(std::unique(c.ids.begin(), c.ids.end()), c.ids.end());
             if (n.kind == NK::HasAnyTag) c.kind = c.ids.empty() ? K::False : K::AnyTag;
             else if (unknown || c.ids.empty()) c.kind = K::False;  // a needed tag no vector has
             else c.kind = n.kind == NK::HasTag ? K::Tag : K::AllTags;
@@ -215,6 +244,80 @@ int CompiledFilter::build(const Filter::Node& n) {
             c.kind = K::True;
             return add(c);
             // GCOVR_EXCL_STOP
+    }
+}
+
+void CompiledFilter::matches_all(NodeId rows, std::vector<std::uint8_t>& out) const {
+    out.assign(rows, 0);
+    if (rows > 0) eval_all(root_, rows, out.data());
+}
+
+void CompiledFilter::eval_all(int index, NodeId rows, std::uint8_t* out) const {
+    const CNode& c = nodes_[static_cast<std::size_t>(index)];
+    const MetadataStore& s = *store_;
+    switch (c.kind) {
+        case K::True: std::fill(out, out + rows, std::uint8_t(1)); return;
+        case K::False: std::fill(out, out + rows, std::uint8_t(0)); return;
+        case K::Not:
+            eval_all(c.children[0], rows, out);
+            for (NodeId r = 0; r < rows; ++r) out[r] ^= 1;
+            return;
+        case K::And:
+        case K::Or: {
+            eval_all(c.children[0], rows, out);
+            std::vector<std::uint8_t> other(rows);
+            eval_all(c.children[1], rows, other.data());
+            if (c.kind == K::And)
+                for (NodeId r = 0; r < rows; ++r) out[r] &= other[r];
+            else
+                for (NodeId r = 0; r < rows; ++r) out[r] |= other[r];
+            return;
+        }
+        default: break;
+    }
+    // The common leaves: one loop over the column's arrays, everything it reads held in
+    // locals (out may alias anything), and the operator as a mask of accepted outcomes of
+    // the three-way comparison (bit 0: less, 1: equal, 2: greater): branch-free, so the
+    // compiler can vectorize. Rows without the field, or beyond the column, never match.
+    const MetadataStore::ColumnView v = s.view(c.field);
+    const NodeId have = static_cast<NodeId>(std::min<std::size_t>(rows, v.rows));
+    const std::uint8_t* present = v.present;
+    std::fill(out + have, out + rows, std::uint8_t(0));
+    static constexpr unsigned kMask[] = {0b010, 0b101, 0b001, 0b011, 0b100, 0b110};  // eq ne lt le gt ge
+    const unsigned mask = kMask[static_cast<int>(c.op)];
+    switch (c.kind) {
+        case K::Exists:
+            for (NodeId r = 0; r < have; ++r) out[r] = present[r];
+            return;
+        case K::IntCmp: {
+            const std::int64_t* x = v.ints;
+            const std::int64_t lit = c.i;
+            for (NodeId r = 0; r < have; ++r) out[r] = static_cast<std::uint8_t>(present[r] & (mask >> ((x[r] > lit) - (x[r] < lit) + 1)) & 1u);
+            return;
+        }
+        case K::FloatCmp: {
+            const double* x = v.floats;
+            const double lit = c.f;
+            for (NodeId r = 0; r < have; ++r) out[r] = static_cast<std::uint8_t>(present[r] & (mask >> ((x[r] > lit) - (x[r] < lit) + 1)) & 1u);
+            return;
+        }
+        case K::Key: {
+            const std::uint32_t* x = v.keywords;
+            const std::uint32_t id = c.id;
+            const bool eq = c.op == CompareOp::Eq;
+            for (NodeId r = 0; r < have; ++r) out[r] = static_cast<std::uint8_t>(present[r] & ((x[r] == id) == eq));
+            return;
+        }
+        case K::Bool: {
+            const std::uint8_t* x = v.bools;
+            const std::uint8_t b = c.b ? 1 : 0;
+            const bool eq = c.op == CompareOp::Eq;
+            for (NodeId r = 0; r < have; ++r) out[r] = static_cast<std::uint8_t>(present[r] & ((x[r] == b) == eq));
+            return;
+        }
+        default:  // the other leaves (ranges, lists, tags, geo, mixed numbers): row by row
+            for (NodeId r = 0; r < rows; ++r) out[r] = eval(index, r);
+            return;
     }
 }
 
@@ -232,6 +335,26 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
     if (!s.has(c.field, slot)) return false;  // comparisons never match a missing field
     switch (c.kind) {
         case K::Exists: return true;
+        case K::GeoRadius:
+        case K::GeoBox: {
+            if (!s.has(c.field2, slot)) return false;
+            const double lat = c.field_is_int ? double(s.int_at(c.field, slot)) : s.float_at(c.field, slot);
+            const double lon = c.field2_is_int ? double(s.int_at(c.field2, slot)) : s.float_at(c.field2, slot);
+            if (!(lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0)) return false;  // not a place
+            if (c.kind == K::GeoBox) {
+                if (lat < c.g[0] || lat > c.g[2]) return false;
+                return c.g[1] <= c.g[3] ? (lon >= c.g[1] && lon <= c.g[3]) : (lon >= c.g[1] || lon <= c.g[3]);  // west > east: across 180
+            }
+            return geo_distance_m(c.g[0], c.g[1], lat, lon) <= c.g[2];
+        }
+        case K::IntCmp: {
+            const std::int64_t v = s.int_at(c.field, slot);
+            return apply_op(c.op, (v > c.i) - (v < c.i));
+        }
+        case K::FloatCmp: {
+            const double v = s.float_at(c.field, slot);
+            return apply_op(c.op, (v > c.f) - (v < c.f));
+        }
         case K::Num: {
             const std::int64_t fi = c.field_is_int ? s.int_at(c.field, slot) : 0;
             const double fd = c.field_is_int ? 0.0 : s.float_at(c.field, slot);
@@ -269,9 +392,10 @@ bool CompiledFilter::eval(int index, NodeId slot) const {
         case K::AllTags: {
             const auto& tags = s.tags_at(c.field, slot);
             if (c.ids.size() > tags.size()) return false;  // cannot hold them all
-            for (std::uint32_t id : c.ids)
-                if (std::find(tags.begin(), tags.end(), id) == tags.end()) return false;
-            return true;
+            // Both are free of repeats: all are held when as many of the row's tags are wanted.
+            std::size_t held = 0;
+            for (const std::uint32_t id : tags) held += std::binary_search(c.ids.begin(), c.ids.end(), id);
+            return held == c.ids.size();
         }
         default: return false;  // GCOVR_EXCL_LINE: unreachable, every kind is handled above
     }

@@ -9,11 +9,11 @@ import json, pathlib, re, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 HEADERS = ["scoring.h", "collection.h", "hnsw_index.h", "flat_index.h", "disk_index.h", "vamana.h", "sparse.h", "metadata.h", "filter.h",
-           "search_result.h", "health.h", "codec.h", "half.h", "facets.h", "inspect.h", "sparse_vector.h", "durable.h", "wal.h", "distance.h"]
+           "search_result.h", "health.h", "codec.h", "half.h", "facets.h", "text_analysis.h", "inspect.h", "sparse_vector.h", "durable.h", "wal.h", "distance.h"]
 # Public API by header, in reference order. Records whose public members are listed in full.
 GROUPS = [
     ("Collections (collection.h)", ["Preset", "Maintenance", "MaintenancePolicy", "MaintenanceReport", "MaintenanceStatus", "TtlOptions", "CollectionOptions",
-                                    "FacetRequest", "FacetValue", "FacetBucket", "FacetResult", "StoredInfo", "Document", "DocumentRecord", "CollectionScanOptions", "CollectionPage", "CollectionQuery", "CollectionSearchOptions", "CollectionHit", "Collection"]),
+                                    "GroupBy", "CollectionGroup", "Recommend", "FacetRequest", "FacetValue", "FacetBucket", "FacetResult", "StoredInfo", "Document", "DocumentRecord", "CollectionScanOptions", "CollectionPage", "CollectionQuery", "CollectionSearchOptions", "CollectionHit", "Collection"]),
     ("Metadata and filters (metadata.h, filter.h)", ["FieldType", "Value", "Metadata", "FieldSpec", "SchemaMode", "Schema", "CompareOp", "Filter",
                                                      "Strategy", "PlanReason", "PlannerParams", "DecayShape", "RecencyDecay", "FieldMultiplier", "MatchBoost",
                                                      "ScoreModifiers", "SearchStats", "SearchOptions", "OperationOptions",
@@ -31,7 +31,7 @@ GROUPS = [
 ]
 FUNCTIONS = ["hybrid_search", "fuse", "sparse_dot", "l2_radius", "write_vectors_file", "read_segment", "sync_path", "sync_directory", "plan_search",
              "validate", "parse_date", "format_date", "now_ms", "relevance_from_distance", "rescored", "mmr_order",
-             "float_to_f16", "f16_to_float", "float_to_bf16", "bf16_to_float", "identify", "stored_kind_name"]
+             "float_to_f16", "f16_to_float", "float_to_bf16", "bf16_to_float", "identify", "stored_kind_name", "stem_english", "tokenize_unicode", "is_english_stop_word"]
 
 def dump():
     with tempfile.NamedTemporaryFile("w", suffix=".cpp", delete=False) as f:

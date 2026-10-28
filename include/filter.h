@@ -50,7 +50,7 @@ class Filter {
 public:
     /// One node of the expression tree.
     struct Node {
-        enum class Kind { All, Compare, Between, In, HasTag, HasAnyTag, HasAllTags, Exists, And, Or, Not };
+        enum class Kind { All, Compare, Between, In, HasTag, HasAnyTag, HasAllTags, Exists, And, Or, Not, GeoRadius, GeoBox };
         Kind kind = Kind::All;
         std::string field;
         CompareOp op = CompareOp::Eq;
@@ -59,6 +59,8 @@ public:
         std::vector<std::string> tags;
         std::vector<std::shared_ptr<const Node>> children;
         int depth = 1;  // levels in this subtree
+        std::string field2;     // geo: the longitude field (`field` holds the latitude)
+        double geo[4] = {};     // GeoRadius: lat, lon, meters; GeoBox: south, west, north, east
     };
 
     /// Deepest filter allowed. Filters are evaluated recursively, so an
@@ -108,6 +110,28 @@ public:
     static Filter has_all_tags(std::string field, std::vector<std::string> tags) { return tags_node(Node::Kind::HasAllTags, std::move(field), std::move(tags)); }
 
     /// The vector has a value for `field`.
+    /// Documents within `meters` of (lat, lon) by great-circle distance (haversine on a
+    /// sphere of the mean Earth radius, 6,371,008.8 m), their latitude and longitude in
+    /// two numeric fields, in degrees. Documents missing either field, or holding a
+    /// latitude outside [-90, 90] or a longitude outside [-180, 180], do not match.
+    /// Throws std::invalid_argument for a center outside those ranges, or a negative or
+    /// non-finite radius.
+    static Filter geo_radius(std::string lat_field, std::string lon_field, double lat, double lon, double meters) {
+        check_point(lat, lon, "geo_radius");
+        if (!(meters >= 0.0) || !std::isfinite(meters)) throw std::invalid_argument("geo_radius: the radius must be finite and >= 0 meters");
+        return geo_node(Node::Kind::GeoRadius, std::move(lat_field), std::move(lon_field), lat, lon, meters, 0.0);
+    }
+    /// Documents inside a box: latitudes in [south, north], longitudes in [west, east],
+    /// edges included. A box crossing the antimeridian has west > east (for example,
+    /// west 170, east -170). Throws std::invalid_argument for coordinates out of range
+    /// or south > north.
+    static Filter geo_box(std::string lat_field, std::string lon_field, double south, double west, double north, double east) {
+        check_point(south, west, "geo_box");
+        check_point(north, east, "geo_box");
+        if (south > north) throw std::invalid_argument("geo_box: south is above north");
+        return geo_node(Node::Kind::GeoBox, std::move(lat_field), std::move(lon_field), south, west, north, east);
+    }
+
     static Filter exists(std::string field) {
         auto n = std::make_shared<Node>();
         n->kind = Node::Kind::Exists;
@@ -149,6 +173,22 @@ private:
         n->a = checked(std::move(v));
         return Filter(std::move(n));
     }
+    static void check_point(double lat, double lon, const char* what) {
+        if (!(lat >= -90.0 && lat <= 90.0)) throw std::invalid_argument(std::string(what) + ": latitudes are within [-90, 90]");
+        if (!(lon >= -180.0 && lon <= 180.0)) throw std::invalid_argument(std::string(what) + ": longitudes are within [-180, 180]");
+    }
+    static Filter geo_node(Node::Kind kind, std::string lat_field, std::string lon_field, double a, double b, double c, double d) {
+        if (lat_field.empty() || lon_field.empty()) throw std::invalid_argument("geo filters need a latitude and a longitude field");
+        auto n = std::make_shared<Node>();
+        n->kind = kind;
+        n->field = std::move(lat_field);
+        n->field2 = std::move(lon_field);
+        n->geo[0] = a;
+        n->geo[1] = b;
+        n->geo[2] = c;
+        n->geo[3] = d;
+        return Filter(std::move(n));
+    }
     static Filter tags_node(Node::Kind kind, std::string field, std::vector<std::string> tags) {
         auto n = std::make_shared<Node>();
         n->kind = kind;
@@ -181,6 +221,10 @@ public:
 
     /// True if slot `slot` satisfies the filter.
     bool matches(NodeId slot) const { return eval(root_, slot); }
+    /// matches() for every row in [0, rows) at once: out[r] is 1 where row r matches.
+    /// Evaluated a node at a time over its column rather than a row at a time over the
+    /// tree, so several times cheaper when every row is examined (exact scans).
+    void matches_all(NodeId rows, std::vector<std::uint8_t>& out) const;
 
     /// Exact number of live matching vectors, when it can be read from the
     /// payload index or presence counts; otherwise nothing.
@@ -193,11 +237,9 @@ public:
     /// matches() (and liveness): an `and` with unindexed parts returns a superset.
     std::optional<std::vector<NodeId>> candidates() const { return candidates_of(root_); }
 
-    /// True if the filter can never match (decided while compiling).
-    bool always_false() const { return nodes_[static_cast<std::size_t>(root_)].kind == K::False; }
 
 private:
-    enum class K { True, False, Num, NumBetween, NumIn, Key, KeyIn, Bool, Tag, AnyTag, AllTags, Exists, And, Or, Not };
+    enum class K { True, False, Num, NumBetween, NumIn, Key, KeyIn, Bool, Tag, AnyTag, AllTags, Exists, And, Or, Not, GeoRadius, GeoBox, IntCmp, FloatCmp };
     struct CNode {
         K kind = K::True;
         std::size_t field = 0;
@@ -211,6 +253,9 @@ private:
         std::vector<Value> nums;
         std::vector<std::uint32_t> ids;
         std::vector<int> children;
+        std::size_t field2 = 0;  // geo: the longitude field
+        bool field2_is_int = false;
+        double g[4] = {};        // geo: as in Filter::Node
     };
 
     int build(const Filter::Node& n);
@@ -219,6 +264,7 @@ private:
         return static_cast<int>(nodes_.size()) - 1;
     }
     bool eval(int n, NodeId slot) const;
+    void eval_all(int n, NodeId rows, std::uint8_t* out) const;
     std::optional<std::vector<NodeId>> candidates_of(int n) const;
 
     const MetadataStore* store_;

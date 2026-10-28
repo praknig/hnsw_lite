@@ -320,6 +320,8 @@ std::unique_ptr<Collection> Collection::open(const std::string& dir, CollectionO
     const CollectionOptions& got = o.index->options_;
     if (got.dim != options.dim || got.metric != options.metric || got.text != options.text || got.sparse != options.sparse)
         throw std::invalid_argument("Collection::open: the directory holds a collection with another dimension, metric or sides");
+    if (got.bm25.unicode != options.bm25.unicode || got.bm25.stop_words != options.bm25.stop_words || got.bm25.stem != options.bm25.stem)
+        throw std::invalid_argument("Collection::open: the directory holds a collection with other text analysis (queries would not match its documents)");
     o.index->options_.durability = durability;
     o.index->options_.ef = options.ef;  // runtime settings come from the caller
     // The settings stored with the collection are kept. The caller can switch a feature

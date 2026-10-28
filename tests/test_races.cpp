@@ -766,6 +766,123 @@ RACE_TEST(r15_fallbacks_rabitq_compaction_and_half_disk) {
     CHECK(bad == 0);
 }
 
+// ---------------------------------------------------------------- r16
+
+RACE_TEST(r16_group_searches_while_documents_change) {
+    // search_groups while writers change the documents and their group field. Each group
+    // is read under one lock: every hit holds its group's value. "fixed" (the ID's last
+    // digit) never changes, so that is checked from the ID alone; "moving" changes under
+    // every write, and its groups must still be internally consistent.
+    CollectionOptions o;
+    o.dim = 4;
+    o.text = true;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    auto doc = [](std::uint64_t i, std::int64_t moving) {
+        Document d;
+        d.vector = std::vector<float>{float(i % 7), float(i % 11), float(i % 13), 1.0f};
+        d.text = (i % 2 ? "red apple " : "green apple ") + std::to_string(i % 5);
+        d.metadata = Metadata().set("fixed", std::int64_t(i % 10)).set("moving", moving);
+        return d;
+    };
+    for (std::uint64_t i = 0; i < 300; ++i) c.add(i, doc(i, std::int64_t(i % 6)));
+    std::atomic<int> bad{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = rng() % 300;
+            if (rng() % 4 == 0) (void)c.remove(i);
+            else (void)c.upsert(i, doc(i, std::int64_t(rng() % 6)));
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            CollectionQuery q;
+            q.text = "apple";
+            const bool stable = rng() % 2 == 0;
+            CollectionSearchOptions so;
+            so.with_metadata = true;
+            for (const auto& grp : c.search_groups(q, GroupBy{stable ? "fixed" : "moving", 4, 3, 0}, so)) {
+                if (grp.hits.empty() || grp.hits.size() > 3) ++bad;
+                for (const auto& h : grp.hits) {
+                    if (stable && std::int64_t(h.id % 10) != grp.value.i) ++bad;   // from the ID: no read-back race
+                    if (!h.metadata || !h.metadata->get(stable ? "fixed" : "moving") ||
+                        h.metadata->get(stable ? "fixed" : "moving")->i != grp.value.i) ++bad;  // read with the hit, under the same lock
+                }
+            }
+        },
+    });
+    CHECK(bad == 0);
+}
+
+// ---------------------------------------------------------------- r17
+
+RACE_TEST(r17_recommend_while_examples_change) {
+    // recommend() while writers update, remove and re-add the example documents. A removed
+    // example makes it refuse (an unknown document): that is correct. Never: an example in
+    // the results, a NaN distance.
+    CollectionOptions o;
+    o.dim = 4;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    auto doc = [](std::uint64_t i, float shift) {
+        Document d;
+        d.vector = std::vector<float>{float(i % 7) + shift, float(i % 11), float(i % 13), 1.0f};
+        return d;
+    };
+    for (std::uint64_t i = 0; i < 300; ++i) c.add(i, doc(i, 0));
+    std::atomic<int> bad{0}, refused{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = rng() % 20;  // the examples' range: they change most
+            if (rng() % 3 == 0) (void)c.remove(i);
+            else (void)c.upsert(i, doc(i, float(rng() % 5)));
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            const std::vector<std::uint64_t> pos{rng() % 20, rng() % 20}, neg{20 + rng() % 10};
+            try {
+                for (const auto& h : c.recommend(Recommend{pos, neg}, 10)) {
+                    if (std::find(pos.begin(), pos.end(), h.id) != pos.end() || h.id == neg[0]) ++bad;
+                    if (h.vector_distance && std::isnan(*h.vector_distance)) ++bad;
+                }
+            } catch (const std::invalid_argument&) {
+                ++refused;  // an example removed meanwhile
+            }
+        },
+    });
+    CHECK(bad == 0);
+}
+
+// ---------------------------------------------------------------- r18
+
+RACE_TEST(r18_geo_searches_while_coordinates_change) {
+    // Geo-filtered searches while writers move documents. "flat"/"flon" never change (a
+    // function of the ID), so each result is checked from its ID alone; "lat"/"lon" move
+    // under every write, and searches on them run concurrently for the race detector.
+    auto fixed = [](std::uint64_t i) { return std::pair<double, double>{double(i % 90) - 45.0, double(i % 360) - 180.0}; };
+    HnswIndex h(2, Metric::L2);
+    auto md = [&](std::uint64_t i, double lat, double lon) {
+        return Metadata().set("flat", fixed(i).first).set("flon", fixed(i).second).set("lat", lat).set("lon", lon);
+    };
+    for (std::uint64_t i = 0; i < 400; ++i) h.add(i, std::vector<float>{float(i % 17), float(i % 23)}, md(i, 0, 0));
+    const Filter box = Filter::geo_box("flat", "flon", -20, -100, 20, 100);
+    std::atomic<int> bad{0};
+    collide({
+        [&](std::size_t, std::mt19937& rng) {
+            const std::uint64_t i = rng() % 400;
+            if (rng() % 4 == 0) (void)h.remove(i);
+            else (void)h.upsert(i, std::vector<float>{float(i % 17), float(i % 23)}, md(i, double(rng() % 180) - 90.0, double(rng() % 360) - 180.0));
+        },
+        [&](std::size_t, std::mt19937& rng) {
+            SearchOptions o;
+            const bool stable = rng() % 2 == 0;
+            o.filter = stable ? box : Filter::geo_radius("lat", "lon", 0, 0, 3000e3);
+            for (const auto& r : h.search(std::vector<float>{float(rng() % 17), float(rng() % 23)}, 10, 32, o)) {
+                const auto [la, lo] = fixed(r.id);
+                if (stable && !(la >= -20 && la <= 20 && lo >= -100 && lo <= 100)) ++bad;  // outside its filter
+            }
+        },
+    });
+    CHECK(bad == 0);
+}
+
 // ---------------------------------------------------------------- main
 
 int main(int argc, char** argv) {

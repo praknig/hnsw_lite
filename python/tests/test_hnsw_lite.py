@@ -674,3 +674,210 @@ def test_facets_on_indexes_and_collections(tmp_path):
     durable.close()
     d = hl.identify(str(tmp_path / "c.db"))
     assert d["kind"] == "collection" and d["durable"] and d["snapshots"] and d["segments"]
+
+
+def test_search_groups(tmp_path):
+    col = hl.Collection(dim=4, metric="l2", text=True, maintenance="manual")
+    words = ["alpha", "beta", "gamma", "delta"]
+    for i in range(120):
+        md = {"doc": f"d{i % 9}", "n": i % 4} if i % 13 else {"n": i % 4}  # some without "doc"
+        col.upsert(i, vector=[float(i % 7), 1.0, 2.0, 3.0], text=" ".join(words[(i + j) % 4] for j in range(3)), metadata=md)
+    full = col.search(text="alpha gamma", k=120, with_metadata=True)
+    expected = {}
+    for h in full:  # grouping the full ranking by hand
+        v = h["metadata"].get("doc")
+        if v is None or (v not in expected and len(expected) == 3):
+            continue
+        expected.setdefault(v, [])
+        if len(expected[v]) < 2:
+            expected[v].append(h["id"])
+    groups = col.search_groups(text="alpha gamma", group_by="doc", groups=3, per_group=2)
+    assert [(g["value"], [h["id"] for h in g["hits"]]) for g in groups] == list(expected.items())
+    # an integer field with 4 values; each text leaves out one word of four, so any two words reach every document
+    assert len(col.search_groups(text="alpha beta", group_by="n", groups=10, per_group=1)) == 4
+    assert col.search_groups(text="alpha", group_by="never", groups=3) == []               # no document holds it
+    hits = col.search_groups(vector=[3, 1, 2, 3], group_by="doc", groups=2, per_group=3, with_metadata=True)
+    assert all(h["metadata"]["doc"] == g["value"] for g in hits for h in g["hits"])
+    for bad in ({"group_by": ""}, {"group_by": "doc", "groups": -1}, {"group_by": "doc", "per_group": 1.5}):
+        with pytest.raises(ValueError):
+            col.search_groups(text="alpha", **bad)
+
+
+def test_recommend():
+    rng = np.random.default_rng(5)
+    col = hl.Collection(dim=6, metric="l2", maintenance="manual")
+    vecs = rng.normal(size=(200, 6)).astype(np.float32)
+    for i in range(200):
+        col.upsert(i, vector=vecs[i], metadata={"g": i % 3})
+    query = 2 * (vecs[3] + vecs[7]) / 2 - vecs[11]   # 2 avg(positive) - avg(negative), as computed in double
+    expected = [h["id"] for h in col.search(vector=query.astype(np.float32), k=13) if h["id"] not in (3, 7, 11)][:10]
+    got = col.recommend([3, 7], [11], k=10)
+    assert [h["id"] for h in got] == expected and all(h["id"] not in (3, 7, 11) for h in got)
+    assert all(h["metadata"]["g"] == 1 for h in col.recommend([3], k=5, filter={"g": 1}, with_metadata=True))
+    keyed = hl.Collection(dim=6, metric="cosine", string_ids=True, maintenance="manual")
+    for i in range(50):
+        keyed.upsert(f"doc-{i}", vector=vecs[i])
+    by_key = keyed.recommend(["doc-1", "doc-2"], ["doc-3"], k=5)
+    assert len(by_key) == 5 and not {"doc-1", "doc-2", "doc-3"} & {h["key"] for h in by_key}
+    for bad in (([],), ([-1],), ([1.5],), ("doc-1",), ([True],)):
+        with pytest.raises(ValueError):
+            col.recommend(*bad)
+    with pytest.raises(ValueError):
+        col.recommend([9999])            # unknown
+    with pytest.raises(ValueError):
+        col.recommend([3, 4], [4])       # both
+
+
+def test_rerank():
+    col = hl.Collection(dim=4, metric="l2", text=True, maintenance="manual")
+    for i in range(60):
+        col.upsert(i, vector=[float(i), 1.0, 0.0, 0.0], text="apple " + "z" * (i % 7))
+    zs = lambda query, texts: [t.count("z") for t in texts]  # a stand-in model: more z, more relevant
+    first = col.search(text="apple", k=20)
+    got = col.search(text="apple", k=5, rerank=zs, rerank_candidates=20)
+    assert [h["rerank_score"] for h in got] == sorted((h_text.count("z") for h_text in
+                                                       [h["text"] for h in col.search(text="apple", k=20, with_text=True)]), reverse=True)[:5]
+    assert all("score" in h and "text" not in h for h in got)          # first-stage score kept; text only if asked
+    by_id = {h["id"]: h["score"] for h in first}
+    assert all(h["score"] == by_id[h["id"]] for h in got)
+    class CrossEncoderLike:                                            # sentence-transformers' interface
+        def predict(self, pairs):
+            assert all(q == "apple" for q, _ in pairs)
+            return np.array([t.count("z") for _, t in pairs], dtype=np.float32)
+    assert [h["id"] for h in col.search(text="apple", k=5, rerank=CrossEncoderLike(), rerank_candidates=20)] == [h["id"] for h in got]
+    same = col.search(text="apple", k=10, rerank=lambda q, texts: [1.0] * len(texts), with_text=True)
+    assert [h["id"] for h in same] == [h["id"] for h in col.search(text="apple", k=10)]  # ties: first-stage order
+    assert all("text" in h for h in same)
+    v = col.search(vector=[3, 1, 0, 0], k=3, rerank=zs, rerank_query="apple")  # vector-only: an explicit query text
+    assert len(v) == 3 and v[0]["rerank_score"] >= v[-1]["rerank_score"]
+    for bad in (dict(rerank=lambda q, t: [1.0]),                       # wrong number of scores
+                dict(rerank=lambda q, t: [float("nan")] * len(t)),     # not finite
+                dict(rerank=42),                                       # not a reranker
+                dict(rerank=zs, rerank_candidates=2),                  # fewer candidates than k
+                dict(rerank=zs, rerank_candidates=-1)):
+        with pytest.raises(ValueError):
+            col.search(text="apple", k=5, **bad)
+    with pytest.raises(ValueError):
+        col.search(vector=[3, 1, 0, 0], k=3, rerank=zs)                # vector-only without rerank_query
+    with pytest.raises(ZeroDivisionError):
+        col.search(text="apple", k=3, rerank=lambda q, t: [1 / 0])    # the model's own errors propagate
+
+
+def _docs(col):
+    return {(d.get("key") or d["id"]): (None if d.get("vector") is None else np.asarray(d["vector"]).tolist(), d.get("text"),
+                                        d.get("sparse"), d.get("metadata"), d.get("expires_at"))
+            for d in col.documents()}
+
+
+@pytest.mark.parametrize("keys", [False, True])
+def test_arrow_and_parquet_round_trip(tmp_path, keys):
+    pa = pytest.importorskip("pyarrow")
+    future = hl.now_ms() + 3_600_000
+    col = hl.Collection(dim=3, metric="l2", text=True, sparse=True, string_ids=keys, ttl=True, maintenance="manual")
+    for i in range(40):
+        md = {"n": i, "tags": ["a", "b"][: i % 3], "flag": i % 2 == 0, "x": i / 4, "text": f"field {i}"}  # "text" clashes
+        if i % 5 == 0:
+            del md["n"]                                       # an integer field with missing values
+        doc_id = f"doc-{i}" if keys else i
+        col.upsert(doc_id, vector=None if i % 9 == 4 else [float(i), 1.0, -2.0],  # some without a vector
+                   text=f"words {i}", sparse=([i % 7, 30], [1.5, 0.25]), metadata=md, expires_at=future + i)
+    table = col.to_arrow()
+    assert table.schema.field("vector").type == pa.list_(pa.float32(), 3) and table.num_rows == 40
+    assert "metadata_text" in table.column_names and table.schema.field("n").type == pa.int64()
+    copy = hl.Collection(dim=3, metric="l2", text=True, sparse=True, string_ids=keys, ttl=True, maintenance="manual")
+    assert copy.upsert_arrow(table) == 40
+    assert _docs(copy) == _docs(col)                          # every side, metadata types and expiry, exactly
+    path = tmp_path / "docs.parquet"
+    assert col.write_parquet(path, batch=7) == 40             # many batches
+    again = hl.Collection(dim=3, metric="l2", text=True, sparse=True, string_ids=keys, ttl=True, maintenance="manual")
+    assert again.upsert_parquet(path, batch=7) == 40 and _docs(again) == _docs(col)
+    assert col.to_arrow(with_vectors=False, with_text=False).column_names[:1] == ["id"]
+
+
+def test_arrow_import_from_other_tools():
+    pa = pytest.importorskip("pyarrow")
+    table = pa.table({"doc_id": pa.array([10, 11, 12], pa.int64()),
+                      "embedding": pa.array([[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], pa.list_(pa.float64())),  # variable lists
+                      "lang": ["en", None, "fr"], "year": pa.array([2020, None, 2022], pa.int64())})
+    col = hl.Collection(dim=2, metric="l2", maintenance="manual")
+    assert col.upsert_arrow(table, id_column="doc_id", vector_column="embedding") == 3
+    assert col.get(11)["metadata"] == {} and col.get(12)["metadata"] == {"lang": "fr", "year": 2022}
+    assert col.search(vector=[1, 1], k=1)[0]["id"] == 12
+    with pytest.raises(ValueError):
+        col.upsert_arrow(pa.table({"v": [[1.0, 2.0]]}), vector_column="v")       # no id column
+    with pytest.raises(ValueError):
+        col.upsert_arrow(pa.table({"id": pa.array([None], pa.int64()), "vector": [[1.0, 2.0]]}))  # a missing id
+    assert hl.Collection(dim=2, metric="l2").to_arrow().num_rows == 0           # empty: the schema, no rows
+
+
+def test_geo_filters():
+    col = hl.Collection(dim=2, metric="l2", maintenance="manual")
+    places = {"london": (51.5074, -0.1278), "paris": (48.8566, 2.3522), "nyc": (40.7128, -74.006),
+              "suva": (-18.1248, 178.4501), "apia": (-13.8333, -171.7667)}
+    for i, (name, (lat, lon)) in enumerate(places.items()):
+        col.upsert(i, vector=[lat, lon], metadata={"name": name, "lat": lat, "lon": lon})
+    near_london = hl.Filter.geo_radius("lat", "lon", 51.5074, -0.1278, 400_000)   # Paris is about 344 km away
+    assert {h["metadata"]["name"] for h in col.search(vector=[50, 0], k=5, filter=near_london, with_metadata=True)} == {"london", "paris"}
+    pacific = hl.Filter.geo_box("lat", "lon", -20, 175, -10, -170)               # across the antimeridian
+    assert {h["metadata"]["name"] for h in col.search(vector=[-15, 179], k=5, filter=pacific, with_metadata=True)} == {"suva", "apia"}
+    both = hl.Filter.geo_radius("lat", "lon", 51.5074, -0.1278, 400_000) & ~hl.Filter.eq("name", "london")
+    assert [h["metadata"]["name"] for h in col.search(vector=[50, 0], k=5, filter=both, with_metadata=True)] == ["paris"]
+    for bad in (lambda: hl.Filter.geo_radius("lat", "lon", 95, 0, 10), lambda: hl.Filter.geo_radius("lat", "lon", 0, 0, -1),
+                lambda: hl.Filter.geo_box("lat", "lon", 10, 0, 0, 5)):
+        with pytest.raises(ValueError):
+            bad()
+
+
+def test_text_analysis(tmp_path):
+    def collection(**analysis):
+        col = hl.Collection(text=True, maintenance="manual", **analysis)
+        for i, t in enumerate(["running shoes", "École de Paris", "the swimming pool", "don\u2019t stop"]):
+            col.upsert(i, text=t)
+        return col
+    plain, stemmed, uni = collection(), collection(stem=True, stop_words=True), collection(unicode=True)
+    assert plain.search(text="runs", k=3) == [] and [h["id"] for h in stemmed.search(text="runs", k=3)] == [0]
+    assert plain.search(text="école", k=3) == [] and [h["id"] for h in uni.search(text="école", k=3)] == [1]
+    assert stemmed.search(text="the", k=3) == []                      # a stop word: nothing to match
+    path = tmp_path / "c.col"
+    stemmed.save(str(path))
+    back = hl.Collection.load(str(path))
+    assert back._core.options.bm25.stem and back._core.options.bm25.stop_words and not back._core.options.bm25.unicode
+    assert [h["id"] for h in back.search(text="running", k=3)] == [0]
+    durable = str(tmp_path / "d.db")
+    d = hl.Collection(text=True, stem=True, path=durable, maintenance="manual")
+    d.upsert(1, text="running")
+    d.close()
+    with pytest.raises(ValueError):
+        hl.Collection(text=True, path=durable, maintenance="manual")   # other analysis than stored: refused
+    again = hl.Collection(text=True, stem=True, path=durable, maintenance="manual")
+    assert [h["id"] for h in again.search(text="runs", k=3)] == [1]
+
+
+def test_empty_and_zero_size_inputs(tmp_path):
+    # This release's features on empty collections, zero rows and zero sizes: empty
+    # answers where nothing matches, clear errors where nothing can be done.
+    empty = hl.Collection(dim=2, metric="l2", text=True, maintenance="manual")
+    assert empty.search_groups(text="a", group_by="g") == []
+    assert empty.search(text="a", k=3, rerank=lambda q, t: [1.0] * len(t)) == []
+    with pytest.raises(ValueError):
+        empty.recommend([1])                                   # no such document
+    assert empty.to_arrow().num_rows == 0
+    path = str(tmp_path / "empty.parquet")
+    assert empty.write_parquet(path) == 0
+    assert hl.Collection(dim=2, metric="l2", text=True).upsert_parquet(path) == 0
+    pa = pytest.importorskip("pyarrow")
+    zero = pa.table({"id": pa.array([], pa.uint64()), "vector": pa.array([], pa.list_(pa.float32(), 2))})
+    assert empty.upsert_arrow(zero) == 0
+    c = hl.Collection(dim=2, metric="l2", maintenance="manual")
+    c.upsert(1, vector=[0, 1])
+    assert c.recommend([1], k=0) == [] and c.search_groups(vector=[0, 1], group_by="g", groups=0) == []
+    assert c.search(vector=[0, 1], k=3, filter={"g": "none"}, rerank=lambda q, t: [], rerank_query="x") == []
+    from hnsw_lite_lib import hnswlib as compat
+    i = compat.Index("l2", 2)
+    with pytest.raises(RuntimeError):
+        i.knn_query(np.zeros(2, np.float32))                   # before init_index
+    i.init_index(10)
+    i.add_items(np.zeros((0, 2), np.float32))
+    assert i.get_ids_list() == []
+    with pytest.raises(RuntimeError):
+        i.knn_query(np.zeros(2, np.float32), k=1)              # nothing stored: as hnswlib
