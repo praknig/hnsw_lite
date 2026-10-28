@@ -8,6 +8,8 @@ All code is in the `vecdb` namespace. Invalid input throws `std::invalid_argumen
 
 
 This is a compact list. The [developer reference](developer-reference.md) explains each method and parameter in detail, with its errors and limits.
+| `stem_english(word)`, `tokenize_unicode(text)`, `is_english_stop_word(token)` (`text_analysis.h`); `Bm25Params::unicode`, `stop_words`, `stem`; `Bm25::analyze(text)` | Text analysis for BM25: the Snowball English stemmer, Unicode tokens, stop words |
+
 ## `common.h`
 
 | Name | Description |
@@ -147,6 +149,8 @@ Not copyable, movable. Frees its memory in the destructor.
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
 | `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
+| `search_groups(query, GroupBy{field, groups, per_group, max_candidates}, options)` → `std::vector<CollectionGroup>` | Group-by: the best values of a field, each with its best documents |
+| `recommend(Recommend{positive, negative}, k, options)` → `std::vector<CollectionHit>` | Documents like some examples and unlike others, by their vectors |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
 | `update(id, vector)`, `update(id, vector, metadata)` | Replaces the vector in place (and, with metadata, the whole metadata); `false` for an unknown ID; all-or-nothing |
@@ -192,7 +196,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Description |
 |---|---|
-| `Filter::eq/ne/lt/le/gt/ge(field, value)`, `between`, `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, `all()` | Conditions; combine with `&&`, `\|\|`, `!` |
+| `Filter::eq/ne/lt/le/gt/ge(field, value)`, `between`, `in`, `has_tag`, `has_any_tag`, `has_all_tags`, `exists`, `geo_radius`, `geo_box`, `all()` | Conditions; combine with `&&`, `\|\|`, `!` |
 | `filter.is_all()`, `filter.root()` | Whether a filter matches everything (`Filter::all()`), and its condition tree, for inspection |
 | `CompiledFilter(filter, store)` | Checks a filter against a schema; `matches(slot)`, `exact_count()` |
 | `SearchOptions { filter, predicate, strategy, planner, stats, range_expand_outside }` | Optional settings for one search |

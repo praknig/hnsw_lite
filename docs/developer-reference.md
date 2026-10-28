@@ -223,6 +223,8 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
 | `CollectionPage scan(const CollectionScanOptions& options = {}) const` | Lists documents **a page at a time, in ascending ID order**, optionally only those matching a filter (see *Reading every document* below). Throws `std::invalid_argument` if `limit` is 0, or for an unknown field under a strict schema. |
+| `std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const` | **Group-by:** the `groups` best values of `group_by.field` (keyword, integer or boolean), each with its `per_group` best documents, ranked as `search()` ranks them. Documents without the field are in no group. Widens the search 4× at a time until the groups are found and filled, every match was seen, or `max_candidates` (0: all) is reached: with an exact search, equal to grouping the full ranking. Under one read lock. `GroupBy { field, groups = 10, per_group = 3, max_candidates = 0 }`; `CollectionGroup { Value value; std::vector<CollectionHit> hits; }`. Other field types, an empty name, or an unknown field under a strict schema throw `std::invalid_argument`. |
+| `std::vector<CollectionHit> recommend(const Recommend& examples, std::size_t k, const CollectionSearchOptions& options = {}) const` | **Recommendation:** documents like `examples.positive` and unlike `examples.negative` (`Recommend { std::vector<std::uint64_t> positive, negative; }`): a vector search from avg(positive), or 2 avg(positive) - avg(negative), each example normalized first for cosine; computed in double and clamped to float's range. The examples are never returned; options apply as in `search()`. Under one read lock. Throws `std::invalid_argument` without a positive example, for an unknown or expired document, one without a vector, one in both lists, or a collection without vectors. |
 | `std::vector<FacetResult> facets(requests, filter)`, `facets_for(ids, requests)` | Faceted counts, as for `HnswIndex` (see *Faceted search*); expired documents are never counted. |
 | `void create_payload_index(std::string_view field)` | Counts and posting lists for a keyword, boolean or tag field (as for `HnswIndex`); logged for durable collections. |
 | `Schema schema() const`, `std::vector<std::string> payload_indexes() const` | The schema in force (also in `options().schema`, which always reports the current one) and the indexed fields. |
@@ -522,6 +524,8 @@ A condition on metadata, built with these functions and combined with `&&`, `||`
 | `Filter::has_any_tag(field, {tags})` | the tag set contains at least one of them |
 | `Filter::has_all_tags(field, {tags})` | the tag set contains all of them (with no tags: every record that has the field) |
 | `Filter::exists(field)` | the record has a value for the field |
+| `Filter::geo_radius(lat_field, lon_field, lat, lon, meters)` | within `meters` of (lat, lon) by great-circle distance (haversine, mean Earth radius 6,371,008.8 m); the two fields numeric, in degrees. Missing or out-of-range coordinates never match; an out-of-range center, or a negative or non-finite radius, throws `std::invalid_argument` |
+| `Filter::geo_box(lat_field, lon_field, south, west, north, east)` | latitude in [south, north] and longitude in [west, east], edges included; west > east crosses the antimeridian. Throws for out-of-range coordinates or south > north |
 | `a && b`, `a \|\| b`, `!a` | both, either, not |
 
 ```cpp
@@ -1010,7 +1014,10 @@ std::vector<HybridResult> fuse(std::span<const SearchResult> dense, std::span<co
 ### 7.4 BM25
 
 ```cpp
-struct Bm25Params { double k1 = 1.2; double b = 0.75; double avg_doc_length = 100.0; };
+struct Bm25Params {
+    double k1 = 1.2, b = 0.75, avg_doc_length = 100.0;
+    bool unicode = false, stop_words = false, stem = false;  // text analysis, off by default
+};
 class Bm25 { /* see below */ };
 ```
 
@@ -1021,17 +1028,23 @@ class Bm25 { /* see below */ };
 | `k1` (1.2) | How quickly repeated words stop adding to a document's score (at least 0). |
 | `b` (0.75) | How much long documents are penalized (0 to 1; 0: not at all). |
 | `avg_doc_length` (100) | Average document length in tokens, for that penalty (greater than 0). Set it with `fit()` or from your data. |
+| `unicode` (false) | Tokens by `tokenize_unicode()` instead of `tokenize()`: UTF-8 decoded, lowercased beyond ASCII (Latin-1, Latin Extended-A, Greek, Cyrillic), Unicode punctuation, spaces, symbols and emoji separating words, invalid UTF-8 never inside a token, and an apostrophe between letters kept (`don't`). |
+| `stop_words` (false) | Leaves out Snowball's English stop words (174: `the`, `and`, `don't`, ...). |
+| `stem` (false) | Reduces tokens of letters a to z (and apostrophes) to their Snowball English stems: `running`, `runs` and `run` match. |
 
 | Method | What it does |
 |---|---|
 | `Bm25(Bm25Params params = {})` | Throws `std::invalid_argument` for values outside the ranges above. |
 | `static std::vector<std::string> tokenize(std::string_view text)` | Lowercase runs of letters and digits; everything else separates tokens. Bytes of UTF-8 characters count as letters, so accented and non-Latin words stay whole (but are not lowercased). |
+| `std::vector<std::string> analyze(std::string_view text) const` | The terms of `text` as the parameters ask: `tokenize()` or `tokenize_unicode()`, then stop words left out, then stems. `fit` and both encoders use it. |
 | `static std::uint32_t term_id(std::string_view token)` | The token's term number: a 32-bit hash (FNV-1a). |
 | `void fit(std::span<const std::string_view> documents)` | Sets `avg_doc_length` to the mean token count of `documents` (unchanged if they have no tokens). |
 | `SparseVector encode_document(std::string_view text) const` | The document's term weights (the term-frequency part of BM25). |
 | `SparseVector encode_query(std::string_view text, const SparseIndex& index) const` | The query's term weights: each term's IDF, `ln(1 + (N − df + 0.5) / (df + 0.5))`, from the index's current document counts. Terms no document has are dropped. |
 
-**Limitations:** no stemming, stop words or synonyms; two different words with the same 32-bit hash merge (rare, and it only blends their counts). Document weights use `avg_doc_length` as it was when they were encoded: changing it later does not update stored documents. Query weights use the index's counts at query time, so encode queries against the index you search.
+**Text analysis** (`text_analysis.h`): `stem_english(word)` is the Snowball English stemmer (Porter2, from Snowball's `english.sbl`), equal to Snowball's own output on all 42,649 words of its test vocabulary; `tokenize_unicode(text)` and `is_english_stop_word(token)` are as above. In a collection the analysis is fixed at creation: saved with it (an optional block, so collections without analysis are written exactly as before, and older versions refuse the block cleanly), and reopening a durable collection with other analysis throws `std::invalid_argument`, since its documents' terms would not match the queries'.
+
+**Limitations:** no synonyms, and stemming and stop words for English only; two different words with the same 32-bit hash merge (rare, and it only blends their counts). Document weights use `avg_doc_length` as it was when they were encoded: changing it later does not update stored documents. Query weights use the index's counts at query time, so encode queries against the index you search.
 
 ---
 
@@ -1319,6 +1332,35 @@ struct CollectionOptions {
 };
 ```
 
+**`GroupBy`**
+
+```cpp
+struct GroupBy {
+    std::string field;
+    std::size_t groups = 10;
+    std::size_t per_group = 3;
+    std::size_t max_candidates = 0;
+};
+```
+
+**`CollectionGroup`**
+
+```cpp
+struct CollectionGroup {
+    Value value;
+    std::vector<CollectionHit> hits;
+};
+```
+
+**`Recommend`**
+
+```cpp
+struct Recommend {
+    std::vector<std::uint64_t> positive;
+    std::vector<std::uint64_t> negative;
+};
+```
+
 **`FacetRequest`**
 
 ```cpp
@@ -1505,6 +1547,8 @@ class Collection {
     CollectionPage scan(const CollectionScanOptions& options = {}) const;
     CollectionOptions options() const;
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
+    std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const;
+    std::vector<CollectionHit> recommend(const Recommend& examples, std::size_t k, const CollectionSearchOptions& options = {}) const;
     void save(const std::string& path) const;
     void save(std::ostream& out) const;
     static std::unique_ptr<Collection> load(const std::string& path);
@@ -1625,6 +1669,8 @@ class Filter {
     static Filter has_tag(std::string field, std::string tag);
     static Filter has_any_tag(std::string field, std::vector<std::string> tags);
     static Filter has_all_tags(std::string field, std::vector<std::string> tags);
+    static Filter geo_radius(std::string lat_field, std::string lon_field, double lat, double lon, double meters);
+    static Filter geo_box(std::string lat_field, std::string lon_field, double south, double west, double north, double east);
     static Filter exists(std::string field);
     friend Filter operator&&(const Filter& x, const Filter& y);
     friend Filter operator||(const Filter& x, const Filter& y);
@@ -2203,6 +2249,9 @@ struct Bm25Params {
     double k1 = 1.2;
     double b = 0.75;
     double avg_doc_length = 100.0;
+    bool unicode = false;
+    bool stop_words = false;
+    bool stem = false;
 };
 ```
 
@@ -2212,6 +2261,7 @@ struct Bm25Params {
 class Bm25 {
     explicit Bm25(Bm25Params params = {});
     static std::vector<std::string> tokenize(std::string_view text);
+    std::vector<std::string> analyze(std::string_view text) const;
     static std::uint32_t term_id(std::string_view token);
     void fit(std::span<const std::string_view> documents);
     SparseVector encode_document(std::string_view text) const;
@@ -2464,6 +2514,9 @@ inline std::uint16_t float_to_bf16(float f) noexcept;
 inline float bf16_to_float(std::uint16_t h) noexcept;
 StoredInfo identify(const std::string& path);
 const char* stored_kind_name(StoredKind kind);
+std::string stem_english(std::string_view word);
+std::vector<std::string> tokenize_unicode(std::string_view text);
+bool is_english_stop_word(std::string_view token);
 ```
 
 <!-- END GENERATED -->

@@ -580,6 +580,12 @@ PYBIND11_MODULE(_core, m) {
         .def_static("has_any_tag", &Filter::has_any_tag)
         .def_static("has_all_tags", &Filter::has_all_tags)
         .def_static("exists", &Filter::exists)
+        .def_static("geo_radius", &Filter::geo_radius, py::arg("lat_field"), py::arg("lon_field"), py::arg("lat"), py::arg("lon"),
+                    py::arg("meters"),
+                    "Documents within `meters` of (lat, lon), by great-circle distance; latitude and longitude in two numeric fields (degrees).")
+        .def_static("geo_box", &Filter::geo_box, py::arg("lat_field"), py::arg("lon_field"), py::arg("south"), py::arg("west"),
+                    py::arg("north"), py::arg("east"),
+                    "Documents inside a box of latitudes [south, north] and longitudes [west, east]; west > east crosses the antimeridian.")
         .def("is_all", &Filter::is_all)
         .def("__and__", [](const Filter& a, const Filter& b) { return a && b; })
         .def("__or__", [](const Filter& a, const Filter& b) { return a || b; })
@@ -618,7 +624,10 @@ PYBIND11_MODULE(_core, m) {
         .def(py::init<>())
         .def_readwrite("k1", &Bm25Params::k1)
         .def_readwrite("b", &Bm25Params::b)
-        .def_readwrite("avg_doc_length", &Bm25Params::avg_doc_length);
+        .def_readwrite("avg_doc_length", &Bm25Params::avg_doc_length)
+        .def_readwrite("unicode", &Bm25Params::unicode)
+        .def_readwrite("stop_words", &Bm25Params::stop_words)
+        .def_readwrite("stem", &Bm25Params::stem);
     py::class_<MaintenancePolicy>(m, "MaintenancePolicy")
         .def(py::init<>())
         .def_readwrite("mode", &MaintenancePolicy::mode)
@@ -951,7 +960,8 @@ PYBIND11_MODULE(_core, m) {
         .def("_search", [](const Collection& c, const py::handle& vector, const py::handle& text, const py::handle& sparse, std::size_t k,
                            std::optional<Filter> filter, Fusion fusion, double rrf_k, double vector_weight, double text_weight, double sparse_weight,
                            std::size_t candidates, std::size_t ef, bool with_metadata, bool with_text, std::optional<double> timeout_s,
-                           const py::handle& modifiers, std::optional<double> diversity) {
+                           const py::handle& modifiers, std::optional<double> diversity, const py::handle& group,
+                           const py::handle& examples) {
             CollectionQuery q;
             if (!vector.is_none()) q.vector = to_vector(vector, "vector");
             if (!text.is_none()) q.text = text.cast<std::string>();
@@ -972,13 +982,8 @@ PYBIND11_MODULE(_core, m) {
             if (timeout_s) o.deadline = std::chrono::steady_clock::now() + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(*timeout_s));
             bool stopped = false;
             o.stopped_early = &stopped;
-            std::vector<CollectionHit> hits;
-            {
-                py::gil_scoped_release free;
-                hits = c.search(q, k, o);
-            }
-            py::list out;
-            for (const CollectionHit& h : hits) {
+            // One conversion for search() and search_groups(): their hits stay alike.
+            auto to_dict = [&](const CollectionHit& h) {
                 py::dict d;
                 d["id"] = h.id;
                 d["score"] = h.score;
@@ -992,12 +997,54 @@ PYBIND11_MODULE(_core, m) {
                 if (h.key) d["key"] = *h.key;
                 if (with_metadata) d["metadata"] = h.metadata ? py::object(from_metadata(*h.metadata)) : py::none();
                 if (with_text) d["text"] = h.text ? py::object(py::str(*h.text)) : py::none();
-                out.append(d);
+                return d;
+            };
+            py::list out;
+            if (!examples.is_none()) {  // recommend: (positive, negative), each item an ID or a string key
+                auto ids = [](const py::handle& list) {
+                    std::vector<std::uint64_t> v;
+                    for (const py::handle x : list) v.push_back(py::isinstance<py::str>(x) ? Collection::id_of(x.cast<std::string>()) : x.cast<std::uint64_t>());
+                    return v;
+                };
+                const auto pair = examples.cast<py::tuple>();
+                const Recommend r{ids(pair[0]), ids(pair[1])};
+                std::vector<CollectionHit> hits;
+                {
+                    py::gil_scoped_release free;
+                    hits = c.recommend(r, k, o);
+                }
+                for (const CollectionHit& h : hits) out.append(to_dict(h));
+                return py::make_tuple(out, stopped);
             }
+            if (!group.is_none()) {  // search_groups: (field, groups, per_group, max_candidates)
+                const auto t = group.cast<std::tuple<std::string, std::size_t, std::size_t, std::size_t>>();
+                const GroupBy g{std::get<0>(t), std::get<1>(t), std::get<2>(t), std::get<3>(t)};
+                std::vector<CollectionGroup> groups;
+                {
+                    py::gil_scoped_release free;
+                    groups = c.search_groups(q, g, o);
+                }
+                for (const CollectionGroup& grp : groups) {
+                    py::dict d;
+                    d["value"] = value_to_py(grp.value);
+                    py::list hits;
+                    for (const CollectionHit& h : grp.hits) hits.append(to_dict(h));
+                    d["hits"] = hits;
+                    out.append(d);
+                }
+                return py::make_tuple(out, stopped);
+            }
+            std::vector<CollectionHit> hits;
+            {
+                py::gil_scoped_release free;
+                hits = c.search(q, k, o);
+            }
+            for (const CollectionHit& h : hits) out.append(to_dict(h));
             return py::make_tuple(out, stopped);
         }, py::arg("vector"), py::arg("text"), py::arg("sparse"), py::arg("k"), py::arg("filter"), py::arg("fusion"), py::arg("rrf_k"),
            py::arg("vector_weight"), py::arg("text_weight"), py::arg("sparse_weight"), py::arg("candidates"), py::arg("ef"), py::arg("with_metadata"),
-           py::arg("with_text"), py::arg("timeout"), py::arg("modifiers") = py::none(), py::arg("diversity") = py::none())
+           py::arg("with_text"), py::arg("timeout"), py::arg("modifiers") = py::none(), py::arg("diversity") = py::none(), py::arg("group") = py::none(),
+           py::arg("examples") = py::none())
         .def("checkpoint", [](Collection& c) { py::gil_scoped_release free; return c.checkpoint(); })
         .def_property_readonly("durable", &Collection::durable)
         .def("maintain", [](Collection& c, long long budget_ms) {

@@ -38,6 +38,21 @@ Build time: 0.02 s for Flat, 8.6 s for HNSW.
 
 `ef` is the speed–accuracy dial: small values are very fast but miss some neighbors; around `ef = 80` HNSW is over 13x faster than exact search while finding 99.8% of the true neighbors. The gap grows with the number of vectors, because Flat's cost grows linearly while HNSW's grows roughly logarithmically.
 
+## Profiling review (complexity and hot paths)
+
+Every workload was profiled with Callgrind (instruction counts: deterministic, unaffected by other load) and the source searched for patterns that scale badly. Each change below was kept only if it measured better, and checked to give the same results as before.
+
+| Area | What was wrong | Change | Measured |
+|---|---|---|---|
+| Writes to collections and sparse indexes | `v.reserve(v.size() + 1)` before each insertion allocates exactly one more slot, so every insertion copied the whole array, including every posting list a document touches: quadratic | Geometric growth (`reserve_one_more`) | 1.28x fewer instructions at 3,000 documents, growing with size |
+| Bulk removals with payload indexes (`remove_where`, `remove_batch`) | Each removed row shifted whole posting lists: quadratic | Posting lists left alone during the batch, then rebuilt in one pass (O(rows + entries)); nothing allocates, since lists only shrink; batches under 32 rows keep the per-row path | 61x at 200,000 rows; a million rows in 0.23 s (about 30 s before) |
+| Filters in exact scans | The filter tree walked once per row (about 145 instructions for two conditions) | Evaluated a column at a time into a bitmap, with the column's arrays held in locals and the operator as a branch-free mask; ranges, lists, tags and geo filters keep the row evaluator | Filtered searches 2.65x fewer instructions; about 29 per row |
+| Hybrid fusion | Every candidate built as a full hit (metadata, text, key) in a hash map, then sorted | Candidates ranked as 40-byte records; full hits built only for those returned | Group-by 1.23x faster; results bit-identical |
+| Checksums (every file) | CRC-32 one byte at a time, with a guard checked per call | Slicing-by-8 over tables built at compile time: the same CRC | Reading 3.07x fewer instructions |
+| `in(...)` and tag filters, `has_all_tags`, tags on writing and loading | Repeats found by linear search: quadratic in the number of values (and on loading, in what a damaged file claims) | Sorting, or a sorted copy for lists over 16 values (shorter lists unchanged, without allocating) | `in` with 40,000 values 5.7x faster |
+
+Tried and not kept: comparing the first value before `memcmp` in the check for duplicate vectors during graph building (no measurable change). What remains in graph building is the algorithm itself (search and distances), and in loading, the validation that refuses damaged files.
+
 ## Baseline for performance work (Phase 0)
 
 Measured with `bench_baseline` (in [bench/](../bench)), which reports build time, index memory, and for `ef` from 16 to 256: queries per second (the median of 5 passes), p50 and p99 latency, and recall@10. hnswlib (v0.10.0 release candidate, header-only C++) was measured with identical data, settings (`M = 16`, `ef_construction = 200`, k = 10) and method.

@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 939 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 955 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -31,6 +31,10 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Compression (SQ8, binary, PQ, half precision) and Matryoshka truncation:** one byte or one bit per dimension, one byte per part of the vector (PQ), or two bytes per dimension (float16 and bfloat16, which halve vector memory with almost no recall lost), searched with codes and re-ranked at full precision; or index only the first dimensions of embeddings trained for it; optionally keep only the codes (about a quarter of the memory) (more codecs and index types are [planned](docs/compression-and-index-types-plan.md)).
 - **Faceted search:** counts by field ("120 in English, 40 in French") over everything, a filter's matches or a search's top hits: top values, numeric range buckets, distinct counts. Payload indexes keep posting lists, so selective filters and facets read only matching documents (measured: up to 1,532× faster on 300,000 documents)
 - **The `hnsw-lite` command-line tool:** `inspect`, `verify`, `health` and `export` (JSON Lines or CSV) for any file or durable directory, without changing it
+- **Drop-in for hnswlib:** `from hnsw_lite_lib import hnswlib` runs hnswlib code unchanged (identical exact results, the same neighbors, errors and conventions, checked against hnswlib itself)
+- **Data in and out:** Arrow and Parquet (streamed), and importers from hnswlib files, FAISS indexes and Chroma collections
+- **Reranking:** a cross-encoder (or any model) re-scores the best candidates
+- **Group-by and recommendations:** the best documents rather than ten chunks of one; "more like these, less like those" from example documents
 - **Search by stored ID, deadlines and cancellation:** "more like record 42"; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
 - **Save and load:** one call writes the whole index to a file and one reads it back, checked against damage and portable between platforms.
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
@@ -213,7 +217,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 939 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 955 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, the roadmap, and references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |

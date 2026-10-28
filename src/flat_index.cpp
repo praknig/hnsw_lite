@@ -134,6 +134,7 @@ std::size_t FlatIndex::remove_batch(std::span<const std::uint64_t> ids) {
     const auto guard = lock_.write("remove_batch");
     const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));
     std::size_t removed = 0;
+    const MetadataStore::BulkRemoval bulk(metadata_, ids.size());
     for (std::uint64_t id : ids) removed += remove_unlocked(id) ? 1 : 0;  // unknown or already removed: skipped
     return removed;
 }
@@ -337,10 +338,12 @@ Page FlatIndex::scan(const ScanOptions& options) const {
     if (options.filter) compiled.emplace(*options.filter, metadata_);  // throws for an unknown field under a strict schema
     // Every candidate after the cursor; then the `limit` smallest IDs, in order.
     std::vector<std::pair<std::uint64_t, NodeId>> candidates;
+    std::vector<std::uint8_t> match;  // the filter a column at a time
+    if (compiled) compiled->matches_all(static_cast<NodeId>(vectors_.size()), match);
     for (NodeId n = 0; n < vectors_.size(); ++n) {
         const std::uint64_t id = ids_.external(n);
         if (options.after && id <= *options.after) continue;
-        if (compiled && !compiled->matches(n)) continue;
+        if (compiled && !match[n]) continue;
         candidates.emplace_back(id, n);
     }
     const bool more = candidates.size() > options.limit;
@@ -364,8 +367,10 @@ std::vector<NodeId> FlatIndex::matching_slots(const Filter& filter) const {
             if (n < vectors_.size() && compiled.matches(n)) slots.push_back(n);
         return slots;
     }
+    std::vector<std::uint8_t> match;  // every row: the filter a column at a time
+    compiled.matches_all(static_cast<NodeId>(vectors_.size()), match);
     for (NodeId n = 0; n < vectors_.size(); ++n)
-        if (compiled.matches(n)) slots.push_back(n);
+        if (match[n]) slots.push_back(n);
     return slots;
 }
 
@@ -405,6 +410,7 @@ std::size_t FlatIndex::remove_where(const Filter& filter) {
     for (NodeId n : slots) ids.push_back(ids_.external(n));
     if (ids.empty()) return 0;
     const ChangeLog::Scope logged(log_, log_.begin(walop::kRemoveBatch, [&] { return walop::encode_ids(ids); }));  // the IDs it matched
+    const MetadataStore::BulkRemoval bulk(metadata_, ids.size());
     for (std::uint64_t id : ids) remove_unlocked(id);
     return ids.size();
 }
@@ -655,9 +661,10 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         const std::size_t count = vectors_.size(), stride = vectors_.stride();
         std::size_t matches = 0, visited = 0;
         bool stop = false;
+        const Eligibility* check = &eligible;  // in an exhaustive scan: without the filter, applied beforehand
         auto visit = [&](NodeId node) {
             if ((++visited & 255) == 0 && detail::search_should_stop()) stop = true;  // deadline or cancel: best so far
-            if (eligible.filtered() && !eligible(node)) return;
+            if (check->filtered() && !(*check)(node)) return;
             ++matches;
             const float d = coded ? codec_->distance(table, codes_.data() + std::size_t(node) * codec_->code_size())
                                   : index_distance(distance_(query, vectors_.get_padded(node).data(), stride), metric_ == Metric::Cosine);
@@ -667,7 +674,20 @@ std::vector<SearchResult> FlatIndex::scan(const float* query, std::size_t k, con
         if (rows) {  // posting lists: only rows that can match
             for (std::size_t i = 0; i < rows->size() && (*rows)[i] < count && !stop; ++i) visit((*rows)[i]);
         } else if (!ivf_trained()) {
-            for (NodeId node = 0; node < count && !stop; ++node) visit(node);
+            std::vector<std::uint8_t> match;  // the filter a column at a time
+            Eligibility rest = eligible;
+            if (eligible.filter) {
+                eligible.filter->matches_all(static_cast<NodeId>(count), match);
+                rest.filter = nullptr;
+                check = &rest;
+            }
+            for (NodeId node = 0; node < count && !stop; ++node) {
+                if (!match.empty() && !match[node]) {  // not matching: counted as visited, as before
+                    if ((++visited & 255) == 0 && detail::search_should_stop()) stop = true;
+                    continue;
+                }
+                visit(node);
+            }
         } else {
             // The nearest lists first: at least `probes`, and more until k matching
             // vectors were seen (a selective filter may need more), or all of them.

@@ -250,6 +250,66 @@ ADV_TEST(a4_absurd_planner_and_codec_settings) {
         }
 }
 
+ADV_TEST(a5_absurd_group_by_settings) {
+    // groups and per_group near 2^64 (the first fetch saturates, never overflows), one
+    // candidate, and a long field name: results come back, bounded by what is stored.
+    CollectionOptions o;
+    o.dim = 4;
+    o.text = true;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 50; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(i), 1, 2, 3};
+        d.text = "word " + std::to_string(i % 4);
+        d.metadata = Metadata().set("g", std::int64_t(i % 5));
+        c.add(i, d);
+    }
+    CollectionQuery q;
+    q.text = "word";
+    const std::size_t huge = std::numeric_limits<std::size_t>::max();
+    std::size_t total = 0;
+    for (const auto& grp : c.search_groups(q, GroupBy{"g", huge, huge, 0})) total += grp.hits.size();
+    CHECK(total == 50);  // every document, in its group
+    CHECK(c.search_groups(q, GroupBy{"g", huge, 1, 1}).size() == 1);  // one candidate: one group
+    CHECK(c.search_groups(q, GroupBy{std::string(100000, 'f'), 3, 3, 0}).empty());  // an unknown field (dynamic schema)
+}
+
+ADV_TEST(a6_absurd_recommendations) {
+    // 5,000 examples with repeats, k of 2^64 - 1 (k plus the examples saturates), and
+    // examples near float's limit: results come back, never an example, never NaN.
+    CollectionOptions o;
+    o.dim = 4;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 200; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(i % 9), float(i % 5), i % 2 ? 3e38f : -3e38f, 1.0f};
+        c.add(i, d);
+    }
+    std::vector<std::uint64_t> pos;
+    for (int i = 0; i < 5000; ++i) pos.push_back(std::uint64_t(i % 50));  // repeats
+    const auto hits = c.recommend(Recommend{pos, {100, 101}}, std::numeric_limits<std::size_t>::max());
+    bool clean = hits.size() == 148;  // every document but the 52 examples
+    for (const auto& h : hits) clean = clean && h.id >= 50 && h.id != 100 && h.id != 101 && !std::isnan(*h.vector_distance);
+    CHECK(clean);
+}
+
+ADV_TEST(a7_absurd_geo_filters) {
+    // Radii of 1e300 and the largest double (everything matches, nothing overflows),
+    // coordinates exactly at the limits, the whole planet, and a one-point box.
+    FlatIndex f(1, Metric::L2);
+    const std::vector<std::pair<double, double>> pts{{90, 180}, {-90, -180}, {90, -180}, {-90, 180}, {0, 0}, {45.5, 120.25}};
+    for (std::uint64_t i = 0; i < pts.size(); ++i) f.add(i, std::vector<float>{float(i)}, Metadata().set("lat", pts[i].first).set("lon", pts[i].second));
+    for (const double r : {1e300, std::numeric_limits<double>::max(), 2.1e7})
+        CHECK(f.count_where(Filter::geo_radius("lat", "lon", 0, 0, r)) == pts.size());
+    CHECK(f.count_where(Filter::geo_radius("lat", "lon", 90, 180, 0)) >= 1);       // the point itself (and the pole's other names)
+    CHECK(f.count_where(Filter::geo_box("lat", "lon", -90, -180, 90, 180)) == pts.size());
+    CHECK(f.count_where(Filter::geo_box("lat", "lon", 45.5, 120.25, 45.5, 120.25)) == 1);
+    CHECK(f.count_where(Filter::geo_box("lat", "lon", -90, 180, 90, -180)) == 4);  // west 180 > east -180: only the meridian itself
+    CHECK(f.count_where(Filter::geo_radius("lat", "lon", -90, 0, 1)) == 2);        // the south pole, whatever its longitude
+}
+
 ADV_TEST(a2_absurd_dimensions) {
     // Refused before any allocation: a dimension near 2^64 would otherwise wrap a
     // size computation around to a tiny buffer.

@@ -43,12 +43,12 @@ from ._core import (  # noqa: F401  (re-exported)
     FormatError,
 )
 
-__all__ = ["identify", 
-    "to_ms", "parse_date", "format_date", "now_ms",
-    "Collection", "HnswIndex", "FlatIndex", "Filter", "Metric", "Preset", "Fusion", "Durability", "Maintenance", "Strategy",
-    "FieldType", "Codec", "HnswParams", "QuantizationParams", "IvfParams", "DurableOptions", "MaintenancePolicy",
-    "CollectionOptions", "FormatError", "Cancelled", "MISSING_ID",
-]
+__all__ = ["identify",
+           "to_ms", "parse_date", "format_date", "now_ms",
+           "Collection", "HnswIndex", "FlatIndex", "Filter", "Metric", "Preset", "Fusion", "Durability", "Maintenance", "Strategy",
+           "FieldType", "Codec", "HnswParams", "QuantizationParams", "IvfParams", "DurableOptions", "MaintenancePolicy",
+           "CollectionOptions", "FormatError", "Cancelled", "MISSING_ID",
+           ]
 __version__ = "0.1.0"
 
 # ---------------------------------------------------------------- names
@@ -323,7 +323,8 @@ class Collection:
                  store_text: bool = True, schema: Optional[Mapping[str, Any]] = None, strict: bool = False,
                  durability: Union[str, Durability] = "grouped", maintenance: Union[str, Maintenance, None] = None,
                  ef: Optional[int] = None, bm25_avg_doc_length: Optional[float] = None, ttl: bool = False, default_ttl=None,
-                 string_ids: bool = False, options: Optional[CollectionOptions] = None) -> None:
+                 string_ids: bool = False, stem: bool = False, stop_words: bool = False, unicode: bool = False,
+                 options: Optional[CollectionOptions] = None) -> None:
         if options is None:
             options = CollectionOptions.preset(dim, _choose(preset, _PRESETS, "preset"), expected_size)
             options.metric = _choose(metric, _METRICS, "metric")
@@ -341,10 +342,11 @@ class Collection:
                 options.maintenance = policy
             if ef is not None:
                 options.ef = ef
+            bm25 = options.bm25
             if bm25_avg_doc_length is not None:
-                bm25 = options.bm25
                 bm25.avg_doc_length = bm25_avg_doc_length
-                options.bm25 = bm25
+            bm25.stem, bm25.stop_words, bm25.unicode = bool(stem), bool(stop_words), bool(unicode)  # text analysis: fixed at creation
+            options.bm25 = bm25
             options.ttl_enabled = bool(ttl or default_ttl is not None)
             options.ttl_default_ms = _ttl_ms(default_ttl)
             options.string_ids = bool(string_ids)
@@ -530,6 +532,151 @@ class Collection:
             if after is None:
                 return
 
+    # -- Arrow and Parquet
+    def _arrow_schema(self, with_vectors: bool, with_text: bool, with_metadata: bool):
+        pa = _pyarrow()
+        options = self._core.options
+        fields = [pa.field("id", pa.uint64(), nullable=False)]
+        if options.string_ids:
+            fields.append(pa.field("key", pa.string()))
+        if options.ttl_enabled:
+            fields.append(pa.field("expires_at", pa.int64()))  # ms since 1970 UTC, as to_pandas()
+        if with_vectors and options.dim:
+            fields.append(pa.field("vector", pa.list_(pa.float32(), options.dim)))
+        if with_vectors and options.sparse:
+            fields.append(pa.field("sparse", pa.struct([("indices", pa.list_(pa.uint32())), ("values", pa.list_(pa.float32()))])))
+        if with_text and options.text:
+            fields.append(pa.field("text", pa.string()))
+        meta = []
+        if with_metadata:
+            kinds = {"int": pa.int64(), "float": pa.float64(), "bool": pa.bool_(), "keyword": pa.string(), "tags": pa.list_(pa.string())}
+            taken = {f.name for f in fields}
+            for name, kind in self.schema().items():
+                column = name if name not in taken else f"metadata_{name}"  # as to_pandas() renames
+                fields.append(pa.field(column, kinds[kind]))
+                meta.append((name, column))
+        return pa.schema(fields), meta
+
+    def arrow_batches(self, *, filter=None, with_vectors: bool = True, with_text: bool = True, with_metadata: bool = True,
+                      batch: int = 10000):
+        """The documents as pyarrow RecordBatches of up to `batch` rows, one schema for all:
+        "id", "key" and "expires_at" when used, "vector" (fixed-size list of float32) and
+        "sparse" (struct of indices and values) for the sides the collection has, "text",
+        then one column per metadata field (renamed metadata_<name> on a clash). Memory
+        stays bounded by `batch`."""
+        pa = _pyarrow()
+        schema, meta = self._arrow_schema(with_vectors, with_text, with_metadata)
+        dim = self._core.options.dim
+        rows = []
+
+        def emit(rows):
+            cols = []
+            for field in schema:
+                n = field.name
+                if n == "vector":
+                    missing = np.array([r.get("vector") is None for r in rows])
+                    flat = np.zeros((len(rows), dim), dtype=np.float32)
+                    for i, r in enumerate(rows):
+                        if not missing[i]:
+                            flat[i] = r["vector"]
+                    cols.append(pa.FixedSizeListArray.from_arrays(pa.array(flat.ravel()), dim, mask=pa.array(missing)))
+                elif n == "sparse":  # documents() gives {index: weight}: the struct holds them as two lists
+                    cols.append(pa.array([None if r.get("sparse") is None else {"indices": list(r["sparse"].keys()), "values": list(r["sparse"].values())}
+                                          for r in rows], type=field.type))
+                elif n in ("id", "key", "expires_at", "text"):
+                    cols.append(pa.array([r.get(n) for r in rows], type=field.type))
+                else:
+                    source = next(s for s, c in meta if c == n)
+                    cols.append(pa.array([(r.get("metadata") or {}).get(source) for r in rows], type=field.type))
+            return pa.RecordBatch.from_arrays(cols, schema=schema)
+
+        for doc in self.documents(filter=filter, batch=batch, with_vectors=with_vectors, with_text=with_text, with_metadata=with_metadata):
+            rows.append(doc)
+            if len(rows) == batch:
+                yield emit(rows)
+                rows = []
+        if rows:
+            yield emit(rows)
+
+    def to_arrow(self, **options):
+        """The documents as one pyarrow Table (see arrow_batches for the columns)."""
+        pa = _pyarrow()
+        schema, _ = self._arrow_schema(options.get("with_vectors", True), options.get("with_text", True), options.get("with_metadata", True))
+        return pa.Table.from_batches(list(self.arrow_batches(**options)), schema=schema)
+
+    def write_parquet(self, path, *, compression: str = "zstd", **options) -> int:
+        """Writes the documents to a Parquet file, batch by batch (bounded memory); returns
+        how many were written. Read it back with upsert_parquet()."""
+        pa = _pyarrow()
+        import pyarrow.parquet as pq
+        schema, _ = self._arrow_schema(options.get("with_vectors", True), options.get("with_text", True), options.get("with_metadata", True))
+        written = 0
+        with pq.ParquetWriter(str(path), schema, compression=compression) as w:
+            for b in self.arrow_batches(**options):
+                w.write_batch(b)
+                written += b.num_rows
+        return written
+
+    def upsert_arrow(self, data, *, id_column: Optional[str] = None, vector_column: Optional[str] = None,
+                     text_column: Optional[str] = None, sparse_column: Optional[str] = None,
+                     metadata_columns: Optional[Sequence[str]] = None, expires_column: Optional[str] = None) -> int:
+        """Upserts the rows of a pyarrow Table or RecordBatch; returns how many were added.
+        Columns default to the names arrow_batches() writes ("key" with string keys, else
+        "id"; "vector", "text", "sparse", "expires_at" when present); every other column is
+        metadata, with a metadata_ prefix from export removed. Vectors are fixed-size or
+        variable lists; nulls are missing values (a row without a vector is stored without
+        one). Values convert directly, not through pandas, so integers stay integers."""
+        pa = _pyarrow()
+        if isinstance(data, pa.RecordBatch):
+            data = pa.Table.from_batches([data])
+        names = data.column_names
+        options = self._core.options
+        pick = lambda given, default: given if given is not None else (default if default in names else None)
+        id_column = pick(id_column, "key" if options.string_ids and "key" in names else "id")
+        if id_column is None:
+            raise ValueError("upsert_arrow: no id column (name it with id_column=)")
+        vector_column, text_column = pick(vector_column, "vector"), pick(text_column, "text")
+        sparse_column, expires_column = pick(sparse_column, "sparse"), pick(expires_column, "expires_at")
+        reserved = {"id", "key", "vector", "text", "sparse", "expires_at"}
+        used = {c for c in (id_column, vector_column, text_column, sparse_column, expires_column, "id", "key") if c}
+        if metadata_columns is None:
+            metadata_columns = [c for c in names if c not in used]
+        rename = {c: (c[len("metadata_"):] if c.startswith("metadata_") and c[len("metadata_"):] in reserved else c) for c in metadata_columns}
+        n = data.num_rows
+        ids = data.column(id_column).to_pylist()
+        if any(i is None for i in ids):
+            raise ValueError("upsert_arrow: the id column has missing values")
+        texts = data.column(text_column).to_pylist() if text_column else None
+        sparse = data.column(sparse_column).to_pylist() if sparse_column else None
+        expires = data.column(expires_column).to_pylist() if expires_column else None
+        columns = {c: data.column(c).to_pylist() for c in metadata_columns}
+        metadata = [{rename[c]: columns[c][i] for c in metadata_columns if columns[c][i] is not None} for i in range(n)] if metadata_columns else None
+        if sparse is not None:
+            sparse = [None if s is None else dict(zip(s["indices"], s["values"])) for s in sparse]  # {index: weight}, as documents() gives
+        vectors, has_vector = None, [False] * n
+        if vector_column:
+            col = data.column(vector_column).combine_chunks()
+            has_vector = [v is not None for v in col.to_pylist()] if col.null_count else [True] * n
+            vectors = [None if not has_vector[i] else np.asarray(col[i].values, dtype=np.float32) for i in range(n)]
+        added = 0
+        for want in (True, False):  # rows with a vector together, then those without
+            rows = [i for i in range(n) if has_vector[i] == want]
+            if not rows:
+                continue
+            sub = lambda xs: None if xs is None else [xs[i] for i in rows]
+            added += self.upsert_many([ids[i] for i in rows], np.stack([vectors[i] for i in rows]) if want else None, sub(texts),
+                                      sub(sparse), sub(metadata), sub(expires))
+        return added
+
+    def upsert_parquet(self, path, *, batch: int = 10000, **columns) -> int:
+        """Upserts a Parquet file batch by batch (bounded memory); columns as upsert_arrow."""
+        _pyarrow()
+        import pyarrow.parquet as pq
+        added = 0
+        for b in pq.ParquetFile(str(path)).iter_batches(batch_size=batch):
+            added += self.upsert_arrow(b, **columns)
+        return added
+
     def to_pandas(self, *, filter=None, with_vectors: bool = True, with_text: bool = True, with_metadata: bool = True,
                   batch: int = 10000):
         """The documents as a DataFrame, in the shape upsert_dataframe() reads: an "id"
@@ -580,7 +727,8 @@ class Collection:
     def search(self, vector=None, text: Optional[str] = None, sparse=None, *, k: int = 10, filter=None,
                fusion: Union[str, Fusion] = "rrf", rrf_k: float = 60.0, vector_weight: float = 1.0, text_weight: float = 1.0,
                sparse_weight: float = 1.0, candidates: int = 0, ef: int = 0, with_metadata: bool = False, with_text: bool = False,
-               timeout: Optional[float] = None, as_dataframe: bool = False, modifiers=None, diversity: Optional[float] = None):
+               timeout: Optional[float] = None, as_dataframe: bool = False, modifiers=None, diversity: Optional[float] = None,
+               rerank=None, rerank_candidates: int = 0, rerank_query: Optional[str] = None):
         """The k best documents for any combination of a vector, text and a sparse
         vector, fused by Reciprocal Rank Fusion (or weighted scores). filter is a
         Filter or a dict. timeout (seconds) stops the search early: the hits so far are
@@ -596,14 +744,90 @@ class Collection:
         carry base_score (before the modifiers) and score (after).
 
         diversity (opt-in, 0 to 1): maximal marginal relevance over the candidates;
-        1 keeps the ranking, lower values favor variety (needs vectors)."""
-        hits, stopped = self._core._search(vector, text, sparse, k, as_filter(filter), _choose(fusion, _FUSION, "fusion"), rrf_k,
+        1 keeps the ranking, lower values favor variety (needs vectors).
+
+        rerank (opt-in): a second, slower model re-scores the best rerank_candidates
+        hits (default 4k) by their text, and the k best of its scores are returned:
+        either f(query, texts) -> scores, or an object with predict(pairs) taking
+        (query, text) pairs (sentence-transformers' CrossEncoder). The query is `text`,
+        or rerank_query (needed for a vector-only search). Hits keep `score` and gain
+        `rerank_score`, and are ordered by it; documents without text are scored as "".
+        Raises ValueError if the reranker returns the wrong number of scores, or one
+        that is not a finite number."""
+        rerank_text = None
+        fetch = k
+        if rerank is not None:
+            rerank_text = rerank_query if rerank_query is not None else text
+            if not isinstance(rerank_text, str) or not rerank_text:
+                raise ValueError("search: rerank needs the query as text: pass text=, or rerank_query= for a vector-only search")
+            if not (callable(rerank) or callable(getattr(rerank, "predict", None))):
+                raise ValueError("search: rerank must be f(query, texts) -> scores, or have predict(pairs)")
+            if not isinstance(rerank_candidates, int) or isinstance(rerank_candidates, bool) or rerank_candidates < 0:
+                raise ValueError("search: rerank_candidates must be a whole number >= 0")
+            fetch = rerank_candidates or 4 * k
+            if fetch < k:
+                raise ValueError("search: rerank_candidates must be at least k")
+        hits, stopped = self._core._search(vector, text, sparse, fetch, as_filter(filter), _choose(fusion, _FUSION, "fusion"), rrf_k,
                                            vector_weight, text_weight, sparse_weight, candidates, ef, with_metadata or as_dataframe,
-                                           with_text, timeout, _modifiers(modifiers), diversity)
+                                           with_text or rerank is not None, timeout, _modifiers(modifiers), diversity)
+        if rerank is not None:
+            hits = _rerank(rerank, rerank_text, hits, k)
+            if not with_text:
+                for h in hits:
+                    h.pop("text", None)
         self.last_search_stopped_early = stopped
         if not as_dataframe:
             return hits
         return _hits_dataframe(hits)
+
+    def search_groups(self, vector=None, text: Optional[str] = None, sparse=None, *, group_by: str, groups: int = 10,
+                      per_group: int = 3, max_candidates: int = 0, filter=None, fusion: Union[str, Fusion] = "rrf",
+                      rrf_k: float = 60.0, vector_weight: float = 1.0, text_weight: float = 1.0, sparse_weight: float = 1.0,
+                      candidates: int = 0, ef: int = 0, with_metadata: bool = False, with_text: bool = False,
+                      timeout: Optional[float] = None, modifiers=None, diversity: Optional[float] = None) -> list:
+        """Group-by: the `groups` best values of the metadata field `group_by`, each with
+        its `per_group` best documents, ranked as search() ranks them (the same query and
+        options). Typical in retrieval over chunks: the best documents, not ten chunks of
+        one. The field is a keyword, integer or boolean field; documents without it are in
+        no group. The search widens until the groups are found and filled, or up to
+        max_candidates documents (0: all). Returns [{"value": ..., "hits": [hit, ...]}, ...],
+        best group first, hits as search() returns them."""
+        if not isinstance(group_by, str) or not group_by:
+            raise ValueError("search_groups: group_by must name a field")
+        for name, n in (("groups", groups), ("per_group", per_group), ("max_candidates", max_candidates)):
+            if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+                raise ValueError(f"search_groups: {name} must be a whole number >= 0")
+        out, stopped = self._core._search(vector, text, sparse, 0, as_filter(filter), _choose(fusion, _FUSION, "fusion"), rrf_k,
+                                          vector_weight, text_weight, sparse_weight, candidates, ef, with_metadata, with_text,
+                                          timeout, _modifiers(modifiers), diversity, (group_by, groups, per_group, max_candidates))
+        self.last_search_stopped_early = stopped
+        return out
+
+    def recommend(self, positive, negative=(), *, k: int = 10, filter=None, ef: int = 0, with_metadata: bool = False,
+                  with_text: bool = False, timeout: Optional[float] = None) -> list:
+        """Documents like the `positive` examples and unlike the `negative` ones, by their
+        vectors: a search from the positives' average (with negatives, pushed away from
+        theirs; each example normalized first for cosine). Examples are IDs or, with string
+        keys, keys. They are never returned; filter, ef and the with_ options apply as in
+        search(). Raises ValueError without a positive example, for an unknown or expired
+        document, one without a vector, one given as both, or a collection without vectors."""
+        def examples(items, name):
+            if isinstance(items, (str, bytes, int)):
+                raise ValueError(f"recommend: {name} must be a list of IDs or keys")
+            items = list(items)
+            for x in items:
+                if isinstance(x, bool) or not (isinstance(x, str) or (isinstance(x, int) and x >= 0)):
+                    raise ValueError(f"recommend: each {name} example must be an ID (int >= 0) or a key (str)")
+            return items
+        pos, neg = examples(positive, "positive"), examples(negative, "negative")
+        if not pos:
+            raise ValueError("recommend: give at least one positive example")
+        if not isinstance(k, int) or isinstance(k, bool) or k < 0:
+            raise ValueError("recommend: k must be a whole number >= 0")
+        hits, stopped = self._core._search(None, None, None, k, as_filter(filter), _choose("rrf", _FUSION, "fusion"), 60.0,
+                                           1.0, 1.0, 1.0, 0, ef, with_metadata, with_text, timeout, None, None, None, (pos, neg))
+        self.last_search_stopped_early = stopped
+        return hits
 
     # -- durability and maintenance
     def checkpoint(self) -> int:
@@ -629,6 +853,34 @@ class Collection:
 
     def save(self, path: str) -> None:
         self._core.save(str(path))
+
+
+def _rerank(model, query: str, hits: list, k: int) -> list:
+    """Re-scores hits with a reranker, best first; stable for equal scores."""
+    if not hits:
+        return hits
+    texts = [h.get("text") or "" for h in hits]
+    if callable(getattr(model, "predict", None)):
+        scores = model.predict([(query, t) for t in texts])
+    else:
+        scores = model(query, texts)
+    scores = [float(s) for s in (scores.tolist() if hasattr(scores, "tolist") else list(scores))]
+    if len(scores) != len(hits):
+        raise ValueError(f"rerank: the reranker returned {len(scores)} scores for {len(hits)} hits")
+    if not all(math.isfinite(s) for s in scores):
+        raise ValueError("rerank: the reranker returned a score that is not a finite number")
+    for h, s in zip(hits, scores):
+        h["rerank_score"] = s
+    order = sorted(range(len(hits)), key=lambda i: -scores[i])  # sorted() is stable: ties keep the first-stage order
+    return [hits[i] for i in order[:k]]
+
+
+def _pyarrow():
+    try:
+        import pyarrow
+    except ImportError as e:  # pragma: no cover - depends on the environment
+        raise ImportError("Arrow and Parquet support needs pyarrow: pip install pyarrow") from e
+    return pyarrow
 
 
 def _hits_dataframe(hits: list):

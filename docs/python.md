@@ -11,6 +11,8 @@ hnsw-lite's Python package: `pip install hnsw-lite-lib`, then `import hnsw_lite_
 - [Collection](#collection)
 - [pandas](#pandas)
 - [HnswIndex and FlatIndex](#hnswindex-and-flatindex)
+- [Coming from hnswlib](#coming-from-hnswlib)
+- [Arrow, Parquet and importers](#arrow-parquet-and-importers)
 - [Filters](#filters)
 - [How Python values are converted](#how-python-values-are-converted)
 - [Threads, errors and limits](#threads-errors-and-limits)
@@ -54,6 +56,8 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
               bm25_avg_doc_length=None, options=None)
 ```
 
+Text analysis for the text side (off by default, fixed at creation, saved with the collection): `hl.Collection(text=True, stem=True, stop_words=True, unicode=True)`. `stem` makes `runs` find `running` (Snowball English), `stop_words` ignores `the`, `and` and the like, and `unicode` lowercases beyond ASCII so `école` finds `École`. Reopening a durable collection needs the same settings.
+
 | Argument | Type | What it does |
 |---|---|---|
 | `dim` | `int` | Vector length; 0 for a collection without vectors (text and/or sparse only). |
@@ -94,6 +98,8 @@ hl.Collection(dim=0, *, path=None, metric="cosine", preset="balanced", expected_
 | `facets(fields, *, filter=None, ids=None)` → `dict` | How many documents hold each value of metadata fields, over everything, those matching `filter`, or those with these `ids` (such as search hits). Each field is a name, or `{"field", "limit": 10, "ranges": [boundaries], "distinct": bool}`. Returns `{field: {"total", "missing", "values": [(value, count)], "other", "buckets": [{"from", "to", "count"}], "distinct"}}`. Expired documents never count. `HnswIndex` and `FlatIndex` have it too. |
 | `create_payload_index(field)`, `payload_indexes()`, `schema()` | Exact counts and posting lists for a keyword, bool or tag field (fast facets and selective filters; logged when durable); the indexed fields; the fields and their types (`{name: "int" | "float" | "bool" | "keyword" | "tags"}`). |
 | `search(vector=None, text=None, sparse=None, *, k=10, filter=None, ...)` | Below. |
+| `search_groups(vector=None, text=None, sparse=None, *, group_by, groups=10, per_group=3, max_candidates=0, ...)` → `list` | Group-by: the best values of the metadata field `group_by`, each with its best documents, ranked as `search()` ranks them (the same query and options). Returns `[{"value": ..., "hits": [hit, ...]}, ...]`, hits shaped as `search()` returns them. |
+| `recommend(positive, negative=(), *, k=10, filter=None, ef=0, with_metadata=False, with_text=False, timeout=None)` → `list` | Documents like the positive examples and unlike the negative ones (IDs, or keys with `string_ids`), by their vectors; the examples are never returned. Hits shaped as `search()` returns them. |
 | `checkpoint()` → `int` | Durable collections: a snapshot. |
 | `maintain(budget_ms=0)` → `dict` | Runs the maintenance that is due; returns what it did (`upkept`, `rebuilt`, `checkpointed`, `notes`, ...). |
 | `maintenance_status()` → `dict` | `log_bytes`, `log_records`, `since_checkpoint_s`, `churn_since_upkeep`, `churn_since_rebuild`, `rounds`. |
@@ -114,6 +120,18 @@ Give at least one of `vector`, `text` and `sparse`. With several, each side's ra
 
 Each hit is a dict: `id`, `score` (higher is better), `vector_rank`, `text_rank`, `sparse_rank` (1-based, or `None` if that side did not find it), `vector_distance`, `text_score`, `sparse_score`, and `metadata` and `text` when asked for.
 
+### Reranking
+
+A first search is fast but coarse; a cross-encoder reads the query and each candidate together and ranks better, but is too slow for a whole collection. `search` combines them: it fetches `rerank_candidates` hits (default 4k), lets the model re-score them by their text, and returns the k best of its scores.
+
+```python
+from sentence_transformers import CrossEncoder
+model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+hits = col.search(text="how do I reset my password", k=10, rerank=model, rerank_candidates=50)
+```
+
+`rerank` is either an object with `predict(pairs)` taking `(query, text)` pairs (sentence-transformers' `CrossEncoder`, and most rerankers), or a function `f(query, texts) -> scores`. The query is `text`, or `rerank_query` for a vector-only search. Hits keep their first-stage `score` and gain `rerank_score`, ordered by it (ties keep the first-stage order); documents without text are scored as an empty string. A reranker returning the wrong number of scores, or one that is not a finite number, raises `ValueError` rather than mis-ranking silently; the model's own errors propagate.
+
 ## Dates and score modifiers
 
 Dates are stored as milliseconds since 1970 (UTC). In metadata and dict filters, `datetime`, `date`, pandas `Timestamp` and NumPy `datetime64` values convert automatically (naive datetimes are taken as UTC); `hl.to_ms(x)` converts explicitly (for `hl.Filter` functions), and `hl.parse_date`, `hl.format_date` and `hl.now_ms` are there too:
@@ -128,11 +146,11 @@ docs.count_where(hl.Filter.ge("published", hl.to_ms("2024-01-01")))
 
 ```python
 hits = docs.search(vector=q, text="pricing", k=10, modifiers={
-    "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
-    "multiply": "provenance_confidence",                           # times a field (0 to 1)
-    "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
-              ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
-    "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
+   "decay": {"field": "published", "half_life_days": 30},        # recency; origin defaults to now
+   "multiply": "provenance_confidence",                           # times a field (0 to 1)
+   "boost": [({"edge_type": "verified_decision"}, 0.5),           # + 0.5 when it matches
+             ({"tags": "stale"}, -0.3)],                           # a negative bonus demotes
+   "pool": 100,                                                   # candidates re-scored (default max(4k, 20))
 })
 ```
 
@@ -217,6 +235,55 @@ I, D = index.search_batch(queries, k=10, ef=64)                # shape (len(quer
 
 **Distances** follow the library's convention: smaller is closer. For L2 they are **squared** distances, for inner product minus the dot product, for cosine 1 − cosine similarity.
 
+## Coming from hnswlib
+
+Code written for [hnswlib](https://github.com/nmslib/hnswlib) runs on hnsw_lite by changing one import:
+
+```python
+from hnsw_lite_lib import hnswlib   # instead of: import hnswlib
+
+p = hnswlib.Index(space="cosine", dim=384)
+p.init_index(max_elements=100_000, ef_construction=200, M=16)
+p.add_items(vectors, ids)
+p.set_ef(50)
+labels, distances = p.knn_query(queries, k=10)
+```
+
+`Index` and `BFIndex` have hnswlib's methods, arguments, return types and shapes, errors (`RuntimeError`) and distance conventions (squared L2; `1 - dot` for "ip"; `1 - cosine` for "cosine"): `init_index`, `add_items` (an existing label is replaced), `knn_query` (with `filter` and `num_threads`), `set_ef` and `ef`, `mark_deleted` and `unmark_deleted`, `resize_index`, `get_items`, `get_ids_list`, `get_current_count`, `get_max_elements`, `save_index` and `load_index`; `BFIndex` adds `delete_vector`. Running the same code against hnswlib 0.8.0 (the differential tests in `test_hnswlib_compat.py`): `BFIndex` labels identical in every space and distances within 10^-6; `Index` the same neighbors (graphs differ, as between hnswlib builds), distances equal where the rows agree; and the same counts, item access, deletions and errors.
+
+What differs, on purpose:
+
+- **Files**: `save_index` writes hnsw_lite's format in one file; hnswlib's files cannot be loaded, nor ours by hnswlib.
+- **`BFIndex.knn_query` with more neighbors than stored vectors** raises `RuntimeError`, as `Index` does; hnswlib's `BFIndex` reads past its results there (undefined behavior).
+- **Not provided**: pickling, `index_file_size`, and hnswlib's graph internals.
+
+Kept on purpose, so switching changes no numbers: hnswlib's `BFIndex` with "cosine" normalizes stored vectors but not the query, so its distances are `1 - |q| cos`; the ranking is cosine's. This module returns the same. Under the hood every hnsw_lite feature remains available through `HnswIndex` and `Collection`.
+
+## Arrow, Parquet and importers
+
+**Arrow and Parquet** (needs `pyarrow`). A collection exports to Arrow in the columns `to_pandas()` uses: `id`, `key` and `expires_at` when used, `vector` as a fixed-size list of float32, `sparse` as a struct of `indices` and `values`, `text`, then one column per metadata field (renamed `metadata_<name>` on a clash), with one schema derived from the collection's field types:
+
+```python
+table = col.to_arrow()                       # a pyarrow.Table
+for batch in col.arrow_batches(batch=10_000):  # RecordBatches: bounded memory
+   ...
+col.write_parquet("docs.parquet")            # streamed, batch by batch
+copy.upsert_parquet("docs.parquet")          # read back, batch by batch
+copy.upsert_arrow(table)                     # or from any Arrow table
+```
+
+`upsert_arrow` takes the standard column names by default and any others by argument (`id_column=`, `vector_column=`, ...); vectors may be fixed-size or variable lists, nulls are missing values, and a row without a vector is stored without one. Values convert directly rather than through pandas, so an integer column with missing values stays integers (pandas would make it floats, which an integer field refuses). A round trip reproduces a collection exactly: every side, metadata types, and expiry times.
+
+**Importers** (`hnsw_lite_lib.importers`) copy existing data into a new index or collection, which builds its own graph:
+
+| Function | Reads | Needs |
+|---|---|---|
+| `from_hnswlib(path, space)` → `HnswIndex` | An hnswlib index file, directly: labels, vectors, `M` and `ef_construction`; elements marked deleted are left out. `space` is the one the file was built with (hnswlib does not store it). `read_hnswlib(path)` returns the raw labels, vectors and settings. | Nothing |
+| `from_faiss(index_or_path, metric=None)` → `HnswIndex` | A FAISS index or file: its vectors, and its IDs through `IndexIDMap`; IVF indexes are reconstructed through a direct map. Indexes storing compressed codes give their reconstructions. Pass `metric=Metric.COSINE` for vectors normalized for cosine. | `faiss-cpu` |
+| `from_chroma(collection, batch=1000)` → `Collection` | A Chroma collection, page by page: IDs as string keys, embeddings, documents as text, metadata; the metric from its `hnsw:space`. | A Chroma client |
+
+Checked against the libraries themselves: vectors read from hnswlib's own files equal its `get_items`, and hnswlib loads files written in the layout the reader expects; four FAISS index types give exactly FAISS's exact neighbors after import. A damaged or hostile hnswlib file (truncated, a flipped header byte, a header claiming terabytes) is refused with `ValueError` before anything is allocated.
+
 ## Filters
 
 ```python
@@ -231,6 +298,8 @@ f = F.eq("lang", "en") & (F.ge("year", 2020) | F.has_tag("tags", "featured")) & 
 | `Filter.in_(field, values)` | any of the values (strings, integers, numbers or booleans) |
 | `Filter.has_tag(field, tag)`, `has_any_tag(field, tags)`, `has_all_tags(field, tags)` | tag sets |
 | `Filter.exists(field)`, `Filter.all()` | has a value; everything |
+| `Filter.geo_radius(lat_field, lon_field, lat, lon, meters)` | within `meters` of a point, by great-circle distance (latitude and longitude in two numeric fields, degrees) |
+| `Filter.geo_box(lat_field, lon_field, south, west, north, east)` | inside a box, edges included; west > east crosses the antimeridian |
 | `a & b`, `a \| b`, `~a` | and, or, not (Python's `and`, `or` and `not` cannot be overloaded: use the operators) |
 
 Anywhere a filter is accepted, a **dict** works too: `{"lang": "en", "year": [2023, 2024]}` means `lang == "en"` and `year` in (2023, 2024). `hl.as_filter(f)` does that conversion explicitly (a `Filter` or `None` is returned as it is), for building on a dict filter with `&`, `|` and `~`. The [filter rules](developer-reference.md#34-filter) apply: for example, a comparison never matches a record that lacks the field.

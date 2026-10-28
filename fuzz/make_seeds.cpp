@@ -105,6 +105,17 @@ int main(int argc, char** argv) {
         kc.add("key" + std::to_string(i), d);
     }
     write(root + "/4", "collection_settings.col", kc);
+    CollectionOptions to = ko;  // both settings blocks: runtime settings, then text analysis
+    to.text = true;
+    to.bm25.unicode = to.bm25.stop_words = to.bm25.stem = true;
+    Collection tc(to);
+    for (std::uint64_t i = 0; i < 8; ++i) {
+        Document d;
+        d.vector = vec(4);
+        d.text = "running \u00C9cole don\u2019t " + std::to_string(i);
+        tc.add("text" + std::to_string(i), d);
+    }
+    write(root + "/4", "collection_analysis.col", tc);
     fs::create_directories(root + "/5");
     const std::string seg = root + "/5/segment.wal";
     fs::remove(seg);

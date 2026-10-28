@@ -69,6 +69,7 @@
 #include <thread>
 #include <vector>
 
+#include "text_analysis.h"
 #include "inspect.h"
 #include "facets.h"
 #include "half.h"
@@ -5063,6 +5064,94 @@ TEST(payload, pi05_oom_index_updates) {
     CHECK(f.metadata().value_count(field, *f.metadata().find_string("zz_new")) == 1);
 }
 
+TEST(payload, pi07_bulk_removal_rebuilds_posting_lists) {
+    // Bulk removals defer posting-list updates and rebuild the lists in one pass. After
+    // every step (batches of 31, 32 and 33 rows around the threshold, remove_where, a
+    // large batch, then additions that reuse freed rows and more bulk removals), filtered
+    // scans through the posting lists must equal brute force over what remains, for
+    // keyword, boolean and tag indexes, in flat and HNSW indexes and collections.
+    struct Row { std::string k; bool b; std::vector<std::string> t; std::int64_t n; };
+    auto row_of = [](std::uint64_t i) {
+        Row r{"k" + std::to_string(i % 5), i % 3 == 0, {}, std::int64_t(i % 211)};
+        for (int t = 0; t < 6; ++t)
+            if ((i >> t) & 1) r.t.push_back("t" + std::to_string(t));
+        return r;
+    };
+    auto md_of = [](const Row& r) { return Metadata().set("k", r.k).set("b", r.b).set("t", r.t).set("n", r.n); };
+    const std::vector<std::pair<Filter, std::function<bool(const Row&)>>> filters{
+        {Filter::eq("k", "k2"), [](const Row& r) { return r.k == "k2"; }},
+        {Filter::in("k", {"k1", "k3"}), [](const Row& r) { return r.k == "k1" || r.k == "k3"; }},
+        {Filter::eq("b", true), [](const Row& r) { return r.b; }},
+        {Filter::has_tag("t", "t1"), [](const Row& r) { return std::count(r.t.begin(), r.t.end(), "t1") > 0; }},
+        {Filter::has_any_tag("t", {"t2", "t5"}), [](const Row& r) { return std::count(r.t.begin(), r.t.end(), "t2") + std::count(r.t.begin(), r.t.end(), "t5") > 0; }},
+        {Filter::has_all_tags("t", {"t1", "t3"}), [](const Row& r) { return std::count(r.t.begin(), r.t.end(), "t1") && std::count(r.t.begin(), r.t.end(), "t3"); }},
+        {Filter::eq("k", "k0") && Filter::has_tag("t", "t4"), [](const Row& r) { return r.k == "k0" && std::count(r.t.begin(), r.t.end(), "t4"); }},
+        {Filter::lt("n", std::int64_t(50)), [](const Row& r) { return r.n < 50; }}};
+    std::size_t compared = 0, kinds = 0;
+    auto run = [&](auto& index, auto add, auto scan_ids) {
+        std::map<std::uint64_t, Row> live;
+        for (std::uint64_t i = 0; i < 600; ++i) {
+            live[i] = row_of(i);
+            add(i, live[i]);
+        }
+        for (const char* f : {"k", "b", "t"}) index.create_payload_index(f);
+        auto check = [&] {
+            for (const auto& [filter, keep] : filters) {
+                std::set<std::uint64_t> expect;
+                for (const auto& [id, r] : live)
+                    if (keep(r)) expect.insert(id);
+                CHECK(scan_ids(filter) == expect);
+                ++compared;
+            }
+        };
+        std::mt19937 rng(7);
+        auto remove_some = [&](std::size_t count) {
+            std::vector<std::uint64_t> ids;
+            for (std::size_t i = 0; i < count; ++i) ids.push_back(rng() % 900);  // some unknown, some repeated
+            index.remove_batch(ids);
+            for (const auto id : ids) live.erase(id);
+            check();
+        };
+        check();
+        for (const std::size_t count : {31, 32, 33}) remove_some(count);
+        index.remove_where(Filter::eq("k", "k4"));
+        std::erase_if(live, [](const auto& e) { return e.second.k == "k4"; });
+        check();
+        remove_some(200);
+        for (std::uint64_t i = 1000; i < 1100; ++i) {  // reuses freed rows
+            live[i] = row_of(i);
+            add(i, live[i]);
+        }
+        check();
+        remove_some(120);
+        ++kinds;
+    };
+    auto ids_of = [](const auto& page_records) {
+        std::set<std::uint64_t> out;
+        for (const auto& r : page_records) out.insert(r.id);
+        return out;
+    };
+    {
+        FlatIndex f(2, Metric::L2);
+        run(f, [&](std::uint64_t i, const Row& r) { f.add(i, std::vector<float>{float(i), 1}, md_of(r)); },
+            [&](const Filter& flt) { ScanOptions o; o.filter = flt; o.limit = 100000; return ids_of(f.scan(o).records); });
+    }
+    {
+        HnswIndex h(2, Metric::L2);
+        run(h, [&](std::uint64_t i, const Row& r) { h.add(i, std::vector<float>{float(i), 1}, md_of(r)); },
+            [&](const Filter& flt) { ScanOptions o; o.filter = flt; o.limit = 100000; return ids_of(h.scan(o).records); });
+    }
+    {
+        CollectionOptions o;
+        o.dim = 2;
+        o.maintenance.mode = Maintenance::Manual;
+        Collection c(o);
+        run(c, [&](std::uint64_t i, const Row& r) { Document d; d.vector = std::vector<float>{float(i), 1}; d.metadata = md_of(r); c.upsert(i, d); },
+            [&](const Filter& flt) { CollectionScanOptions so; so.filter = flt; so.limit = 100000; return ids_of(c.scan(so).documents); });
+    }
+    CHECK(kinds == 3 && compared == 3 * 8 * 8);
+}
+
 TEST(payload, pi06_compact_keeps_index) {
     HnswIndex h(2, Metric::L2, HnswParams{}, Schema::strict(search_fields()));
     h.create_payload_index("category");
@@ -5612,6 +5701,158 @@ TEST(search_e2e, ix06_large_scale_random_filters) {
 // Added by the second coverage audit (beyond the test plan)
 // ===========================================================================
 
+TEST(filter, fl70_geo_filters) {
+    // geo_radius and geo_box against an independent brute-force reference: random points
+    // plus the poles, the antimeridian, the equator; zero and planet-wide radii; boxes
+    // across 180; integer fields, missing and out-of-range coordinates; refusals; and
+    // filtered searches (exact search equal to the brute-force nearest matches).
+    const double R = 6371008.8, rad = 3.14159265358979323846 / 180.0;
+    auto haversine = [&](double la1, double lo1, double la2, double lo2) {  // written independently of the library's
+        const double h = std::pow(std::sin((la2 - la1) * rad / 2), 2) + std::cos(la1 * rad) * std::cos(la2 * rad) * std::pow(std::sin((lo2 - lo1) * rad / 2), 2);
+        return 2 * R * std::asin(std::min(1.0, std::sqrt(h)));
+    };
+    std::mt19937 rng(70);
+    std::uniform_real_distribution<double> ulat(-90, 90), ulon(-180, 180);
+    std::vector<std::pair<double, double>> pts;
+    for (int i = 0; i < 3000; ++i) pts.push_back({ulat(rng), ulon(rng)});
+    for (const auto& p : std::vector<std::pair<double, double>>{{90, 0}, {-90, 45}, {0, 180}, {0, -180}, {10, 179.999}, {10, -179.999}, {0, 0}, {51.4779, -0.0015}})
+        pts.push_back(p);
+    FlatIndex f(2, Metric::L2);
+    for (std::uint64_t i = 0; i < pts.size(); ++i)
+        f.add(i, std::vector<float>{float(pts[i].first), float(pts[i].second)}, Metadata().set("lat", pts[i].first).set("lon", pts[i].second));
+    f.add(90000, std::vector<float>{0, 0}, Metadata().set("lat", 1.0));                       // no longitude: never matches
+    f.add(90001, std::vector<float>{0, 0}, Metadata().set("lat", 95.0).set("lon", 0.0));      // not a place: never matches
+    auto expect = [&](const std::function<bool(double, double)>& in) {
+        std::size_t n = 0;
+        for (const auto& [la, lo] : pts) n += in(la, lo);
+        return n;
+    };
+    std::size_t checked = 0;
+    for (const auto& t : std::vector<std::tuple<double, double, double>>{
+             {0, 0, 1000e3}, {89.9, 10, 500e3}, {-60, 179.5, 2000e3}, {0, -180, 800e3}, {51.4779, -0.0015, 0}, {12, 34, 2.1e7}, {-33.9, 151.2, 5e6}}) {
+        // Plain variables, not structured bindings: Clang before 16 cannot capture those.
+        const double clat = std::get<0>(t), clon = std::get<1>(t), meters = std::get<2>(t);
+        const auto in = [&](double la, double lo) { return haversine(clat, clon, la, lo) <= meters; };
+        CHECK(f.count_where(Filter::geo_radius("lat", "lon", clat, clon, meters)) == expect(in));
+        ++checked;
+    }
+    for (const auto& t : std::vector<std::tuple<double, double, double, double>>{
+             {-10, -20, 10, 20}, {40, 170, 70, -170}, {-90, -180, 90, 180}, {0, 0, 0, 0}, {-30, 179.999, 30, -179.999}}) {
+        const double s = std::get<0>(t), w = std::get<1>(t), n = std::get<2>(t), e = std::get<3>(t);
+        const auto in = [&](double la, double lo) { return la >= s && la <= n && (w <= e ? (lo >= w && lo <= e) : (lo >= w || lo <= e)); };
+        CHECK(f.count_where(Filter::geo_box("lat", "lon", s, w, n, e)) == expect(in));
+        ++checked;
+    }
+    CHECK(checked == 12 && f.count_where(Filter::geo_radius("lat", "lon", 12, 34, 2.1e7)) == pts.size());  // planet-wide: all places
+    // Exact filtered search: the nearest matches by vector, as brute force over the matching points.
+    const Filter near_london = Filter::geo_radius("lat", "lon", 51.5, -0.1, 3000e3);
+    SearchOptions o;
+    o.filter = near_london;
+    const std::vector<float> q{48.0f, 2.0f};
+    std::vector<std::pair<float, std::uint64_t>> ref;
+    for (std::uint64_t i = 0; i < pts.size(); ++i)
+        if (haversine(51.5, -0.1, pts[i].first, pts[i].second) <= 3000e3) {
+            const float dx = float(pts[i].first) - q[0], dy = float(pts[i].second) - q[1];
+            ref.push_back({dx * dx + dy * dy, i});
+        }
+    std::sort(ref.begin(), ref.end());
+    const auto got = f.search(q, 5, o);
+    bool same = got.size() == 5;
+    for (std::size_t i = 0; same && i < 5; ++i) same = got[i].id == ref[i].second;
+    CHECK(same);
+    HnswIndex h(2, Metric::L2);
+    for (std::uint64_t i = 0; i < pts.size(); ++i)
+        h.add(i, std::vector<float>{float(pts[i].first), float(pts[i].second)}, Metadata().set("lat", pts[i].first).set("lon", pts[i].second));
+    bool inside = true;
+    for (const auto& r : h.search(q, 10, 64, o)) inside = inside && haversine(51.5, -0.1, pts[r.id].first, pts[r.id].second) <= 3000e3;
+    CHECK(inside);
+    // Integer coordinate fields work; a dynamic schema's unknown field matches nothing.
+    FlatIndex ints(1, Metric::L2);
+    ints.add(1, std::vector<float>{0}, Metadata().set("la", std::int64_t(10)).set("lo", std::int64_t(20)));
+    CHECK(ints.count_where(Filter::geo_box("la", "lo", 0, 0, 20, 30)) == 1 && ints.count_where(Filter::geo_radius("la", "nope", 10, 20, 1)) == 0);
+    // Refusals: centers and boxes out of range, bad radii, empty names, non-numeric fields, strict unknown fields.
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("a", "b", 91, 0, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("a", "b", 0, -181, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("a", "b", 0, 0, -1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("a", "b", 0, 0, std::numeric_limits<double>::infinity()));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("a", "b", std::numeric_limits<double>::quiet_NaN(), 0, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_box("a", "b", 10, 0, 5, 1));  // south above north
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_box("", "b", 0, 0, 1, 1));
+    FlatIndex words(1, Metric::L2);
+    words.add(1, std::vector<float>{0}, Metadata().set("lat", "north").set("lon", 2.0));
+    CHECK_THROWS_AS(std::invalid_argument, (void)words.count_where(Filter::geo_radius("lat", "lon", 0, 0, 1)));
+    FlatIndex strict(1, Metric::L2, Schema::strict({FieldSpec{"lat", FieldType::Float}}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)strict.count_where(Filter::geo_radius("lat", "lon", 0, 0, 1)));
+}
+
+TEST(filter, fl71_columnar_evaluation_equals_row_by_row) {
+    // matches_all (a node at a time over its column) against matches (a row at a time over
+    // the tree), on every row, for every node kind: the column loops (integer, float,
+    // keyword, boolean, exists), the row-by-row fallback (ranges, lists, tags, geo, mixed
+    // number types), nested and/or/not, rows missing fields, and rows beyond the columns.
+    MetadataStore m(Schema::dynamic());
+    std::mt19937 rng(71);
+    for (NodeId r = 0; r < 700; ++r) {
+        Metadata md;
+        if (rng() % 5) md.set("i", std::int64_t(rng() % 40) - 20);
+        if (rng() % 4) md.set("f", double(rng() % 1000) / 10.0 - 50.0);
+        if (rng() % 3) md.set("k", "k" + std::to_string(rng() % 6));
+        if (rng() % 3) md.set("b", rng() % 2 == 0);
+        if (rng() % 2) md.set_tags("t", {"t" + std::to_string(rng() % 4), "t" + std::to_string(rng() % 4)});
+        if (rng() % 3) md.set("lat", double(rng() % 180) - 90.0).set("lon", double(rng() % 360) - 180.0);
+        m.write(r, md);
+    }
+    m.index_field("k");
+    const std::vector<Filter> filters{
+        Filter::all(), !Filter::all(), Filter::exists("i"), Filter::exists("never"),
+        Filter::eq("i", 3), Filter::ne("i", 3), Filter::lt("i", -5), Filter::le("i", 0), Filter::gt("i", 10), Filter::ge("i", 19),
+        Filter::eq("f", 2.5), Filter::lt("f", 0.0), Filter::ge("f", 49.9), Filter::ne("f", -50.0),
+        Filter::lt("i", 2.5), Filter::ge("f", std::int64_t(10)),                       // mixed number types: the fallback
+        Filter::eq("k", "k2"), Filter::ne("k", "k2"), Filter::eq("k", "absent"),
+        Filter::eq("b", true), Filter::ne("b", true),
+        Filter::between("i", -3, 7), Filter::in("i", {Value::of_int(1), Value::of_int(5)}), Filter::in("k", {"k1", "k3", "absent"}),
+        Filter::has_tag("t", "t1"), Filter::has_any_tag("t", {"t0", "t3"}), Filter::has_all_tags("t", {"t0", "t1"}),
+        Filter::geo_radius("lat", "lon", 0, 0, 5e6), Filter::geo_box("lat", "lon", -30, 150, 30, -150),
+        Filter::eq("i", 3) || (Filter::lt("f", 0.0) && !Filter::eq("k", "k1")),
+        !(Filter::exists("b") && Filter::eq("b", false)) && (Filter::has_tag("t", "t2") || Filter::gt("i", 0)),
+        (Filter::eq("k", "k0") || Filter::eq("k", "k5")) && (Filter::ge("f", 0.0) || !Filter::exists("f")) && !Filter::eq("i", 0)};
+    std::size_t compared = 0, differing = 0;
+    for (const Filter& f : filters) {
+        const CompiledFilter c(f, m);
+        for (const NodeId rows : {NodeId(0), NodeId(1), NodeId(700), NodeId(950)}) {  // 950: beyond the columns
+            std::vector<std::uint8_t> all;
+            c.matches_all(rows, all);
+            if (all.size() != rows) ++differing;
+            for (NodeId r = 0; r < rows && r < all.size(); ++r) {
+                ++compared;
+                differing += (all[r] != 0) != c.matches(r);
+            }
+        }
+    }
+    CHECK(differing == 0 && compared == filters.size() * (1 + 700 + 950));
+}
+
+TEST(filter, fl73_geo_limits_and_scans_under_deadlines) {
+    // Stored coordinates below the limits never match; an exhaustive filtered scan (flat
+    // index) under a deadline already passed stops cleanly with what it has.
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("lat", -95.0).set("lon", 0.0));
+    f.add(2, std::vector<float>{0}, Metadata().set("lat", 0.0).set("lon", -200.0));
+    f.add(3, std::vector<float>{0}, Metadata().set("lat", 0.0).set("lon", 0.0));
+    CHECK(f.count_where(Filter::geo_box("lat", "lon", -90, -180, 90, 180)) == 1);
+    FlatIndex big(2, Metric::L2);
+    for (std::uint64_t i = 0; i < 5000; ++i) big.add(i, std::vector<float>{float(i), 1}, Metadata().set("g", std::int64_t(i % 50)));
+    SearchStats stats;
+    SearchOptions o;
+    o.filter = Filter::eq("g", std::int64_t(7));
+    o.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    o.stats = &stats;
+    const auto hits = big.search(std::vector<float>{0, 1}, 5, o);
+    bool inside = hits.size() <= 5;
+    for (const auto& h : hits) inside = inside && h.id % 50 == 7;
+    CHECK(inside && stats.stopped_early);
+}
+
 TEST(filter, fl60_compile_errors_for_every_type) {
     auto f = small_meta_flat(10);
     const std::vector<float> q{0};
@@ -5876,6 +6117,42 @@ TEST(planner, pl18_plan_search_directly) {
     CHECK(!d.exact_count && d.selectivity == 1.0 && d.strategy == Strategy::ForceGraph);
     d = plan_search(1000, 20, everything, std::size_t(7), 64, Strategy::ForceGraph, PlannerParams{});
     CHECK(d.reason == PlanReason::Forced && d.exact_count && d.estimated_matches == 7);
+}
+
+TEST(metadata, md61_many_tags_and_repeats) {
+    // unique_in_order and has_repeats, short lists (compared directly) and long ones
+    // (through a sorted copy): the same answers. Then a document with 40 tags, repeats
+    // among them: stored once each, in the order given, through saving and loading.
+    using V = std::vector<std::uint32_t>;
+    for (const std::size_t n : {0, 1, 5, 16, 17, 40, 300}) {
+        std::mt19937 rng(static_cast<unsigned>(n));
+        V v(n);
+        for (auto& x : v) x = static_cast<std::uint32_t>(rng() % (n / 2 + 1));
+        V expect;
+        for (const auto x : v)
+            if (std::find(expect.begin(), expect.end(), x) == expect.end()) expect.push_back(x);
+        CHECK(has_repeats(v) == (expect.size() != v.size()));
+        V u = v;
+        unique_in_order(u);
+        CHECK(u == expect);
+        V distinct(n);
+        std::iota(distinct.begin(), distinct.end(), 7u);
+        CHECK(!has_repeats(distinct));
+        unique_in_order(distinct);
+        CHECK(distinct.size() == n);
+    }
+    std::vector<std::string> tags;
+    for (int i = 0; i < 40; ++i) tags.push_back("t" + std::to_string((i * 7) % 25));  // 25 distinct, 15 repeats
+    std::vector<std::string> once;
+    for (const auto& t : tags)
+        if (std::find(once.begin(), once.end(), t) == once.end()) once.push_back(t);
+    HnswIndex h(2, Metric::L2);
+    h.add(1, std::vector<float>{1, 2}, Metadata().set("t", tags));
+    CHECK(h.get_metadata(1)->get("t")->tags == once && once.size() == 25);
+    std::stringstream s;
+    h.save(s);
+    const auto back = HnswIndex::load(s);  // 25 tags: the long check for repeats on loading
+    CHECK(back->get_metadata(1)->get("t")->tags == once && back->count_where(Filter::has_all_tags("t", {"t0", "t7", "t14"})) == 1);
 }
 
 TEST(metadata, md60_every_type_through_every_operation) {
@@ -7700,6 +7977,36 @@ TEST(persistence, p57_every_validation_rule) {
         edit(f.payload("META"));
         expect_rejected(f.assemble());
     }
+}
+
+TEST(persistence, p58_crc32_slicing_equals_one_byte_at_a_time) {
+    // Every file's checksums: the eight-bytes-at-a-time CRC-32 equals the classic one
+    // byte at a time (written out here), for every length to 300 at every alignment, in
+    // one call and chained over two; and gives CRC-32's standard check value.
+    std::uint32_t table[256];
+    for (std::uint32_t i = 0; i < 256; ++i) {
+        std::uint32_t c = i;
+        for (int k = 0; k < 8; ++k) c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : c >> 1;
+        table[i] = c;
+    }
+    auto classic = [&](const unsigned char* p, std::size_t n) {
+        std::uint32_t c = ~0u;
+        for (std::size_t i = 0; i < n; ++i) c = table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
+        return ~c;
+    };
+    std::mt19937 rng(58);
+    std::vector<unsigned char> buf(320);
+    for (auto& b : buf) b = static_cast<unsigned char>(rng());
+    std::size_t wrong = 0, checked = 0;
+    for (std::size_t off = 0; off < 8; ++off)
+        for (std::size_t n = 0; n <= 300; ++n) {
+            const unsigned char* p = buf.data() + off;
+            const std::size_t cut = n / 3;
+            wrong += persist::crc32(0, p, n) != classic(p, n);
+            wrong += persist::crc32(persist::crc32(0, p, cut), p + cut, n - cut) != classic(p, n);
+            checked += 2;
+        }
+    CHECK(wrong == 0 && checked == 4816 && persist::crc32(0, "123456789", 9) == 0xCBF43926u);
 }
 
 TEST(persistence, p56_writing_to_a_failing_stream) {
@@ -18095,6 +18402,182 @@ TEST(sparse, sp14_search_equals_a_brute_force_reference) {
     CHECK(mismatches == 0 && compared == 3 * 60 * 4 * 3);
 }
 
+TEST(sparse, sp15_text_analysis) {
+    // The stemmer against Snowball's whole English vocabulary; Unicode tokens (letters of
+    // several scripts, punctuation, emoji, apostrophes, invalid UTF-8); stop words; the
+    // analysis in BM25 and collections; saving it, compatibly; reopening with other analysis.
+    std::ifstream voc(golden_path("porter2_english.tsv"));
+    std::string line;
+    std::size_t words = 0, wrong = 0;
+    while (std::getline(voc, line)) {
+        const auto tab = line.find('\t');
+        ++words;
+        wrong += stem_english(line.substr(0, tab)) != line.substr(tab + 1);
+    }
+    CHECK(words == 42649 && wrong == 0);
+    using V = std::vector<std::string>;
+    CHECK(tokenize_unicode("Hello, WORLD! École—über naïve") == V({"hello", "world", "école", "über", "naïve"}));
+    CHECK(tokenize_unicode("don't John\u2019s 'quoted' rock'n'roll") == V({"don't", "john's", "quoted", "rock'n'roll"}));
+    CHECK(tokenize_unicode("ΑΘΗΝΑ Αθήνα МОСКВА Ёж ŁÓDŹ") == V({"αθηνα", "αθήνα", "москва", "ёж", "łódź"}));
+    CHECK(tokenize_unicode("cat\U0001F431dog\u3001\u9CE5\u3002 a\u00A0b\u2014c") == V({"cat", "dog", "\u9CE5", "a", "b", "c"}));
+    CHECK(tokenize_unicode("\xFF" "abc\xC0\xAF" "def\xED\xA0\x80" "ghi\xE2\x82") == V({"abc", "def", "ghi"}));  // invalid bytes, overlong, surrogate, cut short
+    CHECK(tokenize_unicode("").empty() && tokenize_unicode("!?\u2026 \u00BF").empty() && tokenize_unicode("'''") .empty());
+    CHECK(tokenize_unicode(std::string(1 << 20, 'x')) == V({std::string(1 << 20, 'x')}));  // one enormous token
+    CHECK(is_english_stop_word("the") && is_english_stop_word("don't") && !is_english_stop_word("thee") && !is_english_stop_word(""));
+    // BM25's analysis: off by default (the tokens as before); stop words, stems, Unicode.
+    Bm25Params p;
+    CHECK(Bm25(p).analyze("The Runners were RUNNING") == Bm25::tokenize("The Runners were RUNNING"));
+    p.stop_words = p.stem = true;
+    CHECK(Bm25(p).analyze("The runners were running quickly") == V({"runner", "run", "quick"}));
+    p.unicode = true;
+    CHECK(Bm25(p).analyze("Don\u2019t stop RUNNING, Zürich") == V({"stop", "run", "zürich"}));  // a stop word with its apostrophe; non-English kept
+    // Collections: "runs" finds "running" with stems, not without.
+    auto texts = [](bool stem) {
+        CollectionOptions o;
+        o.text = true;
+        o.bm25.stem = stem;
+        o.maintenance.mode = Maintenance::Manual;
+        auto c = std::make_unique<Collection>(o);
+        for (const auto& [id, t] : std::vector<std::pair<std::uint64_t, std::string>>{{1, "running shoes"}, {2, "swimming pools"}, {3, "a long walk"}}) {
+            Document d;
+            d.text = t;
+            c->add(id, d);
+        }
+        return c;
+    };
+    CollectionQuery runs;
+    runs.text = "runs";
+    CHECK(texts(false)->search(runs, 5).empty());
+    const auto stemmed = texts(true);
+    CHECK(stemmed->search(runs, 5).size() == 1 && stemmed->search(runs, 5)[0].id == 1);
+    auto bytes = [](const Collection& c) {
+        std::ostringstream out;
+        c.save(out);
+        return out.str();
+    };
+    // Saving: a collection without analysis writes its configuration exactly as before;
+    // with it, a block follows, read back; damaged blocks are refused.
+    ParsedFile plain = ParsedFile::parse(bytes(*texts(false)));
+    ParsedFile with = ParsedFile::parse(bytes(*stemmed));
+    CHECK(plain.payload("CCFG").size() == 39 && with.payload("CCFG").size() == 41);
+    {
+        std::istringstream in(bytes(*stemmed));
+        const auto back = Collection::load(in);
+        CHECK(back->options().bm25.stem && !back->options().bm25.unicode && back->search(runs, 5).size() == 1);
+    }
+    auto refused = [&](std::size_t at, unsigned char value) {
+        ParsedFile e = with;
+        e.payload("CCFG")[at] = static_cast<char>(value);
+        std::istringstream in(e.assemble());
+        try {
+            (void)Collection::load(in);
+        } catch (const FormatError&) {
+            return true;
+        }
+        return false;
+    };
+    CHECK(refused(40, 0) && refused(40, 8) && refused(39, 3) && refused(39, 1));  // no flags, an unknown flag, an unknown block, out of order
+    // Reopening a durable collection with other analysis is refused; the same analysis opens.
+    const std::string dir = durable_dir("sp15");
+    CollectionOptions o;
+    o.text = true;
+    o.bm25.stem = true;
+    {
+        auto c = Collection::open(dir, o);
+        Document d;
+        d.text = "running";
+        c->add(1, d);
+    }
+    CollectionOptions other = o;
+    other.bm25.stem = false;
+    CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, other));
+    CHECK(Collection::open(dir, o)->search(runs, 5).size() == 1);
+    std::filesystem::remove_all(dir);
+}
+
+TEST(sparse, sp16_unicode_tokens_every_rule) {
+    // tokenize_unicode, rule by rule: which characters are letters (every range, at its
+    // edges), how each script lowercases, four-byte characters, and every kind of
+    // invalid UTF-8. Each character is checked inside a word, as "a<c>b": a letter stays
+    // in it (lowercased), a separator splits it.
+    auto utf8 = [](char32_t c) {
+        std::string s;
+        if (c < 0x80) s += char(c);
+        else if (c < 0x800) { s += char(0xC0 | (c >> 6)); s += char(0x80 | (c & 0x3F)); }
+        else if (c < 0x10000) { s += char(0xE0 | (c >> 12)); s += char(0x80 | ((c >> 6) & 0x3F)); s += char(0x80 | (c & 0x3F)); }
+        else { s += char(0xF0 | (c >> 18)); s += char(0x80 | ((c >> 12) & 0x3F)); s += char(0x80 | ((c >> 6) & 0x3F)); s += char(0x80 | (c & 0x3F)); }
+        return s;
+    };
+    using V = std::vector<std::string>;
+    std::size_t checked = 0;
+    // Separators: a word split in two.
+    for (const char32_t c : {char32_t(' '), char32_t('!'), char32_t('~'), char32_t(0x85), char32_t(0xA0), char32_t(0xA1), char32_t(0xBF),
+                             char32_t(0xD7), char32_t(0xF7), char32_t(0x2000), char32_t(0x2014), char32_t(0x2BFF), char32_t(0x2E00),
+                             char32_t(0x2E7F), char32_t(0x3000), char32_t(0x303F), char32_t(0xFE30), char32_t(0xFE4F), char32_t(0xFEFF),
+                             char32_t(0xFF01), char32_t(0xFF0F), char32_t(0xFF1A), char32_t(0xFF20), char32_t(0xFF3B), char32_t(0xFF40),
+                             char32_t(0xFF5B), char32_t(0xFF65), char32_t(0x1F000), char32_t(0x1F600), char32_t(0x1FAFF)}) {
+        CHECK(tokenize_unicode("a" + utf8(c) + "b") == V({"a", "b"}));
+        ++checked;
+    }
+    // Letters kept as they are (already lowercase, or without case).
+    for (const char32_t c : {char32_t('z'), char32_t('0'), char32_t('9'), char32_t(0xAA), char32_t(0xB5), char32_t(0xBA), char32_t(0xDF),
+                             char32_t(0xFF), char32_t(0x138), char32_t(0x149), char32_t(0x17F), char32_t(0x3A2), char32_t(0x3B1),
+                             char32_t(0x430), char32_t(0x905), char32_t(0x1FFF), char32_t(0x2C00), char32_t(0x2E80), char32_t(0x3040),
+                             char32_t(0x9CE5), char32_t(0xFE50), char32_t(0xFF10), char32_t(0xFF21), char32_t(0xFF41), char32_t(0xFF66),
+                             char32_t(0x1EFFF), char32_t(0x1FB00), char32_t(0x20000)}) {
+        CHECK(tokenize_unicode("a" + utf8(c) + "b") == V({"a" + utf8(c) + "b"}));
+        ++checked;
+    }
+    // Lowercased: every rule, at its edges.
+    for (const auto& [upper, lower] : std::vector<std::pair<char32_t, char32_t>>{
+             {'A', 'a'}, {'Z', 'z'}, {0xC0, 0xE0}, {0xDE, 0xFE}, {0x100, 0x101}, {0x136, 0x137}, {0x14A, 0x14B}, {0x176, 0x177},
+             {0x139, 0x13A}, {0x147, 0x148}, {0x179, 0x17A}, {0x17D, 0x17E}, {0x178, 0xFF}, {0x130, 'i'}, {0x391, 0x3B1},
+             {0x3A9, 0x3C9}, {0x3AB, 0x3CB}, {0x386, 0x3AC}, {0x388, 0x3AD}, {0x38A, 0x3AF}, {0x38C, 0x3CC}, {0x38E, 0x3CD},
+             {0x38F, 0x3CE}, {0x410, 0x430}, {0x42F, 0x44F}, {0x400, 0x450}, {0x40F, 0x45F}}) {
+        CHECK(tokenize_unicode("a" + utf8(upper) + "b") == V({"a" + utf8(lower) + "b"}));
+        ++checked;
+    }
+    // Invalid UTF-8: a lone continuation byte, lead bytes never valid (C0, C1, F5, FF),
+    // overlong forms of three and four bytes, a surrogate, beyond U+10FFFF, a bad
+    // continuation in second, third and fourth place, and a sequence cut short.
+    for (const std::string bad : {"\x80", "\xC0\xAF", "\xC1\xBF", "\xF5\x80\x80\x80", "\xFF", "\xE0\x80\x80", "\xF0\x80\x80\x80",
+                                  "\xED\xA0\x80", "\xF4\x90\x80\x80", "\xC3\x41", "\xE2\x82\x41", "\xF0\x9F\x98\x41", "\xE2\x82"}) {
+        const V got = tokenize_unicode("a" + bad + "b");
+        CHECK(!got.empty() && got.front() == "a" && got.back().back() == 'b');  // never inside a token
+        bool clean = true;
+        for (const auto& t : got) clean = clean && t.find('\x80') == std::string::npos && t.find('\xC0') == std::string::npos && t.find('\xFF') == std::string::npos;
+        CHECK(clean);
+        ++checked;
+    }
+    CHECK(tokenize_unicode("x\xF0\x9F\x98\x80y\xF0\xA0\x80\x80z") == V({"x", "y\xF0\xA0\x80\x80z"}));  // an emoji splits; U+20000 is a letter
+    CHECK(checked == 30 + 28 + 27 + 13);
+    // In BM25: stop words alone (no stems); stems only for plain a-to-z words.
+    Bm25Params p;
+    p.stop_words = true;
+    CHECK(Bm25(p).analyze("the running of dogs") == V({"running", "dogs"}));
+    p.stop_words = false;
+    p.stem = true;
+    p.unicode = true;
+    CHECK(Bm25(p).analyze("running caf\u00E9s r2d2 \u00E9coles") == V({"run", "caf\u00E9s", "r2d2", "\u00E9coles"}));
+}
+
+TEST(sparse, sp17_stems_and_apostrophes_at_the_edges) {
+    // Stems for words aimed at the stemmer's rarer paths, expected values from Snowball's
+    // own (Python) stemmer; and apostrophes at a word's end or before a non-letter.
+    const std::vector<std::pair<std::string, std::string>> words{
+        {"inned", "in"}, {"aed", "a"}, {"aying", "aye"}, {"dying", "die"}, {"hopped", "hop"}, {"added", "add"}, {"eggs", "egg"},
+        {"biology", "biolog"}, {"pedagogy", "pedagogi"}, {"apology", "apolog"}, {"nation", "nation"}, {"fusion", "fusion"},
+        {"onion", "onion"}, {"opinion", "opinion"}, {"happily", "happili"}, {"gently", "gentl"}, {"hopefully", "hope"},
+        {"john's", "john"}, {"dogs'", "dog"}, {"ugly", "ugli"}};
+    std::size_t wrong = 0;
+    for (const auto& [w, s] : words) wrong += stem_english(w) != s;
+    CHECK(wrong == 0);
+    using V = std::vector<std::string>;
+    CHECK(tokenize_unicode("dogs' bark") == V({"dogs", "bark"}));         // at the end of a word: not kept
+    CHECK(tokenize_unicode("dog'!s 'tis") == V({"dog", "s", "tis"}));      // before a non-letter, or leading
+    CHECK(tokenize_unicode("x\u013Ay\u017Az") == V({"x\u013Ay\u017Az"}));  // already lowercase: unchanged
+}
+
 TEST(sparse, sp10_concurrent_searches_and_changes) {
     std::mt19937 seed(3006);
     std::vector<SparseVector> pool;
@@ -19136,6 +19619,379 @@ TEST(collection, co18_options_report_the_current_schema) {
     CHECK(c->payload_indexes() == std::vector<std::string>{"lang"});
     c.reset();
     std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co19_search_groups) {
+    // Group-by over an exact ranking (text, BM25): equal to grouping the full ranking by
+    // hand, for every field type and size; then documents without the field, filters, the
+    // candidate cap, refusals, and the vector side's invariants.
+    CollectionOptions o;
+    o.dim = 4;
+    o.text = true;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    std::mt19937 rng(1919);
+    const char* words[] = {"alpha", "beta", "gamma", "delta", "omega", "sigma", "kappa", "zeta"};
+    for (std::uint64_t i = 0; i < 400; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(rng() % 100), float(rng() % 100), float(rng() % 100), float(rng() % 100)};
+        for (int w = 0; w < 6; ++w) d.text += std::string(words[rng() % 8]) + " ";
+        Metadata m;
+        if (i % 17 != 0) m.set("doc", "d" + std::to_string(i % 37));  // some documents without it
+        m.set("n", std::int64_t(i % 23)).set("b", i % 3 == 0).set("t", std::vector<std::string>{"x"}).set("x", 0.5);
+        d.metadata = m;
+        c.add(i, d);
+    }
+    CollectionQuery q;
+    q.text = "alpha gamma omega";
+    CollectionSearchOptions with_md;
+    with_md.with_metadata = true;
+    const auto full = c.search(q, 400, with_md);
+    auto by_hand = [&](const std::vector<CollectionHit>& ranking, const std::string& field, std::size_t groups, std::size_t per) {
+        std::vector<std::pair<std::string, std::vector<std::uint64_t>>> out;
+        for (const auto& h : ranking) {
+            const auto v = h.metadata->get(field);
+            if (!v) continue;
+            const std::string key = v->type == FieldType::Keyword ? v->s : v->type == FieldType::Int ? std::to_string(v->i) : (v->b ? "true" : "false");
+            auto it = std::find_if(out.begin(), out.end(), [&](const auto& g) { return g.first == key; });
+            if (it == out.end()) {
+                if (out.size() == groups) continue;
+                out.push_back({key, {}});
+                it = out.end() - 1;
+            }
+            if (it->second.size() < per) it->second.push_back(h.id);
+        }
+        return out;
+    };
+    auto as_pairs = [](const std::vector<CollectionGroup>& gs) {
+        std::vector<std::pair<std::string, std::vector<std::uint64_t>>> out;
+        for (const auto& g : gs) {
+            const std::string key = g.value.type == FieldType::Keyword ? g.value.s : g.value.type == FieldType::Int ? std::to_string(g.value.i) : (g.value.b ? "true" : "false");
+            std::vector<std::uint64_t> ids;
+            for (const auto& h : g.hits) ids.push_back(h.id);
+            out.push_back({key, ids});
+        }
+        return out;
+    };
+    std::size_t compared = 0;
+    for (const char* field : {"doc", "n", "b"})
+        for (const auto& [groups, per] : std::vector<std::pair<std::size_t, std::size_t>>{{1, 1}, {3, 2}, {10, 3}, {50, 100}}) {
+            GroupBy g;
+            g.field = field;
+            g.groups = groups;
+            g.per_group = per;
+            CHECK(as_pairs(c.search_groups(q, g)) == by_hand(full, field, groups, per));
+            ++compared;
+        }
+    CHECK(compared == 12);
+    // The boolean field has 2 values: asking for 10 groups gives 2.
+    GroupBy two{"b", 10, 5, 0};
+    CHECK(c.search_groups(q, two).size() == 2);
+    // A filter: only matching documents are grouped.
+    CollectionSearchOptions f = with_md;
+    f.filter = Filter::lt("n", std::int64_t(5));
+    GroupBy g{"doc", 8, 2, 0};
+    CHECK(as_pairs(c.search_groups(q, g, f)) == by_hand(c.search(q, 400, f), "doc", 8, 2));
+    // A cap on candidates: the groups come from the best max_candidates documents only.
+    GroupBy capped{"doc", 30, 30, 20};
+    std::size_t in_groups = 0;
+    for (const auto& grp : c.search_groups(q, capped)) in_groups += grp.hits.size();
+    CHECK(in_groups <= 20);
+    // Zero groups or zero per group: nothing; refusals: tags, floats, no name.
+    CHECK(c.search_groups(q, GroupBy{"doc", 0, 3, 0}).empty() && c.search_groups(q, GroupBy{"doc", 3, 0, 0}).empty());
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search_groups(q, GroupBy{"t", 3, 3, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search_groups(q, GroupBy{"x", 3, 3, 0}));
+    CHECK_THROWS_AS(std::invalid_argument, (void)c.search_groups(q, GroupBy{"", 3, 3, 0}));
+    CHECK(c.search_groups(q, GroupBy{"never_seen", 3, 3, 0}).empty());  // dynamic schema: no document holds it
+    CollectionOptions so = o;
+    so.schema = Schema::strict({FieldSpec{"doc", FieldType::Keyword}});
+    Collection strict(so);
+    Document sd;
+    sd.vector = std::vector<float>{1, 2, 3, 4};
+    sd.text = "alpha";
+    sd.metadata = Metadata().set("doc", "d1");
+    strict.add(1, sd);
+    CHECK_THROWS_AS(std::invalid_argument, (void)strict.search_groups(q, GroupBy{"nope", 3, 3, 0}));
+    CHECK(strict.search_groups(q, GroupBy{"doc", 3, 3, 0}).size() == 1);
+    // The vector side (approximate): every hit holds its group's value; values distinct;
+    // sizes bounded; groups ordered by their best hit.
+    CollectionQuery vq;
+    vq.vector = std::vector<float>{50, 50, 50, 50};
+    const auto vg = c.search_groups(vq, GroupBy{"doc", 12, 4, 0}, with_md);
+    bool sound = vg.size() == 12;
+    std::set<std::string> seen;
+    double previous = std::numeric_limits<double>::infinity();
+    for (const auto& grp : vg) {
+        sound = sound && seen.insert(grp.value.s).second && !grp.hits.empty() && grp.hits.size() <= 4 && grp.hits[0].score <= previous;
+        previous = grp.hits[0].score;
+        for (const auto& h : grp.hits) sound = sound && h.metadata->get("doc")->s == grp.value.s;
+    }
+    CHECK(sound);
+}
+
+TEST(collection, co20_recommend) {
+    // recommend() equals a search from the computed query with the examples removed;
+    // cosine normalizes each example; every refusal; vectors near float's limit.
+    auto make = [](Metric m, bool ttl) {
+        CollectionOptions o;
+        o.dim = 8;
+        o.metric = m;
+        o.text = true;
+        o.maintenance.mode = Maintenance::Manual;
+        if (ttl) o.ttl = TtlOptions{true, 0};
+        return o;
+    };
+    std::mt19937 rng(2020);
+    std::normal_distribution<float> nd(0, 1);
+    for (const Metric m : {Metric::L2, Metric::Cosine}) {
+        Collection c(make(m, false));
+        std::vector<std::vector<float>> v(300, std::vector<float>(8));
+        for (std::uint64_t i = 0; i < 300; ++i) {
+            for (float& x : v[i]) x = nd(rng) * (i % 5 + 1.0f);  // lengths differ: cosine must normalize
+            Document d;
+            d.vector = v[i];
+            d.metadata = Metadata().set("g", std::int64_t(i % 4));
+            c.add(i, d);
+        }
+        auto unit = [&](const std::vector<float>& x) {
+            double n = 0;
+            for (const float y : x) n += double(y) * y;
+            std::vector<double> u(x.begin(), x.end());
+            if (m == Metric::Cosine)
+                for (double& y : u) y /= std::sqrt(n);
+            return u;
+        };
+        auto expected = [&](const std::vector<std::uint64_t>& pos, const std::vector<std::uint64_t>& neg, std::size_t k, const CollectionSearchOptions& o) {
+            std::vector<double> p(8, 0.0), q(8, 0.0);
+            for (const auto id : pos) { const auto u = unit(v[id]); for (int j = 0; j < 8; ++j) p[j] += u[j] / double(pos.size()); }
+            for (const auto id : neg) { const auto u = unit(v[id]); for (int j = 0; j < 8; ++j) q[j] += u[j] / double(neg.size()); }
+            CollectionQuery query;
+            for (int j = 0; j < 8; ++j) query.vector.push_back(float(neg.empty() ? p[j] : 2 * p[j] - q[j]));
+            auto hits = c.search(query, k + pos.size() + neg.size(), o);
+            std::erase_if(hits, [&](const CollectionHit& h) {
+                return std::find(pos.begin(), pos.end(), h.id) != pos.end() || std::find(neg.begin(), neg.end(), h.id) != neg.end();
+            });
+            if (hits.size() > k) hits.resize(k);
+            std::vector<std::uint64_t> ids;
+            for (const auto& h : hits) ids.push_back(h.id);
+            return ids;
+        };
+        auto ids_of = [](const std::vector<CollectionHit>& hits) {
+            std::vector<std::uint64_t> ids;
+            for (const auto& h : hits) ids.push_back(h.id);
+            return ids;
+        };
+        CollectionSearchOptions none, filtered;
+        filtered.filter = Filter::eq("g", std::int64_t(2));
+        for (const auto& [pos, neg] : std::vector<std::pair<std::vector<std::uint64_t>, std::vector<std::uint64_t>>>{
+                 {{3}, {}}, {{3, 7, 42}, {}}, {{3, 7}, {11}}, {{5, 6, 7, 8}, {100, 200}}})
+            for (const auto* o : {&none, &filtered}) {
+                const auto got = c.recommend(Recommend{pos, neg}, 10, *o);
+                bool excluded = got.size() == 10;
+                for (const auto& h : got)
+                    excluded = excluded && std::find(pos.begin(), pos.end(), h.id) == pos.end() && std::find(neg.begin(), neg.end(), h.id) == neg.end();
+                CHECK(excluded && ids_of(got) == expected(pos, neg, 10, *o));
+            }
+        CHECK(c.recommend(Recommend{{1}, {}}, 0).empty());
+        // Refusals.
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.recommend(Recommend{{}, {3}}, 5));            // no positive example
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.recommend(Recommend{{99999}, {}}, 5));        // unknown
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.recommend(Recommend{{3}, {99999}}, 5));       // unknown negative
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.recommend(Recommend{{3, 4}, {4}}, 5));        // both
+        Document text_only;
+        text_only.text = "no vector here";
+        c.add(5000, text_only);
+        CHECK_THROWS_AS(std::invalid_argument, (void)c.recommend(Recommend{{5000}, {}}, 5));         // without a vector
+    }
+    // An expired document is unknown.
+    Collection t(make(Metric::L2, true));
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        Document d;
+        d.vector = std::vector<float>(8, float(i));
+        if (i == 3) d.expires_at = now_ms() - 1000;
+        t.add(i, d);
+    }
+    CHECK_THROWS_AS(std::invalid_argument, (void)t.recommend(Recommend{{3}, {}}, 5));
+    CHECK(t.recommend(Recommend{{4}, {}}, 5).size() == 5);
+    // A collection without vectors.
+    CollectionOptions text_only = make(Metric::L2, false);
+    text_only.dim = 0;
+    Collection words(text_only);
+    Document wd;
+    wd.text = "hello";
+    words.add(1, wd);
+    CHECK_THROWS_AS(std::invalid_argument, (void)words.recommend(Recommend{{1}, {}}, 5));
+    // Near float's limit: 2 avg(positive) - avg(negative) is clamped, so the query stays finite.
+    Collection big(make(Metric::L2, false));
+    for (std::uint64_t i = 0; i < 10; ++i) {
+        Document d;
+        d.vector = std::vector<float>(8, i % 2 ? 3e38f : -3e38f);
+        big.add(i, d);
+    }
+    CHECK(big.recommend(Recommend{{1, 3}, {0, 2}}, 3).size() == 3);
+}
+
+TEST(collection, co21_search_groups_deadlines_expiry_and_keys) {
+    // Group-by under a deadline already passed (a valid partial answer, reported as
+    // stopped early), with expired documents (never in a group), and with string keys
+    // (each hit carries its key, the groups as with numeric IDs).
+    CollectionOptions o;
+    o.dim = 4;
+    o.text = true;
+    o.ttl = TtlOptions{true, 0};
+    o.string_ids = true;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(i % 13), float(i % 7), 1, 2};
+        d.text = "apple pie " + std::to_string(i % 9);
+        d.metadata = Metadata().set("doc", "d" + std::to_string(i % 20));
+        if (i % 10 == 3) d.expires_at = now_ms() - 1000;  // expired: never found
+        c.add("key-" + std::to_string(i), d);
+    }
+    CollectionQuery q;
+    q.text = "apple";
+    CollectionSearchOptions so;
+    so.with_metadata = true;
+    const auto groups = c.search_groups(q, GroupBy{"doc", 20, 5, 0}, so);
+    // Groups d3 and d13 hold only expired documents (i % 20 is 3 or 13 exactly when i % 10
+    // is 3): they do not exist. The other 18 do.
+    bool sound = groups.size() == 18;
+    for (const auto& g : groups)
+        sound = sound && g.value.s != "d3" && g.value.s != "d13";
+    for (const auto& g : groups)
+        for (const auto& h : g.hits) {
+            const std::uint64_t i = std::stoull(h.key->substr(4));
+            sound = sound && h.key && i % 10 != 3 && h.metadata->get("doc")->s == g.value.s && h.id == Collection::id_of(*h.key);
+        }
+    CHECK(sound);
+    bool stopped = false;
+    CollectionSearchOptions late = so;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.stopped_early = &stopped;
+    const auto partial = c.search_groups(q, GroupBy{"doc", 20, 5, 0}, late);
+    bool consistent = partial.size() <= 20;
+    for (const auto& g : partial) consistent = consistent && !g.hits.empty() && g.hits.size() <= 5;
+    CHECK(consistent);  // whatever was found before the deadline, well formed (stopped is set when a side stopped)
+    CHECK(!stopped || partial.size() <= groups.size());
+}
+
+TEST(collection, co22_edges_found_by_coverage) {
+    // Edges the coverage measurement showed untested: each analysis setting alone through
+    // saving and loading; damaged runtime settings; reopening with each setting changed;
+    // group-by on an empty collection; a zero vector as a cosine example.
+    auto bytes = [](const Collection& c) {
+        std::ostringstream out;
+        c.save(out);
+        return out.str();
+    };
+    for (int flag = 0; flag < 3; ++flag) {
+        CollectionOptions o;
+        o.text = true;
+        o.maintenance.mode = Maintenance::Manual;
+        o.bm25.unicode = flag == 0;
+        o.bm25.stop_words = flag == 1;
+        o.bm25.stem = flag == 2;
+        Collection c(o);
+        Document d;
+        d.text = "Running dogs";
+        c.add(1, d);
+        std::istringstream in(bytes(c));
+        const auto back = Collection::load(in);
+        CHECK(back->options().bm25.unicode == o.bm25.unicode && back->options().bm25.stop_words == o.bm25.stop_words &&
+              back->options().bm25.stem == o.bm25.stem);
+        const std::string dir = durable_dir("co22_" + std::to_string(flag));
+        Collection::open(dir, o)->add(1, d);
+        CollectionOptions other = o;
+        other.bm25.unicode = !o.bm25.unicode;  // one setting changed at a time
+        if (flag == 1) other = o, other.bm25.stop_words = false;
+        if (flag == 2) other = o, other.bm25.stem = false;
+        CHECK_THROWS_AS(std::invalid_argument, (void)Collection::open(dir, other));
+        std::filesystem::remove_all(dir);
+    }
+    {  // damaged runtime settings: an expiry flag, a key flag, a negative default
+        CollectionOptions o;
+        o.dim = 2;
+        o.ttl = TtlOptions{true, 5};
+        o.maintenance.mode = Maintenance::Manual;
+        Collection c(o);
+        Document d;
+        d.vector = std::vector<float>{1, 2};
+        c.add(1, d);
+        const ParsedFile good = ParsedFile::parse(bytes(c));
+        for (const auto& [at, value] : std::vector<std::pair<std::size_t, unsigned char>>{{40, 2}, {49, 2}, {48, 0x80}}) {
+            ParsedFile e = good;
+            e.payload("CCFG")[at] = static_cast<char>(value);
+            std::istringstream in(e.assemble());
+            CHECK_THROWS_AS(FormatError, (void)Collection::load(in));
+        }
+    }
+    CollectionOptions o;
+    o.dim = 3;
+    o.metric = Metric::Cosine;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection empty(o);
+    CollectionQuery q;
+    q.vector = std::vector<float>{1, 0, 0};
+    CHECK(empty.search_groups(q, GroupBy{"g", 3, 3, 0}).empty());
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 20; ++i) {
+        Document d;
+        d.vector = i == 0 ? std::vector<float>{0, 0, 0} : std::vector<float>{float(i), 1, 2};
+        c.add(i, d);
+    }
+    const auto hits = c.recommend(Recommend{{0, 3}, {}}, 5);  // a zero vector among the examples: no normalizing it
+    CHECK(hits.size() == 5 && std::none_of(hits.begin(), hits.end(), [](const CollectionHit& h) { return h.id == 0 || h.id == 3; }));
+}
+
+TEST(filter, fl72_geo_edges_found_by_coverage) {
+    // A longitude out of range alone, an empty longitude field name, a longitude field
+    // that is not numeric, and a stored longitude out of range with a valid latitude.
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("lat", "lon", 0, 181, 1));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_box("lat", "lon", 0, 0, 1, -180.5));
+    CHECK_THROWS_AS(std::invalid_argument, (void)Filter::geo_radius("lat", "", 0, 0, 1));
+    FlatIndex f(1, Metric::L2);
+    f.add(1, std::vector<float>{0}, Metadata().set("lat", 10.0).set("lon", 200.0));  // no such longitude: never a place
+    f.add(2, std::vector<float>{0}, Metadata().set("lat", 10.0).set("lon", 20.0).set("name", "x"));
+    CHECK(f.count_where(Filter::geo_box("lat", "lon", -90, -180, 90, 180)) == 1);
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.count_where(Filter::geo_radius("lat", "name", 0, 0, 1)));
+}
+
+TEST(collection, co23_settings_order_and_group_deadlines) {
+    // Settings blocks out of order are refused; group-by under a deadline already passed,
+    // on a collection large enough for the deadline to be checked, stops with a
+    // well-formed partial answer and says so.
+    CollectionOptions o;
+    o.dim = 2;
+    o.text = true;
+    o.ttl = TtlOptions{true, 0};
+    o.bm25.stem = true;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    for (std::uint64_t i = 0; i < 4000; ++i) {
+        Document d;
+        d.vector = std::vector<float>{float(i % 97), float(i % 89)};
+        d.text = "running " + std::to_string(i % 13);
+        d.metadata = Metadata().set("g", std::int64_t(i % 400));
+        c.add(i, d);
+    }
+    std::ostringstream out;
+    c.save(out);
+    ParsedFile e = ParsedFile::parse(out.str());
+    e.payload("CCFG")[50] = 1;  // the text block (at 50, after the runtime block at 39) renamed as a second runtime block
+    std::istringstream in(e.assemble());
+    CHECK_THROWS_AS(FormatError, (void)Collection::load(in));
+    CollectionQuery q;
+    q.vector = std::vector<float>{3, 4};
+    bool stopped = false;
+    CollectionSearchOptions late;
+    late.deadline = std::chrono::steady_clock::now() - std::chrono::seconds(1);
+    late.stopped_early = &stopped;
+    const auto groups = c.search_groups(q, GroupBy{"g", 50, 10, 0}, late);
+    bool sound = groups.size() <= 50;
+    for (const auto& g : groups) sound = sound && !g.hits.empty() && g.hits.size() <= 10;
+    CHECK(sound && stopped);
 }
 
 TEST(collection, co16_scan_pages_filters_and_parts) {

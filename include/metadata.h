@@ -237,7 +237,6 @@ public:
 
     SchemaMode mode() const { return mode_; }
     std::size_t field_count() const { return specs_.size(); }
-    const std::string& field_name(std::size_t f) const { return specs_[f].name; }
     FieldType field_type(std::size_t f) const { return specs_[f].type; }
 
     /// Column number of a field, or nothing if it does not exist.
@@ -317,6 +316,28 @@ public:
     void clear(NodeId slot) noexcept {
         for (Column& c : cols_) clear_row_counted(c, slot);
     }
+
+    /// Bulk removals: while a BulkRemoval lives, clearing and moving rows leaves the
+    /// posting lists alone; when it ends they are rebuilt in one ascending pass, O(rows +
+    /// entries) for the whole batch instead of O(list length) per row, which made bulk
+    /// removal quadratic. Only for removals: each value's count shrinks, so the rebuilt
+    /// lists fit the capacity they had and nothing allocates. Small batches (under 32
+    /// rows) keep the per-row path, cheaper than a rebuild.
+    class BulkRemoval {
+    public:
+        BulkRemoval(MetadataStore& store, std::size_t rows) noexcept : store_(rows >= 32 ? &store : nullptr) {
+            if (store_)
+                for (Column& c : store_->cols_) c.postings_deferred = c.indexed;
+        }
+        ~BulkRemoval() {
+            if (store_) store_->rebuild_postings();
+        }
+        BulkRemoval(const BulkRemoval&) = delete;
+        BulkRemoval& operator=(const BulkRemoval&) = delete;
+
+    private:
+        MetadataStore* store_;
+    };
 
     /// Moves row `from` into row `to` (swap-with-last removal; `to` < `from`)
     /// and clears `from`. Never throws.
@@ -425,6 +446,20 @@ public:
         const Column& c = cols_[f];
         return slot < c.present.size() && c.present[slot] != 0;
     }
+    /// A column's raw arrays, for loops over many rows (CompiledFilter::matches_all): rows
+    /// below `rows` have `present[r]` (1 or 0) and, for the column's type, a value.
+    struct ColumnView {
+        std::size_t rows;
+        const std::uint8_t* present;
+        const std::int64_t* ints;
+        const double* floats;
+        const std::uint8_t* bools;
+        const std::uint32_t* keywords;
+    };
+    ColumnView view(std::size_t f) const {
+        const Column& c = cols_[f];
+        return {c.present.size(), c.present.data(), c.ints.data(), c.floats.data(), c.bools.data(), c.keywords.data()};
+    }
     std::int64_t int_at(std::size_t f, NodeId slot) const { return cols_[f].ints[slot]; }
     double float_at(std::size_t f, NodeId slot) const { return cols_[f].floats[slot]; }
     bool bool_at(std::size_t f, NodeId slot) const { return cols_[f].bools[slot] != 0; }
@@ -505,11 +540,14 @@ private:
             std::vector<NodeId>& p = postings[id];
             if (p.size() == p.capacity()) p.reserve(p.size() + p.size() / 2 + 8);
         }
+        bool postings_deferred = false;  // inside a BulkRemoval: rebuilt when it ends
         void posting_insert(std::uint32_t id, NodeId s) noexcept {  // room reserved: no allocation
+            if (postings_deferred) return;
             std::vector<NodeId>& p = postings[id];
             p.insert(std::lower_bound(p.begin(), p.end(), s), s);
         }
         void posting_erase(std::uint32_t id, NodeId s) noexcept {
+            if (postings_deferred) return;
             std::vector<NodeId>& p = postings[id];
             const auto it = std::lower_bound(p.begin(), p.end(), s);
             if (it != p.end() && *it == s) p.erase(it);
@@ -611,6 +649,24 @@ private:
     }
 
     /// Clears row `s` of column `c`, releasing its strings. Never throws.
+    void rebuild_postings() noexcept {  // BulkRemoval's end: every deferred list, from the rows
+        for (Column& c : cols_) {
+            if (!c.postings_deferred) continue;
+            c.postings_deferred = false;
+            for (std::vector<NodeId>& p : c.postings) p.clear();  // capacity kept
+            for (NodeId s = 0; s < c.rows(); ++s) {
+                if (!c.present[s]) continue;
+                switch (c.type) {  // GCOVR_EXCL_BR_LINE: numeric columns are never indexed
+                    case FieldType::Bool: c.postings[c.bools[s]].push_back(s); break;
+                    case FieldType::Keyword: c.postings[c.keywords[s]].push_back(s); break;
+                    case FieldType::Tags:
+                        for (const std::uint32_t id : c.tags[s]) c.postings[id].push_back(s);
+                        break;
+                    default: break;  // GCOVR_EXCL_LINE: numeric columns are never indexed
+                }
+            }
+        }
+    }
     void clear_row_counted(Column& c, NodeId s) noexcept {
         if (s >= c.rows() || !c.present[s]) return;
         auto dec = [&](std::uint32_t id) { if (--refs_[id] == 0) ++dead_strings_; };
@@ -626,8 +682,8 @@ private:
 
     /// Appends a field. May throw; on failure nothing changed.
     void create_field(const std::string& name, FieldType type) {
-        specs_.reserve(specs_.size() + 1);
-        cols_.reserve(cols_.size() + 1);
+        reserve_one_more(specs_);
+        reserve_one_more(cols_);
         by_name_.emplace(name, specs_.size());  // may throw; nothing changed yet
         specs_.push_back({name, type});         // cannot throw: reserved
         cols_.emplace_back(type);
@@ -700,10 +756,8 @@ private:
                         case FieldType::Bool: p.b = value->b; break;
                         case FieldType::Keyword: p.id = intern(value->s); break;
                         case FieldType::Tags:
-                            for (const std::string& t : value->tags) {
-                                const std::uint32_t id = intern(t);
-                                if (std::find(p.tags.begin(), p.tags.end(), id) == p.tags.end()) p.tags.push_back(id);
-                            }
+                            for (const std::string& t : value->tags) p.tags.push_back(intern(t));
+                            unique_in_order(p.tags);  // repeats once, in the order given
                             break;
                     }
                 }

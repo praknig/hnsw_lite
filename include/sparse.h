@@ -155,6 +155,11 @@ struct Bm25Params {
     double k1 = 1.2;                ///< term-frequency saturation
     double b = 0.75;                ///< length normalization
     double avg_doc_length = 100.0;  ///< in tokens; set it with fit() or from your corpus
+    // Text analysis (text_analysis.h), all off by default: tokens as Bm25::tokenize gives
+    // them. Fixed when a collection is created: documents and queries must agree.
+    bool unicode = false;     ///< Unicode-aware tokens: lowercase beyond ASCII, Unicode punctuation separates, apostrophes kept in words
+    bool stop_words = false;  ///< leave out Snowball's English stop words ("the", "and", ...)
+    bool stem = false;        ///< reduce words to stems (Snowball English): "running" matches "run"
 };
 
 /// BM25 as sparse vectors: documents carry the term-frequency part, queries the
@@ -166,6 +171,9 @@ class Bm25 {
 public:
     explicit Bm25(Bm25Params params = {});
     static std::vector<std::string> tokenize(std::string_view text);
+    /// The terms of `text` as the parameters ask: tokenize() or tokenize_unicode(), then
+    /// stop words removed, then stems (of tokens of letters a to z and apostrophes only).
+    std::vector<std::string> analyze(std::string_view text) const;
     static std::uint32_t term_id(std::string_view token);
     /// Sets avg_doc_length to the mean token count of `documents` (unchanged if none).
     void fit(std::span<const std::string_view> documents);

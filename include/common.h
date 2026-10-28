@@ -9,6 +9,7 @@
  *  - round_up(): rounds a size up to a multiple (used for padding).
  */
 #pragma once
+#include <vector>
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
@@ -51,6 +52,43 @@ inline std::size_t checked_dim(std::size_t dim) {
     if (dim == 0) throw std::invalid_argument("dim must be > 0");
     if (dim > kMaxDim) throw std::invalid_argument("dim must be at most 16,777,216");
     return dim;
+}
+
+/// Removes repeated values, keeping each one's first occurrence in place. Small lists
+/// (the usual tag sets) by direct comparison, without allocating; longer ones through a
+/// sorted copy, so the cost stays O(n log n) for any length.
+inline void unique_in_order(std::vector<std::uint32_t>& v) {
+    std::size_t out = 0;
+    if (v.size() <= 16) {
+        for (const std::uint32_t x : v)
+            if (std::find(v.begin(), v.begin() + std::ptrdiff_t(out), x) == v.begin() + std::ptrdiff_t(out)) v[out++] = x;
+        v.resize(out);
+        return;
+    }
+    std::vector<std::uint32_t> sorted(v);
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end()) return;  // no repeats: unchanged
+    std::vector<bool> kept(sorted.size());
+    for (const std::uint32_t x : v) {
+        const auto at = std::size_t(std::lower_bound(sorted.begin(), sorted.end(), x) - sorted.begin());
+        if (!kept[at]) {
+            kept[at] = true;
+            v[out++] = x;
+        }
+    }
+    v.resize(out);
+}
+
+/// Whether any value repeats; as unique_in_order, O(n log n) for any length.
+inline bool has_repeats(const std::vector<std::uint32_t>& v) {
+    if (v.size() <= 16) {
+        for (std::size_t i = 1; i < v.size(); ++i)
+            if (std::find(v.begin(), v.begin() + std::ptrdiff_t(i), v[i]) != v.begin() + std::ptrdiff_t(i)) return true;
+        return false;
+    }
+    std::vector<std::uint32_t> sorted(v);
+    std::sort(sorted.begin(), sorted.end());
+    return std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end();
 }
 
 // Makes sure `v` can take one more push_back without allocating, growing its

@@ -222,6 +222,26 @@ struct CollectionHit {
     std::optional<std::string> key;                     ///< with string ids: the document's key
 };
 
+/// Recommendation examples (Collection::recommend), by document ID.
+struct Recommend {
+    std::vector<std::uint64_t> positive;  ///< at least one: documents like these
+    std::vector<std::uint64_t> negative;  ///< documents unlike these
+};
+
+/// Group-by settings (Collection::search_groups).
+struct GroupBy {
+    std::string field;               ///< a keyword, integer or boolean field
+    std::size_t groups = 10;         ///< how many values (groups)
+    std::size_t per_group = 3;       ///< the best documents kept per group
+    std::size_t max_candidates = 0;  ///< widen the search up to this many documents (0: all of them)
+};
+
+/// One value of the field, and its best documents, best first.
+struct CollectionGroup {
+    Value value;
+    std::vector<CollectionHit> hits;
+};
+
 class Collection {
 public:
     /// An in-memory collection. Throws std::invalid_argument for invalid options
@@ -286,6 +306,22 @@ public:
     /// The k best documents for the query (at least one part; std::invalid_argument
     /// otherwise, or for a part the collection does not have).
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
+    /// Group-by: the `groups` best values of a field, each with its `per_group` best
+    /// documents, as ranked by search() with the same query and options. A group's rank is
+    /// its best document's. The field is a keyword, integer or boolean field (anything
+    /// else throws std::invalid_argument); documents without it belong to no group. The
+    /// search widens (4x at a time, up to `max_candidates`) until the groups are found and
+    /// filled or every match was seen: with an exact search, equal to grouping the full
+    /// ranking. Runs under one read lock: a document's group is read with its rank.
+    std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const;
+    /// Recommendation: documents like the `positive` examples and unlike the `negative`
+    /// ones, by their vectors: a vector search from avg(positive) (with negatives,
+    /// 2 avg(positive) - avg(negative)), each example normalized first for cosine. The
+    /// examples themselves are never returned; options apply as in search() (filters,
+    /// ef, metadata and text in the hits). Throws std::invalid_argument without a positive
+    /// example, for an unknown or expired document, one without a vector, one listed as
+    /// both, or a collection without vectors. Under one read lock.
+    std::vector<CollectionHit> recommend(const Recommend& examples, std::size_t k, const CollectionSearchOptions& options = {}) const;
 
     void save(const std::string& path) const;
     void save(std::ostream& out) const;
@@ -338,6 +374,8 @@ public:
     const SparseIndex* sparse_index() const { return sparse_.get(); }
 
 private:
+    void check_query(const CollectionQuery& query, const CollectionSearchOptions& options) const;  // search's validation
+    std::vector<CollectionHit> search_unlocked(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options) const;
     struct Prepared;  // a checked document (its metadata is checked under the lock)
     /// The runtime settings (expiry, string keys), read once under the lock: an operation
     /// uses one consistent snapshot, as if it ran entirely before or after a change.

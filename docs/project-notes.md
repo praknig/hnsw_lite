@@ -21,6 +21,7 @@ These are deliberate for the current stage:
 - **A plain `save()` does not force data onto the physical disk:** it is atomic (temporary file, then rename), but a power cut right after it returns could lose it. Durable directories (`open_durable()`) flush their log and snapshots to the disk itself.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
 - **User IDs are 64-bit integers only.**
+- **Text analysis is English-first:** stemming and stop words are English; other languages get Unicode-aware tokens (`unicode`) without stemming. No synonyms.
 - **Sparse search is exact without pruning:** very common terms make long posting lists (MaxScore pruning is on the roadmap). A standalone `SparseIndex` can be durable (`open_durable`), as collections are.
 - **One process per durable directory**, enforced with a lock file; a checkpoint holds changes (not searches) while its snapshot is written.
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
@@ -86,6 +87,14 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [ ] LangChain and LlamaIndex integrations; an ann-benchmarks adapter
 - [x] Integer SIMD kernels for SQ8 distances (inner product and cosine)
 - [x] Half precision for the disk index (float16, bfloat16)
+- [x] Group-by (`search_groups`): the best documents rather than many chunks of one
+- [x] Recommendations from example documents (`recommend`)
+- [x] Geo filters (`geo_radius`, `geo_box`) over two numeric fields, across the antimeridian
+- [x] Text analysis for BM25: the Snowball English stemmer, stop words, Unicode-aware tokens (opt-in, saved with a collection)
+- [x] Python: reranking hooks (cross-encoders), Arrow and Parquet import and export, importers from hnswlib files, FAISS and Chroma, an hnswlib-compatible module
+- [x] A profiling review: quadratic bulk removals, insertions and filter compilation made linear or O(n log n); filters evaluated a column at a time; lighter hybrid fusion; a faster checksum (see [Performance](performance.md#profiling-review-complexity-and-hot-paths))
+- [ ] Multi-vector documents (several vectors per document, late interaction)
+- [ ] Read-only, memory-mapped opening shared by several processes
 
 The core capabilities (real deletion, updating vectors, saving and loading, thread safety and parallel building, all done) were planned in [docs/core-capabilities-plan.md](core-capabilities-plan.md), with 119 test scenarios in [docs/core-capabilities-test-plan.md](core-capabilities-test-plan.md). The [hardening and performance plan](hardening-and-performance-plan.md) schedules the remaining work together with edge-case fixes and optimizations.
 
