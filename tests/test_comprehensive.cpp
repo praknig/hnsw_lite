@@ -5728,14 +5728,17 @@ TEST(filter, fl70_geo_filters) {
         return n;
     };
     std::size_t checked = 0;
-    for (const auto& [clat, clon, meters] : std::vector<std::tuple<double, double, double>>{
+    for (const auto& t : std::vector<std::tuple<double, double, double>>{
              {0, 0, 1000e3}, {89.9, 10, 500e3}, {-60, 179.5, 2000e3}, {0, -180, 800e3}, {51.4779, -0.0015, 0}, {12, 34, 2.1e7}, {-33.9, 151.2, 5e6}}) {
+        // Plain variables, not structured bindings: Clang before 16 cannot capture those.
+        const double clat = std::get<0>(t), clon = std::get<1>(t), meters = std::get<2>(t);
         const auto in = [&](double la, double lo) { return haversine(clat, clon, la, lo) <= meters; };
         CHECK(f.count_where(Filter::geo_radius("lat", "lon", clat, clon, meters)) == expect(in));
         ++checked;
     }
-    for (const auto& [s, w, n, e] : std::vector<std::tuple<double, double, double, double>>{
+    for (const auto& t : std::vector<std::tuple<double, double, double, double>>{
              {-10, -20, 10, 20}, {40, 170, 70, -170}, {-90, -180, 90, 180}, {0, 0, 0, 0}, {-30, 179.999, 30, -179.999}}) {
+        const double s = std::get<0>(t), w = std::get<1>(t), n = std::get<2>(t), e = std::get<3>(t);
         const auto in = [&](double la, double lo) { return la >= s && la <= n && (w <= e ? (lo >= w && lo <= e) : (lo >= w || lo <= e)); };
         CHECK(f.count_where(Filter::geo_box("lat", "lon", s, w, n, e)) == expect(in));
         ++checked;

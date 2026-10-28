@@ -861,13 +861,17 @@ def test_empty_and_zero_size_inputs(tmp_path):
     assert empty.search(text="a", k=3, rerank=lambda q, t: [1.0] * len(t)) == []
     with pytest.raises(ValueError):
         empty.recommend([1])                                   # no such document
-    assert empty.to_arrow().num_rows == 0
-    path = str(tmp_path / "empty.parquet")
-    assert empty.write_parquet(path) == 0
-    assert hl.Collection(dim=2, metric="l2", text=True).upsert_parquet(path) == 0
-    pa = pytest.importorskip("pyarrow")
-    zero = pa.table({"id": pa.array([], pa.uint64()), "vector": pa.array([], pa.list_(pa.float32(), 2))})
-    assert empty.upsert_arrow(zero) == 0
+    try:
+        import pyarrow as pa
+    except ImportError:
+        pa = None
+    if pa is not None:  # Arrow and Parquet need pyarrow; everything else here runs without it
+        assert empty.to_arrow().num_rows == 0
+        path = str(tmp_path / "empty.parquet")
+        assert empty.write_parquet(path) == 0
+        assert hl.Collection(dim=2, metric="l2", text=True).upsert_parquet(path) == 0
+        zero = pa.table({"id": pa.array([], pa.uint64()), "vector": pa.array([], pa.list_(pa.float32(), 2))})
+        assert empty.upsert_arrow(zero) == 0
     c = hl.Collection(dim=2, metric="l2", maintenance="manual")
     c.upsert(1, vector=[0, 1])
     assert c.recommend([1], k=0) == [] and c.search_groups(vector=[0, 1], group_by="g", groups=0) == []
