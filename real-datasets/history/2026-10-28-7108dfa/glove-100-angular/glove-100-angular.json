@@ -1,0 +1,867 @@
+{
+ "meta": {
+  "dataset": "glove-100-angular",
+  "n": 1183514,
+  "dim": 100,
+  "metric": "cosine",
+  "queries": 10000,
+  "M": 16,
+  "ef_construction": 200,
+  "threads": 4,
+  "cpu": "AMD EPYC 7763 64-Core Processor",
+  "python": "3.12.15",
+  "date": "2026-10-28",
+  "repeat": 3,
+  "versions": {
+   "hnsw-lite": "0.1.0",
+   "hnswlib": "0.8.0",
+   "faiss": "1.15.1",
+   "usearch": "2.26.6",
+   "numpy": "2.5.4"
+  }
+ },
+ "results": [
+  {
+   "library": "hnsw-lite",
+   "build_s": 261.0078601330001,
+   "memory_bytes": 1324806144,
+   "index_bytes": 1077360295,
+   "threads": 4,
+   "curve": [
+    {
+     "beam": 10,
+     "recall": 0.4777,
+     "qps": 20204.311207642673,
+     "batch_qps": 50165.06589190423,
+     "batch_recall": 0.4777
+    },
+    {
+     "beam": 16,
+     "recall": 0.5629,
+     "qps": 14726.087671335397,
+     "batch_qps": 36484.2828555143,
+     "batch_recall": 0.5629
+    },
+    {
+     "beam": 24,
+     "recall": 0.62947,
+     "qps": 11084.991348926455,
+     "batch_qps": 27457.651535479978,
+     "batch_recall": 0.62947
+    },
+    {
+     "beam": 32,
+     "recall": 0.67289,
+     "qps": 8843.204540502686,
+     "batch_qps": 22365.33857045685,
+     "batch_recall": 0.67289
+    },
+    {
+     "beam": 48,
+     "recall": 0.728,
+     "qps": 6622.473628628186,
+     "batch_qps": 16558.503129732868,
+     "batch_recall": 0.728
+    },
+    {
+     "beam": 64,
+     "recall": 0.76302,
+     "qps": 5217.208702043741,
+     "batch_qps": 13166.026941265118,
+     "batch_recall": 0.76302
+    },
+    {
+     "beam": 96,
+     "recall": 0.80526,
+     "qps": 3727.8928419467015,
+     "batch_qps": 9300.06277663314,
+     "batch_recall": 0.80526
+    },
+    {
+     "beam": 128,
+     "recall": 0.83112,
+     "qps": 2917.591235404015,
+     "batch_qps": 7244.110853717595,
+     "batch_recall": 0.83112
+    },
+    {
+     "beam": 192,
+     "recall": 0.86331,
+     "qps": 2044.2236050604715,
+     "batch_qps": 5117.523599378878,
+     "batch_recall": 0.86331
+    },
+    {
+     "beam": 256,
+     "recall": 0.88434,
+     "qps": 1568.976153284709,
+     "batch_qps": 3918.2873890554356,
+     "batch_recall": 0.88434
+    },
+    {
+     "beam": 384,
+     "recall": 0.90927,
+     "qps": 1063.0973538716091,
+     "batch_qps": 2752.264529470823,
+     "batch_recall": 0.90927
+    },
+    {
+     "beam": 512,
+     "recall": 0.92573,
+     "qps": 834.322806948519,
+     "batch_qps": 2132.8482387847675,
+     "batch_recall": 0.92573
+    }
+   ],
+   "filtered": [
+    {
+     "selectivity": 1,
+     "beam": 16,
+     "recall": 1.0,
+     "qps": 234.40686037894773
+    },
+    {
+     "selectivity": 1,
+     "beam": 24,
+     "recall": 1.0,
+     "qps": 233.8605062468176
+    },
+    {
+     "selectivity": 1,
+     "beam": 32,
+     "recall": 1.0,
+     "qps": 232.61783765709512
+    },
+    {
+     "selectivity": 1,
+     "beam": 48,
+     "recall": 1.0,
+     "qps": 234.0225166567289
+    },
+    {
+     "selectivity": 1,
+     "beam": 64,
+     "recall": 1.0,
+     "qps": 233.55856428924486
+    },
+    {
+     "selectivity": 1,
+     "beam": 96,
+     "recall": 1.0,
+     "qps": 233.98819265631442
+    },
+    {
+     "selectivity": 10,
+     "beam": 16,
+     "recall": 0.823,
+     "qps": 522.7584566946963
+    },
+    {
+     "selectivity": 10,
+     "beam": 24,
+     "recall": 0.8645,
+     "qps": 378.43261728424653
+    },
+    {
+     "selectivity": 10,
+     "beam": 32,
+     "recall": 0.885,
+     "qps": 303.1602416438066
+    },
+    {
+     "selectivity": 10,
+     "beam": 48,
+     "recall": 0.9105,
+     "qps": 211.72215393895917
+    },
+    {
+     "selectivity": 10,
+     "beam": 64,
+     "recall": 0.929,
+     "qps": 154.5475168697034
+    },
+    {
+     "selectivity": 10,
+     "beam": 96,
+     "recall": 0.9495,
+     "qps": 106.231271201155
+    },
+    {
+     "selectivity": 30,
+     "beam": 16,
+     "recall": 0.8135,
+     "qps": 2284.753174913371
+    },
+    {
+     "selectivity": 30,
+     "beam": 24,
+     "recall": 0.8465,
+     "qps": 1637.985083751893
+    },
+    {
+     "selectivity": 30,
+     "beam": 32,
+     "recall": 0.8645,
+     "qps": 1262.2088332707374
+    },
+    {
+     "selectivity": 30,
+     "beam": 48,
+     "recall": 0.8985,
+     "qps": 876.998969512781
+    },
+    {
+     "selectivity": 30,
+     "beam": 64,
+     "recall": 0.92,
+     "qps": 674.5341246594012
+    },
+    {
+     "selectivity": 30,
+     "beam": 96,
+     "recall": 0.9365,
+     "qps": 463.6806934500096
+    }
+   ]
+  },
+  {
+   "library": "hnswlib",
+   "build_s": 224.41632049200007,
+   "memory_bytes": 770981888,
+   "index_bytes": 649187120,
+   "threads": 4,
+   "curve": [
+    {
+     "beam": 10,
+     "recall": 0.47608,
+     "qps": 23852.03375594594,
+     "batch_qps": 53799.5626386666,
+     "batch_recall": 0.47608
+    },
+    {
+     "beam": 16,
+     "recall": 0.55884,
+     "qps": 17697.409170623687,
+     "batch_qps": 39533.266148418435,
+     "batch_recall": 0.55884
+    },
+    {
+     "beam": 24,
+     "recall": 0.626,
+     "qps": 13212.373891810475,
+     "batch_qps": 28725.008305630032,
+     "batch_recall": 0.626
+    },
+    {
+     "beam": 32,
+     "recall": 0.67089,
+     "qps": 10809.020439719738,
+     "batch_qps": 24584.85020117348,
+     "batch_recall": 0.67089
+    },
+    {
+     "beam": 48,
+     "recall": 0.72783,
+     "qps": 7978.4620459662465,
+     "batch_qps": 18110.084925692125,
+     "batch_recall": 0.72783
+    },
+    {
+     "beam": 64,
+     "recall": 0.76258,
+     "qps": 6536.811609748758,
+     "batch_qps": 14614.415689736308,
+     "batch_recall": 0.76258
+    },
+    {
+     "beam": 96,
+     "recall": 0.80581,
+     "qps": 4654.88680839766,
+     "batch_qps": 10444.661460140733,
+     "batch_recall": 0.80581
+    },
+    {
+     "beam": 128,
+     "recall": 0.83167,
+     "qps": 3677.2611750531214,
+     "batch_qps": 8266.71020731898,
+     "batch_recall": 0.83167
+    },
+    {
+     "beam": 192,
+     "recall": 0.86353,
+     "qps": 2592.3292178966876,
+     "batch_qps": 5893.093638175903,
+     "batch_recall": 0.86353
+    },
+    {
+     "beam": 256,
+     "recall": 0.88392,
+     "qps": 2023.0362383896822,
+     "batch_qps": 4592.542204240679,
+     "batch_recall": 0.88392
+    },
+    {
+     "beam": 384,
+     "recall": 0.90909,
+     "qps": 1410.6775819744892,
+     "batch_qps": 3245.2983131383908,
+     "batch_recall": 0.90909
+    },
+    {
+     "beam": 512,
+     "recall": 0.92528,
+     "qps": 1090.7466318930126,
+     "batch_qps": 2468.9816953376917,
+     "batch_recall": 0.92528
+    }
+   ],
+   "filtered": [
+    {
+     "selectivity": 1,
+     "beam": 16,
+     "recall": 0.848,
+     "qps": 231.42650161610698
+    },
+    {
+     "selectivity": 1,
+     "beam": 24,
+     "recall": 0.887,
+     "qps": 159.08397563277978
+    },
+    {
+     "selectivity": 1,
+     "beam": 32,
+     "recall": 0.9105,
+     "qps": 121.42494005530573
+    },
+    {
+     "selectivity": 1,
+     "beam": 48,
+     "recall": 0.9415,
+     "qps": 82.89945928997801
+    },
+    {
+     "selectivity": 1,
+     "beam": 64,
+     "recall": 0.958,
+     "qps": 63.02659579524133
+    },
+    {
+     "selectivity": 1,
+     "beam": 96,
+     "recall": 0.977,
+     "qps": 42.100860037231385
+    },
+    {
+     "selectivity": 10,
+     "beam": 16,
+     "recall": 0.7445,
+     "qps": 1750.616243182374
+    },
+    {
+     "selectivity": 10,
+     "beam": 24,
+     "recall": 0.7945,
+     "qps": 1252.9722930412363
+    },
+    {
+     "selectivity": 10,
+     "beam": 32,
+     "recall": 0.819,
+     "qps": 962.889645692401
+    },
+    {
+     "selectivity": 10,
+     "beam": 48,
+     "recall": 0.8535,
+     "qps": 691.9014854610618
+    },
+    {
+     "selectivity": 10,
+     "beam": 64,
+     "recall": 0.879,
+     "qps": 529.5868705796762
+    },
+    {
+     "selectivity": 10,
+     "beam": 96,
+     "recall": 0.907,
+     "qps": 374.1189899962567
+    },
+    {
+     "selectivity": 30,
+     "beam": 16,
+     "recall": 0.6805,
+     "qps": 4285.691020533823
+    },
+    {
+     "selectivity": 30,
+     "beam": 24,
+     "recall": 0.731,
+     "qps": 3035.650927331525
+    },
+    {
+     "selectivity": 30,
+     "beam": 32,
+     "recall": 0.765,
+     "qps": 2412.8833299505077
+    },
+    {
+     "selectivity": 30,
+     "beam": 48,
+     "recall": 0.812,
+     "qps": 1746.9504076327194
+    },
+    {
+     "selectivity": 30,
+     "beam": 64,
+     "recall": 0.8375,
+     "qps": 1364.8762606585851
+    },
+    {
+     "selectivity": 30,
+     "beam": 96,
+     "recall": 0.8635,
+     "qps": 968.2122180209329
+    }
+   ]
+  },
+  {
+   "library": "faiss-hnsw",
+   "build_s": 186.38966972399976,
+   "memory_bytes": 685096960,
+   "index_bytes": 644153874,
+   "threads": 4,
+   "curve": [
+    {
+     "beam": 10,
+     "recall": 0.47595,
+     "qps": 18340.143202728854,
+     "batch_qps": 71065.6336537251,
+     "batch_recall": 0.47595
+    },
+    {
+     "beam": 16,
+     "recall": 0.56315,
+     "qps": 14789.66180691419,
+     "batch_qps": 51803.28692269276,
+     "batch_recall": 0.56315
+    },
+    {
+     "beam": 24,
+     "recall": 0.63113,
+     "qps": 11710.328201841114,
+     "batch_qps": 37662.54396015736,
+     "batch_recall": 0.63113
+    },
+    {
+     "beam": 32,
+     "recall": 0.67505,
+     "qps": 9823.435756342153,
+     "batch_qps": 30426.47549298898,
+     "batch_recall": 0.67505
+    },
+    {
+     "beam": 48,
+     "recall": 0.73109,
+     "qps": 7618.165229459177,
+     "batch_qps": 22533.951143650836,
+     "batch_recall": 0.73109
+    },
+    {
+     "beam": 64,
+     "recall": 0.76409,
+     "qps": 6270.863004444525,
+     "batch_qps": 17900.56806898136,
+     "batch_recall": 0.76409
+    },
+    {
+     "beam": 96,
+     "recall": 0.80627,
+     "qps": 4552.074488751942,
+     "batch_qps": 12990.988735707528,
+     "batch_recall": 0.80627
+    },
+    {
+     "beam": 128,
+     "recall": 0.8323,
+     "qps": 3712.417213017517,
+     "batch_qps": 10050.96701645408,
+     "batch_recall": 0.8323
+    },
+    {
+     "beam": 192,
+     "recall": 0.86271,
+     "qps": 2643.6619874514263,
+     "batch_qps": 7171.10211128672,
+     "batch_recall": 0.86271
+    },
+    {
+     "beam": 256,
+     "recall": 0.88246,
+     "qps": 2047.2921438865303,
+     "batch_qps": 5482.758858376469,
+     "batch_recall": 0.88246
+    },
+    {
+     "beam": 384,
+     "recall": 0.90682,
+     "qps": 1410.1093578697753,
+     "batch_qps": 3819.7277633347694,
+     "batch_recall": 0.90682
+    },
+    {
+     "beam": 512,
+     "recall": 0.92125,
+     "qps": 1060.0650568540084,
+     "batch_qps": 2895.6130379229808,
+     "batch_recall": 0.92125
+    }
+   ],
+   "filtered": [
+    {
+     "selectivity": 1,
+     "beam": 16,
+     "recall": 0.1285,
+     "qps": 11249.225350077044
+    },
+    {
+     "selectivity": 1,
+     "beam": 24,
+     "recall": 0.1705,
+     "qps": 9356.127229322248
+    },
+    {
+     "selectivity": 1,
+     "beam": 32,
+     "recall": 0.211,
+     "qps": 7897.8149115542155
+    },
+    {
+     "selectivity": 1,
+     "beam": 48,
+     "recall": 0.27,
+     "qps": 6332.358656678803
+    },
+    {
+     "selectivity": 1,
+     "beam": 64,
+     "recall": 0.314,
+     "qps": 5271.220087103587
+    },
+    {
+     "selectivity": 1,
+     "beam": 96,
+     "recall": 0.385,
+     "qps": 4025.1714093781716
+    },
+    {
+     "selectivity": 10,
+     "beam": 16,
+     "recall": 0.3565,
+     "qps": 9818.026800395533
+    },
+    {
+     "selectivity": 10,
+     "beam": 24,
+     "recall": 0.4405,
+     "qps": 7571.919129130904
+    },
+    {
+     "selectivity": 10,
+     "beam": 32,
+     "recall": 0.507,
+     "qps": 6576.295650343821
+    },
+    {
+     "selectivity": 10,
+     "beam": 48,
+     "recall": 0.5795,
+     "qps": 5199.737652401811
+    },
+    {
+     "selectivity": 10,
+     "beam": 64,
+     "recall": 0.6265,
+     "qps": 4458.916999073036
+    },
+    {
+     "selectivity": 10,
+     "beam": 96,
+     "recall": 0.68,
+     "qps": 3288.9848264013767
+    },
+    {
+     "selectivity": 30,
+     "beam": 16,
+     "recall": 0.472,
+     "qps": 7824.537562038197
+    },
+    {
+     "selectivity": 30,
+     "beam": 24,
+     "recall": 0.5455,
+     "qps": 6218.760445573657
+    },
+    {
+     "selectivity": 30,
+     "beam": 32,
+     "recall": 0.613,
+     "qps": 5080.348118672321
+    },
+    {
+     "selectivity": 30,
+     "beam": 48,
+     "recall": 0.68,
+     "qps": 3926.5974439017523
+    },
+    {
+     "selectivity": 30,
+     "beam": 64,
+     "recall": 0.708,
+     "qps": 3381.0834736141132
+    },
+    {
+     "selectivity": 30,
+     "beam": 96,
+     "recall": 0.7435,
+     "qps": 2484.000429041799
+    }
+   ]
+  },
+  {
+   "library": "usearch",
+   "build_s": 360.7788092120004,
+   "memory_bytes": 811675648,
+   "index_bytes": 649237320,
+   "threads": 4,
+   "curve": [
+    {
+     "beam": 10,
+     "recall": 0.47553,
+     "qps": 7070.140160445737,
+     "batch_qps": 29038.813417416102,
+     "batch_recall": 0.47553
+    },
+    {
+     "beam": 16,
+     "recall": 0.55755,
+     "qps": 5602.820874636002,
+     "batch_qps": 20537.75296577379,
+     "batch_recall": 0.55755
+    },
+    {
+     "beam": 24,
+     "recall": 0.62566,
+     "qps": 4508.023715555396,
+     "batch_qps": 16100.618069074364,
+     "batch_recall": 0.62566
+    },
+    {
+     "beam": 32,
+     "recall": 0.6702,
+     "qps": 3757.171569801883,
+     "batch_qps": 13252.405522316738,
+     "batch_recall": 0.6702
+    },
+    {
+     "beam": 48,
+     "recall": 0.72645,
+     "qps": 2866.2544252737475,
+     "batch_qps": 9846.26027544021,
+     "batch_recall": 0.72645
+    },
+    {
+     "beam": 64,
+     "recall": 0.76254,
+     "qps": 2328.3142959468073,
+     "batch_qps": 7936.155671973129,
+     "batch_recall": 0.76254
+    },
+    {
+     "beam": 96,
+     "recall": 0.80542,
+     "qps": 1703.742046948544,
+     "batch_qps": 5668.91192143272,
+     "batch_recall": 0.80542
+    },
+    {
+     "beam": 128,
+     "recall": 0.83109,
+     "qps": 1359.564670948948,
+     "batch_qps": 4550.127644434561,
+     "batch_recall": 0.83109
+    },
+    {
+     "beam": 192,
+     "recall": 0.8642,
+     "qps": 975.5440160422442,
+     "batch_qps": 3232.4296342420225,
+     "batch_recall": 0.8642
+    },
+    {
+     "beam": 256,
+     "recall": 0.88497,
+     "qps": 747.4075275260831,
+     "batch_qps": 2524.143166880395,
+     "batch_recall": 0.88497
+    },
+    {
+     "beam": 384,
+     "recall": 0.90988,
+     "qps": 528.9322728899758,
+     "batch_qps": 1759.0234125760026,
+     "batch_recall": 0.90988
+    },
+    {
+     "beam": 512,
+     "recall": 0.92487,
+     "qps": 398.2244584457526,
+     "batch_qps": 1341.8230996106765,
+     "batch_recall": 0.92487
+    }
+   ],
+   "filtered": []
+  },
+  {
+   "library": "faiss-ivfpq",
+   "build_s": 37.636518766000336,
+   "memory_bytes": 88858624,
+   "index_bytes": 16079956,
+   "threads": 4,
+   "curve": [
+    {
+     "beam": 1,
+     "recall": 0.09645,
+     "qps": 13803.82309745846,
+     "batch_qps": 96637.30120037889,
+     "batch_recall": 0.09645
+    },
+    {
+     "beam": 2,
+     "recall": 0.10758,
+     "qps": 13275.043801901395,
+     "batch_qps": 84367.18712352212,
+     "batch_recall": 0.10758
+    },
+    {
+     "beam": 4,
+     "recall": 0.11306,
+     "qps": 12351.009875936623,
+     "batch_qps": 73158.1385151292,
+     "batch_recall": 0.11306
+    },
+    {
+     "beam": 8,
+     "recall": 0.11576,
+     "qps": 11064.92183664379,
+     "batch_qps": 57398.58028156999,
+     "batch_recall": 0.11576
+    },
+    {
+     "beam": 16,
+     "recall": 0.11683,
+     "qps": 9181.779080050175,
+     "batch_qps": 40661.17328522632,
+     "batch_recall": 0.11683
+    },
+    {
+     "beam": 32,
+     "recall": 0.11716,
+     "qps": 6886.29547511983,
+     "batch_qps": 25859.378854437684,
+     "batch_recall": 0.11716
+    },
+    {
+     "beam": 64,
+     "recall": 0.11725,
+     "qps": 4653.488411573151,
+     "batch_qps": 15034.38094558695,
+     "batch_recall": 0.11725
+    },
+    {
+     "beam": 128,
+     "recall": 0.11723,
+     "qps": 2923.3198006264474,
+     "batch_qps": 8505.49049994973,
+     "batch_recall": 0.11723
+    }
+   ],
+   "filtered": [
+    {
+     "selectivity": 1,
+     "beam": 16,
+     "recall": 0.2725,
+     "qps": 8028.077075564193
+    },
+    {
+     "selectivity": 1,
+     "beam": 32,
+     "recall": 0.284,
+     "qps": 6226.326339746392
+    },
+    {
+     "selectivity": 1,
+     "beam": 64,
+     "recall": 0.286,
+     "qps": 4436.339547834213
+    },
+    {
+     "selectivity": 1,
+     "beam": 128,
+     "recall": 0.293,
+     "qps": 2869.813987821987
+    },
+    {
+     "selectivity": 10,
+     "beam": 16,
+     "recall": 0.187,
+     "qps": 6329.179419116575
+    },
+    {
+     "selectivity": 10,
+     "beam": 32,
+     "recall": 0.1845,
+     "qps": 4429.55905885977
+    },
+    {
+     "selectivity": 10,
+     "beam": 64,
+     "recall": 0.184,
+     "qps": 2884.5955530214083
+    },
+    {
+     "selectivity": 10,
+     "beam": 128,
+     "recall": 0.184,
+     "qps": 1567.0495120137637
+    },
+    {
+     "selectivity": 30,
+     "beam": 16,
+     "recall": 0.1475,
+     "qps": 3532.4938655985165
+    },
+    {
+     "selectivity": 30,
+     "beam": 32,
+     "recall": 0.149,
+     "qps": 2123.9041955150133
+    },
+    {
+     "selectivity": 30,
+     "beam": 64,
+     "recall": 0.1495,
+     "qps": 1364.9001991800314
+    },
+    {
+     "selectivity": 30,
+     "beam": 128,
+     "recall": 0.1495,
+     "qps": 603.0381932548931
+    }
+   ]
+  }
+ ]
+}
