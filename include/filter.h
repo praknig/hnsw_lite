@@ -400,6 +400,11 @@ struct ScoreModifiers {
 struct SearchOptions {
     /// IVF (FlatIndex with IvfParams): lists to probe; 0: the index's default.
     std::size_t probes = 0;
+    /// HnswIndex and SparseIndex: search only among these IDs, scored exactly (unknown or
+    /// removed IDs are ignored; a filter and predicate still apply). Costs work in
+    /// proportion to the list, not the index: for a known, small set of candidates.
+    /// FlatIndex and DiskIndex refuse it (std::invalid_argument).
+    std::optional<std::vector<std::uint64_t>> among;
     std::optional<Filter> filter;
     std::function<bool(std::uint64_t)> predicate;
     Strategy strategy = Strategy::Auto;
@@ -440,6 +445,9 @@ struct OperationOptions {
     /// threads. It must not use the index (other threads may be changing it).
     /// If it throws, the operation is undone and the exception passed on.
     std::function<void(std::size_t done, std::size_t total)> progress;
+    /// compact(): threads deciding links in parallel (0: one per hardware thread). The
+    /// result is the same, byte for byte, whatever the number.
+    std::size_t threads = 0;
 };
 
 namespace detail {
@@ -575,6 +583,7 @@ struct Eligibility {
     const std::function<bool(std::uint64_t)>* predicate = nullptr;
     NodeId exclude = kEmpty;  // a node to leave out (the old version during an update)
 
+    const std::vector<NodeId>* rows = nullptr;  ///< SearchOptions::among, as rows: an exact search of these only
     bool operator()(NodeId n) const {
         if (n == exclude || ids->is_deleted(n)) return false;
         if (filter && !filter->matches(n)) return false;

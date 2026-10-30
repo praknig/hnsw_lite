@@ -28,7 +28,7 @@ A C++20 library with no dependencies, tested on Linux, Windows and macOS (x86 an
 | **Durability** | `open_durable()`: a write-ahead log plus snapshots, crash recovery to the last acknowledged change, three flush modes (`Buffered`, `Grouped`, `Synced`), `checkpoint()`, one writer per directory |
 | **Health and maintenance** | `health()` on every index (reachability, degrees, estimated recall, codec and IVF drift, churn); incremental `upkeep()` with budgets; automatic `compact()`; `rebuild()` while searches and changes continue, retraining codecs and lists |
 | **Concurrency** | Every index thread-safe; searches run in parallel; changes serialized under one lock per index; writers never starved |
-| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 955 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
+| **Robustness** | Invalid input rejected with clear exceptions; every change all-or-nothing, including under out-of-memory; 961 tests, sanitizers, coverage gates, emulated older CPUs, real process kills |
 
 ## Compared with similar libraries
 

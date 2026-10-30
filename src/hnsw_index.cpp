@@ -15,6 +15,8 @@
 #include "kmeans.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -66,10 +68,12 @@ void HnswIndex::prepare_checked(std::span<const float> vector) {
     if (codec_ && codec_->trained()) codec_->check(scratch_.values());  // before any change: encoding must not fail
 }
 
-int HnswIndex::random_level() {
+int HnswIndex::random_level() { return random_level(rng_); }
+
+int HnswIndex::random_level(SplitMix64& rng) const {
     // Uniform in [0, 1) from the top 53 bits. Done by hand instead of with
     // std::uniform_real_distribution so levels are identical on every compiler.
-    const double u = static_cast<double>(rng_() >> 11) * 0x1.0p-53;
+    const double u = static_cast<double>(rng() >> 11) * 0x1.0p-53;
     const double level = -std::log(1.0 - u) * level_factor_;  // 1 - u is in (0, 1]
     return static_cast<int>(std::min(level, static_cast<double>(kMaxLevel)));
 }
@@ -135,7 +139,79 @@ HnswIndex::NodeDistance HnswIndex::node_distance(const float* query) const {
     return d;
 }
 
+double HnswIndex::norm_of(NodeId a) const { return std::sqrt(std::max(0.0, -double(distance_between(a, a)))); }  // inner product: -dot
+
+namespace testing {
+namespace {
+std::atomic<bool> g_insert_planning{true};
+}  // namespace
+void set_insert_planning(bool on) { g_insert_planning.store(on, std::memory_order_relaxed); }
+bool insert_planning() { return g_insert_planning.load(std::memory_order_relaxed); }
+}  // namespace testing
+
+namespace {
+// An update's repair, decided ahead: distances recorded while simulating it under the shared
+// lock (record) and looked up during the real repair under the write lock (lookup). Per
+// thread and per index, so nothing else (another index, another thread) sees them.
+struct MemoState {
+    const void* owner = nullptr;
+    std::vector<std::pair<std::uint64_t, float>>* record = nullptr;
+    const void* lookup = nullptr;  // a HnswIndex::DistanceMemo (private: named only inside the class)
+};
+thread_local MemoState t_memo;
+struct MemoScope {
+    MemoState saved;
+    explicit MemoScope(const MemoState& now) : saved(t_memo) { t_memo = now; }
+    ~MemoScope() { t_memo = saved; }
+    MemoScope(const MemoScope&) = delete;
+    MemoScope& operator=(const MemoScope&) = delete;
+};
+std::uint64_t memo_key(NodeId a, NodeId b) { return (std::uint64_t(a) << 32 | b) + 1; }  // ordered; never 0
+std::uint64_t memo_hash(std::uint64_t k) {
+    k ^= k >> 33;
+    k *= 0xFF51AFD7ED558CCDull;
+    return k ^ (k >> 33);
+}
+}  // namespace
+
+void HnswIndex::DistanceMemo::build(const std::vector<std::pair<std::uint64_t, float>>& recorded) {
+    std::size_t size = 16;
+    while (size < 2 * recorded.size()) size *= 2;
+    keys.assign(size, 0);
+    values.assign(size, 0.0f);
+    for (const auto& [key, value] : recorded)
+        for (std::size_t i = memo_hash(key) & (size - 1);; i = (i + 1) & (size - 1)) {
+            if (keys[i] == key) break;  // computed twice: the same float
+            if (keys[i] == 0) {
+                keys[i] = key;
+                values[i] = value;
+                break;
+            }
+        }
+}
+
+const float* HnswIndex::DistanceMemo::find(std::uint64_t key) const {
+    if (keys.empty()) return nullptr;
+    for (std::size_t i = memo_hash(key) & (keys.size() - 1);; i = (i + 1) & (keys.size() - 1)) {
+        if (keys[i] == key) return &values[i];
+        if (keys[i] == 0) return nullptr;
+    }
+}
+
 float HnswIndex::distance_between(NodeId a, NodeId b) const {
+    if (t_memo.owner == this) {
+        if (t_memo.lookup)
+            if (const float* known = static_cast<const DistanceMemo*>(t_memo.lookup)->find(memo_key(a, b))) return *known;
+        if (t_memo.record) {
+            const float d = distance_between_now(a, b);
+            t_memo.record->push_back({memo_key(a, b), d});
+            return d;
+        }
+    }
+    return distance_between_now(a, b);
+}
+
+float HnswIndex::distance_between_now(NodeId a, NodeId b) const {
     // Compares two stored vectors: never through the code table of a search this
     // may run within, which belongs to another query.
     const CodeQueryScope full_precision(nullptr);
@@ -205,7 +281,8 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
                                                const std::vector<Candidate>& entries,
                                                std::size_t ef, int level, VisitedList& visited,
                                                NodeId exclude, const Eligibility& eligible,
-                                               SearchStats* stats, LinkLocks* locks, std::size_t budget, bool* over_budget) const {
+                                               SearchStats* stats, LinkLocks* locks, std::size_t budget, bool* over_budget,
+                                               std::size_t sorted) const {
     const NodeDistance dist = node_distance(query);
     visited.reset(storage_.size());
     if (exclude != kEmpty) visited.visit(exclude);  // never step onto the excluded node
@@ -213,7 +290,21 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
 
     // candidates: nodes to expand, closest on top (min-heap).
     // results:    best `ef` eligible nodes found, worst on top (TopK).
-    std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>> candidates;
+    // The heap's storage comes from a buffer this thread keeps between searches, so a search
+    // does not grow it from nothing (about nine reallocations each). The heap is the same.
+    thread_local std::vector<Candidate> storage;
+    storage.clear();
+    using Heap = std::priority_queue<Candidate, std::vector<Candidate>, std::greater<>>;
+    Heap candidates(std::greater<>{}, std::move(storage));
+    struct GiveBack {  // the storage returns to the buffer however the search ends
+        Heap& heap;
+        ~GiveBack() {
+            struct Access : Heap {
+                static std::vector<Candidate>& of(Heap& q) { return q.*&Access::c; }
+            };
+            storage = std::move(Access::of(heap));
+        }
+    } give_back{candidates};
     TopK results(ef);
 
     for (const Candidate& e : entries) {
@@ -241,7 +332,9 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
         }
         for (NodeId neighbor : links) {
             if (neighbor == kEmpty) break;
-            if (graph.level(neighbor) < level) continue;  // stale link to a reused slot
+            // A stale link to a reused slot whose node now stops lower; at level 0, where most
+            // of every search is, none can: no read of the node's level there.
+            if (level > 0 && graph.level(neighbor) < level) continue;
             if (!visited.visit(neighbor)) continue;
             const float d = dist(neighbor);
             ++computed;
@@ -258,7 +351,7 @@ std::vector<Candidate> HnswIndex::search_level(const float* query,
         stats->nodes_visited += expanded;
         stats->distance_computations += computed;
     }
-    return results.take_sorted();
+    return results.take_best(sorted);
 }
 
 std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candidate& entry, std::size_t ef,
@@ -316,7 +409,7 @@ std::vector<Candidate> HnswIndex::acorn_level0(const float* query, const Candida
 }
 
 std::vector<NodeId> HnswIndex::select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
-                                                std::size_t max) const {
+                                                std::size_t max, const float* base_vector) const {
     // Equal distances (identical vectors) in an order that differs for every base
     // node, a hash of the pair, not by node number: otherwise every copy would
     // prefer the same lowest-numbered copies (hubs) and leave the rest unreachable.
@@ -354,20 +447,53 @@ std::vector<NodeId> HnswIndex::select_neighbors(NodeId base, const std::vector<C
         if (c.distance == 0) copies.push_back(c.id);
     const std::size_t copy_room = std::min(copies.size(), std::max<std::size_t>(1, max / 2));
     distinct.reserve(max);
+    // Inner product is not a distance: one vector of large norm is "nearer" to almost every
+    // candidate than the base node is, so the usual rule kept a link or two per node and
+    // left most of the graph unreachable (mean degree 1.7, 88% unreachable; filtered graph
+    // searches found half the right answers). For inner product the rule compares angles
+    // instead: c is passed over if a kept neighbor k is closer to it in angle than the base
+    // node is, cos(c, k) > cos(c, base), which is dot(c, k) |base| > dot(c, base) |k| (the
+    // norm of c cancels). The dot products are the distances already computed (negated).
+    const bool angular = metric_ == Metric::InnerProduct;
+    // Not stored yet (an insertion decided ahead): the same kernel on the prepared vector,
+    // which is what will be stored, gives the same number norm_of would.
+    const double base_norm = !angular ? 0.0
+                             : base_vector ? std::sqrt(std::max(0.0, -double(index_distance(distance_(base_vector, base_vector, stride_), false))))
+                                           : norm_of(base);
+    std::vector<double> kept_norms;
+    if (angular) kept_norms.reserve(max);
     for (const Candidate& c : order) {
         if (c.distance == 0) continue;
         if (distinct.size() + copy_room >= max) break;
         // Skip c if an already-kept neighbor is closer to it than the base node is
         // (c is then reachable through that neighbor), or is an exact copy of it.
         bool diverse = true;
-        for (NodeId k : distinct) {
-            if (same_vector(c.id, k) || distance_between(c.id, k) < c.distance) {
+        std::optional<float> self;  // c's distance to itself: exactly what a copy of c is at
+        for (std::size_t i = 0; i < distinct.size(); ++i) {
+            const NodeId k = distinct[i];
+            const float between = distance_between(c.id, k);
+            const bool closer = angular ? -between * base_norm > -c.distance * kept_norms[i] : between < c.distance;
+            // An exact copy of k gives the kernel the very inputs of c with itself, so the
+            // same float: only then can the vectors be the same, and only then are they
+            // compared (comparing every pair was 18% of an update's work). The same decision.
+            if (!closer && !self) self = metric_ == Metric::L2 ? 0.0f : distance_between(c.id, c.id);
+            if (closer || (between == *self && same_vector(c.id, k))) {
                 diverse = false;
                 break;
             }
         }
-        if (diverse) distinct.push_back(c.id);
+        if (diverse) {
+            distinct.push_back(c.id);
+            if (angular) kept_norms.push_back(norm_of(c.id));
+        }
     }
+    // Inner product: backfill. Angles leave fewer links than the list holds; the nearest of
+    // the candidates passed over fill the rest, so no node ends with only a link or two.
+    if (angular)
+        for (const Candidate& c : order) {
+            if (distinct.size() + copy_room >= max) break;
+            if (c.distance != 0 && std::find(distinct.begin(), distinct.end(), c.id) == distinct.end()) distinct.push_back(c.id);
+        }
     // Nearest first, as callers expect: the copies (distance 0), then the others.
     std::vector<NodeId> kept;
     kept.reserve(max);
@@ -419,12 +545,14 @@ void HnswIndex::link_back(NodeId node, const std::vector<NodeId>& neighbors, int
 }
 
 void HnswIndex::add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
     const auto guard = lock_.write("add");
     const ChangeLog::Scope logged(log_, log_.begin(walop::kAdd, [&] { return walop::encode_add(id, vector, metadata); }));
-    add_unlocked(id, vector, metadata);
+    add_unlocked(id, vector, metadata, false, plan ? &*plan : nullptr);
 }
 
-void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared) {
+void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared,
+                             const InsertPlan* plan) {
     const RngGuard rng_guard(rng_);  // a failed change draws no level
     note_change(id);  // for a running rebuild(); harmless if nothing changes
     // 1. Validate everything before changing anything (or drawing a random level).
@@ -439,7 +567,9 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     const NodeId slot = free_slots_.empty() ? static_cast<NodeId>(storage_.size()) : free_slots_.back();
     reserve_code(slot);  // may throw: before any change
     const auto undo = metadata_.write(slot, metadata);
-    const int level = random_level();
+    const bool planned = !prepared && plan_holds(plan, kEmpty, slot);
+    const int level = planned ? plan->level : random_level();
+    if (planned) rng_ = plan->rng;  // the same draw: the generator is as the plan copied it
     NodeId node;
     try {
         if (!free_slots_.empty()) {
@@ -463,7 +593,7 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
     }
 
     try {
-        link_new_node(node, level);
+        link_new_node(node, level, kEmpty, planned ? &plan->chosen : nullptr);
     } catch (...) {
         // Out of memory while linking: the node may be half-linked. Remove it
         // like any other vector: free its ID and put its slot back on the free
@@ -660,8 +790,8 @@ void HnswIndex::roll_back_batch(std::span<const std::uint64_t> ids, const std::v
     }
 }
 
-void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore) {
-    link_levels(node, level, ignore, scratch_.data(), entry_, max_level_, nullptr);
+void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore, const std::vector<std::vector<NodeId>>* decided) {
+    link_levels(node, level, ignore, scratch_.data(), entry_, max_level_, nullptr, decided);
     // 6. A node higher than all others becomes the new entry point.
     if (level > max_level_) {
         max_level_ = level;
@@ -669,8 +799,8 @@ void HnswIndex::link_new_node(NodeId node, int level, NodeId ignore) {
     }
 }
 
-void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry, int top,
-                            LinkLocks* locks) {
+std::vector<std::vector<NodeId>> HnswIndex::decide_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry,
+                                                          int top, LinkLocks* locks, const float* base_vector) const {
     // `ignore` (the old version of an updated vector) is traversed but never
     // chosen as a neighbor, since it is about to be removed.
     const Eligibility eligible{&storage_.ids(), nullptr, nullptr, ignore};
@@ -685,9 +815,9 @@ void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* 
     //    sees a half-linked node or writes a link that would later be overwritten.
     //    (Deferring changes nothing else: each level's search starts from the
     //    previous level's results, never from links this node created.)
-    auto visited = visited_pool_.acquire(storage_.size());
+    auto visited = visited_pool_.acquire(std::max<std::size_t>(storage_.size(), std::size_t(node) + 1));  // the node's own slot too: a plan's or a batch's may lie beyond the stored ones, and the search marks it
     std::vector<Candidate> entries{current};
-    std::vector<std::vector<NodeId>> chosen;  // parallel linking: per level, top-down
+    std::vector<std::vector<NodeId>> chosen;  // per level, top-down
     for (int l = std::min(level, top); l >= 0; --l) {
         // Removed nodes are traversed but not chosen as neighbors (as in hnswlib),
         // so new nodes do not waste link slots on them.
@@ -707,22 +837,124 @@ void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* 
             // have no links at all and could never be found.
             found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only(), nullptr, locks);
         }
-        if (locks) {
-            chosen.push_back(select_neighbors(node, found, params_.M));
-        } else {
-            connect(node, select_neighbors(node, found, params_.M), l);
-        }
+        chosen.push_back(select_neighbors(node, found, params_.M, base_vector));
         if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
     }
-    if (locks) {
-        const int highest = std::min(level, top);
-        for (int l = highest; l >= 0; --l) set_own_links(node, chosen[std::size_t(highest - l)], l, locks);
-        for (int l = highest; l >= 0; --l) link_back(node, chosen[std::size_t(highest - l)], l, locks);
-    }
+    return chosen;
 
 }
 
-void HnswIndex::repair_neighbors(NodeId node) {
+void HnswIndex::link_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry, int top,
+                            LinkLocks* locks, const std::vector<std::vector<NodeId>>* decided) {
+    // Every level is decided first, then linked, top-down. Deciding never reads a link this
+    // node creates (each level's search starts from the previous level's results, and
+    // linking on one level changes no other level), so this is the graph that linking each
+    // level as soon as it was decided gave. A decision made ahead, under the shared lock
+    // (add, update and upsert: plan_insert), is applied the same way.
+    std::vector<std::vector<NodeId>> own;
+    if (!decided) {
+        own = decide_levels(node, level, ignore, query, entry, top, locks, nullptr);
+        decided = &own;
+    }
+    const int highest = std::min(level, top);
+    if (locks) {  // parallel: the node is published only when complete
+        for (int l = highest; l >= 0; --l) set_own_links(node, (*decided)[std::size_t(highest - l)], l, locks);
+        for (int l = highest; l >= 0; --l) link_back(node, (*decided)[std::size_t(highest - l)], l, locks);
+    } else {
+        for (int l = highest; l >= 0; --l) connect(node, (*decided)[std::size_t(highest - l)], l);
+    }
+}
+
+std::optional<HnswIndex::InsertPlan> HnswIndex::plan_insert(std::uint64_t id, std::span<const float> vector) const {
+    // Under the shared lock, alongside searches: the vector prepared, the level drawn from a
+    // copy of the generator, the slot it will take, and every level's neighbors chosen.
+    // Invalid input, an empty or codes-only index: no plan, and the insertion reports or does
+    // it all under the write lock, as without one (so a rejected change is still logged as
+    // aborted). Out of memory is reported here: nothing has changed yet. Inside another index
+    // operation, nothing is planned: the write lock refuses the change, as it always did.
+    if (IndexLock::inside_any()) return std::nullopt;
+    try {
+        if (!testing::insert_planning()) return std::nullopt;
+        const auto guard = lock_.read();
+        if (entry_ == kEmpty || codes_only()) return std::nullopt;
+        InsertPlan plan{lock_.writes(), kEmpty, 0, 0, rng_, PreparedVector(indexed_dim()), {}, {}, {}};
+        if (const auto old = storage_.ids().find(id)) plan.ignore = *old;
+        prepare_truncated(plan.vector, vector, dim(), metric_);
+        if (codec_ && codec_->trained()) codec_->check(plan.vector.values());
+        plan.level = random_level(plan.rng);
+        plan.slot = free_slots_.empty() ? static_cast<NodeId>(storage_.size()) : free_slots_.back();
+        plan.chosen = decide_levels(plan.slot, plan.level, plan.ignore, plan.vector.data(), entry_, max_level_, nullptr, plan.vector.data());
+        if (plan.ignore != kEmpty && params_.repair_on_remove) {  // an update: its repair's distances, ahead
+            std::vector<std::pair<std::uint64_t, float>> recorded;
+            {
+                const MemoScope recording(MemoState{this, &recorded, nullptr});
+                simulate_repair(plan.ignore, plan.relinks);
+            }
+            plan.repair.build(recorded);
+        }
+        return plan;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+bool HnswIndex::plan_holds(const InsertPlan* plan, NodeId ignore, NodeId slot) const {
+    // The caller holds the write lock: no change since the plan means the graph, the entry
+    // point, the free slots and the generator are as the plan saw them.
+    if (!plan || plan->writes != lock_.writes() || plan->ignore != ignore || plan->slot != slot) return false;
+    const auto a = plan->vector.values(), b = scratch_.values();
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](float x, float y) {
+        return std::memcmp(&x, &y, sizeof x) == 0;  // the very same bits, as prepared now
+    });
+}
+
+void HnswIndex::simulate_repair(NodeId node, std::vector<InsertPlan::Relink>& relinks) const {
+    // repair_neighbors as it would run now, writing nothing: what it reads, and so every
+    // distance it computes (recorded by the caller), on the graph as it is. The real repair
+    // then finds them recorded, but for pairs with the new version, which it computes.
+    const GraphStorage& graph = storage_.graph();
+    const IdMap& ids = storage_.ids();
+    for (int l = 0; l <= graph.level(node); ++l) {
+        std::vector<NodeId> around;
+        for (NodeId nb : graph.links(node, l)) {
+            if (nb == kEmpty) break;
+            if (nb != node && !ids.is_deleted(nb) && graph.level(nb) >= l) around.push_back(nb);  // GCOVR_EXCL_BR_LINE: as repair_neighbors
+        }
+        const std::size_t capacity = l == 0 ? graph.M0() : graph.M();
+        for (NodeId n : around) {
+            std::vector<Candidate> options;
+            auto consider = [&](NodeId c) {
+                if (c == n || c == node || ids.is_deleted(c) || graph.level(c) < l) return;
+                options.push_back({distance_between(n, c), c});
+            };
+            for (NodeId c : graph.links(n, l)) {
+                if (c == kEmpty) break;
+                consider(c);
+            }
+            for (NodeId c : around) consider(c);
+            std::sort(options.begin(), options.end());
+            options.erase(std::unique(options.begin(), options.end(),
+                                      [](const Candidate& a, const Candidate& b) { return a.id == b.id; }),
+                          options.end());
+            const auto list = graph.links(n, l);
+            relinks.push_back({l, n, std::vector<NodeId>(list.begin(), list.begin() + std::ptrdiff_t(GraphStorage::count(list))),
+                               select_neighbors(n, options, capacity)});
+        }
+        for (NodeId x : around)
+            for (NodeId n : around)
+                if (n != x) (void)distance_between(n, x);
+    }
+}
+
+void HnswIndex::repair_neighbors(NodeId node, const std::vector<InsertPlan::Relink>* decided, NodeId fresh) {
+    // `decided`: an update's repair decided ahead, consumed in this loop's order. A decision
+    // holds only if its every input is as it was: the neighbor's list unchanged, and no list
+    // read (the neighbor's, or the removed node's, which every decision on its level reads)
+    // naming `fresh`, the new version's slot: a removed node's slot when decided (passed
+    // over), the new version now (taken). The same entry, another node: decided again.
+    std::size_t next = 0;
     GraphStorage& graph = storage_.graph();
     const IdMap& ids = storage_.ids();
     for (int l = 0; l <= graph.level(node); ++l) {
@@ -734,7 +966,19 @@ void HnswIndex::repair_neighbors(NodeId node) {
             if (nb != node && !ids.is_deleted(nb) && graph.level(nb) >= l) around.push_back(nb);  // GCOVR_EXCL_BR_LINE
         }
         const std::size_t capacity = l == 0 ? graph.M0() : graph.M();
+        const auto own = graph.links(node, l);
+        const bool level_holds = std::find(own.begin(), own.end(), fresh) == own.end();
         for (NodeId n : around) {
+            if (decided && next < decided->size() && (*decided)[next].level == l && (*decided)[next].node == n) {
+                const InsertPlan::Relink& r = (*decided)[next++];
+                const auto list = graph.links(n, l);
+                const std::size_t count = GraphStorage::count(list);
+                if (level_holds && count == r.before.size() && std::equal(r.before.begin(), r.before.end(), list.begin()) &&
+                    std::find(r.before.begin(), r.before.end(), fresh) == r.before.end()) {
+                    graph.set_links(n, l, r.after);  // every input as decided: the same list
+                    continue;
+                }
+            }
             // Options: n's own links plus the removed node's neighbors, minus the
             // removed node, n itself, removed nodes and stale links.
             std::vector<Candidate> options;
@@ -827,44 +1071,48 @@ bool HnswIndex::remove(std::uint64_t id) {
 }
 
 bool HnswIndex::update(std::uint64_t id, std::span<const float> vector) {
+    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
     const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, nullptr); }));
-    return replace(id, vector, nullptr);
+    return replace(id, vector, nullptr, plan ? &*plan : nullptr);
 }
 
 bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
     const auto guard = lock_.write("update");
     // No existence check first: invalid input is rejected even for an unknown ID
     // (an unknown ID is logged, and replays as a no-op).
     const ChangeLog::Scope logged(log_, log_.begin(walop::kUpdate, [&] { return walop::encode_update(id, vector, &metadata); }));
-    return replace(id, vector, &metadata);
+    return replace(id, vector, &metadata, plan ? &*plan : nullptr);
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
+    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = storage_.ids().find(id).has_value();  // logged as what it does: an update or an add
     const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, nullptr) : walop::encode_add(id, vector, {});
     }));
-    if (replace(id, vector, nullptr)) return false;
-    add_unlocked(id, vector, {});
+    if (replace(id, vector, nullptr, plan ? &*plan : nullptr)) return false;
+    add_unlocked(id, vector, {}, false, plan ? &*plan : nullptr);
     return true;
 }
 
 bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata) {
+    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = storage_.ids().find(id).has_value();
     const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, &metadata) : walop::encode_add(id, vector, metadata);
     }));
-    if (replace(id, vector, &metadata)) return false;
-    add_unlocked(id, vector, metadata);
+    if (replace(id, vector, &metadata, plan ? &*plan : nullptr)) return false;
+    add_unlocked(id, vector, metadata, false, plan ? &*plan : nullptr);
     return true;
 }
 
-bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata) {
+bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata, const InsertPlan* plan) {
     const RngGuard rng_guard(rng_);  // a failed change draws no level
     // 1. Validate everything before changing anything.
     prepare_checked(vector);
@@ -883,7 +1131,9 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     const NodeId slot = reuse ? free_slots_.back() : static_cast<NodeId>(storage_.size());
     reserve_code(slot);  // may throw: before any change
     const auto undo = metadata_.write(slot, md);
-    const int level = random_level();
+    const bool planned = plan_holds(plan, old, slot);
+    const int level = planned ? plan->level : random_level();
+    if (planned) rng_ = plan->rng;  // the same draw: the generator is as the plan copied it
     try {
         if (reuse) storage_.insert_into_unmapped(slot, id, scratch_.values(), level, vector);
         else storage_.insert_unmapped(id, scratch_.values(), level, vector);
@@ -898,8 +1148,11 @@ bool HnswIndex::replace(std::uint64_t id, std::span<const float> vector, const M
     const NodeId saved_entry = entry_;
     const int saved_max_level = max_level_;
     try {
-        link_new_node(slot, level, old);
-        if (params_.repair_on_remove) repair_neighbors(old);
+        link_new_node(slot, level, old, planned ? &plan->chosen : nullptr);
+        if (params_.repair_on_remove) {
+            const MemoScope known(planned ? MemoState{this, nullptr, &plan->repair} : MemoState{});
+            repair_neighbors(old, planned ? &plan->relinks : nullptr, slot);
+        }
     } catch (...) {
         // Abandon the new version like a failed insert. Links made so far are
         // valid; the repair only re-chose neighbors' links.
@@ -1261,12 +1514,24 @@ std::vector<SearchResult> HnswIndex::search(std::span<const float> query, std::s
     PreparedVector q(indexed_dim());
     prepare_truncated(q, query, dim(), metric_);  // validates even when the index is empty
     std::optional<CompiledFilter> compiled;
-    const Eligibility eligible = eligibility(options, compiled);
+    Eligibility eligible = eligibility(options, compiled);
+    std::vector<NodeId> rows;
+    restrict_to(options, rows, eligible);
     SearchStats stats;
     auto results = search_impl(q.data(), k, ef, eligible, options.strategy,
                                options.planner ? *options.planner : planner_, stats);
     if (options.stats) *options.stats = stats;
     return results;
+}
+
+void HnswIndex::restrict_to(const SearchOptions& options, std::vector<NodeId>& rows, Eligibility& eligible) const {
+    if (!options.among) return;  // the rows of the IDs given: unknown IDs dropped, removed ones by eligibility
+    rows.reserve(options.among->size());
+    for (const std::uint64_t id : *options.among)
+        if (const auto slot = storage_.ids().find(id)) rows.push_back(*slot);
+    std::sort(rows.begin(), rows.end());
+    rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+    eligible.rows = &rows;
 }
 
 std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, const Eligibility& eligible,
@@ -1280,7 +1545,12 @@ std::vector<Candidate> HnswIndex::exact_scan(const float* query, std::size_t k, 
         ++stats.distance_computations;
         top.push({dist(n), n});
     };
-    if (const auto rows = eligible.filter ? eligible.filter->candidates() : std::nullopt) {  // posting lists: only rows that can match
+    if (eligible.rows) {  // SearchOptions::among: only the rows given
+        for (std::size_t i = 0; i < eligible.rows->size(); ++i) {
+            if ((i & 255) == 255 && detail::search_should_stop()) break;
+            visit((*eligible.rows)[i]);
+        }
+    } else if (const auto rows = eligible.filter ? eligible.filter->candidates() : std::nullopt) {  // posting lists: only rows that can match
         for (std::size_t i = 0; i < rows->size() && (*rows)[i] < storage_.size(); ++i) {
             if ((i & 255) == 255 && detail::search_should_stop()) break;
             visit((*rows)[i]);
@@ -1317,7 +1587,10 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
     // Plan: no filter means a plain graph search unless exact search is forced.
     Strategy run = strategy == Strategy::ForceExact ? Strategy::ForceExact : Strategy::ForceGraph;
     stats.reason = strategy == Strategy::Auto ? PlanReason::NoFilter : PlanReason::Forced;
-    if (eligible.filtered()) {
+    if (eligible.rows) {  // a list of candidates (SearchOptions::among): scored exactly, whatever was asked
+        run = Strategy::ForceExact;
+        stats.reason = PlanReason::Forced;
+    } else if (eligible.filtered()) {
         const std::optional<std::size_t> counted =
             (eligible.filter && !eligible.predicate) ? eligible.filter->exact_count() : std::nullopt;
         const PlanDecision d = plan_search(storage_.size(), live_, eligible, counted, ef, strategy, params);
@@ -1384,14 +1657,16 @@ std::vector<SearchResult> HnswIndex::search_impl(const float* query, std::size_t
         const Candidate current = start ? *start : descend();
         // Beam search on level 0, returning only eligible nodes.
         auto visited = visited_pool_.acquire(storage_.size());
-        found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget);
+        // Only the order this needs: the best k, or none when re-ranking (it sorts again).
+        const std::size_t sorted = rerank ? 0 : k;
+        found = search_level(query, {current}, ef, 0, *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget, sorted);
         if (!over_budget && found.size() < k) {
             // The descent ended where few eligible nodes are reachable (possible
             // after many removals without repair, or with a selective filter; links
             // are one-directional). Search again from the entry point too, which is
             // always live.
             found = search_level(query, {current, {distance_to(query, entry_), entry_}}, ef, 0,
-                                 *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget);
+                                 *visited, kEmpty, eligible, &stats, nullptr, budget, &over_budget, sorted);
         }
     }
     if (over_budget) {
@@ -1422,7 +1697,9 @@ std::vector<std::vector<SearchResult>> HnswIndex::search_batch(std::span<const f
     const auto guard = lock_.read();
     const std::size_t nq = validate_batch(queries, dim());  // every query checked before any work
     std::optional<CompiledFilter> compiled;
-    const Eligibility eligible = eligibility(options, compiled);
+    Eligibility eligible = eligibility(options, compiled);
+    std::vector<NodeId> rows;
+    restrict_to(options, rows, eligible);
     const PlannerParams& params = options.planner ? *options.planner : planner_;
     std::vector<std::vector<SearchResult>> results(nq);
     std::atomic<bool> any_stopped{false};
@@ -1460,6 +1737,7 @@ std::vector<SearchResult> HnswIndex::search_range(std::span<const float> query, 
     const NodeDistance dist = node_distance(q.data());
     if (std::isnan(radius)) throw std::invalid_argument("radius is NaN");
     std::optional<CompiledFilter> compiled;
+    if (options.among) throw std::invalid_argument("SearchOptions::among: search and search_batch only, not search_range");
     const Eligibility eligible = eligibility(options, compiled);
     SearchStats stats;
     std::vector<Candidate> hits;
@@ -1673,6 +1951,63 @@ CompactStats HnswIndex::compact_unlocked(const OperationOptions& options) {
     fresh.planner_ = planner_;
     const IdMap& ids = storage_.ids();
     detail::OperationControl control(options, live_);  // a cancel throws before the commit: this index is untouched
+    // The vector each node is inserted from: the original as given, or, where the stored
+    // vector is the original (L2 and inner product, full width, floats kept), the stored
+    // one, which preparing again copies exactly. Elsewhere (cosine without originals, whose
+    // normalizing again could move a bit, or codes only), the insertion is as before.
+    const bool batched = storage_.originals() || (!codes_only() && metric_ != Metric::Cosine && indexed_dim() == dim());
+    auto source = [&](NodeId n) {
+        return storage_.originals() ? storage_.original(n) : storage_.vectors().get(n).first(dim());
+    };
+    if (batched) {
+        // In batches: every node of a batch decides its links at once, in parallel, against
+        // the graph as the batch began (its own nodes, stored but not yet linked, cannot be
+        // reached), then they are linked in order. Levels and slots are assigned in order
+        // first, so the graph depends on the batch sizes alone, which depend on the size
+        // reached, never on threads: replaying a compact gives the same bytes. A node above
+        // the graph's top when its batch began, rare, is inserted as usual; so are the first
+        // 1,024 nodes, one at a time, where a batch would see too little of the graph.
+        std::vector<NodeId> live;
+        live.reserve(live_);
+        for (NodeId n = 0; n < storage_.size(); ++n)
+            if (!ids.is_deleted(n)) live.push_back(n);
+        std::vector<InsertPlan> plans;
+        for (std::size_t start = 0; start < live.size();) {
+            const std::size_t batch = fresh.live_ < 1024 ? 1 : std::min<std::size_t>(256, fresh.live_ / 32);
+            const std::size_t end = std::min(live.size(), start + batch);
+            if (end - start == 1) {
+                fresh.add_unlocked(ids.external(live[start]), source(live[start]), metadata_.read(live[start]));
+                control.advance();
+                start = end;
+                continue;
+            }
+            plans.clear();
+            SplitMix64 r = fresh.rng_;
+            const NodeId first = static_cast<NodeId>(fresh.storage_.size());
+            for (std::size_t j = start; j < end; ++j) {
+                InsertPlan plan{fresh.lock_.writes(), kEmpty, static_cast<NodeId>(first + (j - start)), 0, r,
+                                PreparedVector(fresh.indexed_dim()), {}, {}, {}};
+                plan.level = fresh.random_level(r);
+                plan.rng = r;
+                plans.push_back(std::move(plan));
+            }
+            const int top = fresh.max_level_;
+            const NodeId entry = fresh.entry_;
+            pool_.get(options.threads)->parallel_for(end - start, [&](std::size_t j) {  // reading only: the graph as the batch began
+                InsertPlan& plan = plans[j];
+                prepare_truncated(plan.vector, source(live[start + j]), dim(), metric_);
+                if (plan.level <= top)
+                    plan.chosen = fresh.decide_levels(plan.slot, plan.level, kEmpty, plan.vector.data(), entry, top, nullptr, plan.vector.data());
+            });
+            for (std::size_t j = start; j < end; ++j) {
+                const InsertPlan& plan = plans[j - start];
+                fresh.add_unlocked(ids.external(live[j]), source(live[j]), metadata_.read(live[j]), false,
+                                   plan.level <= top ? &plan : nullptr);
+                control.advance();
+            }
+            start = end;
+        }
+    } else
     for (NodeId n = 0; n < storage_.size(); ++n)
         if (!ids.is_deleted(n)) {
             // Nobody else sees `fresh`. Vectors as given are prepared again exactly as

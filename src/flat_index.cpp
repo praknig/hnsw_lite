@@ -727,6 +727,7 @@ std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::s
 
 std::vector<SearchResult> FlatIndex::search(std::span<const float> query, std::size_t k,
                                             const SearchOptions& options) const {
+    if (options.among) throw std::invalid_argument("SearchOptions::among: HnswIndex and SparseIndex only, not FlatIndex");
     const bool modify = options.modifiers && !options.modifiers->empty();
     if (modify || options.diversity) {  // opt-in: a larger pool, re-scored by metadata and/or diversified
         if (options.diversity && !(*options.diversity >= 0.0 && *options.diversity <= 1.0))

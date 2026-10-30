@@ -32,6 +32,7 @@
  *  - Each test reports PASS or FAIL with its time; a summary lists failures.
  *  - The exit code is 0 only if every selected test passed.
  */
+#include "health.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2119,6 +2120,178 @@ TEST(hnsw, recall_inner_product) {
     CHECK(recall(*fx.hnsw, *fx.flat, fx.queries, 10, 100) >= 0.95);
 }
 
+TEST(hnsw, inner_product_graph_stays_connected) {
+    // Inner product with norms that vary widely (popular items far larger), as in
+    // recommendations: the graph must stay connected. The usual diversity rule let one
+    // large vector prune every other candidate, leaving about 2 links per node and filtered
+    // graph searches finding half the right answers.
+    const std::size_t n = 20000, dim = 32, L = 8, K = 60, nq = 200;
+    std::mt19937 rng(101);
+    std::normal_distribution<double> nd(0, 1);
+    std::vector<double> W(dim * L), C(K * L);
+    for (std::size_t j = 0; j < L; ++j)
+        for (std::size_t d = 0; d < dim; ++d) W[d * L + j] = nd(rng) * std::pow(double(j + 1), -0.6);
+    for (double& c : C) c = nd(rng) * 3;
+    auto sample = [&](float* x) {
+        const std::size_t k = std::min<std::size_t>(K - 1, std::size_t(std::pow(std::uniform_real_distribution<double>(0, 1)(rng), 2.0) * double(K)));
+        double z[8];
+        for (std::size_t j = 0; j < L; ++j) z[j] = C[k * L + j] + nd(rng);
+        const double scale = std::exp(0.6 * nd(rng));
+        for (std::size_t d = 0; d < dim; ++d) {
+            double v = 0;
+            for (std::size_t j = 0; j < L; ++j) v += W[d * L + j] * z[j];
+            x[d] = float((v + 0.1 * nd(rng)) * scale);
+        }
+    };
+    std::vector<float> data(n * dim), q(nq * dim);
+    for (std::size_t i = 0; i < n; ++i) sample(&data[i * dim]);
+    for (std::size_t i = 0; i < nq; ++i) sample(&q[i * dim]);
+    for (std::size_t i = 0; i < 20; ++i) std::fill(data.begin() + std::ptrdiff_t(i * 997 * dim), data.begin() + std::ptrdiff_t((i * 997 + 1) * dim), 0.0f);  // zero vectors
+    std::vector<std::uint64_t> ids(n);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::vector<Metadata> md(n);
+    for (std::size_t i = 0; i < n; ++i) md[i] = Metadata().set("r", std::int64_t(i % 20));
+    FlatIndex flat(dim, Metric::InnerProduct);
+    flat.add_batch(ids, data, std::span<const Metadata>(md));
+    HnswIndex h(dim, Metric::InnerProduct);
+    h.add_batch(ids, data, std::span<const Metadata>(md));
+    auto recall = [](const std::vector<SearchResult>& got, const std::vector<SearchResult>& truth) {
+        std::set<std::uint64_t> t;
+        for (const auto& r : truth) t.insert(r.id);
+        std::size_t hit = 0;
+        for (const auto& r : got) hit += t.count(r.id);
+        return truth.empty() ? 1.0 : double(hit) / double(truth.size());
+    };
+    SearchOptions filtered;
+    filtered.filter = Filter::eq("r", std::int64_t(3));  // 5%, wherever the matches are
+    SearchOptions forced = filtered;
+    forced.strategy = Strategy::ForceGraph;
+    double plain = 0, through_graph = 0;
+    for (std::size_t i = 0; i < nq; ++i) {
+        const std::span<const float> query(&q[i * dim], dim);
+        plain += recall(h.search(query, 10, 64), flat.search(query, 10));
+        through_graph += recall(h.search(query, 10, 128, forced), flat.search(query, 10, filtered));
+    }
+    HealthOptions ho;
+    ho.recall_sample = 0;
+    const HealthReport hr = h.health(ho);
+    std::printf("    mean degree %.1f, recall@10 at ef 64 %.3f, filtered through the graph %.3f\n", hr.mean_degree, plain / double(nq), through_graph / double(nq));
+    CHECK(hr.mean_degree >= 10.0);                  // was about 2
+    CHECK(plain / double(nq) >= 0.98);              // recall@10 at ef 64
+    CHECK(through_graph / double(nq) >= 0.95);      // filtered, through the graph: was about 0.5
+}
+
+TEST(hnsw, search_among_given_ids) {
+    // SearchOptions::among: only the IDs given, scored exactly, whatever the beam: equal to
+    // brute force over the same set, for every metric, with and without a filter. Unknown,
+    // repeated and removed IDs in the list are ignored.
+    const std::size_t n = 3000, dim = 16;
+    std::mt19937 rng(2401);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> data(n * dim);
+    for (float& x : data) x = nd(rng);
+    for (const Metric m : {Metric::L2, Metric::Cosine, Metric::InnerProduct}) {
+        HnswIndex h(dim, m);
+        FlatIndex f(dim, m);
+        for (std::size_t i = 0; i < n; ++i) {
+            const Metadata md = Metadata().set("g", std::int64_t(i % 4));
+            h.add(i, std::span<const float>(&data[i * dim], dim), md);
+            if (i % 37 != 0) f.add(i, std::span<const float>(&data[i * dim], dim), md);
+        }
+        for (std::size_t i = 0; i < n; i += 37) h.remove(i);
+        bool same = true;
+        for (int qn = 0; qn < 40; ++qn) {
+            std::vector<float> query(dim);
+            for (float& x : query) x = nd(rng);
+            std::vector<std::uint64_t> among;
+            for (int j = 0; j < 200; ++j) among.push_back(rng() % (n + 500));  // some unknown, some repeated, some removed
+            const std::set<std::uint64_t> set(among.begin(), among.end());
+            SearchOptions o;
+            o.among = among;
+            SearchOptions ref;
+            ref.predicate = [&](std::uint64_t id) { return set.count(id) > 0; };
+            same = same && same_results(h.search(query, 10, 16, o), f.search(query, 10, ref));
+            o.filter = ref.filter = Filter::eq("g", std::int64_t(1));
+            same = same && same_results(h.search(query, 10, 16, o), f.search(query, 10, ref));
+        }
+        CHECK(same);
+    }
+    HnswIndex h(dim, Metric::L2);
+    for (std::size_t i = 0; i < 500; ++i) h.add(i, std::span<const float>(&data[i * dim], dim));
+    SearchOptions o;
+    o.among = std::vector<std::uint64_t>{3, 7, 7, 400, 9999};
+    std::vector<float> two(data.begin(), data.begin() + std::ptrdiff_t(2 * dim));
+    const auto batch = h.search_batch(two, 10, 16, 2, o);  // a batch honors it too
+    CHECK(batch.size() == 2 && same_results(batch[0], h.search(std::span<const float>(two.data(), dim), 10, 16, o)) && batch[0].size() == 3);
+    SearchStats st;
+    o.stats = &st;
+    (void)h.search(std::span<const float>(two.data(), dim), 10, 16, o);
+    CHECK(st.reason == PlanReason::Forced && st.distance_computations == 3);  // three known IDs, nothing else touched
+    o.stats = nullptr;
+    o.among = std::vector<std::uint64_t>{};
+    CHECK(h.search(std::span<const float>(two.data(), dim), 10, 16, o).empty());  // an empty list: nothing
+    o.among = std::vector<std::uint64_t>{1, 2};
+    CHECK_THROWS_AS(std::invalid_argument, (void)h.search_range(std::span<const float>(two.data(), dim), 1.0f, kNoLimit, o));
+    FlatIndex f(dim, Metric::L2);
+    f.add(1, std::span<const float>(two.data(), dim));
+    CHECK_THROWS_AS(std::invalid_argument, (void)f.search(std::span<const float>(two.data(), dim), 10, o));
+}
+
+TEST(hnsw, planned_writes_equal_direct_writes) {
+    // add, update and upsert decide their links under the shared lock and apply them under
+    // the write lock; doing it all under the write lock must give the same index, byte for
+    // byte, after every change: every metric, repair on and off, with and without codes,
+    // with removals freeing slots for later changes (a removed node's slot taken by a new
+    // version changed what a list entry meant: an update's repair, decided ahead, was then
+    // applied wrongly, found by r12).
+    auto bytes_of = [](const HnswIndex& h) {
+        std::ostringstream out;
+        h.save(out);
+        return out.str();
+    };
+    std::mt19937 rng(2525);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> data(400, std::vector<float>(8));
+    for (auto& v : data) for (float& x : v) x = nd(rng);
+    for (const Metric m : {Metric::L2, Metric::Cosine, Metric::InnerProduct})
+        for (const bool repair : {true, false})
+            for (const bool codes : {false, true}) {
+                HnswParams p;
+                p.repair_on_remove = repair;
+                if (codes) {
+                    p.quantization.codec = CodecKind::SQ8;
+                    p.quantization.train_after = 64;
+                }
+                HnswIndex direct(8, m, p), planned(8, m, p);
+                auto both = [&](auto&& op) {
+                    testing::set_insert_planning(false);
+                    op(direct);
+                    testing::set_insert_planning(true);
+                    op(planned);
+                };
+                std::mt19937 r(7);
+                bool same = true;
+                int first = -1;
+                for (int step = 0; step < 1200 && same; ++step) {
+                    const std::uint64_t id = r() % 300;
+                    const std::size_t row = r() % 400;
+                    const Metadata md = Metadata().set("g", std::int64_t(r() % 5));
+                    switch (r() % 6) {
+                        case 0: both([&](HnswIndex& h) { if (!h.contains(id)) h.add(id, data[row], md); }); break;
+                        case 1: case 2: both([&](HnswIndex& h) { (void)h.upsert(id, data[row], md); }); break;
+                        case 3: both([&](HnswIndex& h) { (void)h.upsert(id, data[id % 400]); }); break;  // the same vector again
+                        case 4: both([&](HnswIndex& h) { (void)h.update(id, data[row]); }); break;
+                        default: both([&](HnswIndex& h) { (void)h.remove(id); }); break;
+                    }
+                    same = bytes_of(direct) == bytes_of(planned);
+                    if (!same) first = step;
+                }
+                if (!same) std::printf("    metric %d, repair %d, codes %d: first difference at step %d\n", int(m), int(repair), int(codes), first);
+                CHECK(same);
+            }
+    testing::set_insert_planning(true);
+}
+
 TEST(hnsw, recall_grows_with_ef) {
     const Fixture& fx = fixture(Metric::L2);
     const double low = recall(*fx.hnsw, *fx.flat, fx.queries, 10, 10);
@@ -3545,6 +3718,66 @@ TEST(deletion, d70_id_map_against_a_model) {
         if (!consistent) std::printf("    diverged from the model at step %d\n", step);
     }
     CHECK(consistent);
+}
+
+TEST(deletion, d67_compact_in_parallel_batches) {
+    // compact() rebuilds in batches whose links are decided in parallel and applied in
+    // order: the same bytes whatever the thread count (replaying a compact must give the
+    // same index), every record kept, and search as good as a graph built one at a time.
+    const std::size_t n = 6000, dim = 16;
+    std::mt19937 rng(6767);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> centers(40 * dim);
+    for (float& x : centers) x = nd(rng) * 3.0f;
+    std::vector<std::vector<float>> data(n, std::vector<float>(dim));
+    for (std::size_t i = 0; i < n; ++i)
+        for (std::size_t d = 0; d < dim; ++d) data[i][d] = centers[(i % 40) * dim + d] + nd(rng);
+    auto bytes_of = [](const HnswIndex& h) {
+        std::ostringstream out;
+        h.save(out);
+        return out.str();
+    };
+    for (const Metric m : {Metric::L2, Metric::Cosine, Metric::InnerProduct})
+        for (const bool codes : {false, true}) {
+            HnswParams p;
+            if (codes) {
+                p.quantization.codec = CodecKind::SQ8;
+                p.quantization.train_after = 500;
+            }
+            HnswIndex h(dim, m, p);
+            for (std::size_t i = 0; i < n; ++i) h.add(i, data[i], Metadata().set("i", std::int64_t(i)));
+            for (std::size_t i = 0; i < n; ++i)
+                if (i % 10 < 3) h.remove(i);
+            const std::string before = bytes_of(h);
+            std::istringstream a_in(before), b_in(before);
+            auto one = HnswIndex::load(a_in), four = HnswIndex::load(b_in);
+            OperationOptions o1, o4;
+            o1.threads = 1;
+            o4.threads = 4;
+            const CompactStats st = one->compact(o1);
+            (void)four->compact(o4);
+            CHECK(bytes_of(*one) == bytes_of(*four));  // the thread count changes nothing
+            CHECK(st.kept == n - n * 3 / 10 && st.reclaimed == n * 3 / 10 && one->size() == st.kept);
+            bool kept = true;
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto v = one->get_vector(i);
+                kept = kept && (i % 10 < 3 ? !v : v && *v == data[i]);
+                if (i % 10 >= 3) kept = kept && one->get_metadata(i) && one->get_metadata(i)->get("i") && one->get_metadata(i)->get("i")->i == std::int64_t(i);
+            }
+            CHECK(kept);
+            FlatIndex f(dim, m);
+            for (std::size_t i = 0; i < n; ++i)
+                if (i % 10 >= 3) f.add(i, data[i]);
+            double recall = 0;
+            for (int q = 0; q < 100; ++q) {
+                std::vector<float> query(dim);
+                for (std::size_t d = 0; d < dim; ++d) query[d] = centers[std::size_t(q % 40) * dim + d] + nd(rng);
+                std::set<std::uint64_t> truth;
+                for (const auto& r : f.search(query, 10)) truth.insert(r.id);
+                for (const auto& r : one->search(query, 10, 64)) recall += double(truth.count(r.id)) / 10.0;
+            }
+            CHECK(recall / 100.0 >= 0.95);
+        }
 }
 
 TEST(deletion, d65_flat_compact_is_noop) {
@@ -18044,6 +18277,32 @@ std::vector<SearchResult> sparse_reference(const std::map<std::uint64_t, SparseV
 
 }  // namespace
 
+TEST(sparse, search_among_scores_identically) {
+    // SearchOptions::among on a sparse index: each listed document scored directly, the
+    // same float sum in the same order as the posting lists, so the results are bit for
+    // bit those of the full search restricted to the set.
+    std::mt19937 rng(2402);
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 1500; ++i) s.add(i, random_sparse(rng, 300, 1, 30, i % 5 == 0));
+    for (std::uint64_t i = 0; i < 1500; i += 11) s.remove(i);
+    bool same = true;
+    for (int qn = 0; qn < 60; ++qn) {
+        const SparseVector q = random_sparse(rng, 300, 1, 10, qn % 4 == 0);
+        std::vector<std::uint64_t> among;
+        for (int j = 0; j < 150; ++j) among.push_back(rng() % 1700);
+        const std::set<std::uint64_t> set(among.begin(), among.end());
+        SearchOptions o;
+        o.among = among;
+        SearchOptions ref;
+        ref.predicate = [&](std::uint64_t id) { return set.count(id) > 0; };
+        for (const std::size_t k : {std::size_t(1), std::size_t(10), std::size_t(500)}) same = same && same_results(s.search(q, k, o), s.search(q, k, ref));
+    }
+    CHECK(same);
+    SearchOptions none;
+    none.among = std::vector<std::uint64_t>{};
+    CHECK(s.search(random_sparse(rng, 300, 1, 10), 10, none).empty());
+}
+
 TEST(sparse, sp01_search_is_exact) {
     std::mt19937 rng(3000);
     SparseIndex s;
@@ -19619,6 +19878,62 @@ TEST(collection, co18_options_report_the_current_schema) {
     CHECK(c->payload_indexes() == std::vector<std::string>{"lang"});
     c.reset();
     std::filesystem::remove_all(dir);
+}
+
+TEST(collection, co24_group_fill_is_exact_per_group) {
+    // Groups scattered through the ranking (a document's chunks on different topics): each
+    // group not filled by the first search is filled by an exact search among its members.
+    // With a beam covering every document the first search is exact too, so every group's
+    // hits are exactly its best (with the default beam, groups the first search fills are
+    // as approximate as any search); a filter applies within the fill too.
+    CollectionOptions o;
+    o.dim = 8;
+    o.metric = Metric::L2;  // the brute force below uses squared L2 (the default is cosine)
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    std::mt19937 rng(2424);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> vec(3000, std::vector<float>(8));
+    for (std::uint64_t i = 0; i < 3000; ++i) {
+        for (float& x : vec[i]) x = nd(rng);
+        Document d;
+        d.vector = vec[i];
+        d.metadata = Metadata().set("doc", "d" + std::to_string(i % 300)).set("keep", i % 3 != 0);
+        c.add(i, d);
+    }
+    for (const bool indexed : {false, true}) {
+        if (indexed) c.create_payload_index("doc");
+        for (const bool filtered : {false, true}) {
+            bool exact = true, held = true;
+            std::size_t groups = 0;
+            for (int qn = 0; qn < 30; ++qn) {
+                CollectionQuery x;
+                x.vector.resize(8);
+                for (float& v : x.vector) v = nd(rng);
+                CollectionSearchOptions so;
+                so.ef = 3000;  // the first search exact: what remains to check is the fill
+                if (filtered) so.filter = Filter::eq("keep", true);
+                for (const CollectionGroup& g : c.search_groups(x, GroupBy{"doc", 6, 3, 0}, so)) {
+                    ++groups;
+                    std::vector<std::pair<double, std::uint64_t>> all;  // brute force over the group's members
+                    for (std::uint64_t i = std::stoul(g.value.s.substr(1)); i < 3000; i += 300) {
+                        if (filtered && i % 3 == 0) continue;
+                        double d2 = 0;
+                        for (std::size_t j = 0; j < 8; ++j) d2 += double(x.vector[j] - vec[i][j]) * double(x.vector[j] - vec[i][j]);
+                        all.push_back({d2, i});
+                    }
+                    std::sort(all.begin(), all.end());
+                    const std::size_t want = std::min<std::size_t>(3, all.size());
+                    exact = exact && g.hits.size() == want;
+                    for (std::size_t j = 0; j < std::min(want, g.hits.size()); ++j) exact = exact && g.hits[j].id == all[j].second;
+                    for (const CollectionHit& h : g.hits) held = held && (!filtered || h.id % 3 != 0);
+                }
+            }
+            CHECK(exact);
+            CHECK(held);
+            CHECK(groups == 30 * 6);
+        }
+    }
 }
 
 TEST(collection, co19_search_groups) {
