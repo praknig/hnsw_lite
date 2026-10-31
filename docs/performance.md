@@ -116,6 +116,8 @@ Values of `M` below 8 leave parts of the graph poorly connected (at `M = 2`, tes
 
 Cosine and L2 give the best HNSW recall. Inner product is not a true distance, so recall is lower on vectors of very different lengths (0.86 to 0.90 at `ef = 100` in tests, against 0.997 or more for L2 and cosine). If your model's vectors can be normalized, normalize them and use cosine.
 
+**Inner product with lengths that vary widely** (recommendations): neighbors are chosen by angle (see the architecture notes). Measured on 500,000 vectors of 256 dimensions: mean degree 1.5 → 16.7, recall@10 at `ef` 64 0.960 → 0.993, at `ef` 128 0.975 → 0.997; searches do more work on the healthy graph (about half the queries per second at the same `ef`) and building takes 2.3 times longer.
+
 ### Filters
 
 - The planner's defaults (exact scan for at most 2,000 matches or 1% of vectors) suit most data. On very large indexes, lower `max_exact_fraction`: 1% of 100 million vectors is a million distance computations.
@@ -208,7 +210,18 @@ A writer holds the exclusive lock only to link, not to find and choose neighbors
 | add | 432M instructions | 12M | unchanged |
 | upsert (an update) | 1,008M | 39M | unchanged (the plan's extra work is paid for by the copy check, which made updates 15% cheaper) |
 
-Searches wait for a writer only that long. The profiling report had shown one writer cutting a reader's throughput 93-fold (65 reads a second, p99 82 ms) on 20 threads; measure on your own machine with several cores (a machine with one core shares it either way).
+Searches wait for a writer only that long. Measured on an Intel Core i9-13900H laptop (6 performance and 8 efficiency cores, 20 threads), Windows, GCC 16, 1,000,000 vectors of 128 dimensions, `ef` 64, with planning off (the former behavior: the insertion holds the write lock throughout) and on, in the same run:
+
+| Readers | Writer | Reads/s, before → now | Read p99, before → now | Writes/s, before → now |
+|---|---|---|---|---|
+| 1 | upserting | 422 → 2,559 | 47.7 ms → 2.5 ms | 794 → 649 |
+| 1 | adding | 489 → 1,925 | 35.4 ms → 3.8 ms | 971 → 718 |
+| 10 | upserting | 2,779 → 5,694 | 29.9 ms → 6.8 ms | 465 → 192 |
+| 10 | adding | 1,355 → 11,368 | 154.7 ms → 2.2 ms | 2,374 → 460 |
+| 19 | upserting | 5,447 → 16,666 | 21.8 ms → 4.1 ms | 1,369 → 211 |
+| 19 | adding | 5,363 → 15,746 | 71.6 ms → 4.8 ms | 2,506 → 317 |
+
+Readers alone: 3,506 reads/s on one thread, 85,091 on 19. Readers gain 2 to 8 times, and their worst-case latency falls 4 to 70 times. Writes go slower with many readers: before, the writer was fast because it kept the readers out; now it competes with them for the cores. For read-heavy use that is the right trade; a write-heavy workload under heavy reading is the next thing to tune.
 
 ### Group-by
 
@@ -218,6 +231,8 @@ Filling groups by searching among each group's members, instead of widening the 
 |---|---|---|---|
 | chunks of a document together, before / now | 2,054 / 2,088 q/s | 1,414 / 1,335 | 1,026 / 987 |
 | chunks scattered (as real documents are), before / now | 11.4 / 1,315 q/s | 9.0 / 877 | 7.6 / 366 |
+
+On the same laptop, a collection of 300,000 chunks (384 dimensions, documents of 8 chunks whose topics differ, a payload index on the document field), group-by queries per second, before → now: 10 groups of 1: 1,350 → 4,309; of 2: 0.8 → 675; of 3: 1.0 → 495; of 5: 0.7 → 323; 50 groups of 3: 0.7 → 119. Grouping by a field with very large groups (`category`, tens of thousands of documents each) falls back to the filtered search beyond 4,096 members: 6.1 → 4.3 queries per second, slow before and after.
 
 ### The search loop
 
@@ -234,9 +249,13 @@ Comparing candidates as single 64-bit keys (the same order) saved 0.5% and was n
 
 **Batches and thread counts.** `search_batch` hands queries to the pool's threads through one atomic counter. Asking for another thread count than the last call rebuilds the pool, which costs milliseconds on Windows: in a benchmark that varies the count on every short run, that is what scaling looks like it stops at. Keep the count the same across calls (0, the default, is one per hardware thread).
 
+On the Intel Core i9-13900H laptop (6 performance and 8 efficiency cores, 20 threads), Windows, GCC 16, single-thread search at `ef` 64 with identical recall and distances per query: 12% faster on 2,000,000 vectors of 96 dimensions and 18% faster on 1,000,000 of 384 (15 to 19% once the machine's own speed, measured by an unchanged exact search, is accounted for). The gain is larger than the instruction count's because the level check skipped on level 0 was also a random memory read.
+
 ### Compaction
 
 `compact()` decides links in parallel batches (see the architecture notes): 93 to 95% of its work is parallel, so expect about 6x on 8 threads and 9x on 20 against the former single thread (205 s for a million 128-dimensional vectors in the profiling report). `OperationOptions::threads` limits it; the result is the same whatever the number.
+
+Measured on the same laptop (20 threads) after removing 39% of the vectors, before → now: 2,000,000 x 96: 414 s → 133 s; 1,000,000 x 384: 527 s → 108 s; 250,000 x 1536: 215 s → 62 s (3.1 to 4.9 times faster; the efficiency cores and memory bandwidth keep it below the ideal).
 
 ### Filtered search: the beam multiplier
 

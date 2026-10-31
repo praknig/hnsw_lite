@@ -12,9 +12,9 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 ## Features
 
 - **Four index types:** `HnswIndex` (approximate graph search: about 14x faster than exact at 99.8% recall on 50,000 vectors), `FlatIndex` (exact, optionally an inverted file), `DiskIndex` (a DiskANN-style graph on disk, for indexes larger than memory) and `SparseIndex` (sparse vectors and BM25, for hybrid search).
-- **Three distance metrics:** squared Euclidean (L2), inner product and cosine.
+- **Three distance metrics:** squared Euclidean (L2), inner product and cosine; inner-product graphs stay connected even when vector lengths vary widely, as in recommendations.
 - **SIMD speed on any CPU:** AVX2, AVX-512 or ARM NEON versions are chosen automatically at runtime.
-- **Updates and real deletion:** `update` and `upsert` replace a vector without ever losing the old one on failure; removed IDs can be reused immediately, and `compact()` rebuilds a heavily changed index.
+- **Updates and real deletion:** `update` and `upsert` replace a vector without ever losing the old one on failure; removed IDs can be reused immediately, and `compact()` rebuilds a heavily changed index in parallel, with the same result whatever the number of threads.
 - **Metadata and filtered search:** integer, float, boolean, keyword and tag fields; filters like `Filter::eq("topic", "tech") && Filter::ge("year", 2020)`; a query planner that picks the fastest strategy.
 - **Batch search** on a thread pool and **range search** (everything within a radius).
 - **Parallel building:** `add_batch` links many vectors into the HNSW graph on several threads, all or nothing.
@@ -34,8 +34,8 @@ hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Q
 - **Drop-in for hnswlib:** `from hnsw_lite_lib import hnswlib` runs hnswlib code unchanged (identical exact results, the same neighbors, errors and conventions, checked against hnswlib itself)
 - **Data in and out:** Arrow and Parquet (streamed), and importers from hnswlib files, FAISS indexes and Chroma collections
 - **Reranking:** a cross-encoder (or any model) re-scores the best candidates
-- **Group-by and recommendations:** the best documents rather than ten chunks of one; "more like these, less like those" from example documents
-- **Search by stored ID, deadlines and cancellation:** "more like record 42"; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
+- **Group-by and recommendations:** the best documents rather than ten chunks of one, each group filled from its own members (fast even when a document's chunks are scattered); "more like these, less like those" from example documents
+- **Search by stored ID, among chosen IDs, deadlines and cancellation:** "more like record 42"; exactly among a list of IDs (`SearchOptions::among`), at a cost in proportion to the list; searches that stop on time with the best results so far; long operations with progress reports that can be cancelled and are then undone.
 - **Save and load:** one call writes the whole index to a file and one reads it back, checked against damage and portable between platforms.
 - **Safe by design:** invalid input is rejected with clear exceptions, and every change is all-or-nothing, even when memory runs out.
 
@@ -190,7 +190,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 ## Things to know
 
 - **Distances are "smaller is closer"** for every metric: L2 returns the *squared* distance, inner product returns the *negative* dot product, and cosine returns 1 minus the cosine similarity.
-- **Thread safety:** every index can be used from any number of threads with no lock of your own. Searches and saves run in parallel; changes run one at a time and wait for running searches. Changes cannot be made from inside a search (for example from a filter predicate): that throws `std::logic_error`.
+- **Thread safety:** every index can be used from any number of threads with no lock of your own. Searches and saves run in parallel. Changes run one at a time; on an HNSW index, an `add`, `update` or `upsert` finds its new neighbors alongside running searches and holds them up only while it links, so searches keep their speed while the index changes (a collection still holds its searches for the whole of a change). Changes cannot be made from inside a search (for example from a filter predicate): that throws `std::logic_error`.
 - **Errors:** invalid input (wrong dimension, NaN, a duplicate ID, a metadata type mismatch) throws `std::invalid_argument` and leaves the index unchanged.
 - **Saving:** `index.save(path)` writes everything, and `HnswIndex::load(path)` returns the index exactly as it was; a damaged file throws `vecdb::FormatError`.
 
@@ -226,7 +226,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 ## Project status
 
-Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys, saved settings, scanning and export to pandas; score modifiers, dates and diversity re-ranking; faceted search (top values, ranges, distinct counts) with payload posting lists; a durable sparse index; the `hnsw-lite` command-line tool; graph reordering; Python bindings and wheels; benchmark and stress tools with a nightly run. Next: see the [roadmap](docs/project-notes.md#roadmap).
+Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys, saved settings, scanning and export to pandas; score modifiers, dates and diversity re-ranking; faceted search (top values, ranges, distinct counts) with payload posting lists; a durable sparse index; the `hnsw-lite` command-line tool; graph reordering; Python bindings and wheels; benchmark and stress tools with a nightly run; connected inner-product graphs, group-by filled from group members, insertions that leave searches running, parallel and deterministic compaction, and a leaner search loop. Next: see the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

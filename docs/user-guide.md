@@ -106,7 +106,7 @@ for (const CollectionGroup& g : collection.search_groups(query, by, options))
     std::cout << g.value.s << ": " << g.hits.size() << " chunks, best score " << g.hits[0].score << "\n";
 ```
 
-It ranks exactly as `search()` would with the same query and options (any mix of vector, text and sparse, filters, modifiers), and groups by a keyword, integer or boolean field; documents without the field are in no group. The search widens until the groups are found and filled, or every match was seen (`max_candidates` caps it), so with an exact search the result equals grouping the full ranking. A document's group is read under the same lock as its rank, so a concurrent change cannot move it between groups mid-search. In Python: `collection.search_groups(text="...", group_by="doc_id", groups=5, per_group=2)`.
+It ranks exactly as `search()` would with the same query and options (any mix of vector, text and sparse, filters, modifiers), and groups by a keyword, integer or boolean field; documents without the field are in no group. The search widens until the groups are found (and while widening stays cheap); a group still short is then filled by a search among its own documents, so grouping stays fast even when a document's chunks lie far apart in the ranking (measured: 48 to 115 times faster on such data). With an exact single-list search the result equals grouping the full ranking; with fusion, a group's documents are ranked within the group. **Create a payload index on the field** (`collection.create_payload_index("doc_id")`): filling a group then reads only its documents. With `max_candidates`, groups and documents come from the best `max_candidates` documents only. A document's group is read under the same lock as its rank, so a concurrent change cannot move it between groups mid-search. In Python: `collection.search_groups(text="...", group_by="doc_id", groups=5, per_group=2)`.
 
 ### More like these (recommendations)
 
@@ -172,7 +172,7 @@ HnswIndex fast(768, Metric::Cosine);    // default settings
 
 Every metric follows the same rule: **smaller distance means closer**, and cosine distances are never negative. With cosine, vectors are normalized automatically when added and when searched, so you do not need to normalize them yourself. An all-zero vector has no direction: with cosine it is accepted and sits at distance 1 from everything, as in hnswlib and Faiss.
 
-Inner product is not a true distance, and HNSW recall is lower with it on vectors of very different lengths. If you can, normalize your vectors and use cosine.
+Inner product is not a true distance. hnsw-lite chooses each node's neighbors by angle with it, so the graph stays connected even when lengths vary widely, as with recommendation models (measured on such data: recall@10 0.960 rising to 0.993 at `ef` 64, and filtered searches finding every right answer where they found half). Searches then do more work than on normalized data, though: if lengths carry no meaning in your data, normalize your vectors and use cosine.
 
 ### HNSW settings
 
@@ -254,7 +254,7 @@ index.add(42, new_embedding);      // the ID can be used again immediately
 
 - `FlatIndex` removes for real: the last vector moves into the removed one's place. Nothing to clean up later.
 - `HnswIndex` frees the vector's ID and reuses its memory for the next insert. The graph is repaired around the removed vector so searches stay accurate. `deleted_count()` reports removed slots not yet reused, and `capacity()` the slots in use plus those.
-- **`compact()`** rebuilds an HNSW index from only its live vectors, giving the best graph quality and returning memory. It is worth calling after removing a large share of the vectors (say a third), at a quiet moment: it takes about as long as building the index from scratch. If it runs out of memory, the original index is kept unchanged.
+- **`compact()`** rebuilds an HNSW index from only its live vectors, giving the best graph quality and returning memory. It is worth calling after removing a large share of the vectors (say a third), at a quiet moment. It rebuilds in parallel (on all cores, or `OperationOptions::threads`), about as long as building the index from scratch with `add_batch`, and gives the same index whatever the number of threads. If it runs out of memory, the original index is kept unchanged.
 
 ## Metadata
 
@@ -368,6 +368,8 @@ Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact sea
 
 Where the matches cluster away from the query, ACORN can miss a few (recall 0.98 at 5% above); set `PlannerParams::acorn_below = 0` to turn it off, or `acorn_ef_multiplier` higher for more recall.
 
+**How much the beam widens.** Between the planner's exact cases and an unfiltered search, a filtered graph search widens its beam by up to 1 / selectivity, capped by `PlannerParams::max_ef_multiplier` (default 32). The search already keeps exploring until it has enough matching results, so the widening matters only on data that is hard to navigate: on data like real embeddings, `max_ef_multiplier = 2` found the same results up to 2.5 times faster, while on uniform random data it lost up to 2.4 points of recall. Measure on your data (see [Performance and tuning](performance.md#filtered-search-the-beam-multiplier)).
+
 **Filters that follow the data.** When a filter's matches sit in a few regions ("only this category", where categories group in vector space), a graph search can cross much of the graph before reaching them. The planner gives such a search a budget, the estimated number of matches in distance computations; past it, the search stops and scans the matches exactly (`stats.reason == PlanReason::ExactFallback`). Measured with a filter matching 10% of 30,000 vectors by cluster: 4.3× faster (6.2× on an indexed field), recall unchanged. `PlannerParams::fallback_factor` sets the budget (0 turns it off).
 
 You can see and steer the decision:
@@ -420,6 +422,7 @@ auto all2 = flat.search_batch(queries, /*k=*/10, /*threads=*/4);
 - An optional `SearchOptions` (filter, predicate) applies to all queries. Statistics are not filled in for batches.
 - Thread counts are capped at a sensible maximum (64, or 4 per core on larger machines).
 - Each thread holds a visited list of 4 bytes per vector slot, so a batch on 64 threads over 1 million vectors uses about 256 MB extra while it runs. Use fewer threads if memory is tight.
+- Keep the thread count the same from call to call: asking for another count rebuilds the thread pool, which costs milliseconds (0, the default, is one per hardware thread).
 
 ## Range search
 
@@ -486,6 +489,16 @@ if (similar) for (const SearchResult& r : *similar) { /* ... */ }
 - It returns nothing (an empty `std::optional`) if the ID is not stored.
 - The record itself is left out unless the last argument is `true`; other records with an identical vector are kept.
 
+**Searching among chosen IDs.** To rank a known, small set of candidates (a user's items, the results of another system), give their IDs in `SearchOptions::among`: only those are scored, exactly, at a cost in proportion to the list rather than the index. A filter and predicate still apply; unknown and removed IDs are ignored.
+
+```cpp
+SearchOptions o;
+o.among = std::vector<std::uint64_t>{17, 42, 99, 1003};
+auto ranked = index.search(query, 3, 64, o);  // the 3 closest of those 4
+```
+
+It works with `HnswIndex` (`search`, `search_batch`) and `SparseIndex`; `search_range`, `FlatIndex` and `DiskIndex` refuse it.
+
 **A C++ trap with functions returning `std::optional`** (`search_by_id`, `get_vector`, `get`): do not loop directly over `*index.search_by_id(...)`. A range-based `for` keeps only its outermost value alive, here a reference into the temporary optional, which is destroyed before the loop body runs (fixed in C++23). Store the result in a variable first, as above.
 
 ## Deadlines, cancellation and progress
@@ -508,7 +521,7 @@ try {
 ```
 
 - **Searches** (single, batch, range and by ID) take a `deadline` and a `cancel` flag in `SearchOptions`. When either fires, the search stops and returns the best results found so far, sorted and valid but possibly incomplete, and sets `SearchStats::stopped_early`. They are checked every few dozen steps, so a search stops within microseconds. A search started inside a predicate has its own deadline, not its caller's.
-- **`add_batch`, `compact` and `save`** take `OperationOptions`: a `deadline`, a `cancel` flag and a `progress` callback. A cancelled or late operation is **undone** and throws `vecdb::Cancelled`: a batch is rolled back, a compaction discarded, a save leaves any existing file untouched and no temporary file (a stream may hold an incomplete index).
+- **`add_batch`, `compact` and `save`** take `OperationOptions`: a `deadline`, a `cancel` flag, a `progress` callback, and for `compact` a thread count (`threads`, 0 for all cores; the result does not depend on it). A cancelled or late operation is **undone** and throws `vecdb::Cancelled`: a batch is rolled back, a compaction discarded, a save leaves any existing file untouched and no temporary file (a stream may hold an incomplete index).
 - **Progress** is reported as `(done, total)`: from 0, never decreasing, at most about 100 times, ending at `(total, total)` on success. Calls never overlap but may come from worker threads, and the callback must not use the index. If it throws, the operation is undone and its exception passed on.
 
 ## Changing many vectors by filter
@@ -829,6 +842,7 @@ Every index is safe to use from any number of threads at once, with no lock of y
 
 - **Searches** of every kind, **saves**, and lookups (`contains`, `get_metadata`, `size` and so on) run in parallel with each other.
 - **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) run one at a time: a change waits until the searches running when it arrived have finished, and searches arriving after it wait until it is done. A queued change is never starved by a steady stream of searches.
+- **Additions and updates hold searches up only briefly.** An `add`, `update` or `upsert` on an HNSW index finds and chooses its neighbors while searches keep running, and holds them up only to link them in (measured with one writer and 19 readers: reads 3 times faster than when the whole insertion blocked them, p99 latency 5 times lower). The other side of it: with many searches running, the writer competes with them for the cores, so writes go slower than they would alone.
 - **`upsert` is atomic:** the check for an existing vector and the update or insert happen under one lock, so two threads upserting the same ID never collide.
 - **Changes cannot be made from inside a search**, for example from a filter predicate, on that index or any other: this throws `std::logic_error`. Waiting would deadlock (the change would wait for the very search that called it), and changes nested inside searches are what create lock cycles between threads. Predicates may still **search** any index, including the one they are filtering.
 - **Batch searches** use their own thread pool; predicates in batch searches run on several threads at once, so they must be thread-safe.
