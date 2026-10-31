@@ -31,7 +31,7 @@ jobs:
         include:
           - { name: Linux x86-64, os: ubuntu-24.04 }
           - { name: Linux ARM64, os: ubuntu-24.04-arm }
-          - { name: macOS Apple Silicon, os: macos-14 }
+          - { name: macOS Apple Silicon, os: macos-15 }  # macos-14 is retired on 2026-11-02; wheels still target macOS 11 (MACOSX_DEPLOYMENT_TARGET)
           - { name: Windows x86-64, os: windows-2022 }
     steps:
       - uses: actions/checkout@v5
