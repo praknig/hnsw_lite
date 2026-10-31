@@ -362,7 +362,7 @@ The `Wheels` workflow (`.github/workflows/wheels.yml`) builds and tests every wh
 
 **Each release.**
 
-1. Change `__version__` in `python/hnsw_lite_lib/__init__.py` (the only place the version is written: `pyproject.toml` reads it), and merge.
+1. Change `__version__` in `python/hnsw_lite_lib/__init__.py` (the only place the version is written: `pyproject.toml`, `CMakeLists.txt` and `conanfile.py` read it), set the same version in `ports/hnsw-lite/vcpkg.json`, and merge.
 2. Tag the merged commit and push the tag:
 
    ```bash
@@ -371,5 +371,6 @@ The `Wheels` workflow (`.github/workflows/wheels.yml`) builds and tests every wh
    ```
 
 3. The workflow builds the 20 wheels (CPython 3.9 to 3.13 on four platforms) and the source distribution, tests each wheel in a clean environment, checks that the tag matches `__version__` (refusing to publish otherwise), checks the files with `twine`, and uploads them.
+4. In `ports/hnsw-lite/portfile.cmake`, set `SHA512` to the new tag's archive: with `SHA512 0`, `vcpkg install hnsw-lite --overlay-ports=ports` stops and prints the right value.
 
 PyPI never accepts the same version twice: a mistake is fixed by releasing the next version.

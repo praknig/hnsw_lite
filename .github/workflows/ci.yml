@@ -392,6 +392,38 @@ jobs:
           name: fuzz-findings
           path: fuzz-out/artifacts
 
+  # The packages: the CMake package installed and used from a separate project, and the
+  # Conan recipe built and tested (conan create runs test_package). vcpkg runs nightly.
+  packaging:
+    name: Packaging (CMake install, Conan)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the library into a prefix
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHNSW_LITE_BUILD_TESTS=OFF \
+            -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF -DHNSW_LITE_BUILD_TOOLS=OFF \
+            -DCMAKE_INSTALL_PREFIX="$PWD/prefix"
+          cmake --build build
+          cmake --install build
+
+      - name: Use it from a separate project (find_package)
+        run: |
+          rm -rf build  # nothing from the build tree may be needed
+          cmake -S test_package -B consumer -DCMAKE_PREFIX_PATH="$PWD/prefix"
+          cmake --build consumer
+          ./consumer/test_package
+
+      - name: Conan recipe (conan create, which builds and runs test_package)
+        run: |
+          python3 -m pip install --user conan
+          conan profile detect
+          conan create . -s compiler.cppstd=20 --build=missing
+
   # The Python package: built from source with pip (scikit-build-core and
   # pybind11), then tested with pytest, on every platform, with the oldest and
   # newest supported Python.
@@ -422,7 +454,7 @@ jobs:
   ci-passed:
     name: CI passed
     if: always()
-    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python, fuzz]
+    needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python, fuzz, packaging]
     runs-on: ubuntu-24.04
     steps:
       - name: Every job that ran succeeded

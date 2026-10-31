@@ -74,7 +74,8 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] RaBitQ compression (one bit per dimension and two numbers; helps most for L2 and wide vectors)
 - [x] Python bindings with NumPy and pandas integration (`hnsw_lite_lib`)
 - [x] Python wheels for Linux, macOS and Windows (`pip install hnsw-lite-lib`)
-- [ ] C++ packaging, a C API (see the [suggested order](feature-catalog.md#suggested-order))
+- [x] C++ packaging: an installable CMake package (`find_package(hnsw_lite)`), a vcpkg port and a Conan recipe
+- [ ] A C API (see the [suggested order](feature-catalog.md#suggested-order))
 - [x] Search features: metadata, filtered search with a query planner, payload index (counts), batch search, range search
 - [x] Payload index posting lists; faceted search (top values, numeric ranges, distinct counts)
 - [ ] Filter-aware graph construction. Measured first (30,000 vectors, filters from 0.5% to 30%, correlated with the clusters or not, indexed or ranges): recall was already 0.995 or better everywhere; the gap was cost, for correlated filters past exact search's limits. Built instead: the planner's exact fallback (4.3 to 6.2× faster there). Construction changes stay open for data where recall does fall.
