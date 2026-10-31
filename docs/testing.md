@@ -68,18 +68,20 @@ The Python package has its own pytest suite in `python/tests` (51 tests: convers
 | `concurrency` | 24 | Up to 8 threads searching HNSW and Flat at once, every answer matching the single-threaded one; plus scenarios C1 to C20 for the index lock: searches during adds, updates, saves and compaction (results always sorted, unique, finite, and every saved snapshot valid), several writers, the same ID added or removed by two threads (exactly one wins), atomic `upsert`, metadata and planner changes during filtered searches, predicates searching their own and other indexes while writers queue (no deadlock), changes from predicates refused on every thread, writers not starved, exceptions (including a predicate's own, on batch worker threads) and running out of memory releasing the lock, the nesting limit, accessors and saves during compaction, and simultaneous saves to one file (each complete, no temporary files left). Tests that could deadlock run under a watchdog that fails the run instead of hanging it |
 | `e2e` | 6 | Add, remove and re-add lifecycles for every metric; 6,000 vectors at 48 dimensions; 5,000 random adds, removes and searches checked against Flat after every step; all metrics on the same data |
 
-Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 15 seconds in Release.
+Tests share large indexes where possible: a 3,000-vector HNSW and Flat pair per metric is built the first time a test needs it, then reused, so the whole suite runs in about 4 to 7 minutes in Release as one process (measured: 252 s in a one-core sandbox, 249 to 445 s on a 20-thread laptop), and in about a minute through CTest on 20 threads.
 
 **Running tests at will:**
 
 ```
 test_comprehensive                      # run every test
-test_comprehensive --list               # list all 949 test names
+test_comprehensive --list               # list all 961 test names
 test_comprehensive --group hnsw         # run one group (repeatable)
 test_comprehensive recall               # every test whose "group.name" contains "recall"
 test_comprehensive flat.k_zero          # a single test
 test_comprehensive --exclude e2e        # skip matching tests (repeatable)
 test_comprehensive --fail-fast          # stop at the first failing test
+test_comprehensive --shard 2/4          # every 4th selected test, from the 2nd (how CTest splits heavy groups)
+test_comprehensive --write-golden       # rewrite the saved-format golden files (format changes only)
 test_comprehensive --help               # show all options
 ```
 
@@ -94,7 +96,7 @@ hnsw-lite comprehensive tests | kernel: avx512 | 961 of 961 tests selected
   PASS  round_up_boundaries                                0.0 ms
   PASS  constants                                          0.0 ms
   ...
-871 passed, 0 failed, 0 skipped, 0 not run, 37745 checks, 129.33 s
+961 passed, 0 failed, 0 skipped, 0 not run, 42938 checks, 252.06 s
 All selected tests passed.
 ```
 
@@ -147,72 +149,76 @@ CTest runs the comprehensive suite as one entry per group, the heaviest groups s
 The environment variable `HNSW_LITE_TEST_EXCLUDE` adds exclusions (space- or comma-separated, like `--exclude`) to every run, including runs through CTest, which cannot pass arguments: CI's sanitizer job uses it to skip the seven heavy measurement tests, which run natively on every platform.
 
 ```
- 1/60 Test # 1: comprehensive.layer1 ...........   Passed
- 2/60 Test # 2: comprehensive.layer2 ...........   Passed
- 3/60 Test # 3: comprehensive.helpers ..........   Passed
- 4/60 Test # 4: comprehensive.flat .............   Passed
- 5/60 Test # 5: comprehensive.hnsw .............   Passed
- 6/60 Test # 6: comprehensive.robustness .......   Passed
- 7/60 Test # 7: comprehensive.deletion.1of2 ....   Passed
- 8/60 Test # 8: comprehensive.deletion.2of2 ....   Passed
- 9/60 Test # 9: comprehensive.concurrency ......   Passed
-10/60 Test #10: comprehensive.metadata .........   Passed
-11/60 Test #11: comprehensive.filter ...........   Passed
-12/60 Test #12: comprehensive.planner ..........   Passed
-13/60 Test #13: comprehensive.payload ..........   Passed
-14/60 Test #14: comprehensive.batch ............   Passed
-15/60 Test #15: comprehensive.range ............   Passed
-16/60 Test #16: comprehensive.search_e2e .......   Passed
-17/60 Test #17: comprehensive.update ...........   Passed
-18/60 Test #18: comprehensive.hardening ........   Passed
-19/60 Test #19: comprehensive.persistence ......   Passed
-20/60 Test #20: comprehensive.add_batch.1of2 ...   Passed
-21/60 Test #21: comprehensive.add_batch.2of2 ...   Passed
-22/60 Test #22: comprehensive.bulk .............   Passed
-23/60 Test #23: comprehensive.records ..........   Passed
-24/60 Test #24: comprehensive.control.1of2 .....   Passed
-25/60 Test #25: comprehensive.control.2of2 .....   Passed
-26/60 Test #26: comprehensive.codec ............   Passed
-27/60 Test #27: comprehensive.sq8.1of2 .........   Passed
-28/60 Test #28: comprehensive.sq8.2of2 .........   Passed
-29/60 Test #29: comprehensive.matryoshka .......   Passed
-30/60 Test #30: comprehensive.lean .............   Passed
-31/60 Test #31: comprehensive.review ...........   Passed
-32/60 Test #32: comprehensive.codes_only.1of2 ..   Passed
-33/60 Test #33: comprehensive.codes_only.2of2 ..   Passed
-34/60 Test #34: comprehensive.binary.1of2 ......   Passed
-35/60 Test #35: comprehensive.binary.2of2 ......   Passed
-36/60 Test #36: comprehensive.pq.1of2 ..........   Passed
-37/60 Test #37: comprehensive.pq.2of2 ..........   Passed
-38/60 Test #38: comprehensive.ivf ..............   Passed
-39/60 Test #39: comprehensive.edges ............   Passed
-40/60 Test #40: comprehensive.vamana ...........   Passed
-41/60 Test #41: comprehensive.disk.1of4 ........   Passed
-42/60 Test #42: comprehensive.disk.2of4 ........   Passed
-43/60 Test #43: comprehensive.disk.3of4 ........   Passed
-44/60 Test #44: comprehensive.disk.4of4 ........   Passed
-45/60 Test #45: comprehensive.health ...........   Passed
-46/60 Test #46: comprehensive.upkeep.1of2 ......   Passed
-47/60 Test #47: comprehensive.upkeep.2of2 ......   Passed
-48/60 Test #48: comprehensive.rebuild ..........   Passed
-49/60 Test #49: comprehensive.wal ..............   Passed
-50/60 Test #50: comprehensive.durable ..........   Passed
-51/60 Test #51: comprehensive.sparse ...........   Passed
-52/60 Test #52: comprehensive.collection .......   Passed
-53/60 Test #53: comprehensive.maintenance ......   Passed
-54/60 Test #54: comprehensive.presets ..........   Passed
-55/60 Test #55: comprehensive.acorn ............   Passed
-56/60 Test #56: comprehensive.reorder ..........   Passed
-57/60 Test #57: comprehensive.scoring ..........   Passed
-58/60 Test #58: comprehensive.features .........   Passed
-59/60 Test #59: comprehensive.stress ...........   Passed
-60/60 Test #60: comprehensive.e2e ..............   Passed
-100% tests passed, 0 tests failed out of 65
+ 1/65 Test # 1: comprehensive.layer1 .............   Passed
+ 2/65 Test # 2: comprehensive.layer2 .............   Passed
+ 3/65 Test # 3: comprehensive.helpers ............   Passed
+ 4/65 Test # 4: comprehensive.flat ...............   Passed
+ 5/65 Test # 5: comprehensive.hnsw ...............   Passed
+ 6/65 Test # 6: comprehensive.robustness .........   Passed
+ 7/65 Test # 7: comprehensive.deletion.1of2 ......   Passed
+ 8/65 Test # 8: comprehensive.deletion.2of2 ......   Passed
+ 9/65 Test # 9: comprehensive.concurrency ........   Passed
+10/65 Test #10: comprehensive.metadata ...........   Passed
+11/65 Test #11: comprehensive.filter .............   Passed
+12/65 Test #12: comprehensive.planner ............   Passed
+13/65 Test #13: comprehensive.payload ............   Passed
+14/65 Test #14: comprehensive.batch ..............   Passed
+15/65 Test #15: comprehensive.range ..............   Passed
+16/65 Test #16: comprehensive.search_e2e .........   Passed
+17/65 Test #17: comprehensive.update .............   Passed
+18/65 Test #18: comprehensive.hardening ..........   Passed
+19/65 Test #19: comprehensive.persistence ........   Passed
+20/65 Test #20: comprehensive.add_batch.1of2 .....   Passed
+21/65 Test #21: comprehensive.add_batch.2of2 .....   Passed
+22/65 Test #22: comprehensive.bulk ...............   Passed
+23/65 Test #23: comprehensive.records ............   Passed
+24/65 Test #24: comprehensive.control.1of2 .......   Passed
+25/65 Test #25: comprehensive.control.2of2 .......   Passed
+26/65 Test #26: comprehensive.codec ..............   Passed
+27/65 Test #27: comprehensive.sq8.1of2 ...........   Passed
+28/65 Test #28: comprehensive.sq8.2of2 ...........   Passed
+29/65 Test #29: comprehensive.matryoshka .........   Passed
+30/65 Test #30: comprehensive.lean ...............   Passed
+31/65 Test #31: comprehensive.review .............   Passed
+32/65 Test #32: comprehensive.codes_only.1of2 ....   Passed
+33/65 Test #33: comprehensive.codes_only.2of2 ....   Passed
+34/65 Test #34: comprehensive.binary.1of2 ........   Passed
+35/65 Test #35: comprehensive.binary.2of2 ........   Passed
+36/65 Test #36: comprehensive.pq.1of2 ............   Passed
+37/65 Test #37: comprehensive.pq.2of2 ............   Passed
+38/65 Test #38: comprehensive.ivf ................   Passed
+39/65 Test #39: comprehensive.edges ..............   Passed
+40/65 Test #40: comprehensive.vamana .............   Passed
+41/65 Test #41: comprehensive.disk.1of4 ..........   Passed
+42/65 Test #42: comprehensive.disk.2of4 ..........   Passed
+43/65 Test #43: comprehensive.disk.3of4 ..........   Passed
+44/65 Test #44: comprehensive.disk.4of4 ..........   Passed
+45/65 Test #45: comprehensive.health .............   Passed
+46/65 Test #46: comprehensive.upkeep.1of2 ........   Passed
+47/65 Test #47: comprehensive.upkeep.2of2 ........   Passed
+48/65 Test #48: comprehensive.rebuild ............   Passed
+49/65 Test #49: comprehensive.wal ................   Passed
+50/65 Test #50: comprehensive.durable ............   Passed
+51/65 Test #51: comprehensive.sparse .............   Passed
+52/65 Test #52: comprehensive.collection .........   Passed
+53/65 Test #53: comprehensive.maintenance ........   Passed
+54/65 Test #54: comprehensive.presets ............   Passed
+55/65 Test #55: comprehensive.acorn ..............   Passed
+56/65 Test #56: comprehensive.reorder ............   Passed
+57/65 Test #57: comprehensive.scoring ............   Passed
+58/65 Test #58: comprehensive.features ...........   Passed
+59/65 Test #59: comprehensive.half ...............   Passed
+60/65 Test #60: comprehensive.facets .............   Passed
+61/65 Test #61: comprehensive.stress .............   Passed
+62/65 Test #62: comprehensive.e2e ................   Passed
+63/65 Test #63: adversarial ......................   Passed
+64/65 Test #64: races ............................   Passed
+65/65 Test #65: cli ..............................   Passed
 ```
 
 Run one group through CTest with, for example, `ctest --test-dir build -R comprehensive.hnsw`.
 
-In a Debug build the comprehensive suite takes about a minute, and several times longer with sanitizers, because it builds many indexes with optimizations off.
+A Debug build runs the comprehensive suite many times slower than Release, and slower still with sanitizers, because it builds many indexes with optimizations off.
 
 ### Verification
 
@@ -223,7 +229,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
-  | Emulated 64-bit ARM | scalar, NEON | NEON |
+  | 64-bit ARM (CI: Apple Silicon and Linux ARM64 machines) | scalar, NEON | NEON |
 
 - **Compilers:** all tests pass with GCC 13, GCC 16 (MinGW, on Windows), Clang 15 and Clang 18. MSVC, MinGW on Windows and Apple Clang are covered by the [CI pipeline](#continuous-integration), which also runs the suite on real ARM hardware.
 - **Sanitizers:** all tests pass with AddressSanitizer and UndefinedBehaviorSanitizer (the out-of-memory tests are skipped there), and the threaded groups pass under ThreadSanitizer with no data races reported.
@@ -557,7 +563,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 
 **The one check to require** in branch protection (Settings, Branches, the rule for `master`, "Require status checks to pass") is **CI passed**: it passes when every job that ran succeeded, and fails if any job failed or was cancelled, including the change detection itself.
 
-**What it runs when code changed (14 jobs in parallel):**
+**What it runs when code changed (21 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
@@ -569,9 +575,11 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |
 | Linux ARM64 / GCC (NEON) | Release | Full suite on ARM with GCC and libstdc++ (macOS covers ARM only with Apple's compiler and libc++) |
 | Linux / Clang + libc++ | Release | Full suite against libc++, macOS's standard library; catches library differences quickly, like the saved-file portability bug |
-| Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers the README promises to support (Ubuntu 22.04) |
-| Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps and the stress group, which are slow under emulation |
-| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only, binary pq, ivf, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance and presets groups |
+| Linux / GCC 11 and Linux / Clang 14 | Release | The oldest compilers supported (Ubuntu 22.04; see [Getting started](getting-started.md#requirements)) |
+| Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps, the stress group and seven heavy measurement tests, which are slow under emulation |
+| Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, features, scoring and reorder groups (26), plus the race tests and the adversarial concurrency tests |
+| Linux / Fuzzing | Clang, libFuzzer | Every file loader fuzzed for 60 seconds ([fuzz.sh](../.github/scripts/fuzz.sh)) |
+| Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.

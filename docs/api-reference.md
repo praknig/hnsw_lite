@@ -1,14 +1,13 @@
 # API reference
 
-Every public class and function, grouped by header. All names are in the `vecdb` namespace. For how to use them together, see the [User guide](user-guide.md).
+The public classes and functions, grouped by header. All names are in the `vecdb` namespace; internal helpers are left out (the namespaces `detail`, `walop`, `persist` and `wal`: index internals, log record encoding, file serialization and syncing files to disk). For how to use them together, see the [User guide](user-guide.md).
 
 Most programs need only `FlatIndex` or `HnswIndex` with `SearchOptions`, `Filter` and `Metadata`. The lower layers (`Storage`, `VectorStore`, `get_distance()` and the rest) are public too, for building other kinds of index.
 
-All code is in the `vecdb` namespace. Invalid input throws `std::invalid_argument`, `std::out_of_range` or `std::length_error`.
+Invalid input throws `std::invalid_argument`, `std::out_of_range` or `std::length_error`.
 
 
 This is a compact list. The [developer reference](developer-reference.md) explains each method and parameter in detail, with its errors and limits.
-| `stem_english(word)`, `tokenize_unicode(text)`, `is_english_stop_word(token)` (`text_analysis.h`); `Bm25Params::unicode`, `stop_words`, `stem`; `Bm25::analyze(text)` | Text analysis for BM25: the Snowball English stemmer, Unicode tokens, stop words |
 
 ## `common.h`
 
@@ -19,6 +18,11 @@ This is a compact list. The [developer reference](developer-reference.md) explai
 | `kAlign` | Alignment in bytes (64) |
 | `kFloatsPerLine` | Floats per cache line (16) |
 | `round_up(n, m)` | Rounds `n` up to a multiple of `m` |
+| `kMaxDim` | The largest vector dimension (16,777,216); beyond it, sizes computed from the dimension could overflow |
+| `checked_dim(dim)` | Returns `dim`; throws `std::invalid_argument` if it is 0 or above `kMaxDim` |
+| `clamped_count(x, limit)` | A count from a `double`: 0 for NaN or anything not positive, at most `limit` |
+| `has_repeats(v)`, `unique_in_order(v)` | Whether a list of numbers repeats a value; removes repeats, keeping each value's first occurrence in place (O(n log n), no allocation for short lists) |
+| `reserve_one_more(v)` | Makes room for one more element (at least 16, then doubling), so the push that follows cannot fail halfway |
 
 ## `AlignedBlock`
 
@@ -111,7 +115,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Description |
 |---|---|
-| `SearchResult { id, distance }` | One result for the user: their 64-bit ID and the distance |
+| `SearchResult { id, distance, score }` | One result for the user: their 64-bit ID, the distance, and with `SearchOptions::modifiers` the modified relevance (higher is better; otherwise 0) |
 | `Candidate { distance, id }` | Internal result with a `NodeId`; ordered by distance, then id |
 | `TopK(k)` | Keeps the k closest candidates (reserves memory for at most 1024 up front, so any k is safe) |
 | `TopK::push(c)` | Adds `c` if there is room or it beats the worst kept; returns whether it was kept |
@@ -261,6 +265,9 @@ These are the building blocks of compressed indexes (see the [compression and in
 
 | Name | Description |
 |---|---|
+| `f16_to_float(h)`, `float_to_f16(f)`, `bf16_to_float(h)`, `float_to_bf16(f)` (`half.h`) | Conversions between float32 and the bits of float16 or bfloat16: to float32 exactly; from float32 rounding to nearest even, values beyond the format's range saturating to its largest |
+| `keeps_originals(q, metric, dim)` | Whether an index keeps each vector as given besides the stored one: when storage changes it (cosine normalizes, truncation shortens) and `keep_full_vectors` is on |
+| `saturating_mul(a, b)` | `a * b`, or `SIZE_MAX` if that would overflow (`k * rerank_factor` never wraps) |
 | `kmeans(data, dim, KMeansParams)` | Clusters `data` (n * dim values) into `k` centroids; returns `KMeansResult` (`centroids`, `assignment`, `inertia`, `iterations_run`). Deterministic for a given seed, on every CPU and thread count |
 | `KMeansParams` | `k`, `iterations` (default 25), `seed`, `threads` (0: all cores) |
 | `nearest_centroid(centroids, dim, point, distance)` | Index of the nearest centroid (squared L2; ties to the lower index) |
@@ -349,10 +356,19 @@ These are the building blocks of compressed indexes (see the [compression and in
 | `HybridOptions` | `fusion` (`Rrf`, `Weighted`), `rrf_k` (60), `dense_weight`, `sparse_weight` (1), `dense_k`, `sparse_k` (0: max(4k, 20)), `dense_ef` (0: max(dense_k, 64)), `filter`, `dense_options`, `sparse_options` |
 | `HybridResult` | `id`, `score` (higher is better), `dense_rank`, `sparse_rank` (1-based), `dense_distance`, `sparse_score` |
 
+## Text analysis (`text_analysis.h`)
+
+| Name | Description |
+|---|---|
+| `stem_english(word)`, `tokenize_unicode(text)`, `is_english_stop_word(token)` (`text_analysis.h`); `Bm25Params::unicode`, `stop_words`, `stem`; `Bm25::analyze(text)` | Text analysis for BM25: the Snowball English stemmer, Unicode tokens, stop words |
+
 ## Supporting types
 
 | Name | Description |
 |---|---|
+| `count_facets(store, requests, slots)` (`facets.h`) | Counts every facet request over the given slots (such as a filter's matches); checks every request before counting. The indexes' and collections' `facets()` call it |
+| `field_type_name(type)` | A metadata field type's readable name, as error messages use it |
+| `stored_kind_name(kind)` (`inspect.h`) | `"flat"`, `"hnsw"`, `"sparse"`, `"collection"` or `"disk"`, as `identify` reports a file's kind |
 | `CompareOp` | `Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`, for comparison filters |
 | `FieldSpec`, `SchemaMode` | A field's name and type in a `Schema`; `Strict` (only declared fields) or `Dynamic` (fields created on first use) |
 | `PlanDecision`, `PlanReason` | What the query planner chose (strategy, estimated matches and selectivity, beam width) and why, from `plan_search()` |

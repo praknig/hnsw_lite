@@ -8782,8 +8782,8 @@ TEST(concurrency, c14_upsert_is_atomic) {
     });
     CHECK(errors == 0 && h.size() == 20 && f.size() == 20);
     // 320 updates per vector of a 20-vector index degrade the graph whatever the
-    // order (single-threaded too: in 27 of 200 random orders one or two vectors
-    // became unreachable, worst 90%; see the project notes). compact() rebuilds it.
+    // order (single-threaded too: in 1 of 200 random orders of these upserts a vector
+    // became unreachable; see the project notes). compact() rebuilds it.
     check_graph(h, 0.85);
     h.compact();
     check_graph(h, 1.0);

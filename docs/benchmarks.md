@@ -22,6 +22,8 @@ python bench/python/compare.py --synthetic 100000,96 --metric cosine   # no down
 | `--repeat` | 3 | Timed runs per point; the median is reported. |
 | `--no-filters` | | Skip the filtered-search comparison. |
 | `--out` | `bench-results` | Where the results go. |
+| `--cache` | `~/.cache/hnsw-lite-bench` | Where downloaded datasets are kept. |
+| `--dataset-url` | the `HNSW_BENCH_DATASET_URL` environment variable | A mirror to download the datasets from, with `{name}` where the dataset's name goes, for when ann-benchmarks' host refuses or is down. |
 
 ## What it produces
 
@@ -70,7 +72,7 @@ python bench/python/stress.py --phases build,recall,load        # some phases on
 | `recall` | Exact ground truth by brute force, then searches at `ef` 32 to 256 | Recall@10 at least 0.9 at `ef` 128, and growing with `ef` |
 | `load` | 1, 2, 4… up to `--clients` concurrent search clients, `--duration` seconds each | No errors; queries per second and latency percentiles; throughput growing with clients (on several cores) |
 | `mixed` | Searchers and writers at once (inserts, updates, removes) | The exact final count; sampled ids present or absent as expected; sampled vectors identical to their last write; recall against a fresh brute force; upkeep leaving no vector unreachable |
-| `durable` | A child process writes to a durable collection and is killed mid-write (`SIGKILL`) | Every write it acknowledged survives recovery, with the right vector (one more may appear: written, but killed before acknowledging) |
+| `durable` | A child process writes to a durable collection and is killed mid-write (`SIGKILL`; on Windows, `TerminateProcess`) | Every write it acknowledged survives recovery, with the right vector (one more may appear: written, but killed before acknowledging) |
 
 Other options: `--dim` (128), `--clusters` (1,000: real embeddings are clustered), `--M`, `--ef-construction`, `--ef` (128, for the load and mixed phases), `--batch`, `--threads`, `--queries` (200), `--writers` (2), `--crash-after` (10 s), `--seed`, `--out`. Memory: about (4 × dim + 200) bytes per vector for the index plus the test's own copy of the data (4 × dim bytes per vector): about 1.3 GB at a million 128-dimensional vectors.
 
@@ -92,7 +94,7 @@ Results go to `stress-results/stress.md` (a summary with every check) and `stres
 
 On the branch: `README.md` (the latest run, the charts, a table of the last 30 runs), `latest-recall.png`, `latest-load.png`, `latest-build.png`, `history.png` (insert speed, queries per second, recall and p99 latency across nights; rates and latencies drawn from zero, so noise looks like noise), `latest.json`, and every run's full results in `runs/`. If any check fails, the results are still published and the job fails, so a regression is both recorded and visible.
 
-**Sizing.** `stress.py --vectors auto` picks the largest run that fits in 70% of the free memory (about 1,400 bytes per vector at 128 dimensions: the index plus the test's copy of the data), at most `--max-vectors` (50 million); `--max-hours 4` stops building at two hours, so a run fits GitHub's six-hour limit. On GitHub's standard runner (16 GB) that is about 8 million vectors; 50 million needs about 70 GB.
+**Sizing.** `stress.py --vectors auto` picks the largest run that fits in 70% of the free memory (about 1,400 bytes per vector at 128 dimensions: the index plus the test's copy of the data), at most `--max-vectors` (50 million); `--max-hours 4` stops building at two hours, so a run fits GitHub's six-hour limit. On GitHub's standard runner (16 GB) that is about 8 million vectors; 50 million uses about 70 GB, so `auto` chooses it with about 100 GB free.
 
 **A bigger machine.** Set the repository variable `BENCHMARK_RUNNER` (*Settings > Secrets and variables > Actions > Variables*) to a [larger runner](https://docs.github.com/en/actions/using-github-hosted-runners/using-larger-runners)'s label, or to `self-hosted` for your own machine; the workflow uses it in `runs-on` without any change. Compare nights on the same machine: the charts mark run sizes when they differ.
 
