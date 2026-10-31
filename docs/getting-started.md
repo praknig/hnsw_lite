@@ -102,6 +102,7 @@ Pass these to the first `cmake` command, for example `-DHNSW_LITE_BUILD_TESTS=OF
 | `HNSW_LITE_BUILD_TOOLS` | Same | Builds the `hnsw-lite` command-line tool (`inspect`, `verify`, `health`, `export`) |
 | `HNSW_LITE_BUILD_PYTHON` | OFF | Builds the Python extension module (`hnsw_lite_lib._core`); `pip install .` turns it on for you |
 | `HNSW_LITE_SANITIZE` | OFF | Adds AddressSanitizer and UndefinedBehaviorSanitizer with GCC or Clang (ignored with MSVC). They work on Linux and macOS, not with MinGW |
+| `HNSW_LITE_INSTALL` | ON when hnsw-lite is the main project (not for the Python build), OFF when included in another | Adds the install rules: `cmake --install` puts the library, its headers (in `include/hnsw_lite/`) and a CMake package in the prefix |
 
 ## Use hnsw-lite in your own project
 
@@ -134,6 +135,43 @@ target_link_libraries(my_app PRIVATE hnsw_lite::hnsw_lite)
 ```
 
 In both cases only the library is built: tests, benchmarks, examples and the command-line tool are skipped automatically.
+
+### Option 3: an installed package (find_package)
+
+Build and install hnsw-lite once, then use it from any project:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DHNSW_LITE_BUILD_TESTS=OFF -DCMAKE_INSTALL_PREFIX=$HOME/.local
+cmake --build build
+cmake --install build
+```
+
+```cmake
+find_package(hnsw_lite 0.1 REQUIRED)   # with -DCMAKE_PREFIX_PATH=$HOME/.local if that prefix is not searched
+target_link_libraries(my_app PRIVATE hnsw_lite::hnsw_lite)
+```
+
+The headers are installed in `include/hnsw_lite/`. Write `#include "hnsw_index.h"`: it works in every setup (FetchContent, add_subdirectory, an installed package, vcpkg, Conan); `#include <hnsw_lite/hnsw_index.h>` works only with an installed package. The package accepts the same minor version only (`0.1` finds 0.1.x, not 0.2): before 1.0, a minor version may change the API.
+
+### Option 4: vcpkg
+
+The repository holds a vcpkg port in `ports/`, used as an overlay port:
+
+```bash
+vcpkg install hnsw-lite --overlay-ports=path/to/hnsw_lite/ports
+```
+
+then the same `find_package(hnsw_lite CONFIG REQUIRED)` with vcpkg's toolchain file. It builds a static library; it downloads the release tag named by `ports/hnsw-lite/vcpkg.json`'s version. To build an unreleased checkout instead, set `HNSW_LITE_SOURCE_DIR` to it and add `VCPKG_KEEP_ENV_VARS=HNSW_LITE_SOURCE_DIR`.
+
+### Option 5: Conan
+
+`conanfile.py` (Conan 2) packages it from a checkout, with C++20:
+
+```bash
+conan create path/to/hnsw_lite -s compiler.cppstd=20
+```
+
+then `hnsw-lite/0.1.0` in your `conanfile.txt` or `conanfile.py` requirements, and the same `find_package(hnsw_lite)` and target through Conan's `CMakeDeps`. Static library only; `fPIC` is an option.
 
 ### Your first program
 

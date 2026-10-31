@@ -1,0 +1,8 @@
+# hnsw-lite's CMake package: find_package(hnsw_lite) gives the target hnsw_lite::hnsw_lite.
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)  # batch search and building run on a thread pool
+
+include("${CMAKE_CURRENT_LIST_DIR}/hnsw_liteTargets.cmake")
+check_required_components(hnsw_lite)

@@ -225,7 +225,7 @@ A Debug build runs the comprehensive suite many times slower than Release, and s
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-      |---|---|---|
+    |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -563,7 +563,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 
 **The one check to require** in branch protection (Settings, Branches, the rule for `master`, "Require status checks to pass") is **CI passed**: it passes when every job that ran succeeded, and fails if any job failed or was cancelled, including the change detection itself.
 
-**What it runs when code changed (21 jobs in parallel):**
+**What it runs when code changed (22 jobs in parallel):**
 
 | Job | Build | What it adds |
 |---|---|---|
@@ -580,6 +580,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, features, scoring and reorder groups (26), plus the race tests and the adversarial concurrency tests |
 | Linux / Fuzzing | Clang, libFuzzer | Every file loader fuzzed for 60 seconds ([fuzz.sh](../.github/scripts/fuzz.sh)) |
 | Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests |
+| Packaging | Release | `cmake --install` into a prefix, then `test_package` built against it with `find_package` (the build tree deleted first); `conan create` with C++20, which builds and runs `test_package` |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
 Each job fails on its own, so one broken platform never hides the results of the others.
@@ -595,6 +596,7 @@ A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every n
 | Emulated Nehalem and Haswell, full suite | The two exhaustive file-corruption sweeps and the stress group, which pull requests skip under emulation |
 | ASan + UBSan, full suite | The same as on pull requests, but checking `master` itself every night |
 | ThreadSanitizer, full suite | Every test group, where pull requests check only the threaded groups |
+| vcpkg port | The port in `ports/` installed from the checkout (debug and release, with vcpkg's own checks), then `test_package` built through vcpkg's toolchain |
 
 **The report:** each run's page shows a table of job results, and for each job the distance code used, the totals, any failed tests and the first lines of any sanitizer report (made by [summarize_tests.sh](../.github/scripts/summarize_tests.sh)). Each job's full test log is attached as an artifact for 14 days. If any job fails, an issue labelled `nightly-failure` is opened, or, if one is already open, commented on, so a recurring failure produces one issue rather than one per night. Watching the repository on GitHub turns these into email notifications.
 
