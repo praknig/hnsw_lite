@@ -1781,6 +1781,7 @@ struct SearchStats {
 ```cpp
 struct SearchOptions {
     std::size_t probes = 0;
+    std::optional<std::vector<std::uint64_t>> among;
     std::optional<Filter> filter;
     std::function<bool(std::uint64_t)> predicate;
     Strategy strategy = Strategy::Auto;
@@ -1801,6 +1802,7 @@ struct OperationOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     const std::atomic<bool>* cancel = nullptr;
     std::function<void(std::size_t done, std::size_t total)> progress;
+    std::size_t threads = 0;
 };
 ```
 

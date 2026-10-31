@@ -140,6 +140,19 @@ public:
     }
 
     /// Removes all candidates and returns them sorted closest first.
+    /// Every result, the best `sorted` of them first and in order (the rest in no order):
+    /// what a caller keeping only the best `sorted`, or ordering them itself, needs.
+    std::vector<Candidate> take_best(std::size_t sorted) {
+        std::vector<Candidate> out = std::move(heap_);
+        heap_.clear();
+        if (sorted >= out.size()) {
+            std::sort_heap(out.begin(), out.end());
+        } else if (sorted > 0) {
+            std::partial_sort(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(sorted), out.end());
+        }
+        return out;
+    }
+
     std::vector<Candidate> take_sorted() {
         std::vector<Candidate> out = std::move(heap_);
         heap_.clear();

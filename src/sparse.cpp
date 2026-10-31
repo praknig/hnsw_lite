@@ -323,6 +323,43 @@ std::vector<SearchResult> SparseIndex::search(const SparseVector& query, std::si
     if (options.filter) compiled.emplace(*options.filter, metadata_);
     if (options.stats) *options.stats = {};
     if (k == 0 || q.empty() || live_count_ == 0) return {};
+    if (options.among) {  // only these documents: each scored directly, the same sum as below
+        std::vector<NodeId> slots;
+        for (const std::uint64_t id : *options.among)
+            if (const auto it = slot_of_.find(id); it != slot_of_.end() && live_[it->second]) slots.push_back(it->second);
+        std::sort(slots.begin(), slots.end());
+        slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+        std::vector<SearchResult> found;
+        std::size_t visited = 0;
+        for (const NodeId s : slots) {
+            const SparseVector& d = docs_[s];
+            float score = 0.0f;  // in query order, in float: bit for bit the posting lists' sum below
+            bool shared = false;
+            for (std::size_t i = 0, j = 0; i < q.size(); ++i) {
+                while (j < d.size() && d.indices[j] < q.indices[i]) ++j;
+                if (j < d.size() && d.indices[j] == q.indices[i]) {
+                    score += q.values[i] * d.values[j];
+                    shared = true;
+                }
+            }
+            visited += d.size();
+            if (!shared) continue;  // as below: only documents sharing a term with the query
+            if (compiled && !compiled->matches(s)) continue;
+            if (options.predicate && !options.predicate(id_of_[s])) continue;
+            found.push_back({id_of_[s], -score});
+        }
+        const auto better = [](const SearchResult& a, const SearchResult& b) {
+            return a.distance < b.distance || (a.distance == b.distance && a.id < b.id);
+        };
+        const std::size_t n = std::min(k, found.size());
+        std::partial_sort(found.begin(), found.begin() + static_cast<std::ptrdiff_t>(n), found.end(), better);
+        found.resize(n);
+        if (options.stats) {
+            options.stats->nodes_visited = slots.size();
+            options.stats->distance_computations = visited;
+        }
+        return found;
+    }
     // Accumulate the products of the query's terms over their posting lists, in
     // per-thread buffers reused across searches: only the slots touched are reset,
     // so a search costs its posting lists, not the index size. A search nested in

@@ -199,6 +199,57 @@ Each node read is one 4 KB block. `W` 1 needed 52 rounds at `L` 50 for the same 
 
 `bench_durability [count] [directory]` times additions without durability and in each mode. Measured on a virtual disk (2,000 additions of 64 dimensions): not durable 10,013 per second, `Buffered` 9,726, `Grouped` 8,863, `Synced` 4,222. The difference is the cost of a flush, which on real disks is 0.1 to several milliseconds: `Synced` can then be 10 to 50 times slower, while `Grouped` stays close to `Buffered`. Run it on the disk you will use.
 
+### Writes alongside searches
+
+A writer holds the exclusive lock only to link, not to find and choose neighbors (see the architecture notes). Measured with Callgrind (deterministic instruction counts), 1,000 changes on 10,000 vectors of 64 dimensions:
+
+| Operation | Under the write lock, before | Under the write lock, now | Total work |
+|---|---|---|---|
+| add | 432M instructions | 12M | unchanged |
+| upsert (an update) | 1,008M | 39M | unchanged (the plan's extra work is paid for by the copy check, which made updates 15% cheaper) |
+
+Searches wait for a writer only that long. The profiling report had shown one writer cutting a reader's throughput 93-fold (65 reads a second, p99 82 ms) on 20 threads; measure on your own machine with several cores (a machine with one core shares it either way).
+
+### Group-by
+
+Filling groups by searching among each group's members, instead of widening the whole search until every group is full (50,000 chunks in documents of 8, a payload index on the document field):
+
+| | 2 per group | 3 per group | 5 per group |
+|---|---|---|---|
+| chunks of a document together, before / now | 2,054 / 2,088 q/s | 1,414 / 1,335 | 1,026 / 987 |
+| chunks scattered (as real documents are), before / now | 11.4 / 1,315 q/s | 9.0 / 877 | 7.6 / 366 |
+
+### The search loop
+
+Profiled with Callgrind (exact instruction counts), 2,000 searches of 20,000 vectors of 128 dimensions with low intrinsic dimension (`ef` 64, 408 distances and 64 nodes expanded per query): only 30% of a search was distance arithmetic; the rest was the loop's bookkeeping, about 200 instructions per distance. Three changes, each giving the same results (532,800 results across metrics, codecs, `k` and filters compared bit for bit before and after):
+
+| Change | Instructions |
+|---|---|
+| No level check per neighbor on level 0 (a node's level is never below 0); also one random memory read fewer per neighbor examined, about 2,000 per query | -5.0% |
+| The candidate heap's storage kept per thread between searches (no regrowing from nothing) | -1.6% |
+| Only the order the caller needs: the best `k` sorted, or none when re-ranking (which sorts again) | -2.4% |
+| **Together** | **-8.7%** |
+
+Comparing candidates as single 64-bit keys (the same order) saved 0.5% and was not kept. Beyond this, the cost at scale is memory: links, visited marks and vectors read at random; layout and prefetching are the next levers, to be measured where the index exceeds the cache.
+
+**Batches and thread counts.** `search_batch` hands queries to the pool's threads through one atomic counter. Asking for another thread count than the last call rebuilds the pool, which costs milliseconds on Windows: in a benchmark that varies the count on every short run, that is what scaling looks like it stops at. Keep the count the same across calls (0, the default, is one per hardware thread).
+
+### Compaction
+
+`compact()` decides links in parallel batches (see the architecture notes): 93 to 95% of its work is parallel, so expect about 6x on 8 threads and 9x on 20 against the former single thread (205 s for a million 128-dimensional vectors in the profiling report). `OperationOptions::threads` limits it; the result is the same whatever the number.
+
+### Filtered search: the beam multiplier
+
+Between the planner's exact cases (few matches) and unfiltered search, a filtered graph search widens its beam by up to `1 / selectivity`, capped by `PlannerParams::max_ef_multiplier` (default 32). The search already explores until it has enough *matching* results, so widening matters only where the graph is hard to navigate. Measured, recall@10 and time per query at 30% selectivity (50,000 vectors; 30,000 for 384 dimensions):
+
+| Data | Multiplier 1 | 2 | default |
+|---|---|---|---|
+| clustered, low intrinsic dimension (like real embeddings), 128-d | 1.000, 0.16 ms | 1.000, 0.26 ms | 1.000, 0.38 ms |
+| harder 384-d cosine, filter correlated with clusters | 0.996, 0.33 ms | 0.998, 0.40 ms | 0.999, 0.56 ms |
+| uniform random 32-d (the hardest case) | 0.976, 0.21 ms | 0.997, 0.36 ms | 1.000, 0.59 ms |
+
+At 1%, 3% and 10% the multiplier changed nothing measurable (the planner scans exactly, or the cap is not reached). The default favors recall; on data like real embeddings, `max_ef_multiplier = 2` (per search through `SearchOptions::planner`, or per index) is up to 2.5 times faster for the same recall: measure on yours. A filter correlated with the data, whose matches lie away from the query, can exhaust the graph search's budget; the search then scans the matches exactly (correct, and bounded at about twice the cost of scanning them directly), which is what makes such filters slow on large indexes.
+
 ### Build type
 
 Always measure Release builds. Debug builds are many times slower.

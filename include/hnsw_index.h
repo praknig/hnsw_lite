@@ -76,6 +76,14 @@ struct HnswParams {
     QuantizationParams quantization;
 };
 
+namespace testing {
+/// Tests only: add, update and upsert decide their links under the shared lock and apply
+/// them under the write lock (on, the default), or do it all under the write lock (off).
+/// Both give the same index, byte for byte: the tests compare them. Process-wide.
+void set_insert_planning(bool on);
+bool insert_planning();
+}  // namespace testing
+
 /**
  * @brief Approximate nearest-neighbor index built on a multi-level graph.
  *
@@ -127,6 +135,7 @@ struct HnswParams {
  * Threading: one writer (add/remove/compact) at a time, with no searches
  * running. Several search() calls may run at the same time when no writer is
  * active; each borrows its own VisitedList from a thread-safe pool.
+
  */
 class HnswIndex {
 public:
@@ -530,6 +539,7 @@ private:
 
     /// Draws a random top level: floor(-ln(u) / ln(M)), u uniform in (0, 1].
     int random_level();
+    int random_level(SplitMix64& rng) const;  // from the given generator (a plan draws from a copy)
 
     /// Distance from a prepared vector (padded row) to stored node `node`.
     float distance_to(const float* query, NodeId node) const;
@@ -543,6 +553,9 @@ private:
 
     /// Distance between two stored nodes.
     float distance_between(NodeId a, NodeId b) const;
+    float distance_between_now(NodeId a, NodeId b) const;  // always computed, never recorded or looked up
+    double norm_of(NodeId a) const;  // inner product indexes: the stored vector's norm
+    void restrict_to(const SearchOptions& options, std::vector<NodeId>& rows, Eligibility& eligible) const;  // SearchOptions::among
 
     /// True if two stored nodes hold bit-identical vectors.
     bool same_vector(NodeId a, NodeId b) const;
@@ -572,7 +585,8 @@ private:
                                         std::size_t ef, int level, VisitedList& visited,
                                         NodeId exclude, const Eligibility& eligible,
                                         SearchStats* stats = nullptr, LinkLocks* locks = nullptr,
-                                        std::size_t budget = 0, bool* over_budget = nullptr) const;  // budget: distances (0: none)
+                                        std::size_t budget = 0, bool* over_budget = nullptr,
+                                        std::size_t sorted = kNoLimit) const;  // results in order: the best `sorted`  // budget: distances (0: none)
 
     /// Eligibility with no filter: "not removed".
     Eligibility live_only() const { return Eligibility{&storage_.ids()}; }
@@ -626,17 +640,57 @@ private:
     };
     NodeDistance node_distance(const float* query) const;
     std::vector<NodeId> select_neighbors(NodeId base, const std::vector<Candidate>& sorted,
-                                         std::size_t max) const;
+                                         std::size_t max, const float* base_vector = nullptr) const;  // base_vector: base not stored yet
 
     /// Steps 4 to 6 of add(): finds neighbors on every level, links the new node
     /// both ways, and makes it the entry point if it is the highest node.
-    void link_new_node(NodeId node, int level, NodeId ignore = kEmpty);
+    void link_new_node(NodeId node, int level, NodeId ignore = kEmpty, const std::vector<std::vector<NodeId>>* decided = nullptr);
 
     /// Links `node` on its levels, starting from `entry` on level `top`, reading
     /// the vector from `query`. With `locks`, every link list is read and written
     /// under its lock. Does not update the entry point.
     void link_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry, int top,
-                     LinkLocks* locks);
+                     LinkLocks* locks, const std::vector<std::vector<NodeId>>* decided = nullptr);
+
+    /// link_levels' reading half: each level's chosen neighbors, from min(level, top) down to
+    /// 0. Changes nothing. `base_vector`: the node's prepared vector when it is not stored yet.
+    std::vector<std::vector<NodeId>> decide_levels(NodeId node, int level, NodeId ignore, const float* query, NodeId entry,
+                                                   int top, LinkLocks* locks, const float* base_vector) const;
+
+    /// An insertion decided under the shared lock (add, update, upsert), applied under the
+    /// write lock only if nothing changed in between; otherwise the insertion runs as usual.
+    /// The decision is most of an insertion's work (finding and choosing neighbors), so
+    /// searches wait only for the linking.
+    /// Distances between stored vectors, recorded under the shared lock and looked up
+    /// under the write lock: the very floats distance_between computed, by ordered pair.
+    struct DistanceMemo {
+        std::vector<std::uint64_t> keys;  // open addressing; 0: empty
+        std::vector<float> values;
+        void build(const std::vector<std::pair<std::uint64_t, float>>& recorded);
+        const float* find(std::uint64_t key) const;
+    };
+    struct InsertPlan {
+        std::uint64_t writes = 0;  ///< lock_.writes() when decided
+        NodeId ignore = kEmpty;    ///< the old version's slot (update), or kEmpty (add)
+        NodeId slot = 0;           ///< the slot the new version will take
+        int level = 0;
+        SplitMix64 rng;            ///< the generator after drawing `level`
+        PreparedVector vector;
+        std::vector<std::vector<NodeId>> chosen;
+        DistanceMemo repair;  ///< an update's repair, simulated ahead: its distances
+        /// ... and its decisions: per level and former neighbor, in repair's order, the
+        /// neighbor's list then and the list chosen for it. Applied as they are where the
+        /// list is still the same (the decision's every input is), recomputed otherwise.
+        struct Relink {
+            int level;
+            NodeId node;
+            std::vector<NodeId> before, after;
+        };
+        std::vector<Relink> relinks;
+    };
+    std::optional<InsertPlan> plan_insert(std::uint64_t id, std::span<const float> vector) const;
+    bool plan_holds(const InsertPlan* plan, NodeId ignore, NodeId slot) const;
+    void simulate_repair(NodeId node, std::vector<InsertPlan::Relink>& relinks) const;  // repair_neighbors, reading only
 
     /// add_batch's work; the caller holds the write lock. `metadata` is an array
     /// of ids.size() entries, or null.
@@ -662,11 +716,12 @@ private:
                          const std::vector<MetadataStore::WriteUndo>& undo) noexcept;
 
     /// update() and upsert(): `metadata` null keeps the old metadata.
-    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata);  // caller holds the write lock
+    bool replace(std::uint64_t id, std::span<const float> vector, const Metadata* metadata, const InsertPlan* plan = nullptr);  // caller holds the write lock
     /// The caller holds the write lock. `prepared`: `vector` is a stored vector of
     /// this index (indexed_dim() values, already normalized), copied exactly; for
     /// compact() without originals, so rebuilding never changes a stored vector.
-    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared = false);
+    void add_unlocked(std::uint64_t id, std::span<const float> vector, const Metadata& metadata, bool prepared = false,
+                      const InsertPlan* plan = nullptr);
     // Compaction and rebuild with codes only re-add decoded vectors: the node's code is
     // copied (set here for the add) instead of encoding the decoded vector again, which
     // not every codec reproduces exactly (RaBitQ's factors change). Byte for byte, as
@@ -684,7 +739,7 @@ private:
 
     /// Before `node` is removed: each live neighbor re-chooses its links from
     /// its own links plus `node`'s links, minus `node`, on every level.
-    void repair_neighbors(NodeId node);
+    void repair_neighbors(NodeId node, const std::vector<InsertPlan::Relink>* decided = nullptr, NodeId fresh = kEmpty);
 
     /// Makes the live node with the highest level the entry point, or sets the
     /// entry point to kEmpty and the top level to -1 if no node is live.

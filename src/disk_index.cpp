@@ -918,6 +918,7 @@ DiskIndex::Node DiskIndex::read_node(NodeId node) const {
 
 std::vector<SearchResult> DiskIndex::search(std::span<const float> query, std::size_t k, const DiskSearchParams& params,
                                             const SearchOptions& options, DiskSearchStats* stats) const {
+    if (options.among) throw std::invalid_argument("SearchOptions::among: HnswIndex and SparseIndex only, not DiskIndex");
     if (params.L < 1 || params.beam_width < 1) throw std::invalid_argument("DiskSearchParams: L and beam_width must be at least 1");
     const detail::SearchStopScope stop(options, options.stats);  // deadline and cancel flag
     PreparedVector q(dim_);

@@ -255,6 +255,7 @@ public:
             // GCOVR_EXCL_STOP
         }
         ~WriteGuard() {
+            lock_.writes_.fetch_add(1, std::memory_order_release);  // still exclusive: counted before anyone else enters
             lock_.pop();
             lock_.unlock();
         }
@@ -290,10 +291,15 @@ public:
     /// Whether this thread is inside an operation on any index.
     static bool inside_any() { return held_by_this_thread().count > 0; }
 
+    /// Changes completed so far (one per write guard released). Equal before and after a
+    /// span means nothing changed in it: work decided under the shared lock is still valid.
+    std::uint64_t writes() const { return writes_.load(std::memory_order_acquire); }
+
     /// Maximum nesting of index operations within one thread (across all indexes).
     static constexpr std::size_t kMaxNesting = 64;
 
 private:
+    mutable std::atomic<std::uint64_t> writes_{0};
     struct Held {
         const IndexLock* items[kMaxNesting];
         std::size_t count = 0;

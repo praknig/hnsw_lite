@@ -307,12 +307,16 @@ public:
     /// otherwise, or for a part the collection does not have).
     std::vector<CollectionHit> search(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options = {}) const;
     /// Group-by: the `groups` best values of a field, each with its `per_group` best
-    /// documents, as ranked by search() with the same query and options. A group's rank is
-    /// its best document's. The field is a keyword, integer or boolean field (anything
-    /// else throws std::invalid_argument); documents without it belong to no group. The
-    /// search widens (4x at a time, up to `max_candidates`) until the groups are found and
-    /// filled or every match was seen: with an exact search, equal to grouping the full
-    /// ranking. Runs under one read lock: a document's group is read with its rank.
+    /// documents. Groups are ranked by their best document, as search() ranks them with the
+    /// same query and options; the search widens (4x at a time) until the groups are found.
+    /// A group with fewer than `per_group` documents among those ranked is then filled by a
+    /// search restricted to its value (the options' filter and field = value), which a
+    /// payload index on the field makes cheap. With an exact single-list search (text,
+    /// sparse, or vectors through an exact plan) the result equals grouping the full ranking;
+    /// with fusion, a group's documents are ranked within the group. With `max_candidates`,
+    /// groups and documents come from the best `max_candidates` documents only. The field
+    /// is a keyword, integer or boolean field (anything else throws std::invalid_argument);
+    /// documents without it belong to no group. Runs under one read lock.
     std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const;
     /// Recommendation: documents like the `positive` examples and unlike the `negative`
     /// ones, by their vectors: a vector search from avg(positive) (with negatives,
@@ -375,7 +379,8 @@ public:
 
 private:
     void check_query(const CollectionQuery& query, const CollectionSearchOptions& options) const;  // search's validation
-    std::vector<CollectionHit> search_unlocked(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options) const;
+    std::vector<CollectionHit> search_unlocked(const CollectionQuery& query, std::size_t k, const CollectionSearchOptions& options,
+                                               const std::vector<std::uint64_t>* among = nullptr) const;  // among: only these documents, exactly
     struct Prepared;  // a checked document (its metadata is checked under the lock)
     /// The runtime settings (expiry, string keys), read once under the lock: an operation
     /// uses one consistent snapshot, as if it ran entirely before or after a change.

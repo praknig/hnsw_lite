@@ -548,7 +548,8 @@ std::vector<CollectionHit> Collection::search(const CollectionQuery& q, std::siz
     return search_unlocked(q, k, o);
 }
 
-std::vector<CollectionHit> Collection::search_unlocked(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o) const {
+std::vector<CollectionHit> Collection::search_unlocked(const CollectionQuery& q, std::size_t k, const CollectionSearchOptions& o,
+                                                       const std::vector<std::uint64_t>* among) const {
     const bool use_vector = !q.vector.empty(), use_text = !q.text.empty(), use_sparse = !q.sparse.empty() || !q.sparse.values.empty();
     if (o.stopped_early) *o.stopped_early = false;
     if (k == 0 || slot_of_.empty()) return {};
@@ -570,6 +571,7 @@ std::vector<CollectionHit> Collection::search_unlocked(const CollectionQuery& q,
     }
     side.deadline = o.deadline;
     side.cancel = o.cancel;
+    if (among) side.among = *among;  // every side scores only these documents, exactly
     if (o.modifiers && !o.modifiers->empty()) o.modifiers->validate();
     if (o.diversity && !(*o.diversity >= 0.0 && *o.diversity <= 1.0)) throw std::invalid_argument("CollectionSearchOptions::diversity must be in [0, 1]");
     if (o.diversity && !dense_) throw std::invalid_argument("CollectionSearchOptions::diversity needs a dense side (the documents' vectors)");
@@ -745,6 +747,13 @@ std::vector<CollectionGroup> Collection::search_groups(const CollectionQuery& q,
         throw std::invalid_argument("search_groups: group by a keyword, integer or boolean field (" + g.field + " is not)");
     const std::size_t cap = g.max_candidates ? std::min(g.max_candidates, slot_of_.size()) : slot_of_.size();
     std::size_t fetch = std::min(cap, std::max<std::size_t>(16, saturating_mul(saturating_mul(g.groups, g.per_group), 2)));
+    // Without a cap, the search widens only until the groups are found; each group not yet
+    // full then gets its hits from a search restricted to its value. Widening until every
+    // group was full could mean ranking the whole collection, again and again (about one
+    // group-by a second at 300,000 documents). With a cap, groups and hits come from the best
+    // `cap` documents only, as documented.
+    const bool fill = g.max_candidates == 0 && g.per_group > 1;
+    bool exhausted = false;
     std::vector<CollectionGroup> out;
     while (true) {
         const std::vector<CollectionHit> hits = search_unlocked(q, fetch, o);
@@ -770,11 +779,33 @@ std::vector<CollectionGroup> Collection::search_groups(const CollectionQuery& q,
         }
         bool full = out.size() == g.groups;
         for (const CollectionGroup& group : out) full = full && group.hits.size() == g.per_group;
-        const bool exhausted = hits.size() < fetch;  // every match was ranked
+        exhausted = hits.size() < fetch || fetch >= slot_of_.size();  // every match was ranked
         const bool stopped = o.stopped_early && *o.stopped_early;
-        if (full || exhausted || stopped || fetch >= cap) break;
+        // With filling, widening continues while it stays cheap (nearby hits fill groups for
+        // free); beyond that, the groups still short are filled by searches of their own.
+        const bool cheap = fetch < std::max<std::size_t>(64, saturating_mul(saturating_mul(g.groups, g.per_group), 4));
+        if (full || (fill && out.size() == g.groups && !cheap) || exhausted || stopped || fetch >= cap) break;
         fetch = std::min(cap, saturating_mul(fetch, 4));
     }
+    if (fill && !exhausted)
+        for (CollectionGroup& group : out) {
+            if (group.hits.size() >= g.per_group || (o.stopped_early && *o.stopped_early)) continue;
+            const Value& v = group.value;
+            const Filter mine = v.type == FieldType::Int ? Filter::eq(g.field, v.i) : v.type == FieldType::Bool ? Filter::eq(g.field, v.b) : Filter::eq(g.field, v.s);
+            CollectionSearchOptions within = o;
+            within.filter = o.filter ? *o.filter && mine : mine;
+            // A group of modest size (as most are: a document's chunks, a user's items) is
+            // searched among its members only, exactly, at a cost in proportion to the group;
+            // a large one, by the filtered search.
+            const std::vector<NodeId> members = matching(mine);
+            std::vector<std::uint64_t> ids;
+            if (members.size() <= 4096) {
+                ids.reserve(members.size());
+                for (const NodeId m : members) ids.push_back(id_of_[m]);
+            }
+            std::vector<CollectionHit> hits = search_unlocked(q, g.per_group, within, members.size() <= 4096 ? &ids : nullptr);
+            if (hits.size() > group.hits.size()) group.hits = std::move(hits);  // the group's best, by a search of it alone
+        }
     return out;
 }
 

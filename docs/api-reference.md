@@ -149,7 +149,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
 | `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
-| `search_groups(query, GroupBy{field, groups, per_group, max_candidates}, options)` → `std::vector<CollectionGroup>` | Group-by: the best values of a field, each with its best documents |
+| `search_groups(query, GroupBy{field, groups, per_group, max_candidates}, options)` → `std::vector<CollectionGroup>` | Group-by: the best values of a field, each with its best documents. The search widens until the groups are found; a group still short is filled by an exact search among its members (up to 4,096; a filtered search beyond), so a payload index on the field keeps it cheap. With an exact single-list search the result equals grouping the full ranking. With `max_candidates`, everything comes from the best `max_candidates` documents |
 | `recommend(Recommend{positive, negative}, k, options)` → `std::vector<CollectionHit>` | Documents like some examples and unlike others, by their vectors |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Deletes it for real (swap-with-last); the ID can be added again; never allocates |
@@ -249,8 +249,9 @@ Not copyable, movable. Frees its memory in the destructor.
 | Name | Description |
 |---|---|
 | `SearchOptions::deadline`, `SearchOptions::cancel` | Stop a search at a moment, or when an `std::atomic<bool>` becomes true; it returns the best results found so far |
+| `SearchOptions::among` | `HnswIndex` and `SparseIndex` (`search`, `search_batch`): only these IDs, scored exactly, in time proportional to the list (unknown or removed IDs ignored; a filter and predicate still apply). `search_range`, `FlatIndex` and `DiskIndex` refuse it with `std::invalid_argument` |
 | `SearchStats::stopped_early` | Whether a deadline or cancel flag stopped the search |
-| `OperationOptions` (`deadline`, `cancel`, `progress`) | Control of `add_batch`, `compact` and `save`; `progress(done, total)` is called in order, at most about 100 times |
+| `OperationOptions` (`deadline`, `cancel`, `progress`, `threads`) | Control of `add_batch`, `compact` and `save`; `progress(done, total)` is called in order, at most about 100 times; `threads`: threads `compact` decides links on (0: one per hardware thread), the result the same whatever the number |
 | `Cancelled` (a `std::runtime_error`) | Thrown by a cancelled or late operation, after undoing it |
 
 ## Training and codecs
