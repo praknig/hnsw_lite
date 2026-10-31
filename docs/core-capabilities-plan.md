@@ -11,7 +11,7 @@ This document plans four capabilities that hnsw-lite lacks compared with product
 
 The test scenarios for these designs are in [core-capabilities-test-plan.md](core-capabilities-test-plan.md).
 
-Status: **all four are implemented** (real deletion, updating vectors, saving and loading, thread safety with parallel building). This document is the original design; the [architecture](architecture.md) describes the code as built, including later changes such as file format versions 2 and 3.
+Status: **all four are implemented** (real deletion, updating vectors, saving and loading, thread safety with parallel building). This document is the original design; the [architecture](architecture.md) describes the code as built, including later changes such as file format versions 2 and 3. Later work changed one point of the thread-safety design: on an `HnswIndex`, an insertion now decides its links under the shared lock and takes the lock alone only to link them (see the [architecture](architecture.md)).
 
 ---
 

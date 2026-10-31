@@ -87,7 +87,7 @@ Each vector costs its numbers (4 bytes each), its links (about `8 × M` bytes) a
 
 - **SIMD kernels.** Distances are computed 8 or 16 numbers at a time, with versions for AVX2, AVX-512 and ARM NEON. The library picks the best one for the CPU it runs on, at startup.
 - **Graph reordering.** `reorder()` renumbers the nodes so that neighbors sit near each other in memory, so the processor's cache serves more of each walk: the same results, about 24% faster on clustered data, as real embeddings are.
-- **Parallel work.** Batches of searches and inserts are spread over a thread pool. Every index and collection can be used from many threads with no locking of your own: searches run in parallel with each other, and changes run one at a time, each waiting for running searches to finish (and a steady stream of searches can never starve a change).
+- **Parallel work.** Batches of searches and inserts are spread over a thread pool. Every index and collection can be used from many threads with no locking of your own: searches run in parallel with each other, and changes run one at a time (a steady stream of searches can never starve a change). On an HNSW index, an insertion does its search for neighbors alongside running searches and holds them up only while it links itself in; a collection still holds its searches for the whole of a change.
 
 ## Keeping data safe
 

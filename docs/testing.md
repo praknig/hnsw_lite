@@ -225,7 +225,7 @@ In a Debug build the comprehensive suite takes about a minute, and several times
   | Emulated Intel Nehalem (2008) | scalar | scalar |
   | Emulated 64-bit ARM | scalar, NEON | NEON |
 
-- **Compilers:** all tests pass with GCC 13 and Clang 18. MSVC, MinGW on Windows and Apple Clang are covered by the [CI pipeline](#continuous-integration), which also runs the suite on real ARM hardware.
+- **Compilers:** all tests pass with GCC 13, GCC 16 (MinGW, on Windows), Clang 15 and Clang 18. MSVC, MinGW on Windows and Apple Clang are covered by the [CI pipeline](#continuous-integration), which also runs the suite on real ARM hardware.
 - **Sanitizers:** all tests pass with AddressSanitizer and UndefinedBehaviorSanitizer (the out-of-memory tests are skipped there), and the threaded groups pass under ThreadSanitizer with no data races reported.
 - **Warnings:** none with `-Wall -Wextra -Wpedantic`, nor with `-Wconversion -Wshadow` (which approximate MSVC's `/W4` conversion warnings), under both GCC and Clang.
 - **Comparison with hnswlib:** where results looked low, the same data and operations were run through the reference hnswlib library. Inner-product recall on the lifecycle data is 0.898 / 0.905 / 0.860 (add / remove / re-add) against hnswlib's 0.887 / 0.900 / 0.853, confirming that lower inner-product numbers come from the metric, not this implementation.
@@ -563,7 +563,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 |---|---|---|
 | Linux / GCC | Release | Full test suite, plus both benchmarks as a smoke test |
 | Linux / Clang | Release | Full test suite with a second compiler |
-| macOS ARM / Apple Clang | Release | Full test suite on **real ARM hardware** (Apple Silicon), using the NEON kernels |
+| macOS ARM / Apple Clang | Release | Full test suite on **real ARM hardware** (Apple Silicon, the `macos-15` runner: GitHub retired macOS 14 images on 2026-11-02), using the NEON kernels |
 | Windows / MSVC | Release | Full test suite with Microsoft's compiler, including the MSVC-specific CPU detection |
 | Windows / MinGW GCC | Release | Full test suite with the MinGW toolchain, including the out-of-memory tests on Windows |
 | Linux / ASan + UBSan | Debug | Memory errors, leaks and undefined behavior (out-of-memory tests report SKIP) |

@@ -64,7 +64,7 @@ With `Cosine`, vectors and queries are normalized to length 1 automatically; a v
 Every index and collection is safe to use from many threads at once, with no locking of your own:
 
 - **Reads** (searches, lookups, saves, health reports) run in parallel with each other.
-- **Changes** (adds, updates, removals, metadata changes) run one at a time, and each waits for running reads to finish. While a change waits, new reads wait too, so a steady stream of searches can never starve a change.
+- **Changes** (adds, updates, removals, metadata changes) run one at a time, and each waits for running reads to finish. While a change waits, new reads wait too, so a steady stream of searches can never starve a change. On an `HnswIndex`, an `add`, `update` or `upsert` first finds and chooses its neighbors under the shared lock, alongside searches, and takes the lock alone only to link them (if nothing changed meanwhile; otherwise it does it all alone): searches wait for the link, not the search. A `Collection` holds its own lock alone for a whole change, so its searches wait for all of it.
 - **No change from inside an index operation on the same thread.** If a predicate (or a progress callback) running inside an index operation tries to change *any* index or collection, the change throws `std::logic_error` instead of deadlocking. Reading from inside a predicate is fine.
 
 ### Errors and "all or nothing"
@@ -223,7 +223,7 @@ Rules, checked **before anything changes** (a violation throws `std::invalid_arg
 | `std::size_t count_where(const Filter& filter) const` | How many documents match `filter`: a preview of `remove_where`. |
 | `std::optional<DocumentRecord> get(std::uint64_t id) const` | The document, or nothing if `id` is not stored. |
 | `CollectionPage scan(const CollectionScanOptions& options = {}) const` | Lists documents **a page at a time, in ascending ID order**, optionally only those matching a filter (see *Reading every document* below). Throws `std::invalid_argument` if `limit` is 0, or for an unknown field under a strict schema. |
-| `std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const` | **Group-by:** the `groups` best values of `group_by.field` (keyword, integer or boolean), each with its `per_group` best documents, ranked as `search()` ranks them. Documents without the field are in no group. Widens the search 4× at a time until the groups are found and filled, every match was seen, or `max_candidates` (0: all) is reached: with an exact search, equal to grouping the full ranking. Under one read lock. `GroupBy { field, groups = 10, per_group = 3, max_candidates = 0 }`; `CollectionGroup { Value value; std::vector<CollectionHit> hits; }`. Other field types, an empty name, or an unknown field under a strict schema throw `std::invalid_argument`. |
+| `std::vector<CollectionGroup> search_groups(const CollectionQuery& query, const GroupBy& group_by, const CollectionSearchOptions& options = {}) const` | **Group-by:** the `groups` best values of `group_by.field` (keyword, integer or boolean), each with its `per_group` best documents, ranked as `search()` ranks them. Documents without the field are in no group. Widens the search 4× at a time until the groups are found (and while that is cheap: up to 4 × groups × per_group), every match was seen, or `max_candidates` (0: all) is reached; a group still short is then filled by a search among its own documents (up to 4,096, through a payload index on the field if there is one; a filtered search beyond). With an exact single-list search, equal to grouping the full ranking; with fusion, a group's documents are ranked within the group. With `max_candidates`, everything comes from the best `max_candidates` documents. Under one read lock. `GroupBy { field, groups = 10, per_group = 3, max_candidates = 0 }`; `CollectionGroup { Value value; std::vector<CollectionHit> hits; }`. Other field types, an empty name, or an unknown field under a strict schema throw `std::invalid_argument`. |
 | `std::vector<CollectionHit> recommend(const Recommend& examples, std::size_t k, const CollectionSearchOptions& options = {}) const` | **Recommendation:** documents like `examples.positive` and unlike `examples.negative` (`Recommend { std::vector<std::uint64_t> positive, negative; }`): a vector search from avg(positive), or 2 avg(positive) - avg(negative), each example normalized first for cosine; computed in double and clamped to float's range. The examples are never returned; options apply as in `search()`. Under one read lock. Throws `std::invalid_argument` without a positive example, for an unknown or expired document, one without a vector, one in both lists, or a collection without vectors. |
 | `std::vector<FacetResult> facets(requests, filter)`, `facets_for(ids, requests)` | Faceted counts, as for `HnswIndex` (see *Faceted search*); expired documents are never counted. |
 | `void create_payload_index(std::string_view field)` | Counts and posting lists for a keyword, boolean or tag field (as for `HnswIndex`); logged for durable collections. |
@@ -637,6 +637,7 @@ Returns up to `k` approximately closest vectors, closest first. **`ef`** is the 
 ```cpp
 struct SearchOptions {
     std::size_t probes = 0;                         // FlatIndex with IVF: lists to probe (0: the index's default)
+    std::optional<std::vector<std::uint64_t>> among; // HnswIndex, SparseIndex: only these IDs, scored exactly
     std::optional<Filter> filter;
     std::function<bool(std::uint64_t)> predicate;
     Strategy strategy = Strategy::Auto;
@@ -645,11 +646,14 @@ struct SearchOptions {
     std::size_t range_expand_outside = 1;
     std::optional<std::chrono::steady_clock::time_point> deadline;
     const std::atomic<bool>* cancel = nullptr;
+    std::optional<ScoreModifiers> modifiers;        // opt-in re-ranking by metadata (below)
+    std::optional<double> diversity;                // opt-in MMR (below)
 };
 ```
 
 | Field | What it does |
 |---|---|
+| `among` | `HnswIndex` (`search`, `search_batch`) and `SparseIndex`: search only these IDs, scored exactly, in time proportional to the list (unknown or removed IDs are ignored; a filter and predicate still apply). The sparse index adds each document's products in query order in `float`, so its results are the full search's restricted to the list, bit for bit. `search_range`, `FlatIndex` and `DiskIndex` throw `std::invalid_argument` rather than ignore it. |
 | `filter` | Only vectors whose metadata matches are returned. **You get k results if at least k match** (the search widens as needed). |
 | `predicate` | Any condition on the ID, for data outside the index (permissions, say). With a filter, both must pass (the filter is checked first). Must be safe to call from several threads (batch searches call it concurrently), and must not change any index. |
 | `strategy` | `Auto` (default): the **query planner** chooses. `ForceExact`: scan every matching vector (exact answers). `ForceGraph`: the graph search that scores every vector it visits. `ForceAcorn`: the ACORN graph search (below; without a filter it is the ordinary graph search). |
@@ -770,7 +774,7 @@ Every type of field has values (a document counts once per distinct tag); bounda
 |---|---|
 | `HealthReport health(const HealthOptions& options = {}) const` | A report on storage, graph structure, an estimate of recall, compression drift and churn. Searches continue meanwhile. See [Health](#91-health-reports). |
 | `UpkeepStats upkeep(const UpkeepOptions& upkeep_options = {}, const OperationOptions& options = {})` | Repairs the graph incrementally, like a database's vacuum: replaces links to removed vectors and reconnects vectors no search can reach. Use `max_nodes` or a deadline to keep each call short; searches run in between calls. A deadline stops it only **after at least one repair** in the call, so repeated calls always finish; a cancellation stops it at once. When complete, churn counters reset. See [Upkeep](#92-upkeep). |
-| `CompactStats compact(const OperationOptions& options = {})` | Rebuilds storage from the live vectors only: no free slots, memory returned. User IDs are kept. The new index is built completely before replacing the old one, so running out of memory leaves the old one intact. **Blocks searches and changes** while it runs. Returns `{ kept, reclaimed }`. |
+| `CompactStats compact(const OperationOptions& options = {})` | Rebuilds storage from the live vectors only: no free slots, memory returned. User IDs are kept. The new index is built completely before replacing the old one, so running out of memory leaves the old one intact. **Blocks searches and changes** while it runs. Links are decided in parallel batches (`options.threads`; 0: all cores) and applied in order, so the result is the same, byte for byte, whatever the thread count, and a logged compact replays identically. Returns `{ kept, reclaimed }`. |
 | `CompactStats reorder(const OperationOptions& options = {})` | **Opt-in speed-up:** renumbers the nodes so neighbors are stored near each other (grouped by nearest k-means centroid, about 1,024 per group, breadth-first within a group). The graph, results and every record are unchanged; removed slots are dropped, as by `compact()`. Measured on 200,000 clustered 128-dimensional vectors: **about 24% faster searches** (95.5–99.0 → 70.5–76.4 µs per query); on uniformly random data, about 4%. Takes a few seconds per 200,000 vectors (k-means assignment, on all cores). Blocks searches and changes while it runs, so call it after building or bulk loading. All or nothing (cancellation, deadlines, out of memory); logged for durable indexes. |
 | `void set_auto_compact(double fraction)`, `double auto_compact() const` | Compact automatically once free slots exceed `fraction` of all slots (0: off, the default; at most 0.9). The change that crosses the threshold then takes as long as a `compact()`. A runtime setting, not saved. |
 | `RebuildStats rebuild(const RebuildOptions& rebuild_options = {}, const OperationOptions& options = {})` | Like `compact()`, but **without blocking**: a snapshot is taken, a new index (with the codec retrained if `retrain`) is built while searches and changes continue, then changes made meanwhile are copied in and the new index swapped in. Needs memory for a second copy. One rebuild at a time (`std::logic_error` otherwise). A deadline, cancellation or running out of memory throws `Cancelled` (or `std::bad_alloc`) and leaves the index as it was. |
@@ -1182,6 +1186,7 @@ struct OperationOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     const std::atomic<bool>* cancel = nullptr;
     std::function<void(std::size_t done, std::size_t total)> progress;
+    std::size_t threads = 0;
 };
 ```
 
@@ -1189,6 +1194,7 @@ struct OperationOptions {
 |---|---|
 | `deadline` | Give up when this moment passes. |
 | `cancel` | Give up when another thread sets the flag to `true`. |
+| `threads` | `compact()`: threads deciding links in parallel (0: one per hardware thread). The result does not depend on it. |
 | `progress` | Called with (done, total): starting at (0, total), never decreasing, at most about 100 times, and ending at (total, total) on success. Calls never overlap but may come from worker threads. It **must not use the index**. If it throws, the operation is undone and the exception passed on. |
 
 When a deadline passes or cancellation is requested, the operation is **undone** and throws `Cancelled` (a `std::runtime_error`): the index is as before, and a save leaves no temporary file. **Exception:** `upkeep()` does not throw; it stops early and keeps what it repaired (after at least one repair, for a deadline).

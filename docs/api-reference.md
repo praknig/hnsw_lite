@@ -166,15 +166,15 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `HnswParams { M = 16, ef_construction = 200, seed = 42, repair_on_remove = true }` | Graph settings; `M >= 2` and `ef_construction >= 1` are required, `M >= 8` is recommended |
 | `HnswIndex(dim, metric, params = {})` | Creates an empty index; throws on invalid params |
-| `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID |
+| `add(id, vector)` | Inserts into the graph; throws on a wrong dimension, NaN or infinity, or a used ID. Its neighbors are found and chosen while searches keep running (under the shared lock); the write lock is held only to link them, and only if nothing changed meanwhile (otherwise all of it is done under the write lock): the same index either way |
 | `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing, linking them on `threads` threads (0: all cores); one thread gives the same index as `add` in order |
 | `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `remove_where(filter)`, `set_metadata_where(filter, changes)`, `count_where(filter)` | Remove, change metadata of, or count every vector matching a filter; return how many matched. `remove_where` always completes; `set_metadata_where` is all or nothing |
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
 | `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |
-| `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added |
-| `compact()` | Rebuilds a dense index from the live vectors; the old index stays intact if memory runs out |
+| `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added. `update` and `upsert` decide their links alongside searches as `add` does, and an update's repair of the old version's neighbors too |
+| `compact(options)` | Rebuilds a dense index from the live vectors, deciding links in parallel batches (`OperationOptions::threads`; 0: all cores) and linking in order, so the result is the same, byte for byte, whatever the thread count (a logged compact replays identically); the old index stays intact if memory runs out or it is cancelled |
 | `deleted_count()`, `capacity()` | Slots waiting to be reused; all slots |
 | `contains(id)` | Stored and not removed |
 | `search(query, k, ef = 64)` | Up to k approximate closest live vectors; `ef` is raised to at least k and capped at the number of nodes |
@@ -227,8 +227,9 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Header | Description |
 |---|---|---|
-| `IndexLock` | `thread_pool.h` | The lock inside every index: reads in parallel, changes one at a time, writers preferred. `ReadGuard`, `WriteGuard` (throws `std::logic_error` inside any index operation), `Hold` (batch tasks), `held()`, `inside_any()`, `kMaxNesting` (64) |
+| `IndexLock` | `thread_pool.h` | The lock inside every index: reads in parallel, changes one at a time, writers preferred. `ReadGuard`, `WriteGuard` (throws `std::logic_error` inside any index operation), `Hold` (batch tasks), `held()`, `inside_any()`, `kMaxNesting` (64); `writes()` counts completed changes (equal before and after a span: nothing changed in it) |
 | `index_distance(raw, cosine)` | `search_result.h` | A distance as indexes report it: cosine clamped at 0, NaN mapped like `ordered_distance()`. `get_distance()` kernels are unchanged |
+| `testing::set_insert_planning(on)`, `testing::insert_planning()` | `hnsw_index.h` | Tests only: insertions decided under the shared lock (on, the default) or all under the write lock (off); both give the same index, which the tests compare |
 | `in_pool_task()` | `thread_pool.h` | True on a thread running a pool task; `parallel_for()` called there runs inline, so nested batches cannot deadlock |
 | `HnswParams::M` | `hnsw_index.h` | Now limited to 2 to 2048 |
 
