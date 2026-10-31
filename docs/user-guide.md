@@ -102,7 +102,7 @@ When documents are split into chunks, a plain top-10 can return ten chunks of on
 
 ```cpp
 GroupBy by{"doc_id", 5, 2};  // 5 documents, the 2 best chunks of each
-for (const CollectionGroup& g : collection.search_groups(query, by, options))
+for (const CollectionGroup& g : docs->search_groups(q, by, so))
     std::cout << g.value.s << ": " << g.hits.size() << " chunks, best score " << g.hits[0].score << "\n";
 ```
 
@@ -113,7 +113,7 @@ It ranks exactly as `search()` would with the same query and options (any mix of
 `recommend` finds documents like some examples and unlike others, without a query: "more like the three articles the reader liked, less like the one they dismissed".
 
 ```cpp
-const auto hits = collection.recommend(Recommend{{liked_a, liked_b, liked_c}, {dismissed}}, 10, options);
+const auto hits = docs->recommend(Recommend{{liked_a, liked_b, liked_c}, {dismissed}}, 10, so);
 ```
 
 It searches from the average of the positive examples' vectors, pushed away from the negatives' (2 avg(positive) - avg(negative)); for cosine, each example is normalized first, so no long vector dominates. The examples are never returned, and options apply as in `search()` (filters, `ef`, metadata and text in the hits). It refuses a call without a positive example, an unknown or expired document, one without a vector, one given as both positive and negative, and a collection without vectors. In Python, examples may be IDs or string keys: `collection.recommend(["doc-1", "doc-2"], ["doc-9"], k=10)`.
@@ -128,7 +128,7 @@ o.filter = Filter::eq("lang", "en");
 o.with_vectors = false;  // text and metadata only
 o.limit = 1000;
 for (;;) {
-    const CollectionPage page = docs.scan(o);
+    const CollectionPage page = docs->scan(o);
     for (const DocumentRecord& d : page.documents) std::cout << d.id << " " << d.text << "\n";
     if (!page.next) break;
     o.after = page.next;  // continue after the last document of this page
@@ -222,9 +222,9 @@ index.add_batch(ids, vectors, metadata, 8); // with one Metadata per vector, on 
 ## Searching
 
 ```cpp
-std::vector<SearchResult> results = flat.search(query, 10);       // FlatIndex: k
-std::vector<SearchResult> results = hnsw.search(query, 10, 64);   // HnswIndex: k, ef
-for (const SearchResult& r : results) use(r.id, r.distance);
+std::vector<SearchResult> exact  = flat.search(query, 10);       // FlatIndex: k
+std::vector<SearchResult> approx = hnsw.search(query, 10, 64);   // HnswIndex: k, ef
+for (const SearchResult& r : approx) use(r.id, r.distance);
 ```
 
 - Results are sorted closest first. Asking for more results than there are vectors returns all of them.
@@ -557,7 +557,7 @@ flat.train_codec();                      // or train now, on the stored vectors
 
 - **SQ8** stores each dimension as one of 256 levels between its smallest and largest trained value. Searches compare the query with these codes, then **re-rank** the best candidates at full precision (`rerank`, on by default). In tests, recall with re-ranking matched full precision exactly; with codes alone (`rerank = false`) it was about 1% lower.
 - **Training** happens automatically once `train_after` vectors are stored (0: only by `train_codec()`), and again whenever you call `train_codec()`. Until then, searches use full precision exactly as without a codec. Training is all or nothing; if memory runs out during automatic training, the add still completes and training is retried on a later add.
-- **Memory:** full-precision vectors are kept too (for re-ranking and `get_vector`), so for now SQ8 adds 25% to vector memory rather than saving it. The saving comes with full-precision vectors kept on disk; see the [plan](compression-and-index-types-plan.md).
+- **Memory:** by default the full-precision vectors are kept too (for re-ranking and `get_vector`), so SQ8 adds 25% to vector memory rather than saving it. To save memory, keep only the codes (`quantization.keep_full_vectors = false`: about a quarter of the vector memory, without re-ranking), or keep the full vectors on disk with the [disk-based index](#disk-based-index).
 - Range searches use full precision. Batch, filtered and exact searches use codes. Saved files keep the codec, its training and the codes (file format version 3).
 - **Setting `HnswParams` positionally** (`HnswParams{16, 200, 42}`) leaves out `quantization`, and compilers warn about that with `-Wextra`. Set fields by name instead, as above.
 
@@ -623,6 +623,7 @@ Each result has `total` (documents counted), `missing` (of those, without the fi
 For English text, `stem` and `stop_words` together usually improve keyword recall; for other languages use `unicode` alone (stemming applies only to plain a-to-z words). A durable collection must be reopened with the same settings.
 
 ```cpp
+std::vector<std::string_view> texts = {"first document", "second document"};  // fit() takes string views
 SparseIndex sparse;                                   // same IDs as the dense index
 Bm25 bm25;
 bm25.fit(texts);                                      // average document length
@@ -638,7 +639,7 @@ A `SparseVector` is a set of (term, weight) pairs (`indices`, `values`; any orde
 
 - **BM25:** `Bm25` turns text into sparse vectors whose dot product is the BM25 score: documents carry the term-frequency part (with `k1`, `b` and the average document length, set by `fit()`), queries the IDF part, computed from the index's document frequencies when the query is encoded. Tokens are lowercase runs of letters and digits (UTF-8 bytes count as letters), hashed to 32-bit term IDs; two tokens with the same hash merge, which is rare. Stemming and stop words are left to you: tokenize your way and build `SparseVector`s directly, or use a learned model such as SPLADE.
 - **Fusion:** `hybrid_search(dense_index, dense_query, sparse_index, sparse_query, k, options)` takes `max(4k, 20)` candidates from each side (`dense_k`, `sparse_k`) and fuses them by ID. Reciprocal Rank Fusion (default) scores each document `dense_weight / (rrf_k + dense rank) + sparse_weight / (rrf_k + sparse rank)` with `rrf_k = 60`: robust, since it uses ranks only. `Fusion::Weighted` scales each list's scores to [0, 1] and adds them with the weights instead, keeping how much better one result is than the next. `options.filter` applies to both sides. `fuse()` fuses any two result lists you already have.
-- **Limits:** a `SparseIndex` has no write-ahead log yet (save it, or rebuild it from your data), and search is exact without pruning: very common terms make long posting lists, so drop stop words for large collections.
+- **Limits:** search is exact without pruning: very common terms make long posting lists, so drop stop words for large collections.
 
 **A durable sparse index.** `SparseIndex::open_durable(dir)` keeps a standalone sparse index in a directory, as `HnswIndex::open_durable` does: every change is logged before it is applied, `checkpoint()` writes a snapshot, and reopening recovers the snapshot and the log after it (a crash loses no acknowledged change). From Python, sparse vectors are durable through collections.
 
@@ -855,7 +856,7 @@ Every index is safe to use from any number of threads at once, with no lock of y
 | Exception | When |
 |---|---|
 | `std::invalid_argument` | Wrong dimension; NaN or infinity in a vector, metadata float or radius; an ID already stored; unknown field (strict schema) or wrong type; invalid filter, planner or HNSW settings; an integer above the 64-bit signed range |
-| `std::logic_error` | A change (`add`, `update`, `remove`, `set_metadata`, `compact` and the like) attempted while a search is running |
+| `std::logic_error` | A change (`add`, `update`, `remove`, `set_metadata`, `compact` and the like) attempted from inside a search on any index, for example from a filter predicate (a change from another thread simply waits); a string-key call on a collection created without `string_ids` |
 | `vecdb::FormatError` (a `std::runtime_error`) | `load` was given a damaged, truncated or unsupported file, or a file of the other index type |
 | `std::runtime_error` | `save` or `load` could not open or write a file |
 | `std::bad_alloc` | Out of memory |
@@ -867,7 +868,7 @@ Removing an ID that is not stored is not an error: `remove` returns `false`, as 
 
 ## Half precision (float16, bfloat16)
 
-Storing each value in 16 bits instead of 32 halves the vectors' memory, with almost no effect on recall (within 0.005 of float32 in our tests). No training is needed: the float32 vectors are never kept.
+Storing each value in 16 bits instead of 32 halves the vectors' memory, with almost no effect on recall (within 0.005 of float32 in our tests). No training is needed; with `keep_full_vectors = false`, as below, the float32 vectors are never stored (by default they are kept as well, which saves nothing).
 
 ```cpp
 HnswParams p;

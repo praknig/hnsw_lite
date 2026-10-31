@@ -179,6 +179,7 @@ struct Document {
     std::string text;            // text for BM25 (empty: none)
     SparseVector sparse;         // learned sparse vector (empty: none)
     Metadata metadata;
+    std::optional<std::int64_t> expires_at;   // with expiry: when it expires (ms since 1970 UTC)
 };
 ```
 
@@ -238,6 +239,8 @@ struct DocumentRecord {
     std::string text;                           // empty unless store_text (or if it had none)
     std::optional<SparseVector> sparse;         // learned sparse vector, if any
     Metadata metadata;
+    std::optional<std::string> key;             // with string ids: the document's key
+    std::optional<std::int64_t> expires_at;     // with expiry: when it expires
 };
 ```
 
@@ -308,6 +311,8 @@ struct CollectionSearchOptions {
     std::optional<std::chrono::steady_clock::time_point> deadline;
     const std::atomic<bool>* cancel = nullptr;
     bool* stopped_early = nullptr;
+    std::optional<ScoreModifiers> modifiers;   // opt-in re-ranking by metadata
+    std::optional<double> diversity;           // opt-in MMR: 1 keeps the ranking, lower = more varied
 };
 ```
 
@@ -335,6 +340,8 @@ struct CollectionHit {
     std::optional<float> text_score, sparse_score;      // dot products (larger is better)
     std::optional<Metadata> metadata;                   // if with_metadata
     std::optional<std::string> text;                    // if with_text
+    std::optional<double> base_score;                   // the fused score before modifiers (when they apply)
+    std::optional<std::string> key;                     // with string ids: the document's key
 };
 ```
 
@@ -342,7 +349,7 @@ Each hit says **which sides found it**, at what rank, and with what raw distance
 
 **Limitations:**
 - Searching an empty collection, or with `k = 0`, returns no hits.
-- Text queries use the same BM25 tokenizer as documents: lowercase runs of letters and digits, **no stemming** ("apples" does not match "apple") and no stop-word removal. Tokenize your way and use the sparse side if you need either.
+- Text queries use the same BM25 tokenizer as documents. By default it takes lowercase runs of letters and digits, with **no stemming** ("apples" does not match "apple") and no stop-word removal; `CollectionOptions::bm25.stem`, `stop_words` and `unicode` (opt-in, fixed at creation) add English stemming, stop-word removal and Unicode-aware tokens. For other languages or analysis, tokenize your way and use the sparse side.
 - The dense side is approximate (HNSW): a document can occasionally be missed. Raise `ef` for better recall.
 
 ### 2.8 Maintenance
@@ -384,7 +391,7 @@ Invalid values (an interval under 1 ms, negative or non-finite thresholds) throw
 
 | Method | What it does |
 |---|---|
-| `MaintenanceReport maintain(std::chrono::milliseconds budget = 0)` | Runs **only what is due**, in this order: a health check and upkeep of the dense side (within `budget`; 0 means no limit), a rebuild if the codec drifted, then a checkpoint if the log has grown. Searches and changes continue meanwhile. Returns what it did. |
+| `MaintenanceReport maintain(std::chrono::milliseconds budget = std::chrono::milliseconds(0))` | Runs **only what is due**, in this order: a health check and upkeep of the dense side (within `budget`; 0 means no limit), a rebuild if the codec drifted, then a checkpoint if the log has grown. Searches and changes continue meanwhile. Returns what it did. |
 | `void set_maintenance(const MaintenancePolicy& policy)` | Changes the policy at any time; starts or stops the background thread as needed. |
 | `std::optional<MaintenanceReport> last_maintenance() const` | The last round's report (manual or background), or nothing if none ran. |
 | `MaintenanceStatus maintenance_status() const` | The counters maintenance decides from, right now. |
@@ -669,7 +676,7 @@ struct SearchOptions {
 - **scans exactly** when at most `max_exact_matches` vectors (2000) **or** at most `max_exact_fraction` of them (1%) are expected to match;
 - otherwise, below `acorn_below` (20%) matching, searches the graph **the ACORN way**: only matching vectors are scored and enter the beam, and a neighbor that fails the filter is looked through to its own neighbors (two hops) without computing its distance, which keeps the graph connected as the filter sees it. Its beam is `ef` × `acorn_ef_multiplier` (4). If it finds fewer than k matches (they lie beyond two hops of where it went), it falls back to the next strategy, so results are never worse than without it;
 - otherwise **searches the graph**, scoring every vector it visits, with `ef` multiplied by 1/selectivity, up to `max_ef_multiplier` (32) times.
-- **Exact fallback:** a graph or ACORN search the planner chose stops once it has computed more distances than `fallback_factor` (1) times the estimated matches (at least 4 × `ef`), and scans the matches exactly instead (`PlanReason::ExactFallback`, `strategy` `ForceExact`). This bounds filters correlated with the vectors, whose matches sit in a few regions the graph search reaches only after crossing much of the graph: measured on 30,000 vectors with a filter matching 10% of them by cluster, 16,876 distances and 5.9 ms became 3,803 and 1.4 ms (4.3× faster; 6.2× on an indexed field), recall unchanged. Results are the exact search's. Forced strategies are never changed; `fallback_factor = 0` turns it off.
+- **Exact fallback:** a graph or ACORN search the planner chose stops once it has computed more distances than `fallback_factor` (1) times the estimated matches (at least 4 × `ef`), and scans the matches exactly instead (`PlanReason::ExactFallback`, `strategy` `ForceExact`). This bounds filters correlated with the vectors, whose matches sit in a few regions the graph search reaches only after crossing much of the graph: measured on 30,000 clustered vectors of 16 dimensions (30 clusters, as test `pl20`) with a filter matching 3 of the clusters (10%) and 200 queries far from them, an average of 24,040 distances per query became 5,280 (4.6 times fewer), recall@10 unchanged (0.980). Results are the exact search's. Forced strategies are never changed; `fallback_factor = 0` turns it off.
 
 Measured on 20,000 clustered 32-dimensional vectors, recall@10 against exact search, ACORN against the widened graph search:
 
@@ -718,7 +725,7 @@ Other searches:
 | `search_range(query, radius, max_results = kNoLimit, options = {})` | Every vector within `radius` (in distance units: **squared** for L2, use `l2_radius(r)`; negative for inner product), closest first, at most `max_results`. Approximate: grows a region from the nearest vectors through graph links (see `range_expand_outside`). `Strategy::ForceExact` scans everything instead. A NaN radius throws. |
 | `search_by_id(id, k, ef = 64, options = {}, include_self = false)` | "More like this": searches with the vector stored for `id`, which cannot change in between. The record itself is left out unless `include_self`. Nothing if `id` is not stored. |
 | `void create_payload_index(std::string_view field)` | Keeps exact value counts and **posting lists** for a **keyword, boolean or tag-set** field: the planner counts matches exactly, and filters on it read only the matching rows (much faster when few match), as do facets. Worth it for fields you filter or facet on often. Other field types throw `std::invalid_argument`. Collections have it too. |
-| `std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = {}) const` | **Faceted counts**: per request, how many vectors hold each value of a field, over every vector or those matching `filter` (see *Faceted search* below). |
+| `std::vector<FacetResult> facets(const std::vector<FacetRequest>& requests, const std::optional<Filter>& filter = std::nullopt) const` | **Faceted counts**: per request, how many vectors hold each value of a field, over every vector or those matching `filter` (see *Faceted search* below). |
 | `std::vector<FacetResult> facets_for(std::span<const std::uint64_t> ids, const std::vector<FacetRequest>& requests) const` | The same over the vectors with these IDs, such as a search's top hits (unknown IDs skipped, repeats counted once). |
 | `Schema schema() const`, `std::vector<std::string> payload_indexes() const` | The metadata schema in force (its fields so far, for a dynamic schema), and the fields with a payload index. |
 | `void set_planner_params(const PlannerParams& p)`, `PlannerParams planner_params() const` | The index's default planner settings. |
@@ -1206,7 +1213,7 @@ When a deadline passes or cancellation is requested, the operation is **undone**
 | Exception | Thrown for | State afterwards |
 |---|---|---|
 | `std::invalid_argument` | Invalid input: wrong dimension, NaN or infinity, a duplicate ID, metadata not fitting the schema, invalid settings, a filter on an unknown field (strict schema), a query part for a missing side | Unchanged |
-| `std::logic_error` | Misuse: a change from inside an index operation on the same thread, a second concurrent rebuild, `checkpoint()` on a non-durable index, swapping a durable index's log, training a codes-only codec again | Unchanged |
+| `std::logic_error` | Misuse: a change from inside an index operation on the same thread, a second concurrent rebuild, `checkpoint()` on a non-durable index, swapping a durable index's log, training a codes-only codec again, a string-key call on a collection created without `string_ids` | Unchanged |
 | `std::runtime_error` | The outside world: a file that cannot be opened or written, a directory locked by another process, a broken log refusing changes | Unchanged (the failed change is not made) |
 | `FormatError` (a `std::runtime_error`) | A damaged, truncated or foreign file or directory; a log that does not match its index | Nothing is loaded |
 | `Cancelled` (a `std::runtime_error`) | A deadline or cancellation stopped a long operation | Undone |
@@ -1221,15 +1228,15 @@ Searches stopped by a deadline or cancellation do **not** throw: they return the
 | Area | Limit |
 |---|---|
 | IDs | 64-bit unsigned integers; collections can also take string keys (opt-in `string_ids`), hashed to 64-bit ids with collisions refused |
-| Vectors | `float` only (no half precision or integers); one dimension per index, from 1 to 16,777,216 (2²⁴); finite values only |
+| Vectors | Given as `float` (not integers or doubles), finite values only; stored as float32, or with a codec as half precision or compressed codes; one dimension per index, from 1 to 16,777,216 (2²⁴) |
 | Memory | In general about 4 × dim + 8 × M + 45 bytes per vector (2 × dim with half precision and codes only), plus metadata. Measured with M 16: 687 bytes at 128 dimensions (448 with float16 or bfloat16, 35% less) and 3,280 at 768 (1,753 with half precision, 47% less). Storage grows in blocks of up to 65,536 rows, but unused rows cost no resident memory |
 | Metrics | L2 (squared), inner product, cosine; `DiskIndex`: L2 and cosine |
 | Graph | `M` from 2 to 2048; HNSW search is approximate |
-| Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic types; a field keeps its first type |
+| Metadata | Integer, float, boolean, keyword and tag-set fields; dates as integers (milliseconds since 1970, `parse_date`); no geographic type, but geographic filters over two numeric fields (`geo_radius`, `geo_box`); a field keeps its first type |
 | Vector magnitudes | Any finite float is accepted. A distance that overflows becomes infinity (never NaN), and infinities sort last, ties in insertion order. Consequence: in an L2 or inner-product graph, a vector whose distances to every neighbor overflow (components near 3e38) ties them all at infinity, so graph search may not reach it; exact search (`Strategy::ForceExact`, `FlatIndex`) still finds it. Cosine normalizes, so it is unaffected. Real embeddings are many orders of magnitude below this. |
-| Half precision | `F16` refuses values beyond ±65504 (use `BF16` for larger ones); queries stay float32, so any finite query works. The disk index (`DiskIndex`) keeps float32 vectors. Building a half-precision index costs a little more time at high dimensions (measured: 26% at 768, none at 128). |
+| Half precision | `F16` refuses values beyond ±65504 (use `BF16` for larger ones); queries stay float32, so any finite query works. The disk index (`DiskIndex`) keeps float32 vectors by default, or float16 or bfloat16 (`DiskIndexParams::vectors`: `DiskVectorFormat::Float16`, `BFloat16`). Building a half-precision index costs a little more time at high dimensions (measured: 26% at 768, none at 128). |
 | Filters | At most 256 levels deep; whole-value comparisons (no substring or full-text matching) |
-| Text | No stemming, stop words or synonyms; 32-bit hashed terms |
+| Text | English stemming (Snowball) and stop words, opt-in, with Unicode-aware tokens; no synonyms; 32-bit hashed terms |
 | Concurrency | One change at a time per index or collection; searches in parallel; no changes from inside predicates |
 | Durability | One process per directory; a checkpoint holds changes while writing; maintenance not logged |
 | Disk index | Read-only; built with the vectors in memory (or partitioned from a file) |

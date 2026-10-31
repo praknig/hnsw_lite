@@ -8,16 +8,13 @@ This guide covers building hnsw-lite, running its tests and examples, and using 
 |---|---|
 | C++ standard | C++20 |
 | GCC (including MinGW / w64devkit on Windows) | 11 |
-| Clang | 14 |
+| Clang | 15 (14 works with GCC 11's standard library, but not with GCC 13's, the default on Ubuntu 24.04) |
 | MSVC | Visual Studio 2022 |
 | CMake | 3.20 |
 
 Any 64-bit x86 or ARM processor works. The fastest distance code for your CPU (AVX2, AVX-512 or NEON) is chosen automatically when the program starts, so the same build runs everywhere.
 
 
-## Python
-
-`pip install hnsw-lite-lib` installs a prebuilt wheel. `pip install .` from the repository root builds the library into the Python package `hnsw_lite_lib` (pip fetches pybind11 and scikit-build-core; a C++20 compiler and CMake are needed). `pip install ".[test]"` and `python -m pytest` run its tests. See the [Python guide](python.md).
 ## Get the code
 
 ```bash
@@ -27,7 +24,7 @@ cd hnsw_lite
 
 ## Build and test
 
-Build in **Release** mode for real use and timing. Debug builds turn off optimizations, so they run many times slower (the test suite takes minutes instead of about 15 seconds).
+Build in **Release** mode for real use and timing. Debug builds turn off optimizations, so they run many times slower (CTest's run of the whole test suite takes about a minute in Release on a 20-thread laptop, many times longer in Debug).
 
 ### Linux and macOS
 
@@ -45,6 +42,8 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+w64devkit includes Ninja. With a MinGW installation that has no Ninja, use `-G "MinGW Makefiles"` instead.
+
 ### Windows with Visual Studio (MSVC)
 
 Open **Developer PowerShell for VS 2022** from the Start menu (an ordinary PowerShell window does not have the compiler set up), then:
@@ -59,7 +58,7 @@ With Visual Studio, programs are placed in `build\Release\`.
 
 ### CLion
 
-1. Open the `hnsw_lite_lib` folder.
+1. Open the `hnsw_lite` folder (the cloned repository).
 2. Add a **Release** profile under Settings → Build, Execution, Deployment → CMake, and select it.
 3. Choose **All CTest** in the run configuration list and click **Run**.
 
@@ -97,14 +96,16 @@ Pass these to the first `cmake` command, for example `-DHNSW_LITE_BUILD_TESTS=OF
 
 | Option | Default | Effect |
 |---|---|---|
-| `HNSW_LITE_BUILD_TESTS` | ON when hnsw-lite is the main project, OFF when included in another | Builds `test_comprehensive` and registers it with CTest |
-| `HNSW_LITE_BUILD_BENCHMARKS` | Same | Builds `bench_distance` and `bench_search` |
+| `HNSW_LITE_BUILD_TESTS` | ON when hnsw-lite is the main project, OFF when included in another | Builds `test_comprehensive`, `test_adversarial` and `test_races` (and `test_cli` with the tool) and registers them with CTest |
+| `HNSW_LITE_BUILD_BENCHMARKS` | Same | Builds `bench_distance`, `bench_search`, `bench_baseline`, `bench_codecs`, `bench_durability` and `bench_locality` |
 | `HNSW_LITE_BUILD_EXAMPLES` | Same | Builds the three example programs |
-| `HNSW_LITE_SANITIZE` | OFF | Adds AddressSanitizer and UndefinedBehaviorSanitizer (GCC and Clang on Linux and macOS only) |
+| `HNSW_LITE_BUILD_TOOLS` | Same | Builds the `hnsw-lite` command-line tool (`inspect`, `verify`, `health`, `export`) |
+| `HNSW_LITE_BUILD_PYTHON` | OFF | Builds the Python extension module (`hnsw_lite_lib._core`); `pip install .` turns it on for you |
+| `HNSW_LITE_SANITIZE` | OFF | Adds AddressSanitizer and UndefinedBehaviorSanitizer with GCC or Clang (ignored with MSVC). They work on Linux and macOS, not with MinGW |
 
 ## Use hnsw-lite in your own project
 
-hnsw-lite is a static library named `hnsw_lite_lib` (also available as `hnsw_lite::hnsw_lite`). Linking it gives your program the include paths and the thread library it needs.
+hnsw-lite is a static library: the CMake target `hnsw_lite` (also available as `hnsw_lite::hnsw_lite`). Linking it gives your program the include paths and the thread library it needs.
 
 ### Option 1: FetchContent (downloads it for you)
 
@@ -132,7 +133,7 @@ add_subdirectory(third_party/hnsw_lite)
 target_link_libraries(my_app PRIVATE hnsw_lite::hnsw_lite)
 ```
 
-In both cases only the library is built: tests, benchmarks and examples are skipped automatically.
+In both cases only the library is built: tests, benchmarks, examples and the command-line tool are skipped automatically.
 
 ### Your first program
 
@@ -163,6 +164,10 @@ id 1  distance 3.02
 
 All public names live in the `vecdb` namespace. Include `hnsw_index.h` for `HnswIndex` or `flat_index.h` for `FlatIndex`; both bring in metadata, filters and search options. Continue with the [User guide](user-guide.md).
 
+## Python
+
+`pip install hnsw-lite-lib` installs a prebuilt wheel. `pip install .` from the repository root builds the library into the Python package `hnsw_lite_lib` (pip fetches pybind11 and scikit-build-core; a C++20 compiler and CMake are needed). `pip install ".[test]"` and `python -m pytest` run its tests. See the [Python guide](python.md).
+
 ## Troubleshooting
 
 | Problem | Solution |
@@ -171,5 +176,5 @@ All public names live in the `vecdb` namespace. Include `hnsw_index.h` for `Hnsw
 | `cl` or MSVC not found | Use **Developer PowerShell for VS 2022**, not a plain PowerShell window. |
 | Everything is very slow | You are probably running a Debug build. Rebuild with `-DCMAKE_BUILD_TYPE=Release` (or `--config Release` with Visual Studio). |
 | `std::span` or other C++20 errors in your project | Set `CMAKE_CXX_STANDARD` to 20 in your own `CMakeLists.txt`. |
-| A test group reports `SKIP` | Expected under the sanitizers: out-of-memory tests need a custom memory allocator that sanitizers replace. |
+| A test reports `SKIP` | Expected in two cases: tests that need another operating system's features (on Windows, one that reads memory through Linux's `/proc` and one that needs POSIX `fork()`, so 959 passed and 2 skipped; on macOS, the `/proc` one only); and under the sanitizers, the out-of-memory tests, which need a custom memory allocator that the sanitizers replace. |
 | Your CPU lacks AVX2 or AVX-512 | Nothing to do: a slower version is chosen automatically, with identical results. The test output's first line shows which one (`kernel: ...`). |

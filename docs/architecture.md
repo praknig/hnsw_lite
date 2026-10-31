@@ -14,7 +14,6 @@ flowchart TB
     C --> D
     B --> E["Layer 1: memory<br/>vector store, adjacency lists, arena"]
     C --> E
-    D --> E
 ```
 
 | Layer | Purpose | Status |
@@ -45,7 +44,7 @@ flowchart TB
     D["include/distance.h<br/>public API"] --> DP["src/dispatch.cpp<br/>CPU detection"]
     DP --> K["src/kernels.h"]
     K --> SC["distance_scalar.cpp<br/>any CPU"]
-    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma"]
+    K --> A2["distance_avx2.cpp<br/>-mavx2 -mfma -mf16c"]
     K --> A5["distance_avx512.cpp<br/>-mavx512f -mavx512bw"]
     K --> NE["distance_neon.cpp<br/>64-bit ARM"]
 ```
@@ -71,28 +70,47 @@ flowchart TB
 ```
 hnsw-lite/
 ├── .github/
-│   └── workflows/
-│       └── ci.yml              # GitHub Actions: build and test on every PR
+│   ├── workflows/
+│   │   ├── ci.yml              # Every pull request: Linux, Windows (MSVC, MinGW), macOS; emulated CPUs, sanitizers, coverage, fuzzing, Python, docs
+│   │   ├── wheels.yml          # Python wheels: built and tested; published to PyPI on version tags
+│   │   ├── benchmark.yml       # Nightly stress and load test, charts on the benchmarks branch
+│   │   ├── nightly.yml         # Nightly long-running checks
+│   │   └── real-benchmarks.yml # Comparison with other libraries on real datasets
+│   └── scripts/
+│       ├── check_links.py      # CI: every link and anchor in the documentation resolves
+│       ├── classify_changes.sh # CI: documentation-only changes skip the builds
+│       ├── fuzz.sh             # Fuzzing every file loader with libFuzzer
+│       ├── gen_signatures.py   # CI: the developer reference's signature appendix, from the headers
+│       └── summarize_tests.sh  # The nightly run's summary of results
 ├── .gitignore                  # Ignores IDE settings and build output
 ├── LICENSE                     # MIT License
-├── CMakeLists.txt              # Builds the library, tests, benchmarks and examples
+├── SECURITY.md                 # Security policy
+├── CMakeLists.txt              # Builds the library, tests, benchmarks, examples and the tool
+├── pyproject.toml              # The Python package (scikit-build-core, pybind11)
 ├── README.md                   # Start here: what it is and how to use it
 ├── docs/
 │   ├── getting-started.md      # Building, build options, using it in your project
+│   ├── how-it-works.md         # Plain-language explanation of the algorithms
 │   ├── user-guide.md           # How to use every feature
-│   ├── api-reference.md        # Every public class and function
-│   ├── performance.md          # Benchmarks and tuning
+│   ├── python.md               # The Python package
+│   ├── api-reference.md        # The public classes and functions, briefly
+│   ├── developer-reference.md  # Every method and parameter in detail, with a signature appendix
 │   ├── architecture.md         # This file: how it works inside
+│   ├── feature-catalog.md      # Features, comparison with similar libraries, open features
+│   ├── performance.md          # Measurements and tuning
+│   ├── benchmarks.md           # Running the comparison and stress benchmarks
 │   ├── testing.md              # Tests, coverage, CI, bugs found
-│   ├── project-notes.md        # Limitations, roadmap, comparison, references
-│   ├── core-capabilities-plan.md       # Plan: deletion, update, persistence, concurrency
-│   └── core-capabilities-test-plan.md  # Test scenarios for that plan
+│   ├── project-notes.md        # Limitations, roadmap, references
+│   ├── core-capabilities-plan.md          # Plan: deletion, update, persistence, concurrency
+│   ├── core-capabilities-test-plan.md     # Test scenarios for that plan
+│   ├── compression-and-index-types-plan.md  # Plan: quantization, IVF, the disk index
+│   └── hardening-and-performance-plan.md  # Plan: edge cases and speed
 ├── examples/                   # Small, complete programs
 │   ├── example_basics.cpp      # Add, search, update, remove, compact
 │   ├── example_filters.cpp     # Metadata, filters, predicates
 │   └── example_batch_range.cpp # Batch and range search
 ├── include/                    # Public headers (namespace vecdb)
-│   ├── common.h                # Layer 1: NodeId, kEmpty, kAlign, round_up
+│   ├── common.h                # Layer 1: NodeId, kEmpty, kAlign, kMaxDim, round_up, small helpers
 │   ├── aligned_block.h         # Layer 1: AlignedBlock, one aligned memory block
 │   ├── arena.h                 # Layer 1: Arena, bump allocator
 │   ├── vector_store.h          # Layer 1: VectorStore, aligned padded rows
@@ -100,14 +118,16 @@ hnsw-lite/
 │   ├── graph_storage.h         # Layer 1: GraphStorage, HNSW neighbor lists
 │   ├── storage.h               # Layer 1: Storage, single entry point
 │   ├── distance.h              # Layer 2: Metric, get_distance(), normalize()
+│   ├── half.h                  # Conversions between float32 and float16 / bfloat16
 │   ├── search_result.h         # Layer 3: SearchResult, Candidate, TopK
 │   ├── prepared_vector.h       # Layer 3: PreparedVector, padded/normalized input
 │   ├── visited_list.h          # Layer 3: VisitedList, VisitedListPool
 │   ├── flat_index.h            # Layer 3: FlatIndex
 │   ├── hnsw_index.h            # Layer 3: HnswIndex, HnswParams
 │   ├── serialize.h             # Saving: checksums, writer, untrusted-file reader, FormatError
+│   ├── inspect.h               # What a file or durable directory holds, from its header (identify)
 │   ├── kmeans.h                # k-means training (for PQ and IVF)
-│   ├── codec.h                 # Vector codecs: SQ8, binary, PQ
+│   ├── codec.h                 # Vector codecs: SQ8, binary, PQ, RaBitQ, float16, bfloat16
 │   ├── vamana.h                # The Vamana graph (DiskANN)
 │   ├── disk_index.h            # The disk-based index
 │   ├── health.h                # Health reports
@@ -115,17 +135,21 @@ hnsw-lite/
 │   ├── wal.h                   # Write-ahead log segments
 │   ├── wal_ops.h               # Logged operations and their encoding
 │   ├── durable.h               # Durable directories
-│   ├── sparse.h                # Sparse vectors, BM25, hybrid search
+│   ├── sparse_vector.h         # SparseVector on its own (as log records carry it)
+│   ├── sparse.h                # Sparse index, BM25, hybrid search
+│   ├── text_analysis.h         # BM25 text analysis: Unicode tokens, English stop words and stemming
 │   ├── collection.h            # Documents over dense, text and sparse sides
-│   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore
+│   ├── metadata.h              # Search: Value, Metadata, Schema, MetadataStore (with posting lists)
 │   ├── filter.h                # Search: Filter, CompiledFilter, SearchOptions, planner interface
 │   ├── payload_index.h         # Search: ValueCounts (exact value counts)
-│   └── thread_pool.h           # Search: ThreadPool, SharedPool (batch search)
+│   ├── facets.h                # Faceted counts per metadata value
+│   ├── scoring.h               # Re-scoring by metadata (ScoreModifiers), MMR, dates
+│   └── thread_pool.h           # IndexLock, ThreadPool, SharedPool (batch work)
 ├── src/                        # Compiled code (Layers 2 and 3)
 │   ├── kernels.h               # Internal declarations of all kernels
 │   ├── dispatch.cpp            # CPU detection, kernel selection, normalize()
 │   ├── distance_scalar.cpp     # Plain loops, any CPU (reference version)
-│   ├── distance_avx2.cpp       # AVX2 + FMA, 8 floats per instruction
+│   ├── distance_avx2.cpp       # AVX2 + FMA (+ F16C), 8 floats per instruction
 │   ├── distance_avx512.cpp     # AVX-512F and BW, 16 floats per instruction
 │   ├── distance_neon.cpp       # NEON, 4 floats per instruction (ARM only)
 │   ├── flat_index.cpp          # FlatIndex implementation
@@ -143,17 +167,40 @@ hnsw-lite/
 │   ├── wal_replay.cpp          # Logging hooks and replay
 │   ├── durable.cpp             # Durable directories: create, recover, checkpoint
 │   ├── sparse.cpp              # Sparse index, BM25, fusion
+│   ├── text_analysis.cpp       # Tokens, stop words, the Snowball English stemmer
 │   ├── collection.cpp          # Collections
+│   ├── facets.cpp              # Faceted counts
+│   ├── scoring.cpp             # Score modifiers and dates
 │   └── query_planner.cpp       # Compiled filters and the query planner
+├── tools/
+│   └── hnsw_lite_cli.cpp       # The hnsw-lite tool: inspect, verify, health and export
 ├── tests/
-│   ├── data/                   # Golden files: format version 1, for compatibility tests
-│   └── test_comprehensive.cpp  # All 961 tests with a built-in runner
+│   ├── data/                   # Golden files of format versions 1 to 3 (flat, HNSW, IVF, codecs), for compatibility
+│   ├── test_comprehensive.cpp  # All 961 tests with a built-in runner
+│   ├── test_adversarial.cpp    # Tries to break it: absurd sizes, leaks, unbounded growth
+│   ├── test_races.cpp          # Threads deliberately colliding on every kind of operation
+│   └── test_cli.cpp            # The command-line tool, run as a program
+├── fuzz/
+│   ├── fuzz_load.cpp           # libFuzzer harnesses for every loader
+│   └── make_seeds.cpp          # One valid file of each kind, for the fuzzers to start from
+├── python/
+│   ├── hnsw_lite_lib/
+│   │   ├── __init__.py         # The Python API: Collection, indexes, filters, NumPy and pandas
+│   │   ├── hnswlib.py          # A drop-in for hnswlib's Python API
+│   │   └── importers.py        # From hnswlib files, FAISS indexes, Chroma collections
+│   ├── src/
+│   │   └── bindings.cpp        # The extension module hnsw_lite_lib._core (pybind11)
+│   ├── tests/                  # pytest: the package, the hnswlib drop-in, the importers
+│   └── README.md               # The package's page on PyPI
 └── bench/
     ├── bench_distance.cpp      # Speed of every kernel version
     ├── bench_search.cpp        # Flat vs. HNSW: queries/s and recall
     ├── bench_baseline.cpp      # Fixed-seed baseline, or a real dataset (.fvecs)
     ├── bench_codecs.cpp        # Code kernels: SQ8, binary, PQ
-    └── bench_durability.cpp    # Additions per second in each durability mode
+    ├── bench_durability.cpp    # Additions per second in each durability mode
+    ├── bench_locality.cpp      # Whether memory stalls dominate search on this machine
+    ├── native.cpp, native_compare.cpp  # hnsw-lite against hnswlib in C++ (with the comparison scripts)
+    └── python/                 # The comparison with other libraries, the stress test, publishing
 ```
 
 Layer 1 and the Layer 3 helpers are header-only. Layer 2's kernels and Layer 3's indexes are compiled into a static library (`hnsw_lite`); the SIMD files need their own compiler flags, and the indexes contain real logic.
@@ -446,7 +493,7 @@ The whole batch runs inside one change, holding the index lock alone, so searche
 
 **Neighbor selection.** `select_neighbors(base, candidates, max)` applies HNSW's diversity rule (skip a candidate that a kept neighbor is closer to, or that is a copy of one) to distinct candidates, choosing them first but only up to the list minus room for copies of the base itself (half the list, or all the copies if fewer); the copies, exempt from the rule, then fill whatever room remains. Equal distances are ordered by a hash of (base, candidate), with a full order so `std::sort` is deterministic and allocation-free (`stable_sort` falls back silently when its buffer cannot be allocated). Before, every copy was a copy of the first one kept, so a vector kept one link per group of copies, and ties went to the lowest node numbers: identical vectors were almost all unreachable.
 
-**Neighbor selection for inner product.** Inner product is not a distance: one vector of large norm is "nearer" to almost every candidate than the node being linked is, so the usual rule kept a link or two per node (measured: mean degree 1.7, 88% of a recommendation-like index unreachable, filtered graph searches finding half the right answers). For inner product the rule compares angles instead: a candidate `c` is passed over when a kept neighbor `k` is closer to it in angle than the node is, cos(c, k) > cos(c, base), which is dot(c, k)·|base| > dot(c, base)·|k| since |c| cancels; the dot products are the distances already computed, and each norm is computed once. Lists the angle rule leaves short are filled with the nearest candidates passed over. Measured on the same data: mean degree 17.2, recall@10 0.999 at `ef` 64 (was 0.979), filtered graph search 1.000 (was 0.484). L2 and cosine are unchanged, byte for byte.
+**Neighbor selection for inner product.** Inner product is not a distance: one vector of large norm is "nearer" to almost every candidate than the node being linked is, so the usual rule kept a link or two per node. For inner product the rule compares angles instead: a candidate `c` is passed over when a kept neighbor `k` is closer to it in angle than the node is, cos(c, k) > cos(c, base), which is dot(c, k)·|base| > dot(c, base)·|k| since |c| cancels; the dot products are the distances already computed, and each norm is computed once. Lists the angle rule leaves short are filled with the nearest candidates passed over. Measured on the recommendation-like data of the test `inner_product_graph_stays_connected` (20,000 vectors of 32 dimensions whose lengths vary widely; the test prints these), before → after: mean degree 2.5 → 18.4, unreachable 73.5% → 16.5% (vectors too short to be any other's nearest by inner product, which searches still return as answers), recall@10 at `ef` 64 0.980 → 1.000, filtered search through the graph 0.712 → 1.000. On 500,000 vectors of 256 dimensions, see the [performance notes](performance.md#metric). L2 and cosine are unchanged, byte for byte.
 
 **Copies, checked only when possible.** The rule also skips a candidate that is an exact copy of a kept neighbor. Comparing the two vectors for every pair was 15% of an update's work; but a copy gives the distance kernel the very inputs of the candidate with itself, so the same float, and the vectors are now compared only when `distance(c, k) == distance(c, c)` (0 for L2). The same decisions, without most comparisons.
 
@@ -543,7 +590,7 @@ A filtered HNSW search can either scan the matching vectors exactly, or search t
 1. **Estimate the number of matches:** exactly from the payload index when the filter allows it (and there is no predicate), exactly by checking every slot when the index is smaller than the sample size, otherwise from a deterministic sample of 256 live vectors.
 2. **Choose:** exact search if the expected matches are at most `max_exact_matches` (default 2,000) **or** their fraction is at most `max_exact_fraction` (default 1%); otherwise **ACORN** below `acorn_below` (20%), with the beam multiplied by `acorn_ef_multiplier` (4); otherwise graph search, with `ef` widened by 1 / selectivity, up to `max_ef_multiplier` (32) times.
 
-**The exact fallback.** The estimate cannot see correlation between a filter and the vectors: a filter matching whole clusters looks like any other of its size, but a graph search finds its matches only after crossing much of the graph (measured: 16,876 distances for 2,936 matches). So a graph or ACORN search the planner chose carries a budget of distances (`fallback_factor` times the estimated matches, at least 4 × ef), checked as `search_level` and `acorn_level0` expand nodes; past it, `search_impl` runs the exact scan instead, whose results it returns. The cost is at most (fallback_factor + 1) times the exact scan's, recall never lower.
+**The exact fallback.** The estimate cannot see correlation between a filter and the vectors: a filter matching whole clusters looks like any other of its size, but a graph search finds its matches only after crossing much of the graph (measured on 30,000 clustered vectors, a filter matching 3 of 30 clusters and queries far from them: 24,040 distances per query for about 3,000 matches, 5,280 with the fallback). So a graph or ACORN search the planner chose carries a budget of distances (`fallback_factor` times the estimated matches, at least 4 × ef), checked as `search_level` and `acorn_level0` expand nodes; past it, `search_impl` runs the exact scan instead, whose results it returns. The cost is at most (fallback_factor + 1) times the exact scan's, recall never lower.
 
 **ACORN** (`acorn_level0`, after Patel et al., SIGMOD 2024, the variant needing no extra links): the upper levels are descended greedily, ignoring the filter; on level 0 only eligible nodes are scored and enter the beam, and an ineligible neighbor is looked through once (its own neighbors are considered, unscored). The starting node is only traversed if it is ineligible. If fewer than k eligible nodes are found (the matches lie beyond two hops of where the search went), the search falls back to the ordinary filtered search with the beam widened by `max_ef_multiplier`, so results are never worse than without ACORN.
 

@@ -47,7 +47,7 @@ Every workload was profiled with Callgrind (instruction counts: deterministic, u
 | Writes to collections and sparse indexes | `v.reserve(v.size() + 1)` before each insertion allocates exactly one more slot, so every insertion copied the whole array, including every posting list a document touches: quadratic | Geometric growth (`reserve_one_more`) | 1.28x fewer instructions at 3,000 documents, growing with size |
 | Bulk removals with payload indexes (`remove_where`, `remove_batch`) | Each removed row shifted whole posting lists: quadratic | Posting lists left alone during the batch, then rebuilt in one pass (O(rows + entries)); nothing allocates, since lists only shrink; batches under 32 rows keep the per-row path | 61x at 200,000 rows; a million rows in 0.23 s (about 30 s before) |
 | Filters in exact scans | The filter tree walked once per row (about 145 instructions for two conditions) | Evaluated a column at a time into a bitmap, with the column's arrays held in locals and the operator as a branch-free mask; ranges, lists, tags and geo filters keep the row evaluator | Filtered searches 2.65x fewer instructions; about 29 per row |
-| Hybrid fusion | Every candidate built as a full hit (metadata, text, key) in a hash map, then sorted | Candidates ranked as 40-byte records; full hits built only for those returned | Group-by 1.23x faster; results bit-identical |
+| Hybrid fusion | Every candidate built as a full hit (metadata, text, key) in a hash map, then sorted | Candidates ranked as 48-byte records; full hits built only for those returned | Group-by 1.23x faster; results bit-identical |
 | Checksums (every file) | CRC-32 one byte at a time, with a guard checked per call | Slicing-by-8 over tables built at compile time: the same CRC | Reading 3.07x fewer instructions |
 | `in(...)` and tag filters, `has_all_tags`, tags on writing and loading | Repeats found by linear search: quadratic in the number of values (and on loading, in what a damaged file claims) | Sorting, or a sorted copy for lists over 16 values (shorter lists unchanged, without allocating) | `in` with 40,000 values 5.7x faster |
 
@@ -55,7 +55,7 @@ Tried and not kept: comparing the first value before `memcmp` in the check for d
 
 ## Baseline for performance work (Phase 0)
 
-Measured with `bench_baseline` (in [bench/](../bench)), which reports build time, index memory, and for `ef` from 16 to 256: queries per second (the median of 5 passes), p50 and p99 latency, and recall@10. hnswlib (v0.10.0 release candidate, header-only C++) was measured with identical data, settings (`M = 16`, `ef_construction = 200`, k = 10) and method.
+Measured with `bench_baseline` (in [bench/](../bench)), which reports build time, index memory, and for `ef` from 16 to 256: queries per second (the median of 5 passes), p50 and p99 latency, and recall@10. hnswlib (header-only C++) was measured with identical data, settings (`M = 16`, `ef_construction = 200`, k = 10) and method; the comparison programs in [bench/](../bench) (`native.cpp`, `native_compare.cpp`) fetch hnswlib v0.8.0.
 
 **Data:** 200,000 vectors of 128 dimensions, L2, 1,000 queries. Points come from 100 clusters in a 16-dimensional space, mapped into 128 dimensions with a little noise, because real embeddings vary along far fewer directions than their dimension. (Plain random noise in all 128 dimensions makes nearest neighbors nearly meaningless: both libraries then reach only 15% to 57% recall, so such data says nothing about either.)
 
@@ -74,9 +74,9 @@ Measured with `bench_baseline` (in [bench/](../bench)), which reports build time
 | 128 | 6,542 | 1.000 | 6,315 | 1.000 |
 | 256 | 3,435 | 1.000 | 3,828 | 1.000 |
 
-**Reading these numbers:** the two libraries are level. Build time and recall match, and search speed is within the machine's noise at every `ef`; hnsw-lite uses about 5% more memory.
+**Reading these numbers:** the two libraries are level. Build time and recall match; search speed is within the machine's noise (below) at every `ef` but 32, where hnsw-lite measured 41% faster in this run, more than the noise explains; hnsw-lite uses about 5% more memory.
 
-**Measurement noise:** on this shared machine, running the same program three times gave 18,759 to 24,773 queries per second (`ef = 64`, 50,000 vectors) and builds of 5.7 to 6.6 seconds: differences of up to 30%. That is far above the 5% gain an optimization must show to be kept, so **optimizations are judged on a quiet machine with dedicated cores**, with the baseline and the candidate run alternately several times and their medians compared.
+**Measurement noise:** on this shared machine, running the same program three times gave 18,759 to 24,773 queries per second (`ef = 64`, 50,000 vectors) and builds of 5.7 to 6.6 seconds: differences of up to 32%. That is far above the 5% gain an optimization must show to be kept, so **optimizations are judged on a quiet machine with dedicated cores**, with the baseline and the candidate run alternately several times and their medians compared.
 
 ### Running the baseline on real data
 
@@ -110,11 +110,11 @@ Values of `M` below 8 leave parts of the graph poorly connected (at `M = 2`, tes
 
 ### The search setting: `ef`
 
-`ef` is the number of candidates a search keeps. It must be at least `k`, and is raised to `k` automatically. From the benchmark above: `ef = 40` finds 98.4% of true neighbors, `ef = 80` finds 99.8%, and each doubling roughly halves speed beyond that. Measure on your own data by comparing HNSW results with `FlatIndex` results for a few hundred queries, and choose the smallest `ef` that meets your recall target.
+`ef` is the number of candidates a search keeps. It must be at least `k`, and is raised to `k` automatically. From the benchmark above: `ef = 40` finds 98.4% of true neighbors, `ef = 80` finds 99.8%, and each doubling beyond that costs about a quarter of the speed (77% and then 72% of it in the table). Measure on your own data by comparing HNSW results with `FlatIndex` results for a few hundred queries, and choose the smallest `ef` that meets your recall target.
 
 ### Metric
 
-Cosine and L2 give the best HNSW recall. Inner product is not a true distance, so recall is lower on vectors of very different lengths (0.86 to 0.90 at `ef = 100` in tests, against 0.997 or more for L2 and cosine). If your model's vectors can be normalized, normalize them and use cosine.
+Cosine and L2 need the least work per search. Inner product is not a true distance: on vectors of very different lengths, the graph needs more distance computations per query for the same recall (below). If lengths carry no meaning in your data, normalize the vectors and use cosine.
 
 **Inner product with lengths that vary widely** (recommendations): neighbors are chosen by angle (see the architecture notes). Measured on 500,000 vectors of 256 dimensions: mean degree 1.5 → 16.7, recall@10 at `ef` 64 0.960 → 0.993, at `ef` 128 0.975 → 0.997; searches do more work on the healthy graph (about half the queries per second at the same `ef`) and building takes 2.3 times longer.
 
@@ -157,16 +157,16 @@ A whole search gains less, as graph traversal and memory access take the rest of
 
 | Setting | Recall@10 | Memory for vectors |
 |---|---|---|
-| Full precision (HNSW, `ef` 64) | 0.93 to 0.99 | 4 bytes per dimension |
+| Full precision (HNSW, `ef` 64) | 0.94 to 0.99 | 4 bytes per dimension |
 | SQ8, re-ranked (default) | the same as full precision | 5 bytes per dimension (codes and floats) |
-| SQ8, codes only (`keep_full_vectors = false`) | 0.972 to 0.976 (about 1.5% lower) | 1 byte per dimension |
+| SQ8, codes only (`keep_full_vectors = false`) | 0.967 to 0.978 (up to 1.7% lower) | 1 byte per dimension |
 | Binary, re-ranked, Flat `rerank_factor` 32 or HNSW `ef` 400 | 0.96 to 0.99 | 4 bytes and 1 bit per dimension |
 | Binary, re-ranked with the defaults (`rerank_factor` 4, `ef` 64) | 0.63 to 0.79 | the same |
 | Binary, codes only | 0.34 to 0.39: not recommended | 1 bit per dimension |
 | PQ (8 dimensions per part), re-ranked: Flat `rerank_factor` 16, HNSW `ef` 200 | 0.89 to 0.97 | 4 bytes per dimension plus 1 byte per part |
 | PQ, codes only | 0.31 to 0.40 on this test data | 1 byte per part (32 times smaller by default) |
 
-- **SQ8** is the safe choice: re-ranked, it matches full precision; with codes only it saves three quarters of the vector memory for about 1.5% recall.
+- **SQ8** is the safe choice: re-ranked, it matches full precision; with codes only it saves three quarters of the vector memory for up to 1.7% recall.
 - **Binary codes** need a large re-ranking budget: a `rerank_factor` of 16 to 32 for Flat, a larger `ef` for HNSW. Keep the full vectors with them.
 - **PQ** gives the smallest codes for a given recall once re-ranked with a generous budget; choose more parts (`pq_subspaces`) for better recall. Its training (k-means) is slower than SQ8's.
 - **Matryoshka truncation** (`truncate_to`) cuts the cost of every distance in proportion, for embeddings trained for it; add `keep_full_vectors = false` to save the memory too.
@@ -225,7 +225,7 @@ Readers alone: 3,506 reads/s on one thread, 85,091 on 19. Readers gain 2 to 8 ti
 
 ### Group-by
 
-Filling groups by searching among each group's members, instead of widening the whole search until every group is full (50,000 chunks in documents of 8, a payload index on the document field):
+Filling groups by searching among each group's members, instead of widening the whole search until every group is full (50,000 chunks in documents of 8, a payload index on the document field; one shared virtual core):
 
 | | 2 per group | 3 per group | 5 per group |
 |---|---|---|---|

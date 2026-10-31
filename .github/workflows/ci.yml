@@ -351,7 +351,7 @@ jobs:
         run: cmake --build build --parallel --target test_comprehensive test_adversarial test_races
 
       - name: Test threaded groups
-        # The threaded groups (14), four at a time.
+        # The threaded groups (26), four at a time.
         run: ctest --test-dir build --output-on-failure -j 4 -R '^comprehensive\.(concurrency|helpers|deletion|add_batch|codec|sq8|matryoshka|lean|review|codes_only|binary|pq|ivf|disk|health|upkeep|rebuild|wal|durable|sparse|collection|maintenance|presets|features|scoring|reorder)(\..*)?$'
 
       - name: Adversarial concurrency

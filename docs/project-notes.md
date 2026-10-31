@@ -14,16 +14,16 @@ These are deliberate for the current stage:
 
 - **Changes run one at a time.** Indexes are thread-safe, and every change takes the lock alone to apply itself. An `add`, `update` or `upsert` on an HNSW index finds and chooses its neighbors while searches keep running and holds them up only to link (see the [architecture](architecture.md)); `add_batch` links its vectors on several threads, but searches wait while it runs.
 - **Writes slow down under heavy concurrent reading.** Since searches are no longer held up by an insertion's search work, a writer competes with them for the cores: with 10 to 19 readers on 20 threads, upserts and adds ran 2.4 to 8 times slower than with readers kept out, while the readers ran 2 to 8 times faster. Finer-grained locking would serve both.
-- **Heavy update churn weakens the graph until upkeep.** Each update links a new version and repairs around the old one; small losses add up. Measured with 320 updates per vector of a 20-vector index: vectors became unreachable in 37 of 200 random orders, 7 since removal repair keeps each former neighbor's incoming link, and none after `upkeep()`, which reconnects them (see the [user guide](user-guide.md#upkeep)). `compact()` still rebuilds the graph completely. (hnswlib has the same weakness with repeated updates.)
+- **Heavy update churn weakens the graph until upkeep.** Each update links a new version and repairs around the old one; small losses add up. Measured on the current code with test `c14`'s 20 vectors and its 6,400 upserts (320 per vector) applied in 200 random orders: a vector became unreachable in 1 order (at worst 1 of the 20), and none after `upkeep()`, which reconnects them; removal repair keeps each former neighbor's incoming link (see the [user guide](user-guide.md#upkeep)). `compact()` still rebuilds the graph completely. (hnswlib has the same weakness with repeated updates.)
 - **Inner product with vectors of very different lengths:** neighbors are chosen by angle, so the graph stays connected and searches find their answers (measured on 500,000 recommendation-like vectors: recall@10 0.993 at `ef` 64; filtered graph searches found every right answer). Vectors of very small length, though, are rarely any other vector's nearest by inner product, so many have no link pointing to them (a health report counts them unreachable); they are found as answers when a filter or `among` asks for them. If lengths carry no meaning in your data, normalize and use cosine.
 - **Cosine indexes use twice the memory for vectors**, keeping each vector as given (for `get_vector`) besides the normalized copy used for searching.
 - **Graphs made almost entirely of identical vectors keep some of them unreachable until upkeep.** Neighbor selection now keeps copies of a vector (up to the room distinct neighbors do not need) and breaks distance ties by a hash of the pair: with a dozen copies per value nothing becomes unreachable; with 600 identical vectors and M 8 about 10% do (98.5% before), and `upkeep()` reconnects them. Run it after building heavily duplicated data.
 - **HNSW build speed.** One-by-one adds are single-threaded (use `add_batch` to build on several threads), and every access is bounds-checked for safety. Unchecked accessors in the hot loops are future optimizations.
 - **A plain `save()` does not force data onto the physical disk:** it is atomic (temporary file, then rename), but a power cut right after it returns could lose it. Durable directories (`open_durable()`) flush their log and snapshots to the disk itself.
 - **HNSW reclaims memory by reuse.** A removed vector's slot is reused by the next insert, so memory stays bounded by the peak number of live vectors, but it is not returned to the system until `compact()` is called.
-- **User IDs are 64-bit integers only.**
+- **Index IDs are 64-bit integers.** Collections can also take string keys (`string_ids`): each is hashed to a 64-bit ID, and two keys with the same hash are refused, never mixed up.
 - **Text analysis is English-first:** stemming and stop words are English; other languages get Unicode-aware tokens (`unicode`) without stemming. No synonyms.
-- **Sparse search is exact without pruning:** very common terms make long posting lists (MaxScore pruning is on the roadmap). A standalone `SparseIndex` can be durable (`open_durable`), as collections are.
+- **Sparse search is exact without pruning:** very common terms make long posting lists (MaxScore pruning was tried and searched slower; block-max WAND is on the roadmap). A standalone `SparseIndex` can be durable (`open_durable`), as collections are.
 - **Group-by with very large groups** (over 4,096 documents per value) fills short groups with the full filtered search rather than a search among the group's members; grouping by a field with few, large values (a category) stays slow.
 - **One process per durable directory**, enforced with a lock file; a checkpoint holds changes (not searches) while its snapshot is written.
 - **Filters are limited to 256 levels of nesting.** Combine many conditions with `in()`, `has_any_tag()` or a balanced tree instead.
@@ -31,7 +31,7 @@ These are deliberate for the current stage:
 - **Filter-aware graph construction is not implemented.** Very selective filters go to exact search; between roughly 1% and 10% selectivity the planner's thresholds matter most, and may need tuning per dataset.
 - **HNSW range search is approximate**, like k-nearest search; use `Strategy::ForceExact` when every vector in the radius must be found.
 - **Custom predicates must be thread-safe** when used with batch search, and the planner can only estimate them by sampling.
-- **Inner product costs more per search than L2 and cosine.** It is not a true distance: on data with very different lengths, a healthy graph needs more distance computations per query (about twice the work at the same `ef` on recommendation-like data), and building takes about twice as long.
+- **Inner product costs more per search than L2 and cosine.** It is not a true distance: on data with very different lengths, a healthy graph needs more distance computations per query (measured on 500,000 recommendation-like vectors at `ef` 64: 1.35 times as many, and half the queries per second), and building took 2.3 times as long.
 - **Very small `M` builds a sparse graph.** `M = 2` works but leaves about 10% of nodes unreachable in tests; use `M >= 8`.
 - **Kernels compare one pair of vectors at a time.** Batched query-vs-many kernels and matrix-multiplication-based flat search are possible future optimizations.
 - **On some older Intel CPUs, heavy AVX-512 use lowers the clock speed.** If the AVX2 version benchmarks faster on your machine, that is why.
@@ -81,7 +81,7 @@ Every feature that could come next, consolidated and in a suggested order, is in
 - [x] Graph reordering for memory locality (`reorder()`), score modifiers (recency decay, confidence, boosts), dates, MMR diversity, document expiry (TTL), string keys
 - [x] Benchmark tools: a comparison with hnswlib, FAISS and USearch, a stress test at a million vectors and more, a nightly job publishing charts
 - [x] Half-precision vectors (float16, bfloat16), a compact ID map, and collection settings (expiry, string keys) saved with the collection
-- [ ] Benchmark results on SIFT1M and GloVe, published
+- [x] Benchmark results on SIFT1M and GloVe, published on the `benchmarks` branch (`real-datasets/`, from 2026-10-28)
 - [x] Collections: scanning every document, and exporting to a DataFrame (`scan()`, `documents()`, `to_pandas()`)
 - [x] Faceted search: counts by field over the top hits and the whole corpus, filtered counts, numeric ranges
 - [x] A command-line tool: `inspect`, `verify`, `health` and `export` for any file
@@ -123,6 +123,8 @@ The comparison with hnswlib, USearch, FAISS, Annoy, ScaNN, Voyager, DiskANN, sql
 - [Qdrant](https://github.com/qdrant/qdrant)
 - [Milvus](https://github.com/milvus-io/milvus)
 - [USearch](https://github.com/unum-cloud/usearch)
-- J. Subramanya et al., *DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*, NeurIPS 2019.
+- S. Jayaram Subramanya et al., *DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node*, NeurIPS 2019.
+- L. Patel et al., *ACORN: Performant and Predicate-Agnostic Search Over Vector Embeddings and Structured Data*, SIGMOD 2024.
+- J. Gao and C. Long, *RaBitQ: Quantizing High-Dimensional Vectors with a Theoretical Error Bound for Approximate Nearest Neighbor Search*, SIGMOD 2024.
 - G. V. Cormack, C. L. A. Clarke and S. Buettcher, *Reciprocal Rank Fusion outperforms Condorcet and individual rank learning methods*, SIGIR 2009.
 - [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks)
