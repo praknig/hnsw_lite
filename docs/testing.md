@@ -225,7 +225,7 @@ A Debug build runs the comprehensive suite many times slower than Release, and s
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-    |---|---|---|
+      |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -485,6 +485,7 @@ Two test assumptions were also wrong and corrected: a zero vector is valid with 
 131. **A decided update's repair could be applied wrongly** (found by `r12_snapshots_taken_during_writes`, failing on every run, during development of the above). A removed node's slot, taken by the new version, made a neighbor's list name a live node where the plan had seen a removed one; the list was unchanged, its meaning was not. Reused decisions now also require that no list read names the new slot. The differential test `planned_writes_equal_direct_writes` (every change, 12 configurations) catches it, fails with the check removed, and nothing before compared the two paths: replay uses the same public methods.
 
 132. **A batch of decided insertions wrote past a visited list.** Deciding links reads a visited list sized by the nodes stored; a plan's node is one beyond them, a batch's up to 256 beyond, and the search marks the node it leaves out. Sized for the single plan, the batched compact corrupted the heap on its first run that reached it (found by the experiment that checked the batched path ran at all: the first version took the old path for L2 and inner product, which keep no separate originals, and its result matched the old one exactly). The list now covers the node's own slot.
+133. **The coverage job ran out of time** (60 minutes) with every finished test passing: unoptimized, instrumented and with atomic counters for the threaded tests, the suite runs about 50 times slower than in Release, and the tests added with planned insertions and parallel compaction (about a tenth of the suite's time) took it past the limit. Its limit is now 120 minutes; CTest sets no limit per test (the project calls `enable_testing()` without `include(CTest)`), so no single slow group can fail on its own.
 
 ## Adversarial tests
 

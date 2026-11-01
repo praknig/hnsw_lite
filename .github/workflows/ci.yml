@@ -271,7 +271,10 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     name: Linux / Coverage
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Unoptimized and instrumented, with atomic counters (-fprofile-update=atomic, for the
+    # threaded tests): the suite runs about 50 times slower than in Release, about 85 minutes
+    # on four cores. CTest sets no per-test limit (enable_testing() without include(CTest)).
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v5
 
