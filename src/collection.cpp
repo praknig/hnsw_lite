@@ -1292,6 +1292,11 @@ std::optional<MaintenanceReport> Collection::last_maintenance() const {
 
 MaintenanceStatus Collection::maintenance_status() const {
     MaintenanceStatus st;
+    // A checkpoint replaces the log's writer while holding only the shared lock (changes wait;
+    // readers do not): the log is read under the checkpoint mutex too, taken first, as
+    // checkpoint() takes it.
+    std::unique_lock<std::mutex> no_checkpoint;
+    if (durable_) no_checkpoint = std::unique_lock<std::mutex>(durable_->checkpoint_mutex);
     const auto lock = read_lock(mutex_, this);
     if (durable_) {
         st.log_bytes = log_.writer().size() - wal::kHeaderSize;
@@ -1410,6 +1415,7 @@ MaintenanceReport Collection::maintain(std::chrono::milliseconds budget) {
     if (durable_) {
         std::uint64_t bytes = 0, records = 0;
         {
+            const std::lock_guard<std::mutex> no_checkpoint(durable_->checkpoint_mutex);  // see maintenance_status
             const auto lock = read_lock(mutex_, this);
             bytes = log_.writer().size() - wal::kHeaderSize;
             records = log_.writer().next_lsn() - checkpoint_lsn_.load();

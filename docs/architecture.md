@@ -182,7 +182,7 @@ hnsw-lite/
 │   └── hnsw_lite_cli.cpp       # The hnsw-lite tool: inspect, verify, health and export
 ├── tests/
 │   ├── data/                   # Golden files of format versions 1 to 3 (flat, HNSW, IVF, codecs), for compatibility
-│   ├── test_comprehensive.cpp  # All 966 tests with a built-in runner
+│   ├── test_comprehensive.cpp  # All 967 tests with a built-in runner
 │   ├── test_adversarial.cpp    # Tries to break it: absurd sizes, leaks, unbounded growth
 │   ├── test_races.cpp          # Threads deliberately colliding on every kind of operation
 │   └── test_cli.cpp            # The command-line tool, run as a program

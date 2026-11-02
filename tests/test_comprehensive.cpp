@@ -20200,9 +20200,11 @@ TEST(collection, co25_planned_writes_equal_direct_writes) {
     auto bytes_of = [](const Collection& c, const std::string& name) {
         const std::string path = temp_path(name);
         c.save(path);
-        std::ifstream in(path, std::ios::binary);
         std::ostringstream all;
-        all << in.rdbuf();
+        {
+            std::ifstream in(path, std::ios::binary);
+            all << in.rdbuf();
+        }  // closed before removing: Windows cannot remove an open file
         std::filesystem::remove(path);
         return all.str();
     };
@@ -21031,6 +21033,39 @@ TEST(maintenance, mt07_background_maintenance_during_changes_and_searches) {
     for (const auto& [id, text] : expected) same = same && c->get(id) && c->get(id)->text == text;
     CHECK(same);
     c.reset();  // close it first: Windows cannot delete the locked LOCK file of an open collection
+    std::filesystem::remove_all(dir);
+}
+
+TEST(maintenance, mt08_status_read_while_checkpointing) {
+    // A checkpoint replaces the log's writer under the shared lock; maintenance_status() and
+    // maintain() read the log meanwhile. They wait for a checkpoint in progress (found by
+    // ThreadSanitizer in mt05: a background checkpoint racing a status read).
+    auto data = random_vectors(200, 8, 4108);
+    const std::string dir = co_dir("mt08");
+    CollectionOptions o = co_options();
+    o.maintenance.mode = Maintenance::Manual;
+    {
+        auto c = Collection::open(dir, o);
+        for (std::uint64_t i = 0; i < 100; ++i) c->add(i, co_doc(data, i));
+        std::atomic<bool> done{false};
+        std::thread checkpointer([&] {
+            for (std::uint64_t i = 0; i < 60; ++i) {
+                c->upsert(100 + i, co_doc(data, 100 + i));
+                (void)c->checkpoint();
+            }
+            done = true;
+        });
+        std::size_t reads = 0;
+        while (!done) {
+            const MaintenanceStatus st = c->maintenance_status();
+            CHECK(st.log_bytes < (std::uint64_t(1) << 40));
+            if (reads % 8 == 0) (void)c->maintain();
+            ++reads;
+        }
+        checkpointer.join();
+        CHECK(reads > 0);
+        CHECK(c->size() == 160);
+    }
     std::filesystem::remove_all(dir);
 }
 
