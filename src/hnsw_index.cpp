@@ -687,16 +687,17 @@ void HnswIndex::add_batch_alongside(std::span<const std::uint64_t> ids, std::spa
                 nodes.push_back(slot);
                 levels.push_back(level);
             }
-            std::vector<std::vector<NodeId>> decided;  // between the steps: no change can intervene
-            const bool decide = entry_ != kEmpty;
-            if (decide) decided = decide_levels(slot, level, kEmpty, scratch_.data(), entry_, max_level_, nullptr, nullptr);
+            // Decided between the steps: no change can intervene (the change token), so the entry
+            // point is the same when the decision is applied.
+            std::vector<std::vector<NodeId>> decided;
+            if (entry_ != kEmpty) decided = decide_levels(slot, level, kEmpty, scratch_.data(), entry_, max_level_, nullptr, nullptr);
             {
                 const auto step = lock_.write("add_batch");
                 if (entry_ == kEmpty) {
                     entry_ = slot;
                     max_level_ = level;
                 } else {
-                    link_new_node(slot, level, kEmpty, decide ? &decided : nullptr);
+                    link_new_node(slot, level, kEmpty, &decided);
                 }
             }
             control.advance();
@@ -745,7 +746,7 @@ void HnswIndex::add_batch_alongside(std::span<const std::uint64_t> ids, std::spa
                         max_level_ = levels[j];
                         continue;
                     }
-                    const bool use = entry != kEmpty && levels[j] <= top;
+                    const bool use = levels[j] <= top;  // decided (an empty index's chunks are of one, entered above)
                     std::vector<float> buffer;
                     link_levels(nodes[j], levels[j], kEmpty, stored_padded(nodes[j], buffer).data(), entry_, max_level_, nullptr,
                                 use ? &decided[j - start] : nullptr);
