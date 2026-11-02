@@ -15,7 +15,7 @@ else()
         OUT_SOURCE_PATH SOURCE_PATH
         REPO praknig/hnsw_lite
         REF "v${VERSION}"
-        SHA512 0
+        SHA512 <REPLACE_WITH_REAL_SHA512_FOR_v${VERSION}_ARCHIVE>
         HEAD_REF master
     )
 endif()
