@@ -223,6 +223,26 @@ Searches wait for a writer only that long. Measured on an Intel Core i9-13900H l
 
 Readers alone: 3,506 reads/s on one thread, 85,091 on 19. Readers gain 2 to 8 times, and their worst-case latency falls 4 to 70 times. Writes go slower with many readers: before, the writer was fast because it kept the readers out; now it competes with them for the cores. For read-heavy use that is the right trade; a write-heavy workload under heavy reading is the next thing to tune.
 
+
+**Collections.** A collection's `add` and `upsert` decide the dense side's links under the collection's shared lock too, and hold it exclusively only to apply the document to every side. Measured on one shared virtual core, a collection of 20,000 documents of 128 dimensions (cosine) with text, 2,000 writes each, timing the exclusive section directly, planning off (the former behavior) and on:
+
+| Write | Held exclusively, before → now | Total cost per write, before → now |
+|---|---|---|
+| A new document | 0.652 ms → 0.134 ms (4.9 times less) | 0.656 ms → 0.637 ms (the same) |
+| An update of a document | 1.338 ms → 0.156 ms (8.6 times less) | 1.344 ms → 1.944 ms (45% more) |
+
+Searches wait 5 to 9 times less during collection writes. Additions get it for nothing; an update pays 45% more in all, because its plan also simulates the repair of the old version's neighbors ahead of time (as `HnswIndex::upsert` has since its insertions were split): a single writer making updates as fast as it can is slower, and readers alongside it are much faster. Making that simulation cheaper is on the roadmap.
+
+**Batches.** `add_batch` stores its vectors pending, decides their links between short exclusive steps and publishes them together. Measured on one shared virtual core, 5,000 vectors of 128 dimensions added to an index of 50,000, timing every exclusive hold of the lock:
+
+| `add_batch` | Batch | Exclusive holds | Longest a search can wait | Exclusive in all |
+|---|---|---|---|---|
+| Former, 1 thread | 4,939 ms | 1 | 4,939 ms | 4,939 ms |
+| Now, 1 thread | 4,941 ms | 5,003 | 3.3 ms | 1,021 ms |
+| Former, 4 threads | 4,764 ms | 1 | 4,764 ms | 4,764 ms |
+| Now, 4 threads | 5,833 ms | 23 | 71 ms (a chunk of up to 256) | 1,258 ms |
+
+Searches wait 67 to 1,500 times less. Applying links is now sequential (about a fifth of the work here) where the former parallel path also applied them in parallel: on many cores a batch may take longer than before (one core cannot show it); a bulk-load mode for batches nobody searches alongside is on the roadmap.
 ### Group-by
 
 Filling groups by searching among each group's members, instead of widening the whole search until every group is full (50,000 chunks in documents of 8, a payload index on the document field; one shared virtual core):

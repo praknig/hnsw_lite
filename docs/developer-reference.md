@@ -64,7 +64,7 @@ With `Cosine`, vectors and queries are normalized to length 1 automatically; a v
 Every index and collection is safe to use from many threads at once, with no locking of your own:
 
 - **Reads** (searches, lookups, saves, health reports) run in parallel with each other.
-- **Changes** (adds, updates, removals, metadata changes) run one at a time, and each waits for running reads to finish. While a change waits, new reads wait too, so a steady stream of searches can never starve a change. On an `HnswIndex`, an `add`, `update` or `upsert` first finds and chooses its neighbors under the shared lock, alongside searches, and takes the lock alone only to link them (if nothing changed meanwhile; otherwise it does it all alone): searches wait for the link, not the search. A `Collection` holds its own lock alone for a whole change, so its searches wait for all of it.
+- **Changes** (adds, updates, removals, metadata changes) run one at a time, and each waits for running reads to finish. While a change waits, new reads wait too, so a steady stream of searches can never starve a change. On an `HnswIndex`, an `add`, `update` or `upsert` first finds and chooses its neighbors under the shared lock, alongside searches, and takes the lock alone only to link them (if nothing changed meanwhile; otherwise it does it all alone): searches wait for the link, not the search. A `Collection`'s `add` and `upsert` do the same: the dense side's links are decided under the collection's shared lock, and its lock is taken alone only to apply the document to every side (searches see it in all of them at once); its other changes (removals, metadata changes, settings) hold its lock for the whole change, which is short. An `HnswIndex`'s `add_batch` holds a change token for its whole run instead (`IndexLock::change`): other changes wait for it without holding searches back, saving, health reports and checkpoints wait for it (a settled read), and searches run between its exclusive steps, never seeing its vectors before they are published together.
 - **No change from inside an index operation on the same thread.** If a predicate (or a progress callback) running inside an index operation tries to change *any* index or collection, the change throws `std::logic_error` instead of deadlocking. Reading from inside a predicate is fine.
 
 ### Errors and "all or nothing"
@@ -597,7 +597,7 @@ Creates an empty index for `dim`-dimensional vectors. Throws `std::invalid_argum
 | Method | What it does |
 |---|---|
 | `void add(std::uint64_t id, std::span<const float> vector, const Metadata& metadata = {})` | Inserts a vector under `id`. Throws `std::invalid_argument` for a wrong dimension, NaN or infinity, an ID already stored, or invalid metadata. |
-| `void add_batch(ids, vectors, threads = 0, options = {})` and `add_batch(ids, vectors, metadata, threads = 0, options = {})` | Inserts many vectors at once: `vectors` holds `ids.size()` vectors back to back; `metadata`, if given, has one entry per vector. **Everything is checked first** (dimensions, values, IDs against the index and within the batch, metadata); any problem throws and nothing changes. The graph is then built on `threads` threads (0: all cores). With one thread the result is identical to calling `add()` in order; with more, the graph differs from run to run, but not its quality. Searches wait and then see all of the batch or none of it. `options` adds a deadline, cancellation and progress reports; a cancelled batch is undone and throws `Cancelled`. |
+| `void add_batch(ids, vectors, threads = 0, options = {})` and `add_batch(ids, vectors, metadata, threads = 0, options = {})` | Inserts many vectors at once: `vectors` holds `ids.size()` vectors back to back; `metadata`, if given, has one entry per vector. **Everything is checked first** (dimensions, values, IDs against the index and within the batch, metadata); any problem throws and nothing changes. The graph is then built on `threads` threads (0: all cores). With one thread the result is identical to calling `add()` in order; with more, links are decided in parallel per chunk (up to 256 vectors) against the graph as each chunk began and applied in order, so the result is the same whatever their number. Searches run meanwhile: the vectors are stored pending, linked in short exclusive steps and published together, so searches see all of the batch or none of it and wait at most one step; other changes, saves and health reports wait for the batch. `options` adds a deadline, cancellation and progress reports; a cancelled batch is undone and throws `Cancelled`. |
 | `bool update(std::uint64_t id, std::span<const float> vector)` | Replaces the vector of `id`, **keeping its metadata**. The new version is linked in a fresh slot while the old one stays searchable, then swapped in: a failure leaves the old vector exactly as it was. Returns `false` if `id` is not stored. Invalid vectors throw even for an unknown ID. |
 | `bool update(id, vector, const Metadata& metadata)` | Replaces the vector **and its whole metadata** (fields not given are cleared). |
 | `bool upsert(std::uint64_t id, std::span<const float> vector)` | Adds, or replaces the vector keeping its metadata. Returns `true` if added. |
@@ -995,7 +995,7 @@ An **inverted index**: for each term, the list of documents containing it. Searc
 | `compact()` | Drops removed documents from the lists. Runs automatically once removed entries or slots outnumber live ones. |
 | `save(path)`, `save(out)`, `load(path)`, `load(in)` | One file, checksummed. Saving writes the compacted form, so the bytes do not depend on pending removals. |
 
-**Limitations:** search is exact without pruning, so very common terms (stop words) make long lists and slow searches: drop them for large text collections. A standalone `SparseIndex` has **no write-ahead log** (a `Collection` logs its sparse sides). Term numbers are 32-bit.
+**Limitations:** search is exact without pruning, so very common terms (stop words) make long lists and slow searches: drop them for large text collections. A standalone `SparseIndex` is durable through `SparseIndex::open_durable` (a `Collection` logs its sparse sides in its own log). Term numbers are 32-bit.
 
 ### 7.3 Searching combined dense and sparse indexes by hand
 
@@ -1964,6 +1964,8 @@ class HnswIndex {
     bool update(std::uint64_t id, std::span<const float> vector);
     bool update(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
     bool upsert(std::uint64_t id, std::span<const float> vector);
+    UpsertPlan plan_upsert(std::uint64_t id, std::span<const float> vector) const;
+    bool upsert(std::uint64_t id, std::span<const float> vector, const UpsertPlan& plan);
     bool upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
     bool contains(std::uint64_t id) const;
     std::vector<SearchResult> search(std::span<const float> query, std::size_t k, std::size_t ef = 64) const;

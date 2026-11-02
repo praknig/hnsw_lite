@@ -78,6 +78,7 @@ struct Collection::Prepared {
     SparseVector text_terms;
     SparseVector sparse;
     Metadata metadata;
+    HnswIndex::UpsertPlan dense_plan;  // empty: the dense side inserts directly
 };
 
 // ---------------------------------------------------------------- presets
@@ -225,6 +226,15 @@ Collection::Prepared Collection::prepare_keyed(const Document& d, std::optional<
 
 // ---------------------------------------------------------------- changes
 
+void Collection::plan_dense(std::uint64_t id, Prepared& p) const {
+    // The dense side's insertion is most of a document's cost: its links are decided here,
+    // under the shared lock, so searches run meanwhile; the write lock then only applies them
+    // (or, if another change came first, does it all, with the same result).
+    if (!dense_ || !(p.parts & kPartVector)) return;
+    const auto lock = read_lock(mutex_, this);
+    p.dense_plan = dense_->plan_upsert(id, p.vector);
+}
+
 bool Collection::apply_upsert(std::uint64_t id, const Prepared& p) {
     const auto it = slot_of_.find(id);
     const bool existed = it != slot_of_.end();
@@ -254,7 +264,7 @@ bool Collection::apply_upsert(std::uint64_t id, const Prepared& p) {
         std::string text = options_.store_text ? p.text : std::string();
         undo = metadata_.write(slot, p.metadata);
         if (dense_) {
-            if (p.parts & kPartVector) (void)dense_->upsert(id, p.vector);
+            if (p.parts & kPartVector) (void)dense_->upsert(id, p.vector, p.dense_plan);
             else if (old_vector) (void)dense_->remove(id);
         }
         ++sides_done;
@@ -323,6 +333,7 @@ bool Collection::apply_remove(std::uint64_t id) {
 
 void Collection::add(std::uint64_t id, const Document& document) {
     Prepared p = prepare(document);
+    plan_dense(id, p);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (slot_of_.count(id)) throw std::invalid_argument("Collection: duplicate id " + std::to_string(id));
@@ -335,6 +346,7 @@ void Collection::add(std::uint64_t id, const Document& document) {
 
 bool Collection::upsert(std::uint64_t id, const Document& document) {
     Prepared p = prepare(document);
+    plan_dense(id, p);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     metadata_.validate(p.metadata);
@@ -1115,6 +1127,7 @@ void Collection::add(std::string_view key, const Document& document) {
     const Runtime rt = runtime();
     const std::uint64_t id = keyed_id(key, rt);
     Prepared p = prepare_keyed(document, key, rt);
+    plan_dense(id, p);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (slot_of_.count(id)) {
@@ -1135,6 +1148,7 @@ bool Collection::upsert(std::string_view key, const Document& document) {
     const Runtime rt = runtime();
     const std::uint64_t id = keyed_id(key, rt);
     Prepared p = prepare_keyed(document, key, rt);
+    plan_dense(id, p);
     const auto lock = write_lock(mutex_, this);
     check_changeable();
     if (const auto it = slot_of_.find(id); it != slot_of_.end()) {

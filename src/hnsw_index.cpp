@@ -536,7 +536,7 @@ void HnswIndex::link_back(NodeId node, const std::vector<NodeId>& neighbors, int
         options.push_back({distance_between(neighbor, node), node});
         for (std::size_t i = 0; i < count; ++i) {
             const NodeId c = slots[i];
-            if (ids.is_deleted(c) || graph.level(c) < level) continue;
+            if (ids.is_retired(c) || graph.level(c) < level) continue;  // a batch's pending nodes are kept
             options.push_back({distance_between(neighbor, c), c});
         }
         std::sort(options.begin(), options.end());
@@ -610,17 +610,195 @@ void HnswIndex::add_unlocked(std::uint64_t id, std::span<const float> vector, co
 
 void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors, std::size_t threads,
                           const OperationOptions& options) {
-    const auto guard = lock_.write("add_batch");
+    if (!testing::insert_planning()) {  // tests: all of it under the write lock, as before
+        const auto guard = lock_.write("add_batch");
+        const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
+        add_batch_unlocked(ids, vectors, nullptr, threads, options);
+        return;
+    }
+    const auto change = lock_.change("add_batch");  // other changes wait; searches run between its steps
     const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, {}); }));
-    add_batch_unlocked(ids, vectors, nullptr, threads, options);
+    add_batch_alongside(ids, vectors, nullptr, threads, options);
 }
 
 void HnswIndex::add_batch(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                           std::span<const Metadata> metadata, std::size_t threads, const OperationOptions& options) {
     if (metadata.size() != ids.size()) throw std::invalid_argument("add_batch: one metadata entry per vector is required");
-    const auto guard = lock_.write("add_batch");
+    if (!testing::insert_planning()) {  // tests: all of it under the write lock, as before
+        const auto guard = lock_.write("add_batch");
+        const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
+        add_batch_unlocked(ids, vectors, metadata.data(), threads, options);
+        return;
+    }
+    const auto change = lock_.change("add_batch");  // other changes wait; searches run between its steps
     const ChangeLog::Scope logged(log_, log_.begin(walop::kAddBatch, [&] { return walop::encode_add_batch(ids, vectors, metadata); }));
-    add_batch_unlocked(ids, vectors, metadata.data(), threads, options);
+    add_batch_alongside(ids, vectors, metadata.data(), threads, options);
+}
+
+void HnswIndex::add_batch_alongside(std::span<const std::uint64_t> ids, std::span<const float> vectors,
+                                    const Metadata* metadata, std::size_t threads, const OperationOptions& options) {
+    // The caller holds the change token: no other change runs, so links decided between
+    // steps are still valid when applied; searches run between the steps and never see the
+    // batch until it is published (its slots pending, its IDs unmapped, its metadata unwritten).
+    const RngGuard rng_guard(rng_);  // a failed batch draws no levels
+    const std::size_t n = ids.size(), d = dim();
+    if (vectors.size() != n * d) throw std::invalid_argument("add_batch: expected ids.size() * dim() values");
+    if (n == 0) return;
+    const Metadata none;
+    auto row = [&](std::size_t i) -> const Metadata& { return metadata ? metadata[i] : none; };
+    auto vec = [&](std::size_t i) { return vectors.subspan(i * d, d); };
+    std::vector<NodeId> nodes;
+    std::vector<int> levels;
+    std::size_t reuse = 0;
+    detail::OperationControl control(options, n);  // progress counts linked vectors; may throw Cancelled
+    {   // 1. Validate everything and reserve what publishing and undoing need (one step).
+        const auto step = lock_.write("add_batch");
+        for (std::uint64_t id : ids) note_change(id);  // for a running rebuild(), before anything changes
+        std::unordered_set<std::uint64_t> seen;
+        seen.reserve(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            prepare_checked(vec(i));
+            if (storage_.ids().find(ids[i]) || !seen.insert(ids[i]).second)
+                throw std::invalid_argument("add_batch: an ID is already stored or appears twice in the batch");
+        }
+        if (metadata) metadata_.validate_batch(metadata, n);
+        nodes.reserve(n);
+        levels.reserve(n);
+        free_slots_.reserve(free_slots_.size() + n);
+        storage_.ids().reserve_entries(n);
+        reuse = std::min(n, free_slots_.size());
+        if (n > reuse) reserve_code(static_cast<NodeId>(storage_.size() + (n - reuse) - 1));
+    }
+    try {
+        // 2. Vectors that reuse removed slots: one at a time, in the order add_batch has always
+        //    used (a reused slot keeps its old links, which searches follow, until it is reused).
+        for (std::size_t i = 0; i < reuse; ++i) {
+            NodeId slot = 0;
+            int level = 0;
+            {
+                const auto step = lock_.write("add_batch");
+                prepare_checked(vec(i));
+                slot = free_slots_.back();
+                level = random_level();
+                storage_.insert_into_unmapped(slot, ids[i], scratch_.values(), level, vec(i));
+                storage_.ids().mark_pending(slot);
+                free_slots_.pop_back();
+                encode_slot(slot);
+                nodes.push_back(slot);
+                levels.push_back(level);
+            }
+            std::vector<std::vector<NodeId>> decided;  // between the steps: no change can intervene
+            const bool decide = entry_ != kEmpty;
+            if (decide) decided = decide_levels(slot, level, kEmpty, scratch_.data(), entry_, max_level_, nullptr, nullptr);
+            {
+                const auto step = lock_.write("add_batch");
+                if (entry_ == kEmpty) {
+                    entry_ = slot;
+                    max_level_ = level;
+                } else {
+                    link_new_node(slot, level, kEmpty, decide ? &decided : nullptr);
+                }
+            }
+            control.advance();
+        }
+        // 3. The rest: stored in order, pending, in one step (all storage grows here, so
+        //    nothing reallocates while their links are decided).
+        if (n > reuse) {
+            const auto step = lock_.write("add_batch");
+            for (std::size_t i = reuse; i < n; ++i) {
+                prepare_checked(vec(i));
+                const int level = random_level();
+                const NodeId slot = storage_.insert_unmapped(ids[i], scratch_.values(), level, vec(i));
+                storage_.ids().mark_pending(slot);
+                encode_slot(slot);
+                nodes.push_back(slot);
+                levels.push_back(level);
+                if ((i & 63) == 63) control.check();
+            }
+        }
+        // 4. Their links: decided between steps (in parallel for a chunk, against the graph as
+        //    the chunk began, as compact does), applied in order in a step. One thread: one at
+        //    a time, which gives the index a direct add_batch gives.
+        const std::size_t workers = std::min(effective_threads(threads), n - reuse);
+        for (std::size_t start = reuse; start < n;) {
+            const std::size_t linked = live_ + start;
+            const std::size_t chunk = workers <= 1 || linked < 1024 ? 1 : std::min<std::size_t>(256, linked / 32);
+            const std::size_t end = std::min(n, start + chunk);
+            const NodeId entry = entry_;
+            const int top = max_level_;
+            std::vector<std::vector<std::vector<NodeId>>> decided(end - start);
+            if (entry != kEmpty) {
+                auto decide = [&](std::size_t j) {
+                    if (levels[start + j] > top) return;  // above the graph: linked directly, in the step
+                    std::vector<float> buffer;
+                    decided[j] = decide_levels(nodes[start + j], levels[start + j], kEmpty,
+                                               stored_padded(nodes[start + j], buffer).data(), entry, top, nullptr, nullptr);
+                };
+                if (end - start > 1) pool_.get(workers)->parallel_for(end - start, decide);
+                else decide(0);
+            }
+            {
+                const auto step = lock_.write("add_batch");
+                for (std::size_t j = start; j < end; ++j) {
+                    if (entry_ == kEmpty) {
+                        entry_ = nodes[j];
+                        max_level_ = levels[j];
+                        continue;
+                    }
+                    const bool use = entry != kEmpty && levels[j] <= top;
+                    std::vector<float> buffer;
+                    link_levels(nodes[j], levels[j], kEmpty, stored_padded(nodes[j], buffer).data(), entry_, max_level_, nullptr,
+                                use ? &decided[j - start] : nullptr);
+                    if (levels[j] > max_level_) {
+                        max_level_ = levels[j];
+                        entry_ = nodes[j];
+                    }
+                }
+            }
+            for (std::size_t j = start; j < end; ++j) control.advance();
+            start = end;
+        }
+        control.finish();  // a throwing progress callback undoes the batch too
+        // 5. Publish, in one step: metadata, then the IDs (room reserved: cannot fail), the
+        //    pending marks and the count. Searches then see all of the batch at once.
+        const auto step = lock_.write("add_batch");
+        std::vector<MetadataStore::WriteUndo> undo;
+        undo.reserve(n);
+        try {
+            for (std::size_t k = 0; k < n; ++k) undo.push_back(metadata_.write(nodes[k], row(k)));
+        } catch (...) {
+            for (std::size_t k = undo.size(); k-- > 0;) metadata_.undo_write(nodes[k], undo[k]);
+            throw;
+        }
+        IdMap& map = storage_.ids();
+        for (const NodeId slot : nodes) {
+            map.map_unmapped(slot);
+            map.publish(slot);
+        }
+        live_ += n;
+        maybe_train();
+    } catch (...) {
+        roll_back_pending(nodes);
+        throw;
+    }
+}
+
+void HnswIndex::roll_back_pending(const std::vector<NodeId>& nodes) noexcept {
+    // Nothing of the batch was visible: its IDs were never mapped, its metadata never written,
+    // the count never changed. Its slots are retired (free for later additions; the free list
+    // has room), and the graph is repaired around them, best effort, as remove() does.
+    const auto step = lock_.write("add_batch");
+    IdMap& map = storage_.ids();
+    for (std::size_t k = nodes.size(); k-- > 0;) {
+        map.retire(nodes[k]);
+        free_slots_.push_back(nodes[k]);
+    }
+    if (entry_ != kEmpty && map.is_deleted(entry_)) choose_new_entry();
+    if (!params_.repair_on_remove) return;
+    try {
+        for (const NodeId node : nodes) repair_neighbors(node);
+    } catch (...) {  // GCOVR_EXCL_LINE: needs memory to run out while undoing
+    }
 }
 
 void HnswIndex::add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
@@ -803,7 +981,8 @@ std::vector<std::vector<NodeId>> HnswIndex::decide_levels(NodeId node, int level
                                                           int top, LinkLocks* locks, const float* base_vector) const {
     // `ignore` (the old version of an updated vector) is traversed but never
     // chosen as a neighbor, since it is about to be removed.
-    const Eligibility eligible{&storage_.ids(), nullptr, nullptr, ignore};
+    Eligibility eligible{&storage_.ids(), nullptr, nullptr, ignore};
+    eligible.include_pending = true;  // a batch's pending nodes are candidates too
     // 4. Greedy descent through the levels above the new node's level.
     Candidate current{distance_to(query, entry), entry};
     for (int l = top; l > level; --l) current = greedy_closest(query, current, l, node, locks);
@@ -835,7 +1014,7 @@ std::vector<std::vector<NodeId>> HnswIndex::decide_levels(NodeId node, int level
             // through it as a last resort. After it is retired it stays
             // traversable, bridging to the new version, which would otherwise
             // have no links at all and could never be found.
-            found = search_level(query, entries, params_.ef_construction, l, *visited, node, live_only(), nullptr, locks);
+            found = search_level(query, entries, params_.ef_construction, l, *visited, node, linkable(), nullptr, locks);
         }
         chosen.push_back(select_neighbors(node, found, params_.M, base_vector));
         if (!found.empty()) entries = std::move(found);  // empty only when updating the only vector
@@ -1088,15 +1267,26 @@ bool HnswIndex::update(std::uint64_t id, std::span<const float> vector, const Me
     return replace(id, vector, &metadata, plan ? &*plan : nullptr);
 }
 
-bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) {
-    const std::optional<InsertPlan> plan = plan_insert(id, vector);  // under the shared lock
+bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector) { return upsert(id, vector, plan_upsert(id, vector)); }
+
+HnswIndex::UpsertPlan HnswIndex::plan_upsert(std::uint64_t id, std::span<const float> vector) const {
+    UpsertPlan p;
+    p.owner_ = this;
+    p.id_ = id;
+    p.plan_ = plan_insert(id, vector);  // under the shared lock
+    return p;
+}
+
+bool HnswIndex::upsert(std::uint64_t id, std::span<const float> vector, const UpsertPlan& prepared) {
+    // Another index's plan, or another ID's, is not this insertion's: done directly then.
+    const InsertPlan* const plan = prepared.owner_ == this && prepared.id_ == id && prepared.plan_ ? &*prepared.plan_ : nullptr;
     const auto guard = lock_.write("upsert");  // one lock across both steps: atomic
     const bool exists = storage_.ids().find(id).has_value();  // logged as what it does: an update or an add
     const ChangeLog::Scope logged(log_, log_.begin(exists ? walop::kUpdate : walop::kAdd, [&] {
         return exists ? walop::encode_update(id, vector, nullptr) : walop::encode_add(id, vector, {});
     }));
-    if (replace(id, vector, nullptr, plan ? &*plan : nullptr)) return false;
-    add_unlocked(id, vector, {}, false, plan ? &*plan : nullptr);
+    if (replace(id, vector, nullptr, plan)) return false;
+    add_unlocked(id, vector, {}, false, plan);
     return true;
 }
 

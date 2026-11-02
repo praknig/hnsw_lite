@@ -400,6 +400,9 @@ private:
     void check_runtime(const TtlOptions& ttl, bool string_ids) const;  // a strict schema has the reserved fields
     bool replaying_ = false;  // replay(): documents applied exactly as logged (expiry and keys included)
     Prepared prepare(const Document& d) const;
+    /// The dense side's new links, decided under the shared lock while searches run (none
+    /// without a vector); apply_upsert uses them if nothing changed the dense side since.
+    void plan_dense(std::uint64_t id, Prepared& p) const;
     bool apply_upsert(std::uint64_t id, const Prepared& p);
     bool apply_remove(std::uint64_t id);
     void check_changeable() const;

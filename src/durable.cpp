@@ -252,7 +252,7 @@ std::unique_ptr<HnswIndex> HnswIndex::open_durable(const std::string& dir, std::
 std::uint64_t HnswIndex::checkpoint() {
     if (!durable_) throw std::logic_error("checkpoint: not a durable index (open it with open_durable)");
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
-    const auto guard = lock_.read();  // no change can run until the snapshot is written
+    const auto guard = lock_.settled_read();  // no change (nor a batch midway) until the snapshot is written
     return checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out, {}); });
 }
 

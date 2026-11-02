@@ -584,8 +584,10 @@ struct Eligibility {
     NodeId exclude = kEmpty;  // a node to leave out (the old version during an update)
 
     const std::vector<NodeId>* rows = nullptr;  ///< SearchOptions::among, as rows: an exact search of these only
+    /// Linking only: a batch's pending nodes are candidates (for readers they do not exist).
+    bool include_pending = false;
     bool operator()(NodeId n) const {
-        if (n == exclude || ids->is_deleted(n)) return false;
+        if (n == exclude || (include_pending ? ids->is_retired(n) : ids->is_deleted(n))) return false;
         if (filter && !filter->matches(n)) return false;
         if (predicate && !(*predicate)(ids->external(n))) return false;
         return true;
