@@ -2,3 +2,5 @@
 cmake-build-*/
 build/
 fuzz-out/
+# Written by conan install
+CMakeUserPresets.json

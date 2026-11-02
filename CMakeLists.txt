@@ -1,5 +1,15 @@
 cmake_minimum_required(VERSION 3.20)
-project(hnsw-lite LANGUAGES CXX)
+
+# The version is written in one place, the Python package (python/hnsw_lite_lib/__init__.py);
+# the wheels, the CMake package, vcpkg and Conan all read it from there.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/python/hnsw_lite_lib/__init__.py" HNSW_LITE_VERSION_LINE
+        REGEX "^__version__ = \"[0-9]+\\.[0-9]+\\.[0-9]+\"")
+string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" HNSW_LITE_VERSION "${HNSW_LITE_VERSION_LINE}")
+if(NOT HNSW_LITE_VERSION)
+  message(FATAL_ERROR "No __version__ = \"X.Y.Z\" line in python/hnsw_lite_lib/__init__.py")
+endif()
+project(hnsw-lite VERSION ${HNSW_LITE_VERSION} LANGUAGES CXX)
+include(GNUInstallDirs)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,6 +28,14 @@ option(HNSW_LITE_BUILD_EXAMPLES "Build the example programs" ${HNSW_LITE_IS_MAIN
 option(HNSW_LITE_BUILD_TOOLS "Build the hnsw-lite command-line tool" ${HNSW_LITE_IS_MAIN_PROJECT})
 option(HNSW_LITE_SANITIZE "Build with AddressSanitizer + UBSan (GCC/Clang, Linux/macOS)" OFF)
 option(HNSW_LITE_BUILD_PYTHON "Build the Python extension module (hnsw_lite_lib._core)" OFF)
+# Installing the library and its CMake package (for find_package, vcpkg and Conan). Off for
+# the Python build, whose install step makes the wheel, and when included in another project.
+if(HNSW_LITE_IS_MAIN_PROJECT AND NOT HNSW_LITE_BUILD_PYTHON)
+  set(HNSW_LITE_INSTALL_DEFAULT ON)
+else()
+  set(HNSW_LITE_INSTALL_DEFAULT OFF)
+endif()
+option(HNSW_LITE_INSTALL "Install the library, headers and CMake package" ${HNSW_LITE_INSTALL_DEFAULT})
 
 find_package(Threads REQUIRED)  # batch search runs on a thread pool
 
@@ -30,7 +48,13 @@ add_library(hnsw_lite STATIC
         src/flat_index.cpp src/hnsw_index.cpp src/query_planner.cpp src/persistence.cpp      # Layer 3
         src/kmeans.cpp src/codec.cpp src/facets.cpp src/text_analysis.cpp src/vamana.cpp src/disk_index.cpp src/health.cpp src/upkeep.cpp src/rebuild.cpp src/wal.cpp src/wal_ops.cpp src/wal_replay.cpp src/durable.cpp src/sparse.cpp src/collection.cpp src/scoring.cpp  # ..., durability, sparse and hybrid search, collections
         ${HNSW_LITE_HEADERS})
-target_include_directories(hnsw_lite PUBLIC include)
+# Installed headers go into include/hnsw_lite/ (their names, such as common.h, are generic);
+# #include "hnsw_index.h" works in every setup; #include <hnsw_lite/hnsw_index.h> only against an
+# installed package (FetchContent and add_subdirectory use include/ as it is in the source tree).
+target_include_directories(hnsw_lite PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/hnsw_lite>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(hnsw_lite PUBLIC Threads::Threads)
 add_library(hnsw_lite::hnsw_lite ALIAS hnsw_lite)
 
@@ -171,4 +195,28 @@ if(HNSW_LITE_BUILD_PYTHON)
   pybind11_add_module(_core python/src/bindings.cpp)
   target_link_libraries(_core PRIVATE hnsw_lite)
   install(TARGETS _core LIBRARY DESTINATION hnsw_lite_lib)
+endif()
+
+# ---------------------------------------------------------------------------
+# Installing: the library, its headers and a CMake package (find_package(hnsw_lite))
+# ---------------------------------------------------------------------------
+if(HNSW_LITE_INSTALL)
+  include(CMakePackageConfigHelpers)
+  set(HNSW_LITE_CMAKE_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/hnsw_lite)
+  install(TARGETS hnsw_lite EXPORT hnsw_liteTargets
+          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/hnsw_lite FILES_MATCHING PATTERN "*.h")
+  install(EXPORT hnsw_liteTargets NAMESPACE hnsw_lite:: DESTINATION ${HNSW_LITE_CMAKE_DIR})
+  configure_package_config_file(cmake/hnsw_liteConfig.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/hnsw_liteConfig.cmake
+          INSTALL_DESTINATION ${HNSW_LITE_CMAKE_DIR})
+  # 0.x: a new minor version may change the API, so only the same minor version is accepted.
+  write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/hnsw_liteConfigVersion.cmake
+          VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/hnsw_liteConfig.cmake ${CMAKE_CURRENT_BINARY_DIR}/hnsw_liteConfigVersion.cmake
+          DESTINATION ${HNSW_LITE_CMAKE_DIR})
+  if(TARGET hnsw-lite)
+    install(TARGETS hnsw-lite RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+  endif()
 endif()

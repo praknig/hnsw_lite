@@ -230,3 +230,30 @@ jobs:
 
       - name: Run
         run: ${{ matrix.run }}
+
+  # The vcpkg port, built from this checkout as an overlay port (a vcpkg clone and bootstrap
+  # take a few minutes, so it runs nightly), then used through vcpkg's toolchain.
+  vcpkg:
+    name: vcpkg port
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: vcpkg
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$RUNNER_TEMP/vcpkg"
+          "$RUNNER_TEMP/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+
+      - name: Install the port from this checkout
+        env:
+          HNSW_LITE_SOURCE_DIR: ${{ github.workspace }}
+          VCPKG_KEEP_ENV_VARS: HNSW_LITE_SOURCE_DIR
+        run: '"$RUNNER_TEMP/vcpkg/vcpkg" install hnsw-lite --overlay-ports=ports --disable-metrics'
+
+      - name: Use it through vcpkg's toolchain
+        run: |
+          cmake -S test_package -B consumer -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$RUNNER_TEMP/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          cmake --build consumer
+          ./consumer/test_package

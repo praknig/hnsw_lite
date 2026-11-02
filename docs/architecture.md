@@ -85,7 +85,13 @@ hnsw-lite/
 ├── .gitignore                  # Ignores IDE settings and build output
 ├── LICENSE                     # MIT License
 ├── SECURITY.md                 # Security policy
-├── CMakeLists.txt              # Builds the library, tests, benchmarks, examples and the tool
+├── CMakeLists.txt              # Builds the library, tests, benchmarks, examples and the tool; installs the package
+├── cmake/
+│   └── hnsw_liteConfig.cmake.in  # The installed CMake package: find_package(hnsw_lite)
+├── conanfile.py                # Conan 2 recipe (conan create)
+├── test_package/               # Builds and runs a program against the package (Conan, and CI's install check)
+├── ports/
+│   └── hnsw-lite/              # vcpkg port: vcpkg.json, portfile.cmake, usage
 ├── pyproject.toml              # The Python package (scikit-build-core, pybind11)
 ├── README.md                   # Start here: what it is and how to use it
 ├── docs/

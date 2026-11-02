@@ -67,7 +67,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 
 **Strengths.** Among embedded libraries, hnsw-lite is the one that behaves like a database engine: crash-safe durability, real deletion that keeps the graph healthy, health reports, incremental upkeep and rebuilds while in use, typed metadata with a query planner, and hybrid search, in one library with no dependencies. It is also unusually well verified: byte-identical results on every platform, all-or-nothing changes under allocation failure, and crash tests that kill real processes.
 
-**Gaps.** Reach: C++ and Python only, with no C API, no packages for vcpkg or Conan, and no other language bindings yet. Scale: no GPU support and no memory-mapped loading; very long posting lists are scanned without pruning, which limits text and hybrid search on large corpora. Retrieval: no multivector (ColBERT-style) search yet, and text analysis is English-first. Benchmarks: results on SIFT1M and GloVe against hnswlib, FAISS and USearch are published on the `benchmarks` branch, on one cloud machine class; other hardware is still to be measured. The open features below address these.
+**Gaps.** Reach: C++ and Python only, with no C API and no other language bindings yet (C++ packages: CMake, vcpkg and Conan). Scale: no GPU support and no memory-mapped loading; very long posting lists are scanned without pruning, which limits text and hybrid search on large corpora. Retrieval: no multivector (ColBERT-style) search yet, and text analysis is English-first. Benchmarks: results on SIFT1M and GloVe against hnswlib, FAISS and USearch are published on the `benchmarks` branch, on one cloud machine class; other hardware is still to be measured. The open features below address these.
 
 ## Open features
 
@@ -79,7 +79,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | 2 | **Automatic maintenance:** thresholds deciding when to run `upkeep()`, `rebuild()` and `checkpoint()`, from a background thread or a `maintain()` call | **done** for collections (`MaintenancePolicy`) | |
 | 3 | **Presets:** balanced, low memory and high recall settings chosen from dimension and size | **done** (`CollectionOptions::preset`) | |
 | 4 | **Python bindings,** with wheels for every platform | **done**: `pip install hnsw-lite-lib` (collections, indexes, filters, NumPy, pandas); wheels for Linux, macOS and Windows built and tested by CI, published on version tags | |
-| 5 | **Packaging:** vcpkg, Conan, and a CMake package configuration | | 2–3 days |
+| 5 | **Packaging:** vcpkg, Conan, and a CMake package configuration | **done**: `cmake --install` and `find_package(hnsw_lite)`; a vcpkg port (`ports/hnsw-lite`); a Conan 2 recipe (`conanfile.py`, with `test_package`); checked in CI (vcpkg nightly) | |
 | 6 | **C API:** a stable interface for Rust, Go, C# and others | | 2 days |
 | 7 | **Command-line tool:** inspect, verify, report health, compact, convert and export | **done**: `inspect`, `verify`, `health`, `export`; open: `compact` and `convert` | 1 day |
 | 8 | **Import and export:** NumPy, `.fvecs` and `.ivecs`, Parquet, metadata as JSON | **done**: NumPy, Arrow and Parquet, importers from hnswlib, FAISS and Chroma, export to JSON Lines or CSV; open: loading `.fvecs` and `.ivecs` into an index (the benchmarks read them) | 1 day |
@@ -107,7 +107,7 @@ Systems with their own storage engine or server, for context: hnsw-lite gives up
 | Stage | Features | Why |
 |---|---|---|
 | **A. One object, no babysitting** | ~~1, 2, 3~~ (done) | Turns the toolkit into a product: one API, maintained automatically |
-| **B. Reach** | ~~4~~ (done), 5, 6 | Python first, then C++ packaging and other languages |
+| **B. Reach** | ~~4, 5~~ (done), 6 | Python first, then C++ packaging and other languages |
 | **C. Operating it** | ~~7, 8~~ (mostly done), 9 | Looking inside indexes, moving data in and out, watching them in production |
 | **D. Confidence** | ~~10~~ (done), 20 | Published numbers on standard datasets (done); faster builds |
 | **E. Speed at scale** | 19, 22, 15 | Writers and readers both fast; memory locality; text search on large corpora |
