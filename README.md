@@ -7,7 +7,7 @@ A small, fast, in-memory **vector search library** in modern C++20.
 
 Store vectors (for example, text or image embeddings) under your own IDs, optionally with metadata, then find the vectors closest to a query: **exactly** with a Flat index, or **approximately and much faster** with an HNSW graph. Searches can be filtered by metadata, run in batches, or return everything within a distance.
 
-hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 961 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
+hnsw-lite was built from scratch to show how libraries like hnswlib, Faiss and Qdrant work inside, so the code is meant to be read as well as used. It is tested thoroughly: 971 tests, at least 99% line and 97% branch coverage (enforced in CI), memory and thread checkers, and CI on Linux, Windows and macOS.
 
 ## Features
 
@@ -190,7 +190,7 @@ For HNSW, the defaults (`M = 16`, `ef_construction = 200`) suit most data. At se
 ## Things to know
 
 - **Distances are "smaller is closer"** for every metric: L2 returns the *squared* distance, inner product returns the *negative* dot product, and cosine returns 1 minus the cosine similarity.
-- **Thread safety:** every index can be used from any number of threads with no lock of your own. Searches and saves run in parallel. Changes run one at a time; on an HNSW index, an `add`, `update` or `upsert` finds its new neighbors alongside running searches and holds them up only while it links, so searches keep their speed while the index changes (a collection still holds its searches for the whole of a change). Changes cannot be made from inside a search (for example from a filter predicate): that throws `std::logic_error`.
+- **Thread safety:** every index can be used from any number of threads with no lock of your own. Searches and saves run in parallel. Changes run one at a time; on an HNSW index, an `add`, `update` or `upsert` finds its new neighbors alongside running searches and holds them up only while it links, so searches keep their speed while the index changes (so does a collection's `add` and `upsert`: its searches wait only while the document is applied to every side; and `add_batch` stores its vectors pending (invisible), links them in short exclusive steps with their links decided between them, and publishes them together, so searches see none of a batch or all of it and wait at most one step). Changes cannot be made from inside a search (for example from a filter predicate): that throws `std::logic_error`.
 - **Errors:** invalid input (wrong dimension, NaN, a duplicate ID, a metadata type mismatch) throws `std::invalid_argument` and leaves the index unchanged.
 - **Saving:** `index.save(path)` writes everything, and `HnswIndex::load(path)` returns the index exactly as it was; a damaged file throws `vecdb::FormatError`.
 
@@ -217,7 +217,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 | [API reference](docs/api-reference.md) | Every public class and function |
 | [Performance and tuning](docs/performance.md) | Benchmarks and how to choose settings |
 | [Architecture and design](docs/architecture.md) | How it works inside: memory layout, SIMD kernels, the HNSW graph, filters and the query planner |
-| [Testing](docs/testing.md) | The 961 tests, code coverage, continuous integration, and bugs found by testing |
+| [Testing](docs/testing.md) | The 971 tests, code coverage, continuous integration, and bugs found by testing |
 | [Project notes](docs/project-notes.md) | Limitations, the roadmap, and references |
 | [Core capabilities plan](docs/core-capabilities-plan.md) and [its test plan](docs/core-capabilities-test-plan.md) | The original designs and test scenarios for deletion, updates, saving and loading, and thread safety (all implemented) |
 | [Hardening and performance plan](docs/hardening-and-performance-plan.md) | Edge cases, optimizations and their order, with the status of each phase |
@@ -226,7 +226,7 @@ See [Benchmarks](docs/benchmarks.md#nightly-benchmark) for running it yourself.
 
 ## Project status
 
-Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys, saved settings, scanning and export to pandas; score modifiers, dates and diversity re-ranking; faceted search (top values, ranges, distinct counts) with payload posting lists; a durable sparse index; the `hnsw-lite` command-line tool; graph reordering; Python bindings and wheels; benchmark and stress tools with a nightly run; connected inner-product graphs, group-by filled from group members, insertions that leave searches running, parallel and deterministic compaction, and a leaner search loop. Next: see the [roadmap](docs/project-notes.md#roadmap).
+Done: flat, HNSW, IVF and disk-based indexes; SIMD kernels; updates, real deletion, health reports, upkeep and rebuilds; metadata, filtered search with a query planner and ACORN, batch, range and by-ID search; saving and loading, and durability (a write-ahead log with crash recovery); thread-safe indexes and parallel building; compression (half precision, SQ8, binary and PQ, Matryoshka truncation, codes only); sparse vectors, BM25 and hybrid search; collections with automatic maintenance, presets, expiry, string keys, saved settings, scanning and export to pandas; score modifiers, dates and diversity re-ranking; faceted search (top values, ranges, distinct counts) with payload posting lists; a durable sparse index; the `hnsw-lite` command-line tool; graph reordering; Python bindings and wheels; C++ packages (CMake, vcpkg, Conan); benchmark and stress tools with a nightly run; connected inner-product graphs, group-by filled from group members, insertions that leave searches running, parallel and deterministic compaction, and a leaner search loop. Next: see the [roadmap](docs/project-notes.md#roadmap).
 
 ## License
 

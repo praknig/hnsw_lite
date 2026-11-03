@@ -366,6 +366,15 @@ public:
     /// metadata). Returns true if it was added, false if it was replaced.
     bool upsert(std::uint64_t id, std::span<const float> vector);
 
+    /// Insertion in two steps, for a caller that changes several indexes under a lock of its
+    /// own (a Collection): plan_upsert decides the new version's links under the shared lock,
+    /// while searches run; upsert(id, vector, plan) applies them under the write lock. A plan
+    /// is used only by the index that made it, for the same ID, and only if nothing changed
+    /// this index in between; otherwise the insertion is done directly, with the same result.
+    class UpsertPlan;
+    UpsertPlan plan_upsert(std::uint64_t id, std::span<const float> vector) const;
+    bool upsert(std::uint64_t id, std::span<const float> vector, const UpsertPlan& plan);
+
     /// Adds `id` with this metadata, or replaces its vector and whole metadata.
     /// Returns true if it was added, false if it was replaced.
     bool upsert(std::uint64_t id, std::span<const float> vector, const Metadata& metadata);
@@ -590,6 +599,12 @@ private:
 
     /// Eligibility with no filter: "not removed".
     Eligibility live_only() const { return Eligibility{&storage_.ids()}; }
+    /// For linking: live nodes and a batch's pending ones (never results for readers).
+    Eligibility linkable() const {
+        Eligibility e{&storage_.ids()};
+        e.include_pending = true;
+        return e;
+    }
 
     /// Compiles the options' filter (if any) into `holder` and returns the eligibility test.
     Eligibility eligibility(const SearchOptions& options, std::optional<CompiledFilter>& holder) const;
@@ -688,12 +703,33 @@ private:
         };
         std::vector<Relink> relinks;
     };
+public:
+    class UpsertPlan {  // opaque: made by plan_upsert, used by upsert(id, vector, plan)
+    public:
+        UpsertPlan() = default;  // an empty plan: the insertion is done directly
+
+    private:
+        friend class HnswIndex;
+        const HnswIndex* owner_ = nullptr;
+        std::uint64_t id_ = 0;
+        std::optional<InsertPlan> plan_;
+    };
+
+private:
     std::optional<InsertPlan> plan_insert(std::uint64_t id, std::span<const float> vector) const;
     bool plan_holds(const InsertPlan* plan, NodeId ignore, NodeId slot) const;
     void simulate_repair(NodeId node, std::vector<InsertPlan::Relink>& relinks) const;  // repair_neighbors, reading only
 
     /// add_batch's work; the caller holds the write lock. `metadata` is an array
     /// of ids.size() entries, or null.
+    /// add_batch with the change token held: searches run between its steps. Vectors are
+    /// stored pending (invisible to readers, IDs unmapped), linked in short exclusive steps
+    /// with their links decided between them, then published together: all or nothing.
+    void add_batch_alongside(std::span<const std::uint64_t> ids, std::span<const float> vectors, const Metadata* metadata,
+                             std::size_t threads, const OperationOptions& options);
+    /// Undoes a pending batch (in a step of its own): its slots retired, the entry point and
+    /// the neighbors repaired. Never throws.
+    void roll_back_pending(const std::vector<NodeId>& nodes) noexcept;
     void add_batch_unlocked(std::span<const std::uint64_t> ids, std::span<const float> vectors,
                             const Metadata* metadata, std::size_t threads, const OperationOptions& options);
 

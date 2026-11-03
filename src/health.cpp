@@ -92,7 +92,7 @@ HealthReport HnswIndex::health(const HealthOptions& options) const {
     };
     std::vector<Probe> probes;
     {
-        const auto guard = lock_.read();
+        const auto guard = lock_.settled_read();  // not a batch midway
         const GraphStorage& g = storage_.graph();
         const IdMap& ids = storage_.ids();
         const std::size_t n = storage_.size();
@@ -212,7 +212,7 @@ HealthReport FlatIndex::health(const HealthOptions& options) const {
     };
     std::vector<Probe> probes;
     {
-        const auto guard = lock_.read();
+        const auto guard = lock_.settled_read();  // not a batch midway
         r.live = live_;
         r.slots = live_;  // a flat index keeps its rows packed: no free slots
         r.removals = removals_since_upkeep_;

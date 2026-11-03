@@ -524,6 +524,26 @@ const Fixture& fixture(Metric m) {
 // Layer 1: common.h
 // ===========================================================================
 
+TEST(layer1, id_map_pending_slots) {
+    // A batch's slot: invisible to readers (is_deleted) but not removed (is_retired), never
+    // free for reuse, not findable until mapped; publishing makes it live; retiring frees it.
+    IdMap m;
+    const NodeId a = m.add_unmapped(7);
+    m.mark_pending(a);
+    CHECK(m.is_pending(a) && m.is_deleted(a) && !m.is_retired(a));
+    CHECK(!m.is_free(a));
+    CHECK(!m.find(7));
+    m.reserve_entries(4);
+    m.map_unmapped(a);
+    m.publish(a);
+    CHECK(!m.is_pending(a) && !m.is_deleted(a) && !m.is_retired(a));
+    CHECK(m.find(7) && *m.find(7) == a);
+    const NodeId b = m.add_unmapped(9);
+    m.mark_pending(b);
+    m.retire(b);
+    CHECK(m.is_retired(b) && m.is_free(b) && !m.find(9));
+}
+
 TEST(layer1, round_up_boundaries) {
     CHECK(round_up(0, 16) == 0);
     CHECK(round_up(1, 16) == 16);
@@ -2290,6 +2310,87 @@ TEST(hnsw, planned_writes_equal_direct_writes) {
                 CHECK(same);
             }
     testing::set_insert_planning(true);
+}
+
+TEST(hnsw, upsert_plan_used_only_where_it_holds) {
+    // upsert(id, vector, plan) applies a plan made by plan_upsert only if it is this index's,
+    // for this ID, with nothing changed in between; otherwise it inserts directly. Either way
+    // the index must equal one built by direct insertions, byte for byte.
+    auto bytes_of = [](const HnswIndex& h) {
+        std::ostringstream out;
+        h.save(out);
+        return out.str();
+    };
+    std::mt19937 rng(2626);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> data(300, std::vector<float>(8));
+    for (auto& v : data) for (float& x : v) x = nd(rng);
+    for (const Metric m : {Metric::L2, Metric::Cosine, Metric::InnerProduct}) {
+        HnswIndex direct(8, m), planned(8, m), other(8, m);
+        for (std::uint64_t i = 0; i < 200; ++i) {
+            direct.add(i, data[i]);
+            planned.add(i, data[i]);
+            other.add(i, data[i]);
+        }
+        std::mt19937 r(9);
+        for (int step = 0; step < 300; ++step) {
+            const std::uint64_t id = r() % 260, other_id = r() % 260;
+            const std::size_t row = r() % 300, other_row = r() % 300;
+            const int kind = static_cast<int>(r() % 5);
+            HnswIndex::UpsertPlan plan;
+            if (kind == 4) {  // stale with the same slot: reorder() renumbers every node in place
+                plan = planned.plan_upsert(id, data[row]);
+                (void)direct.reorder();
+                (void)planned.reorder();
+            } else if (kind == 0) {  // stale: another change between planning and applying
+                plan = planned.plan_upsert(id, data[row]);
+                (void)direct.upsert(other_id, data[other_row]);
+                (void)planned.upsert(other_id, data[other_row]);
+            } else if (kind == 1) {
+                plan = planned.plan_upsert(other_id, data[row]);  // another ID's plan
+            } else if (kind == 2) {
+                plan = other.plan_upsert(id, data[row]);  // another index's plan
+            } else {
+                plan = planned.plan_upsert(id, data[row]);  // a plan that holds
+            }
+            (void)direct.upsert(id, data[row]);
+            (void)planned.upsert(id, data[row], plan);
+            if (step % 25 == 0) CHECK(bytes_of(direct) == bytes_of(planned));
+        }
+        CHECK(bytes_of(direct) == bytes_of(planned));
+        const HnswIndex::UpsertPlan empty;  // an empty plan: inserted directly
+        (void)direct.upsert(999, data[0]);
+        (void)planned.upsert(999, data[0], empty);
+        CHECK(bytes_of(direct) == bytes_of(planned));
+    }
+}
+
+TEST(hnsw, among_stops_at_a_deadline) {
+    // An among search over many IDs checks the deadline every 256 rows: a passed deadline (or a
+    // set cancel flag) stops it early, with valid results from the list only. Also: an update
+    // with metadata and an invalid vector, which has no plan, is refused.
+    auto data = random_vectors(700, 8, 4321);
+    HnswIndex h(8, Metric::L2);
+    for (std::uint64_t i = 0; i < 700; ++i) h.add(i, data[i], Metadata().set("g", std::int64_t(i % 4)));
+    std::vector<std::uint64_t> among;
+    for (std::uint64_t i = 0; i < 600; ++i) among.push_back(i);
+    for (const bool by_cancel : {false, true}) {
+        SearchOptions o;
+        o.among = among;
+        o.filter = Filter::ne("g", std::int64_t(3));
+        std::atomic<bool> cancel{true};
+        if (by_cancel) o.cancel = &cancel;
+        else o.deadline = std::chrono::steady_clock::now();
+        SearchStats stats;
+        o.stats = &stats;
+        const auto found = h.search(data[650], 10, 64, o);
+        CHECK(stats.stopped_early);
+        for (const auto& r : found) CHECK(r.id < 600 && r.id % 4 != 3);
+    }
+    std::vector<float> bad(8, 0.5f);
+    bad[2] = std::numeric_limits<float>::quiet_NaN();
+    CHECK_THROWS_AS(std::invalid_argument, h.update(1, bad, Metadata()));
+    CHECK(h.get_vector(1).has_value());
 }
 
 TEST(hnsw, recall_grows_with_ef) {
@@ -9049,6 +9150,179 @@ TEST(concurrency, c19_lock_limits_and_failures) {
     }
 }
 
+TEST(concurrency, index_lock_change_of_several_steps) {
+    // A change made of several exclusive steps (a batch applied in chunks) holds a token for
+    // its whole run: searches run between its steps, other changes wait for the token without
+    // holding searches back, and settled reads (saving, health) wait for it.
+    using namespace std::chrono_literals;
+    auto eventually = [](const std::atomic<bool>& flag) {  // true within 5 s
+        for (int i = 0; i < 500 && !flag.load(); ++i) std::this_thread::sleep_for(10ms);
+        return flag.load();
+    };
+    {   // 1, 2, 3: reads proceed; another writer waits for the token, without blocking reads
+        IndexLock lock;
+        std::atomic<bool> token_held{false}, release{false}, writer_done{false}, reader_done{false};
+        std::thread changer([&] {
+            const auto change = lock.change("batch");
+            { const auto step = lock.write("step"); }  // the holder's own exclusive steps
+            token_held = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+            { const auto step = lock.write("step"); }
+        });
+        CHECK(eventually(token_held));
+        std::thread writer([&] { const auto w = lock.write("upsert"); writer_done = true; });
+        std::this_thread::sleep_for(100ms);
+        CHECK(!writer_done);  // waits for the change of several steps
+        std::thread reader([&] { const auto r = lock.read(); reader_done = true; });
+        CHECK(eventually(reader_done));  // a waiting writer does not hold reads back
+        CHECK(!writer_done);
+        release = true;
+        changer.join();
+        CHECK(eventually(writer_done));
+        writer.join();
+        reader.join();
+    }
+    {   // 4: a settled read waits for another thread's change, not for its own
+        IndexLock lock;
+        std::atomic<bool> token_held{false}, release{false}, settled_done{false}, own_settled{false};
+        std::thread changer([&] {
+            const auto change = lock.change("batch");
+            { const auto r = lock.settled_read(); own_settled = true; }
+            token_held = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        CHECK(eventually(token_held));
+        CHECK(own_settled);
+        std::thread saver([&] { const auto r = lock.settled_read(); settled_done = true; });
+        std::this_thread::sleep_for(100ms);
+        CHECK(!settled_done);
+        release = true;
+        changer.join();
+        CHECK(eventually(settled_done));
+        saver.join();
+    }
+    {   // 5: a change waits for a writer already inside
+        IndexLock lock;
+        std::atomic<bool> writing{false}, release{false}, changed{false};
+        std::thread writer([&] {
+            const auto w = lock.write("upsert");
+            writing = true;
+            while (!release) std::this_thread::sleep_for(1ms);
+        });
+        CHECK(eventually(writing));
+        std::thread changer([&] { const auto c = lock.change("batch"); changed = true; });
+        std::this_thread::sleep_for(100ms);
+        CHECK(!changed);
+        release = true;
+        writer.join();
+        CHECK(eventually(changed));
+        changer.join();
+    }
+    {   // 6: not from inside an index operation
+        IndexLock lock;
+        const auto r = lock.read();
+        CHECK_THROWS_AS(std::logic_error, lock.change("batch"));
+    }
+    {   // 7: a writer queued behind a reader when a change starts steps back (letting readers
+        //    in) and goes after the change
+        IndexLock lock;
+        std::atomic<bool> reading{false}, release_read{false}, writer_done{false}, token_held{false}, release_token{false}, late_done{false};
+        std::thread reader([&] {
+            const auto r = lock.read();
+            reading = true;
+            while (!release_read) std::this_thread::sleep_for(1ms);
+        });
+        CHECK(eventually(reading));
+        std::thread writer([&] { const auto w = lock.write("upsert"); writer_done = true; });
+        std::this_thread::sleep_for(100ms);  // queued behind the reader
+        std::thread changer([&] {
+            const auto c = lock.change("batch");  // taken while the writer is queued
+            token_held = true;
+            while (!release_token) std::this_thread::sleep_for(1ms);
+        });
+        CHECK(eventually(token_held));
+        release_read = true;  // the writer wakes, finds the change and steps back
+        reader.join();
+        std::thread late([&] { const auto r = lock.read(); late_done = true; });
+        CHECK(eventually(late_done));  // not held back by the writer stepping back
+        CHECK(!writer_done);
+        release_token = true;
+        changer.join();
+        CHECK(eventually(writer_done));
+        writer.join();
+        late.join();
+    }
+}
+
+TEST(concurrency, c21_add_batch_never_seen_in_part) {
+    // Searches run while add_batch links its vectors; they must see none of a batch or all of
+    // it: an exact search over everything finds either none of its IDs or every one, size()
+    // is the count before or after, never between. A cancelled batch is never seen at all and
+    // leaves the same content: count, IDs and exact results (its slots become free slots and
+    // its neighbors are repaired, as when any batch fails, so the bytes may differ).
+    auto exact_of = [](const HnswIndex& h, const std::vector<float>& q) {
+        SearchOptions o;
+        o.strategy = Strategy::ForceExact;
+        std::vector<std::pair<std::uint64_t, float>> out;
+        for (const auto& r : h.search(q, h.size(), 64, o)) out.emplace_back(r.id, r.distance);
+        return out;
+    };
+    const std::size_t dim = 8, base = 2000, batch = 3000;
+    std::mt19937 rng(2828);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> data((base + batch) * dim);
+    for (float& x : data) x = nd(rng);
+    std::vector<std::uint64_t> ids(base + batch);
+    for (std::size_t i = 0; i < ids.size(); ++i) ids[i] = i;
+    for (const std::size_t threads : {std::size_t{1}, std::size_t{4}}) {
+        HnswIndex h(dim, Metric::L2);
+        h.add_batch(std::span<const std::uint64_t>(ids.data(), base), std::span<const float>(data.data(), base * dim), 1);
+        std::atomic<bool> done{false}, final_batch{false};
+        std::atomic<long> partial{0}, size_between{0}, searches{0}, seen_early{0};
+        auto reader = [&] {
+            std::vector<float> q(dim, 0.1f);
+            while (!done) {
+                const std::size_t before = h.size();
+                if (before != base && before != base + batch) ++size_between;
+                SearchOptions o;
+                o.strategy = Strategy::ForceExact;
+                std::size_t seen = 0;
+                for (const auto& r : h.search(q, base + batch, 64, o)) seen += r.id >= base ? 1 : 0;
+                if (seen != 0 && seen != batch) ++partial;
+                if (seen != 0 && !final_batch) ++seen_early;  // the cancelled batch: never seen
+                ++searches;
+            }
+        };
+        std::thread r1(reader), r2(reader);
+        // A cancelled batch first: cancelled once a third of it is linked.
+        const std::vector<float> q1(dim, 0.1f), q2(dim, -0.3f);
+        const auto before1 = exact_of(h, q1), before2 = exact_of(h, q2);
+        std::atomic<bool> cancel{false};
+        OperationOptions o;
+        o.cancel = &cancel;
+        o.progress = [&](std::size_t linked, std::size_t total) { if (linked * 3 >= total) cancel = true; };
+        CHECK_THROWS_AS(Cancelled, h.add_batch(std::span<const std::uint64_t>(ids.data() + base, batch),
+                                               std::span<const float>(data.data() + base * dim, batch * dim), threads, o));
+        CHECK(h.size() == base);
+        CHECK(!h.contains(base) && !h.contains(base + batch - 1));
+        CHECK(exact_of(h, q1) == before1);
+        CHECK(exact_of(h, q2) == before2);
+        // Then the batch itself.
+        final_batch = true;
+        h.add_batch(std::span<const std::uint64_t>(ids.data() + base, batch), std::span<const float>(data.data() + base * dim, batch * dim), threads);
+        done = true;
+        r1.join();
+        r2.join();
+        std::printf("    %zu thread(s): %ld searches during the batches\n", threads, searches.load());
+        CHECK(partial == 0);
+        CHECK(size_between == 0);
+        CHECK(seen_early == 0);
+        CHECK(h.size() == base + batch);
+        CHECK(h.contains(base) && h.contains(base + batch - 1));
+    }
+}
+
+
 
 // ===========================================================================
 // add_batch: parallel inserts (B1-B19; B20 is the benchmark's threads option)
@@ -9351,45 +9625,67 @@ TEST(add_batch, b10_refused_inside_a_search) {
 
 TEST(add_batch, b11_out_of_memory_removes_the_batch) {
     if constexpr (!HNSW_ALLOC_HOOK) SKIP("allocation hook disabled under sanitizers");
-    auto data = clustered(140, 8, 4, 711);
-    for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+    // Both paths: batches linked alongside searches, and the former all-exclusive one (still
+    // the reference the tests switch to).
+    for (const bool former : {false, true}) {
+    testing::set_insert_planning(!former);
+        auto data = clustered(140, 8, 4, 711);
+        for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+            HnswIndex h(8, Metric::L2);
+            for (std::size_t i = 0; i < 80; ++i) h.add(i, data[i], meta_for(i));
+            for (std::uint64_t i = 0; i < 80; i += 8) h.remove(i);  // some slots to reuse
+            const std::size_t before = h.size(), fields = h.metadata().field_count();
+            const auto ids = id_range(1000, 60);
+            const auto vecs = flatten(Vectors(data.begin() + 80, data.end()));
+            std::vector<Metadata> meta(60);
+            for (std::size_t i = 0; i < 60; ++i) meta[i] = meta_for(i).set("batch_only", std::int64_t(i));  // a new field
+            bool clean = true;
+            const long points = sweep_allocation_failures([&] { h.add_batch(ids, vecs, meta, threads); }, [&] {
+                clean = clean && h.size() == before && h.metadata().field_count() == fields;
+                for (std::uint64_t id : ids) clean = clean && !h.contains(id);
+                for (std::uint64_t i = 1; i < 80; i += 8) clean = clean && h.contains(i) && h.get_metadata(i).has_value();
+                clean = clean && !h.search(data[1], 5, 32).empty();
+                clean = clean && !h.storage().ids().is_deleted(h.entry_point()) && h.max_level() == highest_live_level(h);
+            });
+            CHECK(points > 0 && clean);
+            CHECK(h.size() == before + 60);  // the final, unhindered attempt succeeded
+            check_graph(h, 0.97);
+            h.add(5000, data[0]);  // still fully usable
+            CHECK(h.contains(5000));
+        }
+        // Into an empty index (a failure may come before any vector is the entry point),
+        // and with graph repair turned off.
+        for (bool repair : {true, false}) {
+            HnswParams params;
+            params.repair_on_remove = repair;
+            HnswIndex h(8, Metric::L2, params);
+            const auto ids = id_range(0, 50);
+            const auto vecs = flatten(Vectors(data.begin(), data.begin() + 50));
+            bool clean = true;
+            CHECK(sweep_allocation_failures([&] { h.add_batch(ids, vecs, 4); }, [&] {
+                clean = clean && h.size() == 0 && h.entry_point() == kEmpty && h.max_level() == -1;
+            }) > 0);
+            CHECK(clean && h.size() == 50);
+            check_graph(h, 0.97, repair ? 0.02 : 1.0);  // without repair, links to removed vectors may remain
+        }
+    {   // the former path's other failures: a repeated ID changes nothing; cancelled, it is undone
         HnswIndex h(8, Metric::L2);
-        for (std::size_t i = 0; i < 80; ++i) h.add(i, data[i], meta_for(i));
-        for (std::uint64_t i = 0; i < 80; i += 8) h.remove(i);  // some slots to reuse
-        const std::size_t before = h.size(), fields = h.metadata().field_count();
-        const auto ids = id_range(1000, 60);
-        const auto vecs = flatten(Vectors(data.begin() + 80, data.end()));
-        std::vector<Metadata> meta(60);
-        for (std::size_t i = 0; i < 60; ++i) meta[i] = meta_for(i).set("batch_only", std::int64_t(i));  // a new field
-        bool clean = true;
-        const long points = sweep_allocation_failures([&] { h.add_batch(ids, vecs, meta, threads); }, [&] {
-            clean = clean && h.size() == before && h.metadata().field_count() == fields;
-            for (std::uint64_t id : ids) clean = clean && !h.contains(id);
-            for (std::uint64_t i = 1; i < 80; i += 8) clean = clean && h.contains(i) && h.get_metadata(i).has_value();
-            clean = clean && !h.search(data[1], 5, 32).empty();
-            clean = clean && !h.storage().ids().is_deleted(h.entry_point()) && h.max_level() == highest_live_level(h);
-        });
-        CHECK(points > 0 && clean);
-        CHECK(h.size() == before + 60);  // the final, unhindered attempt succeeded
-        check_graph(h, 0.97);
-        h.add(5000, data[0]);  // still fully usable
-        CHECK(h.contains(5000));
+        h.add_batch(id_range(0, 40), flatten(Vectors(data.begin(), data.begin() + 40)), 1);
+        std::vector<std::uint64_t> twice = id_range(100, 20);
+        twice[7] = twice[3];
+        CHECK_THROWS_AS(std::invalid_argument, h.add_batch(twice, flatten(Vectors(data.begin() + 40, data.begin() + 60)), 1));
+        CHECK(h.size() == 40);
+        for (std::size_t threads : {std::size_t(1), std::size_t(4)}) {
+            std::atomic<bool> cancel{false};
+            OperationOptions o;
+            o.cancel = &cancel;
+            o.progress = [&](std::size_t linked, std::size_t) { if (linked >= 10) cancel = true; };
+            CHECK_THROWS_AS(Cancelled, h.add_batch(id_range(200, 60), flatten(Vectors(data.begin() + 80, data.end())), threads, o));
+            CHECK(h.size() == 40 && !h.contains(200) && !h.contains(259));
+        }
     }
-    // Into an empty index (a failure may come before any vector is the entry point),
-    // and with graph repair turned off.
-    for (bool repair : {true, false}) {
-        HnswParams params;
-        params.repair_on_remove = repair;
-        HnswIndex h(8, Metric::L2, params);
-        const auto ids = id_range(0, 50);
-        const auto vecs = flatten(Vectors(data.begin(), data.begin() + 50));
-        bool clean = true;
-        CHECK(sweep_allocation_failures([&] { h.add_batch(ids, vecs, 4); }, [&] {
-            clean = clean && h.size() == 0 && h.entry_point() == kEmpty && h.max_level() == -1;
-        }) > 0);
-        CHECK(clean && h.size() == 50);
-        check_graph(h, 0.97, repair ? 0.02 : 1.0);  // without repair, links to removed vectors may remain
     }
+    testing::set_insert_planning(true);
 }
 
 TEST(add_batch, b12_thread_counts) {
@@ -9524,6 +9820,78 @@ TEST(add_batch, b19_many_threads_every_metric) {
         for (std::size_t i = 0; i < 2500; ++i) f.add(i, data[i]);
         check_graph(h, 0.99);
         CHECK(recall(h, f, queries, 10, 64) > 0.9);
+    }
+}
+
+TEST(add_batch, b20_alongside_searches_equals_direct) {
+    // add_batch now stores its vectors pending, decides their links between short exclusive
+    // steps and publishes them together. With one thread it must give the very index of the
+    // former path (all under the write lock), byte for byte: every metric, slots reused from
+    // removals, metadata, repair on and off, codes. With several threads the chunks are
+    // decided against the graph as each began, so the result must not depend on their number.
+    auto bytes_of = [](const HnswIndex& h) {
+        std::ostringstream out;
+        h.save(out);
+        return out.str();
+    };
+    std::mt19937 rng(2727);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    const std::size_t dim = 8;
+    std::vector<float> data(3000 * dim);
+    for (float& x : data) x = nd(rng);
+    std::vector<std::uint64_t> ids(3000);
+    std::vector<Metadata> md(3000);
+    for (std::size_t i = 0; i < 3000; ++i) {
+        ids[i] = 10000 + i;
+        md[i] = Metadata().set("g", std::int64_t(i % 7));
+    }
+    auto span_of = [&](std::size_t from, std::size_t count) { return std::span<const float>(&data[from * dim], count * dim); };
+    for (const Metric m : {Metric::L2, Metric::Cosine, Metric::InnerProduct})
+        for (const bool repair : {true, false})
+            for (const bool codes : {false, true}) {
+                HnswParams p;
+                p.repair_on_remove = repair;
+                if (codes) {
+                    p.quantization.codec = CodecKind::SQ8;
+                    p.quantization.train_after = 400;
+                }
+                HnswIndex direct(dim, m, p), alongside(dim, m, p);
+                auto both = [&](auto&& op) {
+                    testing::set_insert_planning(false);
+                    op(direct);
+                    testing::set_insert_planning(true);
+                    op(alongside);
+                };
+                both([&](HnswIndex& h) { h.add_batch(std::span<const std::uint64_t>(ids.data(), 600), span_of(0, 600),
+                                                     std::span<const Metadata>(md.data(), 600), 1); });
+                both([&](HnswIndex& h) { for (std::uint64_t i = 10000; i < 10600; i += 3) (void)h.remove(i); });  // free slots
+                both([&](HnswIndex& h) { h.add_batch(std::span<const std::uint64_t>(ids.data() + 600, 900), span_of(600, 900),
+                                                     std::span<const Metadata>(md.data() + 600, 900), 1); });
+                both([&](HnswIndex& h) { h.add_batch(std::span<const std::uint64_t>(ids.data() + 1500, 50), span_of(1500, 50), 1); });
+                testing::set_insert_planning(true);
+                CHECK(bytes_of(direct) == bytes_of(alongside));
+                CHECK(direct.size() == alongside.size());
+            }
+    // Several threads: the same index whatever their number; and the former path on several
+    // threads (linked concurrently, still the reference the tests switch to) holds the same
+    // vectors: exact searches agree.
+    for (const Metric m : {Metric::L2, Metric::Cosine}) {
+        HnswIndex two(dim, m), four(dim, m), former(dim, m);
+        two.add_batch(std::span<const std::uint64_t>(ids.data(), 3000), span_of(0, 3000), 2);
+        four.add_batch(std::span<const std::uint64_t>(ids.data(), 3000), span_of(0, 3000), 4);
+        testing::set_insert_planning(false);
+        former.add_batch(std::span<const std::uint64_t>(ids.data(), 3000), span_of(0, 3000), 4);
+        testing::set_insert_planning(true);
+        CHECK(bytes_of(two) == bytes_of(four));
+        CHECK(two.size() == 3000 && former.size() == 3000);
+        SearchOptions exact;
+        exact.strategy = Strategy::ForceExact;
+        for (std::size_t q = 0; q < 5; ++q) {
+            const std::span<const float> query(&data[q * 97 * dim], dim);
+            const auto a = two.search(query, 10, 64, exact), b = former.search(query, 10, 64, exact);
+            CHECK(a.size() == b.size());
+            for (std::size_t r = 0; r < std::min(a.size(), b.size()); ++r) CHECK(a[r].id == b[r].id);
+        }
     }
 }
 
@@ -18937,6 +19305,33 @@ TEST(sparse, sp12_edges_found_on_review) {
     CHECK_THROWS_AS(std::invalid_argument, (void)fuse({}, {}, 3, bad));
 }
 
+TEST(sparse, sp_among_with_filter_and_predicate) {
+    // A sparse search among given IDs applies the filter and the predicate too; results come
+    // in the usual order (score, then ID).
+    SparseIndex s;
+    for (std::uint64_t i = 0; i < 300; ++i) {
+        SparseVector v;
+        v.indices = {std::uint32_t(i % 7), std::uint32_t(7 + i % 5)};
+        v.values = {1.0f + float(i % 3), 0.5f};
+        s.add(i, v, Metadata().set("g", std::int64_t(i % 3)));
+    }
+    SparseVector q;
+    q.indices = {1, 8};
+    q.values = {1.0f, 1.0f};
+    SearchOptions o;
+    o.among = std::vector<std::uint64_t>{};
+    for (std::uint64_t i = 0; i < 300; i += 2) o.among->push_back(i);
+    o.among->push_back(9999);  // unknown: ignored
+    o.filter = Filter::ne("g", std::int64_t(0));
+    o.predicate = [](std::uint64_t id) { return id % 10 != 4; };
+    const auto found = s.search(q, 20, o);
+    CHECK(!found.empty());
+    for (std::size_t r = 0; r < found.size(); ++r) {
+        CHECK(found[r].id % 2 == 0 && found[r].id % 3 != 0 && found[r].id % 10 != 4);
+        if (r > 0) CHECK(found[r - 1].distance < found[r].distance || (found[r - 1].distance == found[r].distance && found[r - 1].id < found[r].id));
+    }
+}
+
 TEST(sparse, sp13_every_path) {
     std::mt19937 rng(3020);
     SparseIndex s;
@@ -19936,6 +20331,111 @@ TEST(collection, co24_group_fill_is_exact_per_group) {
     }
 }
 
+TEST(collection, co25_planned_writes_equal_direct_writes) {
+    // A document's dense links are decided under the collection's shared lock (searches run
+    // meanwhile) and applied under its write lock; doing it all under the write lock must give
+    // the same collection, byte for byte: additions, replacements (also by the same vector),
+    // removals freeing slots, by ID and by string key, with text beside the vectors.
+    auto bytes_of = [](const Collection& c, const std::string& name) {
+        const std::string path = temp_path(name);
+        c.save(path);
+        std::ostringstream all;
+        {
+            std::ifstream in(path, std::ios::binary);
+            all << in.rdbuf();
+        }  // closed before removing: Windows cannot remove an open file
+        std::filesystem::remove(path);
+        return all.str();
+    };
+    std::mt19937 rng(2525);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<std::vector<float>> data(300, std::vector<float>(8));
+    for (auto& v : data) for (float& x : v) x = nd(rng);
+    for (const Metric m : {Metric::L2, Metric::Cosine})
+        for (const bool keys : {false, true}) {
+            CollectionOptions o;
+            o.dim = 8;
+            o.metric = m;
+            o.string_ids = keys;
+            o.maintenance.mode = Maintenance::Manual;
+            Collection direct(o), planned(o);
+            auto both = [&](auto&& op) {
+                testing::set_insert_planning(false);
+                op(direct);
+                testing::set_insert_planning(true);
+                op(planned);
+            };
+            std::mt19937 r(11);
+            bool same = true;
+            int first = -1;
+            for (int step = 0; step < 600 && same; ++step) {
+                const std::uint64_t id = r() % 200;
+                const std::size_t row = r() % 300;
+                Document d;
+                d.vector = data[(r() % 4 == 0) ? id % 300 : row];  // sometimes the same vector again
+                d.text = "document " + std::to_string(row % 37) + " about topic " + std::to_string(row % 11);
+                d.metadata = Metadata().set("g", std::int64_t(r() % 5));
+                const std::string key = "doc-" + std::to_string(id);
+                switch (r() % 4) {
+                    case 0:
+                        both([&](Collection& c) {
+                            if (keys) { if (!c.get(key)) c.add(key, d); }
+                            else if (!c.contains(id)) c.add(id, d);
+                        });
+                        break;
+                    case 1: case 2: both([&](Collection& c) { if (keys) (void)c.upsert(key, d); else (void)c.upsert(id, d); }); break;
+                    default: both([&](Collection& c) { if (keys) (void)c.remove(key); else (void)c.remove(id); }); break;
+                }
+                if (step % 50 == 49 && bytes_of(direct, "co25_direct") != bytes_of(planned, "co25_planned")) {
+                    same = false;
+                    first = step;
+                }
+            }
+            testing::set_insert_planning(true);
+            if (!same) std::printf("    metric %d, keys %d: first difference by step %d\n", static_cast<int>(m), keys ? 1 : 0, first);
+            CHECK(same);
+            CHECK(bytes_of(direct, "co25_direct") == bytes_of(planned, "co25_planned"));
+        }
+}
+
+TEST(collection, co26_group_fill_by_int_and_bool_fields) {
+    // Groups filled by an exact search among their members, keyed by an integer field and by a
+    // boolean one (co24 groups by a string): every hit carries its group's value. A passed
+    // deadline stops grouping early and says so.
+    CollectionOptions o;
+    o.dim = 8;
+    o.metric = Metric::L2;
+    o.maintenance.mode = Maintenance::Manual;
+    Collection c(o);
+    auto data = random_vectors(1500, 8, 2626);
+    for (std::uint64_t i = 0; i < 1500; ++i) {
+        Document d;
+        d.vector = data[i];
+        d.metadata = Metadata().set("num", std::int64_t(i % 40)).set("flag", i % 2 == 0);
+        c.add(i, d);
+    }
+    CollectionSearchOptions so;
+    CollectionQuery query;
+    query.vector = data[7];
+    for (const auto& field : {std::string("num"), std::string("flag")}) {
+        const auto groups = c.search_groups(query, GroupBy{field, 6, 3, 0}, so);
+        CHECK(!groups.empty());
+        for (const CollectionGroup& g : groups) {
+            CHECK(g.hits.size() <= 3);
+            for (const CollectionHit& hit : g.hits) {
+                const auto md = c.get(hit.id)->metadata.get(field);
+                CHECK(md.has_value() && (field == "num" ? md->i == g.value.i : md->b == g.value.b));
+            }
+        }
+    }
+    bool stopped = false;
+    CollectionSearchOptions late;
+    late.deadline = std::chrono::steady_clock::now();
+    late.stopped_early = &stopped;
+    (void)c.search_groups(query, GroupBy{"num", 6, 3, 0}, late);
+    CHECK(stopped);
+}
+
 TEST(collection, co19_search_groups) {
     // Group-by over an exact ranking (text, BM25): equal to grouping the full ranking by
     // hand, for every field type and size; then documents without the field, filters, the
@@ -20710,6 +21210,39 @@ TEST(maintenance, mt07_background_maintenance_during_changes_and_searches) {
     for (const auto& [id, text] : expected) same = same && c->get(id) && c->get(id)->text == text;
     CHECK(same);
     c.reset();  // close it first: Windows cannot delete the locked LOCK file of an open collection
+    std::filesystem::remove_all(dir);
+}
+
+TEST(maintenance, mt08_status_read_while_checkpointing) {
+    // A checkpoint replaces the log's writer under the shared lock; maintenance_status() and
+    // maintain() read the log meanwhile. They wait for a checkpoint in progress (found by
+    // ThreadSanitizer in mt05: a background checkpoint racing a status read).
+    auto data = random_vectors(200, 8, 4108);
+    const std::string dir = co_dir("mt08");
+    CollectionOptions o = co_options();
+    o.maintenance.mode = Maintenance::Manual;
+    {
+        auto c = Collection::open(dir, o);
+        for (std::uint64_t i = 0; i < 100; ++i) c->add(i, co_doc(data, i));
+        std::atomic<bool> done{false};
+        std::thread checkpointer([&] {
+            for (std::uint64_t i = 0; i < 60; ++i) {
+                c->upsert(100 + i, co_doc(data, 100 + i));
+                (void)c->checkpoint();
+            }
+            done = true;
+        });
+        std::size_t reads = 0;
+        while (!done) {
+            const MaintenanceStatus st = c->maintenance_status();
+            CHECK(st.log_bytes < (std::uint64_t(1) << 40));
+            if (reads % 8 == 0) (void)c->maintain();
+            ++reads;
+        }
+        checkpointer.join();
+        CHECK(reads > 0);
+        CHECK(c->size() == 160);
+    }
     std::filesystem::remove_all(dir);
 }
 

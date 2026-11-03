@@ -56,7 +56,15 @@ public:
 
     // Deleting only sets a flag ("tombstone"); memory is not reclaimed.
     void mark_deleted(NodeId id) { deleted_.at(id) = 1; }
-    bool is_deleted(NodeId id) const { return deleted_.at(id) != 0; }
+    bool is_deleted(NodeId id) const { return deleted_.at(id) != 0; }  // removed, or pending: not visible
+
+    /// Removed from the graph (not merely pending): what linking and pruning skip.
+    bool is_retired(NodeId id) const { return deleted_.at(id) == 1; }
+    /// A slot of a batch still being linked: live for the batch's own linking, invisible to
+    /// readers (is_deleted) until publish(). Its ID stays unmapped meanwhile. Never throws.
+    void mark_pending(NodeId slot) noexcept { deleted_[slot] = 2; }
+    void publish(NodeId slot) noexcept { deleted_[slot] = 0; }
+    bool is_pending(NodeId slot) const { return deleted_.at(slot) == 2; }
 
     /// Real deletion: frees the user ID so it can be added again, and marks its
     /// slot as free (deleted) so the slot can be reused. Returns the freed slot,
@@ -72,7 +80,7 @@ public:
 
     /// True if `slot` exists, is deleted and no user ID maps to it (it was released).
     bool is_free(NodeId slot) const {
-        if (slot >= to_external_.size() || !deleted_[slot]) return false;
+        if (slot >= to_external_.size() || deleted_[slot] != 1) return false;  // a pending slot is not free
         const std::size_t b = locate(to_external_[slot]);
         return b == kNone || buckets_[b] != slot;
     }
@@ -117,6 +125,20 @@ public:
         to_external_[slot] = external;
         deleted_[slot] = 0;
     }
+
+    /// Room for `k` more mapped IDs, so that k map_unmapped() calls cannot fail. All-or-nothing.
+    void reserve_entries(std::size_t k) {
+        if ((count_ + k) * 10 <= buckets_.size() * 7) return;
+        std::size_t size = std::max<std::size_t>(16, buckets_.size());
+        while ((count_ + k) * 10 > size * 7) size *= 2;
+        std::vector<NodeId> grown(size, kFree);
+        for (const NodeId v : buckets_)
+            if (v != kFree) place(grown, v);
+        buckets_.swap(grown);
+    }
+    /// Makes an unmapped live slot findable by its ID (a batch's publication). The ID must not
+    /// be mapped; room must have been reserved (reserve_entries). Never throws.
+    void map_unmapped(NodeId slot) noexcept { insert(slot); }
 
     /// Makes `find(external)` return `slot`. `external` must be stored. Never throws.
     void repoint(std::uint64_t external, NodeId slot) noexcept { buckets_[locate(external)] = slot; }

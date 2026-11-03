@@ -212,9 +212,9 @@ public:
     /// Reads the index: shared with other reads; free if this thread is already inside it.
     class ReadGuard {
     public:
-        explicit ReadGuard(const IndexLock& lock) : lock_(lock), nested_(lock.held()) {
+        explicit ReadGuard(const IndexLock& lock, bool settled = false) : lock_(lock), nested_(lock.held()) {
             if (nested_) return;
-            lock_.lock_shared(inside_any());
+            lock_.lock_shared(inside_any(), settled);
             try {
                 lock_.push();
             } catch (...) {
@@ -266,6 +266,27 @@ public:
         const IndexLock& lock_;
     };
 
+    /// A change made of several exclusive steps, with the lock released between them so that
+    /// searches run (a batch applied in chunks). While a thread holds it, other threads'
+    /// changes wait for it (before queueing: they do not hold searches back meanwhile), and
+    /// settled reads wait for it; the holder takes write() for each step. Throws
+    /// std::logic_error if this thread is inside an operation on any index.
+    class ChangeGuard {
+    public:
+        ChangeGuard(const IndexLock& lock, const char* operation) : lock_(lock) {
+            if (inside_any())
+                throw std::logic_error(std::string("vecdb: ") + operation +
+                                       " called from inside an index operation (for example a filter predicate); "
+                                       "change indexes only outside searches");
+            lock_.acquire_change();
+        }
+        ~ChangeGuard() { lock_.release_change(); }
+        ChangeGuard(const ChangeGuard&) = delete;
+        ChangeGuard& operator=(const ChangeGuard&) = delete;
+
+    private:
+        const IndexLock& lock_;
+    };
     /// Marks this thread as inside the index without locking, for work done on
     /// behalf of a caller that already holds a read (batch tasks on pool threads).
     class Hold {
@@ -280,6 +301,10 @@ public:
     };
 
     ReadGuard read() const { return ReadGuard(*this); }
+    /// A read that also waits for another thread's change of several steps to finish: for
+    /// readers needing the index as no such change left it midway (saving, health reports).
+    ReadGuard settled_read() const { return ReadGuard(*this, true); }
+    ChangeGuard change(const char* operation) const { return ChangeGuard(*this, operation); }
     WriteGuard write(const char* operation) const { return WriteGuard(*this, operation); }
 
     /// Whether this thread is inside an operation on this index.
@@ -323,9 +348,9 @@ private:
             }
     }
 
-    void lock_shared(bool nested) const {
+    void lock_shared(bool nested, bool settled) const {
         std::unique_lock<std::mutex> l(m_);
-        cv_.wait(l, [&] { return !writer_ && (nested || waiting_writers_ == 0); });
+        cv_.wait(l, [&] { return !writer_ && (nested || waiting_writers_ == 0) && !(settled && changed_by_other()); });
         ++readers_;
     }
     void unlock_shared() const {
@@ -334,10 +359,28 @@ private:
     }
     void lock() const {
         std::unique_lock<std::mutex> l(m_);
-        ++waiting_writers_;
-        cv_.wait(l, [&] { return !writer_ && readers_ == 0; });
-        --waiting_writers_;
+        for (;;) {
+            // Another thread's change of several steps first: waited for without counting as a
+            // waiting writer, which would hold new readers back for all of it.
+            cv_.wait(l, [&] { return !changed_by_other(); });
+            ++waiting_writers_;
+            cv_.wait(l, [&] { return (!writer_ && readers_ == 0) || changed_by_other(); });
+            --waiting_writers_;
+            if (!changed_by_other()) break;
+            cv_.notify_all();  // one started meanwhile: back to waiting for it, letting readers in
+        }
         writer_ = true;
+    }
+    bool changed_by_other() const { return change_owner_ != std::thread::id() && change_owner_ != std::this_thread::get_id(); }
+    void acquire_change() const {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return !writer_ && change_owner_ == std::thread::id(); });
+        change_owner_ = std::this_thread::get_id();
+    }
+    void release_change() const {
+        std::lock_guard<std::mutex> l(m_);
+        change_owner_ = std::thread::id();
+        cv_.notify_all();
     }
     void unlock() const {
         std::lock_guard<std::mutex> l(m_);
@@ -350,6 +393,7 @@ private:
     mutable std::size_t readers_ = 0;
     mutable std::size_t waiting_writers_ = 0;
     mutable bool writer_ = false;
+    mutable std::thread::id change_owner_{};  // the thread holding a ChangeGuard, if any
 };
 
 }  // namespace vecdb

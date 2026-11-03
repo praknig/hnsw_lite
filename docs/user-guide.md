@@ -83,7 +83,7 @@ for (const CollectionHit& h : docs->search(q, 10, so)) { /* h.id, h.score, h.vec
 - **Presets:** `CollectionOptions::preset(dim, preset, expected_size)` fills in the graph, compression and search beam, cosine distance, BM25 text, and background maintenance; adjust any field afterwards. Measured on 4,000 clustered 64-dimensional vectors (recall@10 against exact search; size of the dense side):
 
   | Preset | Graph | Compression | Search beam | Recall@10 | Size |
-      |---|---|---|---|---|---|
+    |---|---|---|---|---|---|
   | `Balanced` (default) | `M` 16, `ef_construction` 200 (24 and 300 from a million vectors) | none | 128 | 0.982 | 2.5 MB |
   | `HighRecall` | `M` 32, `ef_construction` 400 (48 and 500 from a million) | none | 256 | 1.000 | 2.8 MB |
   | `LowMemory` | `M` 12, `ef_construction` 150 | SQ8, codes only | 128 | 0.933 | 0.63 MB |
@@ -843,7 +843,7 @@ Every index is safe to use from any number of threads at once, with no lock of y
 
 - **Searches** of every kind, **saves**, and lookups (`contains`, `get_metadata`, `size` and so on) run in parallel with each other.
 - **Changes** (`add`, `update`, `upsert`, `remove`, `set_metadata`, `create_payload_index`, `set_planner_params`, `compact`) run one at a time: a change waits until the searches running when it arrived have finished, and searches arriving after it wait until it is done. A queued change is never starved by a steady stream of searches.
-- **Additions and updates hold searches up only briefly.** An `add`, `update` or `upsert` on an HNSW index finds and chooses its neighbors while searches keep running, and holds them up only to link them in (measured with one writer and 19 readers: reads 3 times faster than when the whole insertion blocked them, p99 latency 5 times lower). The other side of it: with many searches running, the writer competes with them for the cores, so writes go slower than they would alone.
+- **Additions and updates hold searches up only briefly.** An `add`, `update` or `upsert` on an HNSW index, and a collection's `add` and `upsert`, find and choose the new neighbors while searches keep running, and hold them up only to link them in (measured with one writer and 19 readers: reads 3 times faster than when the whole insertion blocked them, p99 latency 5 times lower). The other side of it: with many searches running, the writer competes with them for the cores, so writes go slower than they would alone. Batches too: `add_batch` stores its vectors pending (invisible), links them in short exclusive steps with their links decided between them, and publishes them together, so searches see none of a batch or all of it and wait at most one step (measured: 3.3 ms at most for 5,000 vectors on one thread, where searches used to wait about 5 s); other changes, saves and health reports wait for a batch to finish.
 - **`upsert` is atomic:** the check for an existing vector and the update or insert happen under one lock, so two threads upserting the same ID never collide.
 - **Changes cannot be made from inside a search**, for example from a filter predicate, on that index or any other: this throws `std::logic_error`. Waiting would deadlock (the change would wait for the very search that called it), and changes nested inside searches are what create lock cycles between threads. Predicates may still **search** any index, including the one they are filtering.
 - **Batch searches** use their own thread pool; predicates in batch searches run on several threads at once, so they must be thread-safe.

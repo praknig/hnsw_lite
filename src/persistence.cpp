@@ -358,7 +358,7 @@ void FlatIndex::save(const std::string& path, const OperationOptions& options) c
 }
 
 void FlatIndex::save(std::ostream& out, const OperationOptions& options) const {
-    const auto guard = lock_.read();  // a save reads: searches continue, changes wait
+    const auto guard = lock_.settled_read();  // a save reads: searches continue; changes, and a batch midway, wait
     save_unlocked(out, options);
 }
 
@@ -514,7 +514,7 @@ void HnswIndex::save(const std::string& path, const OperationOptions& options) c
 }
 
 void HnswIndex::save(std::ostream& out, const OperationOptions& options) const {
-    const auto guard = lock_.read();  // a save reads: searches continue, changes wait
+    const auto guard = lock_.settled_read();  // a save reads: searches continue; changes, and a batch midway, wait
     save_unlocked(out, options);
 }
 

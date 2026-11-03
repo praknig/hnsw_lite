@@ -71,6 +71,9 @@ Not copyable, movable. Frees its memory in the destructor.
 | `add_unmapped(external)`, `occupy_unmapped(slot, external)` | A live slot holding a user ID without being findable (the new version during an update) |
 | `repoint(external, slot)`, `retire(slot)` | Switches a user ID to another slot; frees a slot `find()` no longer points to |
 | `size()` | Number of registered IDs |
+| `is_retired(slot)`, `is_pending(slot)` | Removed from the graph (what linking skips), or pending: a batch's slot not yet published, live for its linking, absent for readers (`is_deleted` is true for both) |
+| `mark_pending(slot)`, `publish(slot)` | A batch's slot made pending, then visible |
+| `reserve_entries(k)`, `map_unmapped(slot)` | Room for `k` more IDs; then makes an unmapped slot findable by its ID without failing (a batch's publication) |
 
 ## `GraphStorage`
 
@@ -150,7 +153,7 @@ Not copyable, movable. Frees its memory in the destructor.
 |---|---|
 | `FlatIndex(dim, metric)` | Creates an empty exact index |
 | `add(id, vector)` | Stores a vector; throws on a wrong dimension, NaN or infinity, or a used ID |
-| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread |
+| `add_batch(ids, vectors, [metadata], threads)` | Adds many vectors, all or nothing; on the calling thread. `HnswIndex`: stored pending, linked in short exclusive steps while searches run, published together |
 | `search_by_id(id, k, ...)`, `remove_batch(ids)` | Search with a stored record's vector (empty optional if not stored; the record itself left out unless `include_self`); remove many IDs, skipping unknown ones. Do not range-for over `*search_by_id(...)` directly: store the optional first |
 | `get_vector(id)`, `get(id)`, `scan(options)` | Read back one vector (exactly as given; cosine indexes keep the original), one record, or pages of records in ascending ID order (`ScanOptions`: `filter`, `limit`, `after`, `with_vectors`, `with_metadata`; `Page`: `records`, `next`) |
 | `search_groups(query, GroupBy{field, groups, per_group, max_candidates}, options)` → `std::vector<CollectionGroup>` | Group-by: the best values of a field, each with its best documents. The search widens until the groups are found; a group still short is filled by an exact search among its members (up to 4,096; a filtered search beyond), so a payload index on the field keeps it cheap. With an exact single-list search the result equals grouping the full ranking. With `max_candidates`, everything comes from the best `max_candidates` documents |
@@ -178,6 +181,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `remove(id)` | Repairs the graph around it (if enabled), frees the ID for reuse and its slot for the next insert |
 | `update(id, vector)`, `update(id, vector, metadata)` | Builds and links the new version in another slot, then switches the ID over and frees the old slot; `false` for an unknown ID; a failure leaves the old vector intact |
 | `upsert(id, vector)`, `upsert(id, vector, metadata)` | Adds or replaces; returns `true` if added. `update` and `upsert` decide their links alongside searches as `add` does, and an update's repair of the old version's neighbors too |
+| `plan_upsert(id, vector)`, `upsert(id, vector, plan)`, `UpsertPlan` | An insertion in two steps, for a caller holding its own lock across several indexes (a `Collection`): the links decided under the shared lock, then applied under the write lock. A plan is used only by the index that made it, for the same ID, with nothing changed in between; otherwise the insertion is done directly, with the same result |
 | `compact(options)` | Rebuilds a dense index from the live vectors, deciding links in parallel batches (`OperationOptions::threads`; 0: all cores) and linking in order, so the result is the same, byte for byte, whatever the thread count (a logged compact replays identically); the old index stays intact if memory runs out or it is cancelled |
 | `deleted_count()`, `capacity()` | Slots waiting to be reused; all slots |
 | `contains(id)` | Stored and not removed |
@@ -207,6 +211,7 @@ Not copyable, movable. Frees its memory in the destructor.
 | `Strategy { Auto, ForceExact, ForceGraph }` | How a filtered search runs |
 | `PlannerParams { max_exact_matches = 2000, max_exact_fraction = 0.01, sample_size = 256, max_ef_multiplier = 32, acorn_below = 0.2, acorn_ef_multiplier = 4, fallback_factor = 1 }` | Planner settings (`fallback_factor`: a graph or ACORN search past that many times the estimated matches in distances scans them exactly instead, `PlanReason::ExactFallback`); `Strategy` is `Auto`, `ForceExact`, `ForceGraph` or `ForceAcorn` |
 | `SearchStats` | Strategy, reason, selectivity, estimated matches, `ef`, nodes visited, distances computed |
+| `Eligibility { ids, filter, predicate, exclude, rows, include_pending }` | Which slots a search may return: not removed, not pending (unless `include_pending`, for linking only), not `exclude` (an update's old version), matching the filter and predicate; `rows` restricts it to `SearchOptions::among` |
 
 ## New index methods (`FlatIndex` and `HnswIndex`)
 
@@ -231,7 +236,7 @@ Not copyable, movable. Frees its memory in the destructor.
 
 | Name | Header | Description |
 |---|---|---|
-| `IndexLock` | `thread_pool.h` | The lock inside every index: reads in parallel, changes one at a time, writers preferred. `ReadGuard`, `WriteGuard` (throws `std::logic_error` inside any index operation), `Hold` (batch tasks), `held()`, `inside_any()`, `kMaxNesting` (64); `writes()` counts completed changes (equal before and after a span: nothing changed in it) |
+| `IndexLock` | `thread_pool.h` | The lock inside every index: reads in parallel, changes one at a time, writers preferred. `ReadGuard`, `WriteGuard` (throws `std::logic_error` inside any index operation), `Hold` (batch tasks), `held()`, `inside_any()`, `kMaxNesting` (64); `writes()` counts completed changes (equal before and after a span: nothing changed in it); `change(operation)` (a `ChangeGuard`: a change of several exclusive steps; other changes wait for it without holding reads back) and `settled_read()` (a read that also waits for another thread's change of several steps) |
 | `index_distance(raw, cosine)` | `search_result.h` | A distance as indexes report it: cosine clamped at 0, NaN mapped like `ordered_distance()`. `get_distance()` kernels are unchanged |
 | `testing::set_insert_planning(on)`, `testing::insert_planning()` | `hnsw_index.h` | Tests only: insertions decided under the shared lock (on, the default) or all under the write lock (off); both give the same index, which the tests compare |
 | `in_pool_task()` | `thread_pool.h` | True on a thread running a pool task; `parallel_for()` called there runs inline, so nested batches cannot deadlock |
