@@ -49,7 +49,7 @@ __all__ = ["identify",
            "FieldType", "Codec", "HnswParams", "QuantizationParams", "IvfParams", "DurableOptions", "MaintenancePolicy",
            "CollectionOptions", "FormatError", "Cancelled", "MISSING_ID",
            ]
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 # ---------------------------------------------------------------- names
 
