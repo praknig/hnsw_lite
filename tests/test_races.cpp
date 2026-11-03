@@ -891,6 +891,9 @@ int main(int argc, char** argv) {
     int run = 0;
     for (const Case& c : cases()) {
         if (!only.empty() && std::string(c.name).find(only) == std::string::npos) continue;
+        // Named before it runs, on unbuffered stderr: if a test crashes the process (as one did,
+        // once, on Windows with MinGW: heap corruption), the log says which.
+        std::fprintf(stderr, "  start %s\n", c.name);
         const int before = g_failures;
         const auto t0 = std::chrono::steady_clock::now();
         try {
