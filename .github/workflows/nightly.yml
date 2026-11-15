@@ -27,7 +27,7 @@ jobs:
   # The whole suite on emulated older x86 CPUs, with nothing skipped (pull
   # requests skip the two file-corruption sweeps and the stress group here).
   emulated:
-    name: Emulated ${{ matrix.cpu }}, full suite
+    name: Emulated ${{ matrix.cpu }}, full suite${{ matrix.shard != '1/1' && format(' ({0})', matrix.shard) || '' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -36,15 +36,24 @@ jobs:
         include:
           - cpu: Nehalem  # no AVX: the plain C++ kernels
             qemu_cpu: Nehalem
+            shard: 1/1
           # AVX2. Haswell's TSX (hle, rtm) is switched off: QEMU cannot emulate it and
           # warns at every thread start, burying the output; hnsw-lite does not use it.
-          - cpu: Haswell
-            qemu_cpu: Haswell,-hle,-rtm
+          # Emulating AVX2 is fast on some runner hosts and up to 8 times slower on others
+          # (the same commit took 25 minutes one night and over 2 hours the next), so the
+          # suite runs in four shards: each stays well within the limit on a slow host.
+          - {cpu: Haswell, qemu_cpu: "Haswell,-hle,-rtm", shard: 1/4}
+          - {cpu: Haswell, qemu_cpu: "Haswell,-hle,-rtm", shard: 2/4}
+          - {cpu: Haswell, qemu_cpu: "Haswell,-hle,-rtm", shard: 3/4}
+          - {cpu: Haswell, qemu_cpu: "Haswell,-hle,-rtm", shard: 4/4}
     steps:
       - uses: actions/checkout@v5
 
       - name: Install QEMU
         run: sudo apt-get update && sudo apt-get install -y qemu-user
+
+      - name: Host CPU  # emulation speed depends on it: explains a slow night
+        run: lscpu | grep -E 'Model name|^CPU\(s\)|Flags' | cut -c1-200
 
       - name: Configure
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DHNSW_LITE_BUILD_BENCHMARKS=OFF -DHNSW_LITE_BUILD_EXAMPLES=OFF
@@ -55,17 +64,17 @@ jobs:
       - name: Test
         run: |
           set -o pipefail
-          qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive 2>&1 | tee test.log
+          qemu-x86_64 -cpu ${{ matrix.qemu_cpu }} ./build/test_comprehensive --shard ${{ matrix.shard }} 2>&1 | tee test.log
 
       - name: Summary
         if: always()
-        run: bash .github/scripts/summarize_tests.sh test.log "Emulated ${{ matrix.cpu }}, full suite" >> "$GITHUB_STEP_SUMMARY"
+        run: bash .github/scripts/summarize_tests.sh test.log "Emulated ${{ matrix.cpu }}, full suite, shard ${{ matrix.shard }}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload log
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: nightly-log-emulated-${{ matrix.cpu }}
+          name: nightly-log-emulated-${{ matrix.cpu }}-${{ strategy.job-index }}
           path: test.log
           retention-days: 14
           if-no-files-found: ignore

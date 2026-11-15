@@ -225,7 +225,7 @@ A Debug build runs the comprehensive suite many times slower than Release, and s
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-    |---|---|---|
+  |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -489,6 +489,7 @@ Two test assumptions were also wrong and corrected: a zero vector is valid with 
 134. **A checkpoint raced a status read** (found by ThreadSanitizer in CI, in `mt05_the_background_thread`; present since collections gained background maintenance). `Collection::checkpoint()` replaces the log's writer while holding only the shared lock, which keeps changes out but not readers, and `maintenance_status()` and `maintain()` read the writer under the shared lock too. They now take the checkpoint mutex first, as `checkpoint()` does; `mt08_status_read_while_checkpointing` reproduces the race on the former code every run.
 135. **A test removed a file it still had open** (`co25`, on Windows only: removing an open file fails there). The test now closes the file first.
 136. **The former batch path went untested** (found by the coverage job: lines 98.7%, branches 96.5%). Once `add_batch` linked its batches alongside searches, the former all-exclusive path (still the reference the tests switch to, linking on several threads with per-node locks, and undoing a failed batch with `roll_back_batch`) was no longer run by any test. `b11` now runs on both paths, with the former's repeated-ID and cancellation cases, and `b20` builds with the former path on four threads, its exact searches compared with the new path's; two conditions that could never be false were removed from the new path, and tests cover `among` stopped by a deadline, groups by integer and boolean fields, and a sparse `among` with a filter and predicate.
+137. **The nightly emulated Haswell job ran out of time again** (2 hours), every finished test passing, on code that had passed in 25 minutes the night before: the same tests ran a median 7.9 times slower, so the runner's host made the difference (QEMU's emulation of AVX2 is much slower on some hosts). The suite now runs in four shards, each well within the limit on a slow host, and the job prints the host CPU.
 
 ## Adversarial tests
 
@@ -597,7 +598,7 @@ A second workflow, [nightly.yml](../.github/workflows/nightly.yml), runs every n
 
 | Job | What it adds to the pull-request checks |
 |---|---|
-| Emulated Nehalem and Haswell, full suite | The two exhaustive file-corruption sweeps and the stress group, which pull requests skip under emulation |
+| Emulated Nehalem and Haswell, full suite | The two exhaustive file-corruption sweeps and the stress group, which pull requests skip under emulation; Haswell in four shards (`--shard K/4`), since emulating AVX2 is up to 8 times slower on some runner hosts |
 | ASan + UBSan, full suite | The same as on pull requests, but checking `master` itself every night |
 | ThreadSanitizer, full suite | Every test group, where pull requests check only the threaded groups |
 | vcpkg port | The port in `ports/` installed from the checkout (debug and release, with vcpkg's own checks), then `test_package` built through vcpkg's toolchain |
