@@ -69,7 +69,7 @@ python bench/python/stress.py --phases build,recall,load        # some phases on
 | Phase | What it does | What it checks |
 |---|---|---|
 | `build` | Inserts the vectors in batches on every core | Every vector stored; insert speed holding up as the index grows |
-| `recall` | Exact ground truth by brute force, then searches at `ef` 32 to 256 | Recall@10 at least 0.9 at `ef` 128, and growing with `ef` |
+| `recall` | Exact ground truth by brute force, then searches at `ef` 32 to 256 | Recall@10 at least 0.9 at `ef` 256, and growing with `ef` (the generated clusters hold thousands of nearly equidistant points at millions of vectors, so `ef` 128 is not enough there for hnsw-lite or hnswlib) |
 | `load` | 1, 2, 4… up to `--clients` concurrent search clients, `--duration` seconds each | No errors; queries per second and latency percentiles; throughput growing with clients (on several cores) |
 | `mixed` | Searchers and writers at once (inserts, updates, removes) | The exact final count; sampled ids present or absent as expected; sampled vectors identical to their last write; recall against a fresh brute force; upkeep leaving no vector unreachable |
 | `durable` | A child process writes to a durable collection and is killed mid-write (`SIGKILL`; on Windows, `TerminateProcess`) | Every write it acknowledged survives recovery, with the right vector (one more may appear: written, but killed before acknowledging) |
