@@ -45,16 +45,16 @@ struct Searching {
 };
 
 /// A read lock, unless this thread already holds it in a search of this collection.
-std::shared_lock<std::shared_mutex> read_lock(std::shared_mutex& m, const void* c) {
-    std::shared_lock<std::shared_mutex> l(m, std::defer_lock);
+std::shared_lock<SharedMutex> read_lock(SharedMutex& m, const void* c) {
+    std::shared_lock<SharedMutex> l(m, std::defer_lock);
     if (!inside(c)) l.lock();
     return l;
 }
 
 /// A write lock; refused from inside a search of this collection.
-std::unique_lock<std::shared_mutex> write_lock(std::shared_mutex& m, const void* c) {
+std::unique_lock<SharedMutex> write_lock(SharedMutex& m, const void* c) {
     if (inside(c)) throw std::logic_error("Collection: changes from inside its own search (a predicate) are refused");
-    return std::unique_lock<std::shared_mutex>(m);
+    return std::unique_lock<SharedMutex>(m);
 }
 
 template <class Index, class Old>

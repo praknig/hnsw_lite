@@ -185,6 +185,55 @@ private:
 
 
 /**
+ * @brief A shared mutex (any number of readers, or one writer) built from std::mutex
+ *        and std::condition_variable, for Collection.
+ *
+ * std::shared_mutex is not used there: with MinGW it is winpthreads' read-write lock,
+ * which under a collection's mix of changes, reads and searches let two writers in at
+ * once (found by the race tests on Windows with MinGW: the collection's bookkeeping
+ * corrupted, then the heap; reproduced under Wine, and gone with this lock).
+ *
+ * **Readers are preferred**, as std::shared_mutex is with glibc, where every test has
+ * run: a reader waits only for a writer holding the lock, never for one waiting, so a
+ * thread may take the shared lock again while holding it (a checkpoint saving, for
+ * example). Meets the SharedMutex requirements used: std::shared_lock, std::unique_lock.
+ */
+class SharedMutex {
+public:
+    void lock() {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return !writer_ && readers_ == 0; });
+        writer_ = true;
+    }
+    void unlock() {
+        {
+            std::lock_guard<std::mutex> l(m_);
+            writer_ = false;
+        }
+        cv_.notify_all();
+    }
+    void lock_shared() {
+        std::unique_lock<std::mutex> l(m_);
+        cv_.wait(l, [&] { return !writer_; });
+        ++readers_;
+    }
+    void unlock_shared() {
+        bool last = false;
+        {
+            std::lock_guard<std::mutex> l(m_);
+            last = --readers_ == 0;
+        }
+        if (last) cv_.notify_all();
+    }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::size_t readers_ = 0;
+    bool writer_ = false;
+};
+
+/**
  * @brief The lock inside every index: any number of reads (searches, saves,
  *        lookups) at once, or one change at a time.
  *

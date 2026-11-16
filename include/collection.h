@@ -423,7 +423,7 @@ private:
     std::vector<std::string> texts_;
     std::vector<NodeId> free_;
     bool failed_ = false;  // a rollback failed: changes refused
-    mutable std::shared_mutex mutex_;
+    mutable SharedMutex mutex_;  // not std::shared_mutex: see SharedMutex
     ChangeLog log_;
     std::shared_ptr<detail::DurableState> durable_;
     // Maintenance.
