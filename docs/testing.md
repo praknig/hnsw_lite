@@ -225,7 +225,7 @@ A Debug build runs the comprehensive suite many times slower than Release, and s
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-    |---|---|---|
+  |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -489,7 +489,6 @@ Two test assumptions were also wrong and corrected: a zero vector is valid with 
 134. **A checkpoint raced a status read** (found by ThreadSanitizer in CI, in `mt05_the_background_thread`; present since collections gained background maintenance). `Collection::checkpoint()` replaces the log's writer while holding only the shared lock, which keeps changes out but not readers, and `maintenance_status()` and `maintain()` read the writer under the shared lock too. They now take the checkpoint mutex first, as `checkpoint()` does; `mt08_status_read_while_checkpointing` reproduces the race on the former code every run.
 135. **A test removed a file it still had open** (`co25`, on Windows only: removing an open file fails there). The test now closes the file first.
 136. **The former batch path went untested** (found by the coverage job: lines 98.7%, branches 96.5%). Once `add_batch` linked its batches alongside searches, the former all-exclusive path (still the reference the tests switch to, linking on several threads with per-node locks, and undoing a failed batch with `roll_back_batch`) was no longer run by any test. `b11` now runs on both paths, with the former's repeated-ID and cancellation cases, and `b20` builds with the former path on four threads, its exact searches compared with the new path's; two conditions that could never be false were removed from the new path, and tests cover `among` stopped by a deadline, groups by integer and boolean fields, and a sparse `among` with a filter and predicate.
-137. **Windows with MinGW: a collection's lock let two writers in** (the race tests crashed with heap corruption, `0xc0000374`, in about 3 runs out of 7 since 3 November; once named, the test was `r11`). A collection's string keys came out attached to another key's document ("key k164 has the same id as key k184"), a reader found an id missing from the collection's own map, and then the heap broke. Reproduced with the MinGW build under Wine (about 1 run in 10, on code from before the concurrency changes too); an invariant check showed two writers inside the collection's exclusive section at once. With MinGW, `std::shared_mutex` is winpthreads' read-write lock (8 bytes: a pointer to it), while with glibc and MSVC it is another lock; r11's locking pattern on its own did not break it, but the collection's whole workload did, and with a lock made of a mutex and a condition variable no run of 120 failed. Collections now use that lock, `SharedMutex`, preferring readers as glibc's does, so nothing that ran on Linux can newly wait.
 
 ## Adversarial tests
 
@@ -584,7 +583,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps, the stress group and seven heavy measurement tests, which are slow under emulation |
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, features, scoring and reorder groups (26), plus the race tests and the adversarial concurrency tests |
 | Linux / Fuzzing | Clang, libFuzzer | Every file loader fuzzed for 60 seconds ([fuzz.sh](../.github/scripts/fuzz.sh)) |
-| Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests |
+| Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests; on macOS a job of its own, which CI passed tolerates if GitHub had no macOS machine for it (the job is then abandoned without running, and a warning says so) |
 | Packaging | Release | `cmake --install` into a prefix, then `test_package` built against it with `find_package` (the build tree deleted first); `conan create` with C++20, which builds and runs `test_package` |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
