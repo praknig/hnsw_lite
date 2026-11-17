@@ -459,13 +459,35 @@ jobs:
     if: always()
     needs: [changes, docs, build-and-test, emulated-cpus, windows-mingw, address-sanitizer, coverage, thread-sanitizer, python, fuzz, packaging]
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read  # to list this run's jobs: which never got a machine, and for which system
     steps:
       - name: Every job that ran succeeded
         env:
           RESULTS: ${{ toJSON(needs) }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
           if echo "$RESULTS" | jq -e 'to_entries | any(.value.result == "failure" or .value.result == "cancelled")' > /dev/null; then
             echo "A job failed or was cancelled."
             exit 1
+          fi
+          # "abandoned": GitHub gave up on a job without running it (no machine for it).
+          # Tolerated only for macOS jobs, whose ARM machines run short at times; a job for
+          # any other system that never ran fails CI. A job never ran if it got no runner
+          # and has no steps; one that ran and failed is a failure above.
+          if echo "$RESULTS" | jq -e 'to_entries | any(.value.result == "abandoned")' > /dev/null; then
+            gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq '.jobs[] | select((.runner_name // "") == "" and (.steps | length) == 0 and .name != "CI passed"
+                                     and (.conclusion == "cancelled" or .conclusion == "abandoned"))
+                    | [.name, (.labels | join(","))] | @tsv' > never-ran.tsv
+            echo "Jobs that never got a machine:"
+            cat never-ran.tsv
+            if [ ! -s never-ran.tsv ] || awk -F'\t' '$2 !~ /^macos-/' never-ran.tsv | grep -q .; then
+              echo "A job other than a macOS one never got a machine, or none could be found."
+              exit 1
+            fi
+            cut -f1 never-ran.tsv | while read -r name; do
+              echo "::warning title=Not run: $name::GitHub had no macOS machine for this job, so it did not run. Re-run failed jobs to check it."
+            done
           fi

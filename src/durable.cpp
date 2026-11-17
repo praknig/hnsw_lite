@@ -352,7 +352,7 @@ std::uint64_t Collection::checkpoint() {
     if (!durable_) throw std::logic_error("checkpoint: not a durable collection (open it with Collection::open)");
     if (searching_here()) throw std::logic_error("checkpoint: refused from inside a search of this collection");
     const std::lock_guard<std::mutex> one(durable_->checkpoint_mutex);
-    const std::shared_lock<std::shared_mutex> lock(mutex_);  // no change can run until the snapshot is written
+    const std::shared_lock<SharedMutex> lock(mutex_);  // no change can run until the snapshot is written
     const std::uint64_t lsn = checkpoint_dir(*durable_, log_, [&](std::ostream& out) { save_unlocked(out); });
     checkpoint_lsn_ = lsn;
     checkpoint_time_ = std::chrono::steady_clock::now().time_since_epoch().count();

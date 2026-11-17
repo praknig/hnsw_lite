@@ -225,7 +225,7 @@ A Debug build runs the comprehensive suite many times slower than Release, and s
 - **CPUs:** all tests pass on every CPU type below. Each kernel rounds slightly differently, so each CPU builds a slightly different graph; passing on all of them shows the HNSW tests do not depend on one exact graph.
 
   | CPU | Kernel versions tested | Version chosen |
-    |---|---|---|
+  |---|---|---|
   | Modern x86-64 with AVX-512 | scalar, AVX2, AVX-512 | AVX-512 |
   | Emulated Intel Haswell (2013) | scalar, AVX2 | AVX2 |
   | Emulated Intel Nehalem (2008) | scalar | scalar |
@@ -583,7 +583,7 @@ It does not run on pushes to a branch without a pull request; that would run eve
 | Linux / emulated Nehalem and Haswell | Release | The plain C++ and AVX2 distance code on emulated CPUs (QEMU), which GitHub's machines (AVX2 or better) never exercise; skips the two exhaustive file-corruption sweeps, the stress group and seven heavy measurement tests, which are slow under emulation |
 | Linux / ThreadSanitizer | RelWithDebInfo | Data races in the concurrency, helpers, deletion, add_batch, codec, sq8, matryoshka, lean, review, codes_only, binary, pq, ivf, disk, health, upkeep, rebuild, wal, durable, sparse, collection, maintenance, presets, features, scoring and reorder groups (26), plus the race tests and the adversarial concurrency tests |
 | Linux / Fuzzing | Clang, libFuzzer | Every file loader fuzzed for 60 seconds ([fuzz.sh](../.github/scripts/fuzz.sh)) |
-| Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests |
+| Python (Linux, Windows, macOS; Python 3.9 and 3.13) | Release | The package built from source and its 51 pytest tests; on macOS a job of its own, which CI passed tolerates if GitHub had no macOS machine for it (the job is then abandoned without running, and a warning says so) |
 | Packaging | Release | `cmake --install` into a prefix, then `test_package` built against it with `find_package` (the build tree deleted first); `conan create` with C++20, which builds and runs `test_package` |
 | Linux / Coverage | Debug | Line and branch coverage; fails if it drops below 99% of lines or 97% of branches, and uploads an HTML report |
 
