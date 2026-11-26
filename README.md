@@ -4,9 +4,9 @@ Published by the nightly workflow (`.github/workflows/benchmark.yml`) from `benc
 
 Comparisons on real datasets (SIFT1M, GloVe) against hnswlib, FAISS and USearch: [real-datasets](real-datasets/README.md).
 
-## Latest: 2026-11-25 11:15 UTC, commit [`a10eec9`](https://github.com/praknig/hnsw_lite/commit/a10eec96aa789f9c5c446efc1a56cefeb8f5c91b)
+## Latest: 2026-11-26 10:43 UTC, commit [`a10eec9`](https://github.com/praknig/hnsw_lite/commit/a10eec96aa789f9c5c446efc1a56cefeb8f5c91b)
 
-**8,000,000 vectors of 128 dimensions**, M 16, ef_construction 200; 4 cores; Python 3.12.16. **17 of 17 checks passed** ([run](https://github.com/praknig/hnsw_lite/actions/runs/45597314839)).
+**7,800,000 vectors of 128 dimensions**, M 16, ef_construction 200; 4 cores; Python 3.12.16. **17 of 17 checks passed** ([run](https://github.com/praknig/hnsw_lite/actions/runs/45799069667)).
 
 ![latest-recall.png](latest-recall.png)
 
@@ -22,6 +22,7 @@ Runs on different machines or of different sizes are not directly comparable (si
 
 | Date (UTC) | Commit | Vectors | Inserts/s | Recall@10 (ef 128) | Queries/s (ef 128) | p99 ms | Checks |
 |---|---|---|---|---|---|---|---|
+| 2026-11-26 10:43 | `a10eec9` | 7,800,000 | 5,252 | 0.872 | 3,028 | 0.85 | 17/17 |
 | 2026-11-25 11:15 | `a10eec9` | 8,000,000 | 4,849 | 0.873 | 2,820 | 1.09 | 17/17 |
 | 2026-11-24 12:18 | `a10eec9` | 7,800,000 | 5,391 | 0.872 | 3,272 | 0.88 | 17/17 |
 | 2026-11-23 10:33 | `a10eec9` | 7,900,000 | 4,676 | 0.872 | 2,883 | 1.01 | 17/17 |
@@ -51,4 +52,3 @@ Runs on different machines or of different sizes are not directly comparable (si
 | 2026-10-30 08:23 | `7108dfa` | 7,900,000 | 5,510 | 0.869 | 2,948 | 0.97 | 16/17 **FAIL** |
 | 2026-10-29 08:19 | `7108dfa` | 8,000,000 | 5,433 | 0.874 | 2,516 | 1.21 | 16/17 **FAIL** |
 | 2026-10-28 08:11 | `9f53b0b` | 8,000,000 | 6,106 | 0.874 | 2,778 | 1.06 | 16/17 **FAIL** |
-| 2026-10-27 07:29 | `1fc4117` | 8,000,000 | 6,060 | 0.869 | 3,249 | 0.78 | 16/17 **FAIL** |
